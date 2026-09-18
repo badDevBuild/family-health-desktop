@@ -53,9 +53,14 @@ try {
 } finally {
   client.shutdown();
   await new Promise<void>((resolveExit) => {
-    if (child.exitCode !== null || child.killed) return resolveExit();
-    const timer = setTimeout(() => { child.kill('SIGKILL'); resolveExit(); }, 2_000);
-    child.once('exit', () => { clearTimeout(timer); resolveExit(); });
+    if (child.exitCode !== null) return resolveExit();
+    const killTimer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+    const giveUpTimer = setTimeout(resolveExit, 5_000);
+    child.once('exit', () => {
+      clearTimeout(killTimer);
+      clearTimeout(giveUpTimer);
+      resolveExit();
+    });
   });
-  rmSync(privateRoot, { recursive: true, force: true });
+  rmSync(privateRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
