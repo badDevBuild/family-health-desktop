@@ -30,6 +30,20 @@ function normalizeEvidenceText(value: string): string {
   return value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+function evidenceContainsReportedText(evidence: string, reported: string): boolean {
+  if (evidence.includes(reported)) return true;
+  const compactEvidence = evidence.replace(/\s+/g, '');
+  const compactReported = reported.replace(/\s+/g, '');
+  return compactReported.length > 0 && compactEvidence.includes(compactReported);
+}
+
+function evidenceQuoteMatchesSource(source: string, cited: string): boolean {
+  if (source.includes(cited)) return true;
+  const compactSource = source.replace(/\s+/g, '');
+  const compactCited = cited.replace(/\s+/g, '');
+  return compactCited.length > 0 && compactSource.includes(compactCited);
+}
+
 function evidenceContentProblems(candidate: ObservationCandidate, manifest: SourceManifest): string[] {
   const spans = new Map(manifest.spans.map((span) => [span.id, span]));
   const problems: string[] = [];
@@ -44,7 +58,7 @@ function evidenceContentProblems(candidate: ObservationCandidate, manifest: Sour
       }
       const source = normalizeEvidenceText(span.quote);
       const cited = normalizeEvidenceText(reference.quote);
-      if (!cited || !source.includes(cited)) {
+      if (!cited || !evidenceQuoteMatchesSource(source, cited)) {
         problems.push(`evidence_quote_mismatch:${reference.sourceSpanId}`);
         continue;
       }
@@ -67,7 +81,9 @@ function evidenceContentProblems(candidate: ObservationCandidate, manifest: Sour
   }
   if ((candidate.value.kind === 'qualitative' || candidate.value.kind === 'text') && supportedText.length > 0) {
     const raw = normalizeEvidenceText(candidate.value.rawText);
-    if (raw && !supportedText.some((text) => text.includes(raw))) problems.push('reported_value_not_in_evidence');
+    if (raw && !supportedText.some((text) => evidenceContainsReportedText(text, raw))) {
+      problems.push('reported_value_not_in_evidence');
+    }
   }
   if (candidate.clinicalDate && supportedText.length > 0) {
     const [year, month, day] = candidate.clinicalDate.split('-').map(Number);

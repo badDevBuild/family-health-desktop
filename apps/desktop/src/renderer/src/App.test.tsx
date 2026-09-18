@@ -196,7 +196,7 @@ describe('App member display editing', () => {
       id: 'identity-review-1', personId: 'personal-person-1', documentId: 'document-identity-1',
       kind: 'person_conflict', severity: 'blocking', title: '确认报告姓名与成员身份',
       description: '报告写的是“测试姓名甲”，当前准备归入已选成员。请确认两者是否为同一人。',
-      evidenceRefs: ['identity-span-1'], candidateOptions: [], candidateDiffs: [], reportedName: '测试姓名甲', resolutionStatus: 'open'
+      evidenceRefs: ['identity-span-1'], candidateOptions: [], candidateDiffs: [], reportedName: '测试姓名甲', reasonCodes: [], resolutionStatus: 'open'
     }];
     snapshot.openReviewCount = 1;
     const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'confirm_identity' as const } }));
@@ -237,7 +237,7 @@ describe('App member display editing', () => {
       id: 'legacy-review-1', personId: 'personal-person-1', documentId: 'legacy-document-1',
       kind: 'field_conflict', severity: 'blocking', title: '按新规则重新核对这份报告',
       description: '这项核对由旧版逐字段完全一致规则产生。', evidenceRefs: ['legacy-span'],
-      candidateOptions, candidateDiffs: [], reportedName: null, resolutionStatus: 'open'
+      candidateOptions, candidateDiffs: [], reportedName: null, reasonCodes: [], resolutionStatus: 'open'
     }];
     snapshot.openReviewCount = 1;
     const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'retry_review' as const } }));
@@ -278,7 +278,7 @@ describe('App member display editing', () => {
       description: '两轮核对共有 3 项候选，其中 1 项核心字段不一致。只需核对下方差异项。',
       evidenceRefs: ['conflict-span'], candidateOptions: candidates,
       candidateDiffs: [{ localKey: 'candidate-1', itemName: '收缩压', fields: ['value'] }],
-      reportedName: null, resolutionStatus: 'open'
+      reportedName: null, reasonCodes: [], resolutionStatus: 'open'
     }];
     snapshot.openReviewCount = 1;
     installBridge(snapshot);

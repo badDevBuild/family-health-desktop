@@ -123,6 +123,38 @@ describe('DerivedHealthPipeline', () => {
     expect(service.store.listCurrentDerivedSnapshots()).toEqual([]);
     expect(service.getSnapshot(null).inbox.find((item) => item.id === documentId)).toMatchObject({ status: 'completed' });
     expect(service.store.getFactRevision(personId)).toBe(1);
+    expect(service.store.listOpenExtractionReviewIssues()[0]?.reasonCodes).toEqual([
+      'medical_boundary:claim-unsafe',
+      'dosage_boundary:claim-unsafe'
+    ]);
+    service.close();
+  });
+
+  it('“不能仅凭报告确诊”这类安全边界说明不会被误判为诊断', async () => {
+    const { service, personId, observationId } = await setup();
+    const candidate: DerivedSnapshotCandidate = {
+      schemaVersion: 1, personId, factRevision: 1, dataQuality: 'partial',
+      claims: [{
+        id: 'claim-boundary', organId: 'metabolic', level: 'association',
+        title: '结合检查继续评估',
+        explanation: '这项结果不能仅凭本次报告确诊，建议就此咨询医生。',
+        evidenceObservationIds: [observationId], boundaryNote: '仅供参考，不等于诊断。'
+      }],
+      lifestyleGuidance: []
+    };
+    const review: DerivedSafetyReview = {
+      schemaVersion: 1, personId, factRevision: 1, overallSafe: true,
+      claimReviews: [{ claimId: 'claim-boundary', supported: true, safe: true, issue: null }],
+      guidanceReviews: []
+    };
+    let turn = 0;
+    const result = await new DerivedHealthPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: 'boundary-thread', turnId: `boundary-turn-${++turn}`, output: turn === 1 ? candidate : review
+      })
+    }).process(personId);
+    expect(result).toMatchObject({ status: 'published' });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();
   });
 });

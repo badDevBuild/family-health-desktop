@@ -398,6 +398,7 @@ export const reviewIssueSchema = z.object({
   candidateOptions: z.array(observationCandidateSchema),
   candidateDiffs: z.array(reviewCandidateDiffSchema),
   reportedName: z.string().min(1).nullable(),
+  reasonCodes: z.array(z.string().min(1)),
   resolutionStatus: z.enum(['open', 'resolved', 'deferred'])
 }).strict();
 

@@ -589,6 +589,7 @@ export class PersonalWorkspaceService {
         candidateOptions: [],
         candidateDiffs: [],
         reportedName: null,
+        reasonCodes: [],
         resolutionStatus: 'open' as const
       }));
     const extractionIssues = this.store.listOpenExtractionReviewIssues()
@@ -615,7 +616,11 @@ export class PersonalWorkspaceService {
           description: issue.kind === 'person_conflict'
             ? `报告写的是“${issue.reportedName ?? '未识别姓名'}”，当前准备归入已选成员。请确认两者是否为同一人。`
             : issue.kind === 'derived_safety'
-            ? '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
+            ? issue.reasonCodes.some((code) => code.startsWith('evidence_mismatch:'))
+              ? '报告事实已经安全保存；这次生成的说明有内容缺少对应事实依据，因此没有发布。'
+              : issue.reasonCodes.some((code) => code.startsWith('medical_boundary:') || code.startsWith('dosage_boundary:'))
+                ? '报告事实已经安全保存；这次生成的说明可能被误解为诊断、处方或剂量建议，因此没有发布。'
+                : '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
             : legacyFieldReview
               ? '这项核对由旧版逐字段完全一致规则产生。重新核对后，只在核心事实真正冲突时再请你确认。'
               : issue.kind === 'field_conflict'
@@ -625,6 +630,7 @@ export class PersonalWorkspaceService {
           candidateOptions: issue.candidateOptions,
           candidateDiffs: issue.candidateDiffs,
           reportedName: issue.reportedName,
+          reasonCodes: issue.reasonCodes,
           resolutionStatus: 'open' as const
         };
       })

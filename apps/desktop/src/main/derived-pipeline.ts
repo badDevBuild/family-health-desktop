@@ -22,8 +22,17 @@ export type DerivedPipelineResult =
 
 const candidateOutputSchema = z.toJSONSchema(derivedSnapshotCandidateSchema, { target: 'draft-7' }) as Record<string, unknown>;
 const reviewOutputSchema = z.toJSONSchema(derivedSafetyReviewSchema, { target: 'draft-7' }) as Record<string, unknown>;
-const prohibitedMedicalPattern = /(确诊|诊断为|患有|你有[^，。；]{0,12}(?:病|症)|必须服用|开始服用|停止服用|停药|加量|减量|换药|开药|处方)/i;
+const prohibitedMedicalPattern = /(诊断为|患有|你有[^，。；]{0,12}(?:病|症)|必须服用|开始服用|停止服用|停药|加量|减量|换药|开药)/i;
 const dosagePattern = /\d+(?:\.\d+)?\s*(?:mg|mcg|μg|iu|毫克|微克|国际单位)\b/i;
+
+function containsProhibitedMedicalClaim(text: string): boolean {
+  if (prohibitedMedicalPattern.test(text)) return true;
+  const withoutNegatedDiagnosis = text.replace(
+    /(?:不能|无法|不可|不足以|不作为|尚不能|尚无法|并非|不是|不等于)[^，。；]{0,12}确诊/g,
+    ''
+  );
+  return /确诊/.test(withoutNegatedDiagnosis);
+}
 
 function buildFactPackage(
   personId: string,
@@ -75,7 +84,7 @@ function deterministicSafetyIssues(candidate: DerivedSnapshotCandidate, observat
     ids.add(item.id);
     if (item.evidence.some((id) => !known.has(id))) issues.push(`evidence_mismatch:${item.id}`);
     if (item.boundaryRequired && !item.boundaryNote) issues.push(`boundary_note_required:${item.id}`);
-    if (prohibitedMedicalPattern.test(item.text)) issues.push(`medical_boundary:${item.id}`);
+    if (containsProhibitedMedicalClaim(item.text)) issues.push(`medical_boundary:${item.id}`);
     if (dosagePattern.test(item.text)) issues.push(`dosage_boundary:${item.id}`);
   }
   return issues;
@@ -192,6 +201,7 @@ export class DerivedHealthPipeline {
       kind: 'derived_safety',
       severity: 'blocking',
       evidenceRefs: observations.map((observation) => observation.sourceSpanId),
+      reasonCodes: reason.split(',').filter(Boolean),
       preserveDocumentStatus: true
     });
     return {

@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
 import { PersonalWorkspaceService } from './workspace-service.js';
-import { DocumentExtractionPipeline, partitionPdfSpans, partitionSourceSpans } from './processing-pipeline.js';
+import { compareIndependentExtractions, DocumentExtractionPipeline, partitionPdfSpans, partitionSourceSpans } from './processing-pipeline.js';
 
 const roots: string[] = [];
 const require = createRequire(import.meta.url);
@@ -318,6 +318,490 @@ describe('DocumentExtractionPipeline', () => {
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
     expect(service.store.getFactRevision(personId)).toBe(1);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('两轮只有一侧给出参考范围时保守留空并继续发布', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const withoutReferenceRange: ExtractionResult = {
+      ...output,
+      candidates: output.candidates.map((candidate) => ({ ...candidate, referenceRangeRaw: null }))
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `one-sided-range-thread-${turn}`,
+        turnId: `one-sided-range-turn-${++turn}`,
+        output: turn === 1 ? output : withoutReferenceRange
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: 'LDL-C', decimalValue: '4.2', referenceRange: null })
+    ]);
+    service.close();
+  });
+
+  it('同一来源内前后片段唯一的省略证据会展开为连续原文', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const abbreviated: ExtractionResult = {
+      ...output,
+      candidates: output.candidates.map((item) => ({
+        ...item,
+        evidence: item.evidence.map((reference) => ({
+          ...reference,
+          quote: '2026-09-17…低密度脂蛋白胆固醇 4.2 mmol/L'
+        }))
+      }))
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `abbreviated-evidence-thread-${turn}`,
+        turnId: `abbreviated-evidence-turn-${++turn}`,
+        output: turn === 1 ? output : abbreviated
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('省略证据的结尾在后续科室重复时，只在下一科室日期前展开', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-section-abbreviation-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '分科证据工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '内科 内科 检查日期：2023-10-08 心脏未见异常 小结 未见异常 外科 外科 检查日期：2023-10-08 皮肤无异常 小结 未见异常';
+    await service.importFiles([{ path: '/tmp/分科报告.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const base: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'internal-summary', originalName: '内科小结', standardNameCandidate: null,
+        value: { kind: 'qualitative', rawText: '未见异常', category: 'no abnormality detected' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: span.id, quote: '内科 内科 检查日期：2023-10-08 心脏未见异常 小结 未见异常' }],
+        issues: []
+      }]
+    };
+    const abbreviated: ExtractionResult = {
+      ...base,
+      candidates: base.candidates.map((candidate) => ({
+        ...candidate,
+        evidence: [{ sourceSpanId: span.id, quote: '内科 内科 检查日期：2023-10-08……小结 未见异常' }]
+      }))
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `section-abbreviation-thread-${turn}`,
+        turnId: `section-abbreviation-turn-${++turn}`,
+        output: turn === 1 ? base : abbreviated
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('同一事实的彩超与多普勒超声写法视为同一方法，真正不同的影像方法仍阻断', async () => {
+    const { service, output } = await setup();
+    const withMethod = (method: string): ExtractionResult => ({
+      ...output,
+      candidates: output.candidates.map((candidate) => ({ ...candidate, method }))
+    });
+
+    expect(compareIndependentExtractions(
+      withMethod('甲状腺彩超'),
+      withMethod('彩色多普勒超声检查')
+    )).toEqual({ compatible: true, differences: [] });
+    expect(compareIndependentExtractions(
+      withMethod('胸部 CT'),
+      withMethod('胸部 MRI')
+    )).toEqual({
+      compatible: false,
+      differences: [expect.objectContaining({ fields: ['method'] })]
+    });
+    service.close();
+  });
+
+  it('单轮额外提取的正常小结静默省略，异常小结仍要求核对', async () => {
+    const first = await setup();
+    const normalSummary = {
+      ...first.output.candidates[0]!,
+      localKey: 'eye-summary',
+      originalName: '眼科小结',
+      standardNameCandidate: 'Ophthalmology summary',
+      value: { kind: 'qualitative' as const, rawText: '未见异常', category: 'no abnormality detected' },
+      unitRaw: null,
+      referenceRangeRaw: null,
+      reportedAbnormalFlag: null
+    };
+    let turn = 0;
+    const normalPipeline = new DocumentExtractionPipeline(first.service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `normal-summary-thread-${turn}`,
+        turnId: `normal-summary-turn-${++turn}`,
+        output: turn === 1
+          ? { ...first.output, candidates: [...first.output.candidates, normalSummary] }
+          : first.output
+      })
+    });
+    await expect(normalPipeline.process(first.documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(first.service.store.listAcceptedObservations(first.personId)).toHaveLength(1);
+    first.service.close();
+
+    const second = await setup();
+    const abnormalSummary = {
+      ...second.output.candidates[0]!,
+      localKey: 'thyroid-summary',
+      originalName: '甲状腺彩超小结',
+      standardNameCandidate: 'Thyroid ultrasound impression',
+      value: { kind: 'text' as const, rawText: '甲状腺回声异常' },
+      unitRaw: null,
+      referenceRangeRaw: null,
+      reportedAbnormalFlag: '异常'
+    };
+    turn = 0;
+    const abnormalPipeline = new DocumentExtractionPipeline(second.service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `abnormal-summary-thread-${turn}`,
+        turnId: `abnormal-summary-turn-${++turn}`,
+        output: turn === 1
+          ? { ...second.output, candidates: [...second.output.candidates, abnormalSummary] }
+          : second.output
+      })
+    });
+    await expect(abnormalPipeline.process(second.documentId)).resolves.toMatchObject({
+      status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH'
+    });
+    expect(second.service.store.getFactRevision(second.personId)).toBe(0);
+    second.service.close();
+  });
+
+  it('单轮把空白栏识别成未知时静默省略，已填写事实仍正常发布', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const emptyUnknown = {
+      ...output.candidates[0]!,
+      localKey: 'uncorrected-visual-acuity-right',
+      originalName: '裸眼视力 (右)',
+      standardNameCandidate: 'uncorrected_visual_acuity_right',
+      value: { kind: 'unknown' as const, rawText: null, reason: '报告对应栏位为空白' },
+      unitRaw: null,
+      referenceRangeRaw: null,
+      reportedAbnormalFlag: null,
+      issues: []
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `empty-unknown-thread-${turn}`,
+        turnId: `empty-unknown-turn-${++turn}`,
+        output: turn === 1
+          ? { ...output, candidates: [...output.candidates, emptyUnknown] }
+          : output
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('明确标出收缩压和舒张压的组合值会稳定拆为两个数值事实', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-blood-pressure-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '血压规范化工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期 2023-10-08 血压 107/70 mmHg 收缩压 107 mmHg 舒张压 70 mmHg';
+    await service.importFiles([{ path: '/tmp/血压报告.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const shared = {
+      unitRaw: 'mmHg', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+      evidence: [{ sourceSpanId: span.id, quote: sourceText }]
+    };
+    const base: Omit<ExtractionResult, 'candidates'> = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id]
+    };
+    const combined: ExtractionResult = {
+      ...base,
+      candidates: [{
+        localKey: 'blood-pressure', originalName: '血压', standardNameCandidate: '血压',
+        value: { kind: 'text', rawText: '107/70' }, ...shared,
+        issues: [{ code: 'pair_value_preserved', message: '保留报告中的成对表达' }]
+      }]
+    };
+    const separated: ExtractionResult = {
+      ...base,
+      candidates: [
+        {
+          localKey: 'model-sbp', originalName: '收缩压', standardNameCandidate: 'SBP',
+          value: { kind: 'numeric', rawText: '107', decimal: '107', comparator: 'eq' }, ...shared, issues: []
+        },
+        {
+          localKey: 'model-dbp', originalName: '舒张压', standardNameCandidate: 'DBP',
+          value: { kind: 'numeric', rawText: '70', decimal: '70', comparator: 'eq' }, ...shared, issues: []
+        }
+      ]
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `bp-thread-${turn}`,
+        turnId: `bp-turn-${++turn}`,
+        output: turn === 1 ? combined : separated
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 2 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '收缩压', valueKind: 'numeric', decimalValue: '107', unit: 'mmHg', clinicalDate: '2023-10-08' }),
+      expect.objectContaining({ conceptKey: '舒张压', valueKind: 'numeric', decimalValue: '70', unit: 'mmHg', clinicalDate: '2023-10-08' })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('同一清晰来源片段只有一个日期时会补齐日期上下文而不要求人工确认', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-date-context-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '日期上下文工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期：2023-10-08 检查结果 身高 187 厘米';
+    await service.importFiles([{ path: '/tmp/身高报告.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const output: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'height', originalName: '身高', standardNameCandidate: 'Height',
+        value: { kind: 'numeric', rawText: '187', decimal: '187', comparator: 'eq' },
+        unitRaw: '厘米', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: span.id, quote: '身高 187 厘米' }], issues: []
+      }]
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'date-context-thread', turnId: `date-context-turn-${++turn}`, output })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: 'Height', decimalValue: '187', clinicalDate: '2023-10-08' })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('同一长来源片段包含多个科室日期时按项目之前最近的检查日期补齐证据', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-section-date-context-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '科室日期上下文工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检验科 幽门螺菌尿素酶抗体 检查日期：2023-10-08 项目名称 检查结果 幽门螺杆菌抗体测定 阴性 阴性 (-) 检验科 EB 病毒抗体 检查日期：2023-10-09 项目名称 检查结果 EB 病毒抗体 0.05';
+    await service.importFiles([{ path: '/tmp/多科室报告.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const output: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'h-pylori', originalName: '幽门螺杆菌抗体测定', standardNameCandidate: null,
+        value: { kind: 'qualitative', rawText: '阴性', category: 'negative' },
+        unitRaw: null, referenceRangeRaw: '阴性 (-)', reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: span.id, quote: '幽门螺杆菌抗体测定 阴性 阴性 (-)' }], issues: []
+      }]
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'section-date-thread', turnId: `section-date-turn-${++turn}`, output })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '幽门螺杆菌抗体测定', rawText: '阴性', clinicalDate: '2023-10-08' })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('同一项目文字在不同日期重复出现时不自动补齐临床日期', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-ambiguous-date-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '多日期工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期：2023-10-08 身高 187 厘米；检查日期：2024-10-08 身高 187 厘米';
+    await service.importFiles([{ path: '/tmp/多日期报告.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const output: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'height', originalName: '身高', standardNameCandidate: 'Height',
+        value: { kind: 'numeric', rawText: '187', decimal: '187', comparator: 'eq' },
+        unitRaw: '厘米', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: span.id, quote: '身高 187 厘米' }], issues: []
+      }]
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'ambiguous-date-thread', turnId: `ambiguous-date-turn-${++turn}`, output })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({
+      status: 'needs_review', reason: 'clinical_date_not_in_evidence'
+    });
+    expect(service.store.getFactRevision(personId)).toBe(0);
+    expect(service.store.listAcceptedObservations(personId)).toEqual([]);
+    service.close();
+  });
+
+  it('非阻断数据标记的写法差异不要求人工确认，阻断标记仍保持失败关闭', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const withIssue = (code: string): ExtractionResult => ({
+      ...output,
+      candidates: output.candidates.map((candidate) => ({
+        ...candidate,
+        issues: [{ code, message: '虚构测试标记' }]
+      }))
+    });
+    let turn = 0;
+    const nonBlockingPipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `non-blocking-thread-${turn}`,
+        turnId: `non-blocking-turn-${++turn}`,
+        output: turn === 1 ? withIssue('format_note') : output
+      })
+    });
+    await expect(nonBlockingPipeline.process(documentId)).resolves.toMatchObject({ status: 'published' });
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    service.close();
+
+    const second = await setup();
+    turn = 0;
+    const blockingPipeline = new DocumentExtractionPipeline(second.service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `blocking-thread-${turn}`,
+        turnId: `blocking-turn-${++turn}`,
+        output: turn === 1
+          ? { ...second.output, candidates: second.output.candidates.map((candidate) => ({ ...candidate, issues: [{ code: 'blocking_source_ambiguity', message: '来源仍有歧义' }] })) }
+          : second.output
+      })
+    });
+    await expect(blockingPipeline.process(second.documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
+    expect(second.service.store.getFactRevision(second.personId)).toBe(0);
+    expect(second.service.store.listOpenExtractionReviewIssues()[0]!.candidateDiffs)
+      .toEqual([{ localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['issues'] }]);
+    second.service.close();
+  });
+
+  it('定性原文一致且只有一轮补充标准分类时继续发布', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-qualitative-category-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '定性分类工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期：2023-10-08 尿白细胞 (LEU) 隂性';
+    await service.importFiles([{ path: '/tmp/尿常规报告.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const candidate = {
+      localKey: 'urine-leukocyte', originalName: '尿白细胞 (LEU)', standardNameCandidate: null,
+      unitRaw: null, referenceRangeRaw: '隂性', reportedAbnormalFlag: null,
+      specimen: '尿液', method: '尿常规', bodySite: null, clinicalDate: '2023-10-08',
+      evidence: [{ sourceSpanId: span.id, quote: sourceText }], issues: []
+    } as const;
+    const base: Omit<ExtractionResult, 'candidates'> = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id]
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: 'qualitative-category-thread',
+        turnId: `qualitative-category-turn-${++turn}`,
+        output: {
+          ...base,
+          candidates: [{
+            ...candidate,
+            value: { kind: 'qualitative' as const, rawText: '隂性', category: turn === 1 ? null : '阴性' }
+          }]
+        }
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '尿白细胞 (LEU)', rawText: '隂性', valueKind: 'qualitative' })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('定性原文一致但两轮标准分类相互矛盾时仍阻止发布', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-conflicting-category-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '定性冲突工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期：2023-10-08 尿白细胞 (LEU) 隂性';
+    await service.importFiles([{ path: '/tmp/尿常规分类冲突.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: 'conflicting-category-thread',
+        turnId: `conflicting-category-turn-${++turn}`,
+        output: {
+          schemaVersion: 1,
+          documentId,
+          subject: { reportedName: null, evidence: [], confidence: 'absent' },
+          coveredSourceSpanIds: [span.id],
+          candidates: [{
+            localKey: 'urine-leukocyte', originalName: '尿白细胞 (LEU)', standardNameCandidate: null,
+            value: { kind: 'qualitative' as const, rawText: '隂性', category: turn === 1 ? '阴性' : '阳性' },
+            unitRaw: null, referenceRangeRaw: '隂性', reportedAbnormalFlag: null,
+            specimen: '尿液', method: '尿常规', bodySite: null, clinicalDate: '2023-10-08',
+            evidence: [{ sourceSpanId: span.id, quote: sourceText }], issues: []
+          }]
+        }
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
+    expect(service.store.getFactRevision(personId)).toBe(0);
+    expect(service.store.listOpenExtractionReviewIssues()[0]!.candidateDiffs)
+      .toEqual([{ localKey: 'urine-leukocyte', itemName: '尿白细胞 (LEU)', fields: ['value'] }]);
     service.close();
   });
 

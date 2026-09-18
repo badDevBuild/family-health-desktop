@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(9);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -279,6 +279,726 @@ describe('WorkspaceStore', () => {
       coveredUnitIndexes: [0, 1],
       conversionWarnings: ['historical_manifest_reconstructed_from_verified_pdf']
     });
+    store.close();
+  });
+
+  it('schema v11 只重试仅有非阻断标记差异的旧血压组合值核对', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v9-blood-pressure-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期 2023-10-08 血压 107/70 mmHg 收缩压 107 mmHg 舒张压 70 mmHg';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '血压体检报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'blood-pressure-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '血压体检报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'blood-pressure-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'e'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['blood-pressure-span'],
+      candidateOptions: [{
+        localKey: 'blood-pressure', originalName: '血压', standardNameCandidate: '血压',
+        value: { kind: 'text', rawText: '107/70' },
+        unitRaw: 'mmHg', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'blood-pressure-span', quote: sourceText }],
+        issues: [{ code: 'pair_value_preserved', message: '保留报告中的成对表达' }]
+      }],
+      candidateDiffs: [{ localKey: 'blood-pressure', itemName: '血压', fields: ['issues'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 10; PRAGMA user_version = 10;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v12 只重试同一来源片段内临床日期唯一的旧证据上下文误拦截', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v11-date-context-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期：2023-10-08 检查结果 身高 187 厘米';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '身高体检报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'height-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '身高体检报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'height-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'f'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['height-span'],
+      candidateOptions: [{
+        localKey: 'height', originalName: '身高', standardNameCandidate: 'Height',
+        value: { kind: 'numeric', rawText: '187', decimal: '187', comparator: 'eq' },
+        unitRaw: '厘米', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'height-span', quote: '身高 187 厘米' }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'height', itemName: '身高', fields: ['issues'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 11; PRAGMA user_version = 11;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v13 只重试原文定性值有清晰依据的旧标准分类差异', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v12-qualitative-category-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期：2023-10-08 尿白细胞 (LEU) 隂性';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '尿常规报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'qualitative-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '尿常规报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'qualitative-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '1'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['qualitative-span'],
+      candidateOptions: [{
+        localKey: 'urine-leukocyte', originalName: '尿白细胞 (LEU)', standardNameCandidate: null,
+        value: { kind: 'qualitative', rawText: '隂性', category: '阴性' },
+        unitRaw: null, referenceRangeRaw: '隂性', reportedAbnormalFlag: null,
+        specimen: '尿液', method: '尿常规', bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'qualitative-span', quote: sourceText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'urine-leukocyte', itemName: '尿白细胞 (LEU)', fields: ['value'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 12; PRAGMA user_version = 12;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v14 只重试项目文字唯一且前置检查日期一致的旧证据误拦截', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v13-section-date-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检验科 幽门螺菌尿素酶抗体 检查日期：2023-10-08 项目名称 检查结果 幽门螺杆菌抗体测定 阴性 阴性 (-) 检验科 EB 病毒抗体 检查日期：2023-10-09 项目名称 检查结果 EB 病毒抗体 0.05';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '多科室体检报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'section-date-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '多科室体检报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'section-date-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '2'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['section-date-span'],
+      candidateOptions: [{
+        localKey: 'h-pylori', originalName: '幽门螺杆菌抗体测定', standardNameCandidate: null,
+        value: { kind: 'qualitative', rawText: '阴性', category: 'negative' },
+        unitRaw: null, referenceRangeRaw: '阴性 (-)', reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'section-date-span', quote: '幽门螺杆菌抗体测定 阴性 阴性 (-)' }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'h-pylori', itemName: '幽门螺杆菌抗体测定', fields: ['issues'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 13; PRAGMA user_version = 13;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v15 只重试同一超声项目的方法别名差异', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v14-ultrasound-method-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '甲状腺彩超 检查日期：2023-10-09 小结 甲状腺回声异常';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '超声报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'ultrasound-method-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '超声报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'ultrasound-method-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '3'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['ultrasound-method-span'],
+      candidateOptions: [{
+        localKey: 'thyroid-ultrasound', originalName: '甲状腺彩超小结', standardNameCandidate: 'Thyroid ultrasound impression',
+        value: { kind: 'text', rawText: '甲状腺回声异常' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: '异常',
+        specimen: null, method: '甲状腺彩超', bodySite: '甲状腺', clinicalDate: '2023-10-09',
+        evidence: [{ sourceSpanId: 'ultrasound-method-span', quote: sourceText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'thyroid-ultrasound', itemName: '甲状腺彩超小结', fields: ['method'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 14; PRAGMA user_version = 14;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v16 只重试 PDF 排版空格造成的结果断字误拦截', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v15-whitespace-evidence-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '甲状腺彩超 检查日期：2023-10-09 小结 甲状腺回声异常，请结合实验室检 查';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '断字报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'whitespace-evidence-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '断字报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'whitespace-evidence-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '4'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['whitespace-evidence-span'],
+      candidateOptions: [{
+        localKey: 'thyroid-ultrasound', originalName: '甲状腺彩超小结', standardNameCandidate: null,
+        value: { kind: 'text', rawText: '甲状腺回声异常，请结合实验室检查' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: '异常',
+        specimen: null, method: '甲状腺彩超', bodySite: '甲状腺', clinicalDate: '2023-10-09',
+        evidence: [{ sourceSpanId: 'whitespace-evidence-span', quote: sourceText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'thyroid-ultrasound', itemName: '甲状腺彩超小结', fields: ['issues'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 15; PRAGMA user_version = 15;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v17 只重试有清晰原文依据的单侧正常小结', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v16-normal-summary-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '眼科 检查日期：2023-10-08 小结 未见异常';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '眼科报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'normal-summary-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '眼科报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'normal-summary-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '5'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['normal-summary-span'],
+      candidateOptions: [{
+        localKey: 'eye-summary', originalName: '眼科小结', standardNameCandidate: 'Ophthalmology summary',
+        value: { kind: 'qualitative', rawText: '未见异常', category: 'no abnormality detected' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: '眼科检查', bodySite: '眼', clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'normal-summary-span', quote: sourceText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'eye-summary', itemName: '眼科小结', fields: ['presence'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 16; PRAGMA user_version = 16;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v18 只重试有清晰项目名依据的单侧空白未知项', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v17-empty-unknown-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '眼科 检查日期：2023-10-08 裸眼视力 (右)    矫正视力 (右) 5.0';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '眼科报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'empty-unknown-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '眼科报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'empty-unknown-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '6'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['empty-unknown-span'],
+      candidateOptions: [{
+        localKey: 'uncorrected-visual-acuity-right', originalName: '裸眼视力 (右)', standardNameCandidate: 'uncorrected_visual_acuity_right',
+        value: { kind: 'unknown', rawText: null, reason: '报告对应栏位为空白' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: '眼科检查', bodySite: '右眼', clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'empty-unknown-span', quote: sourceText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'uncorrected-visual-acuity-right', itemName: '裸眼视力 (右)', fields: ['presence'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 17; PRAGMA user_version = 17;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v19 只重试字符相同但 PDF 空白排版不同的证据摘录', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v18-whitespace-citation-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '肝胆脾胰彩超 检查日期：2023-10-09 彩色多普 勒 小结 肝、胆、脾、胰：未见明显异常声像';
+    const citedText = '肝胆脾胰彩超 检查日期：2023-10-09 彩色多普勒 小结 肝、胆、脾、胰：未见明显异常声像';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '超声报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'whitespace-citation-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '超声报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'whitespace-citation-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '7'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['whitespace-citation-span'],
+      candidateOptions: [{
+        localKey: 'hepatobiliary-summary', originalName: '肝胆脾胰彩超小结', standardNameCandidate: null,
+        value: { kind: 'text', rawText: '肝、胆、脾、胰：未见明显异常声像' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: '彩色多普勒超声', bodySite: '肝、胆、脾、胰', clinicalDate: '2023-10-09',
+        evidence: [{ sourceSpanId: 'whitespace-citation-span', quote: citedText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'hepatobiliary-summary', itemName: '肝胆脾胰彩超小结', fields: ['issues'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 18; PRAGMA user_version = 18;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v20 只重试同一来源内前后片段可唯一定位的省略证据', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v19-abbreviated-citation-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '一般状况 身高、体重 检查日期：2023-10-08 检查医生：张医生 项目名称 检查结果 身高 187 厘米 体重 91 Kg';
+    const citedText = '身高、体重 检查日期：2023-10-08…身高 187 厘米';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '身高体重报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'abbreviated-citation-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '身高体重报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'abbreviated-citation-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '8'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['abbreviated-citation-span'],
+      candidateOptions: [{
+        localKey: 'height', originalName: '身高', standardNameCandidate: 'Body height',
+        value: { kind: 'numeric', rawText: '187', decimal: '187', comparator: 'eq' },
+        unitRaw: '厘米', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'abbreviated-citation-span', quote: citedText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'height', itemName: '身高', fields: ['issues'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 19; PRAGMA user_version = 19;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v21 允许省略证据的结尾在后续科室重复，但当前科室内必须唯一', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v20-section-abbreviation-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '内科 内科 检查日期：2023-10-08 心脏未见异常 小结 未见异常 外科 外科 检查日期：2023-10-08 皮肤无异常 小结 未见异常';
+    const citedText = '内科 内科 检查日期：2023-10-08……小结 未见异常';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '分科报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'section-abbreviation-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '分科报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'section-abbreviation-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: '9'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['section-abbreviation-span'],
+      candidateOptions: [{
+        localKey: 'internal-summary', originalName: '内科小结', standardNameCandidate: null,
+        value: { kind: 'qualitative', rawText: '未见异常', category: 'no abnormality detected' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'section-abbreviation-span', quote: citedText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'internal-summary', itemName: '内科小结', fields: ['issues'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 20; PRAGMA user_version = 20;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v22 将单侧缺失的参考范围保守留空并重新排队', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v21-reference-range-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '检查日期：2023-10-08 血压 107/70 mmHg';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: '血压报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'reference-range-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '血压报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'reference-range-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: sourceText, readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'a'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['reference-range-span'],
+      candidateOptions: [{
+        localKey: 'bp-systolic', originalName: '收缩压', standardNameCandidate: 'Systolic blood pressure',
+        value: { kind: 'numeric', rawText: '107', decimal: '107', comparator: 'eq' },
+        unitRaw: 'mmHg', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'reference-range-span', quote: sourceText }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'bp-systolic', itemName: '收缩压', fields: ['referenceRangeRaw'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 21; PRAGMA user_version = 21;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v23 重新运行可能由否定式医学边界误判而暂停的派生分析', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v22-derived-boundary-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('虚构报告事实'), mediaType: 'text/plain', displayName: '虚构报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'b'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'derived_safety',
+      severity: 'blocking',
+      evidenceRefs: [],
+      preserveDocumentStatus: true
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`
+      UPDATE documents SET status = 'completed' WHERE id = '${document.documentId}';
+      UPDATE jobs SET stage = 'analyze' WHERE id = '${job.id}';
+      UPDATE workspaces SET schema_version = 22;
+      PRAGMA user_version = 22;
+    `);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    upgraded.close();
     store.close();
   });
 

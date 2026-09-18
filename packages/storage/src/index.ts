@@ -13,8 +13,106 @@ import type {
   SourceManifest
 } from '@contracts';
 
-export const WORKSPACE_SCHEMA_VERSION = 9;
+export const WORKSPACE_SCHEMA_VERSION = 23;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
+
+function calendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
+  const dates: Array<{ date: string; index: number; length: number }> = [];
+  const pattern = /(?<!\d)(\d{4})\s*(?:([-/.])\s*(\d{1,2})\s*\2\s*(\d{1,2})|年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?)(?!\d)/g;
+  for (const match of text.matchAll(pattern)) {
+    const year = Number(match[1]);
+    const month = Number(match[3] ?? match[5]);
+    const day = Number(match[4] ?? match[6]);
+    const parsed = new Date(Date.UTC(year, month - 1, day));
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) continue;
+    dates.push({
+      date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+      index: match.index,
+      length: match[0].length
+    });
+  }
+  return dates;
+}
+
+function calendarDatesInText(text: string): string[] {
+  return [...new Set(calendarDateMatchesInText(text).map((match) => match.date))];
+}
+
+function labelledCalendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
+  const dates: Array<{ date: string; index: number; length: number }> = [];
+  const pattern = /(?:检查|检验|采样|采集|体检|就诊|临床|报告)\s*日期\s*[：:]?\s*((?<!\d)(\d{4})\s*(?:([-/.])\s*(\d{1,2})\s*\3\s*(\d{1,2})|年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?)(?!\d))/g;
+  for (const match of text.matchAll(pattern)) {
+    const year = Number(match[2]);
+    const month = Number(match[4] ?? match[6]);
+    const day = Number(match[5] ?? match[7]);
+    const parsed = new Date(Date.UTC(year, month - 1, day));
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) continue;
+    dates.push({
+      date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+      index: match.index,
+      length: match[0].length
+    });
+  }
+  return dates;
+}
+
+function hasUnambiguousContextualDateEvidence(spanQuote: string, citedQuote: string, clinicalDate: string): boolean {
+  const quoteIndex = spanQuote.indexOf(citedQuote);
+  if (quoteIndex < 0 || spanQuote.indexOf(citedQuote, quoteIndex + 1) >= 0) return false;
+  const nearestPrecedingDate = labelledCalendarDateMatchesInText(spanQuote)
+    .filter((match) => match.index + match.length <= quoteIndex)
+    .sort((left, right) => right.index - left.index)[0];
+  return Boolean(nearestPrecedingDate
+    && nearestPrecedingDate.date === clinicalDate
+    && quoteIndex - (nearestPrecedingDate.index + nearestPrecedingDate.length) <= 2_000);
+}
+
+function isUltrasoundMethod(value: string | null | undefined): boolean {
+  if (!value) return false;
+  return /(?:彩超|超声|b\s*超|ultrasound|sonograph|doppler)/i.test(value.normalize('NFKC'));
+}
+
+function compactEvidenceText(value: string): string {
+  return value.normalize('NFKC').replace(/\s+/g, '').toLocaleLowerCase('zh-CN');
+}
+
+function isOptionalNormalSummaryCandidate(candidate: ObservationCandidate): boolean {
+  const name = candidate.originalName.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
+  if (!/(?:小结|总结|结论|印象|summary|impression)$/.test(name)) return false;
+  if (candidate.reportedAbnormalFlag !== null
+    && !/^(?:正常|未见异常|无异常|normal|no abnormality)$/.test(candidate.reportedAbnormalFlag.normalize('NFKC').trim().toLocaleLowerCase('zh-CN'))) {
+    return false;
+  }
+  if (candidate.value.kind !== 'qualitative' && candidate.value.kind !== 'text') return false;
+  return /^(?:未见异常|无异常|正常|no abnormality detected|normal)$/.test(
+    candidate.value.rawText.normalize('NFKC').trim().toLocaleLowerCase('zh-CN')
+  );
+}
+
+function isOptionalEmptyUnknownCandidate(candidate: ObservationCandidate): boolean {
+  return candidate.value.kind === 'unknown'
+    && !(candidate.value.rawText ?? '').trim()
+    && candidate.reportedAbnormalFlag === null
+    && !candidate.issues.some((issue) => issue.code.startsWith('blocking_'));
+}
+
+function uniquelyExpandedAbbreviatedQuote(source: string, cited: string): string | null {
+  const parts = cited.split(/(?:…|\.\.\.)/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length !== 2) return null;
+  const [prefix, suffix] = parts as [string, string];
+  const prefixIndex = source.indexOf(prefix);
+  if (prefixIndex < 0 || source.indexOf(prefix, prefixIndex + 1) >= 0) return null;
+  const suffixIndex = source.indexOf(suffix, prefixIndex + prefix.length);
+  if (suffixIndex < 0) return null;
+  const nextSectionDate = labelledCalendarDateMatchesInText(source)
+    .find((match) => match.index > prefixIndex + prefix.length);
+  const sectionEnd = nextSectionDate?.index ?? source.length;
+  if (suffixIndex + suffix.length > sectionEnd) return null;
+  const repeatedSuffixIndex = source.indexOf(suffix, suffixIndex + 1);
+  if (repeatedSuffixIndex >= 0 && repeatedSuffixIndex < sectionEnd) return null;
+  const expanded = source.slice(prefixIndex, suffixIndex + suffix.length);
+  return expanded.length <= 2_000 ? expanded : null;
+}
 
 function extractReportedNameFromIdentityEvidence(quote: string): string | null {
   const match = quote.normalize('NFKC').match(/姓\s*名\s*[：:]\s*([^\s，,；;。]{1,20}?)(?=\s*性\s*别\s*[：:])/);
@@ -133,6 +231,7 @@ export interface OpenExtractionReviewIssue {
   candidateOptions: ObservationCandidate[];
   candidateDiffs: ReviewCandidateDiff[];
   reportedName: string | null;
+  reasonCodes: string[];
 }
 
 export interface StoredJobSummary {
@@ -1379,6 +1478,7 @@ export class WorkspaceStore {
     candidateOptions?: ObservationCandidate[];
     candidateDiffs?: ReviewCandidateDiff[];
     reportedName?: string;
+    reasonCodes?: string[];
   }): string {
     const id = randomUUID();
     const transaction = this.db.transaction(() => {
@@ -1390,11 +1490,12 @@ export class WorkspaceStore {
       `).run(
         id, input.jobId ?? null, `document:${input.documentId}`, input.kind,
         input.severity, JSON.stringify(input.evidenceRefs),
-        input.candidateOptions || input.candidateDiffs || input.reportedName
+        input.candidateOptions || input.candidateDiffs || input.reportedName || input.reasonCodes?.length
           ? JSON.stringify({
               ...(input.candidateOptions ? { candidateOptions: input.candidateOptions } : {}),
               ...(input.candidateDiffs ? { candidateDiffs: input.candidateDiffs } : {}),
-              ...(input.reportedName ? { reportedName: input.reportedName } : {})
+              ...(input.reportedName ? { reportedName: input.reportedName } : {}),
+              ...(input.reasonCodes?.length ? { reasonCodes: input.reasonCodes } : {})
             })
           : null,
         this.now().toISOString()
@@ -1422,6 +1523,7 @@ export class WorkspaceStore {
             candidateOptions?: ObservationCandidate[];
             candidateDiffs?: ReviewCandidateDiff[];
             reportedName?: string;
+            reasonCodes?: string[];
           }
         : {};
       return {
@@ -1433,7 +1535,8 @@ export class WorkspaceStore {
         evidenceRefs: JSON.parse(String(row.evidence_refs_json)) as string[],
         candidateOptions: payload.candidateOptions ?? [],
         candidateDiffs: payload.candidateDiffs ?? [],
-        reportedName: payload.reportedName ?? null
+        reportedName: payload.reportedName ?? null,
+        reasonCodes: payload.reasonCodes ?? []
       };
     });
   }
@@ -2995,6 +3098,761 @@ export class WorkspaceStore {
         current = 9;
       }
 
+      if (current === 9) {
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 10;
+          PRAGMA user_version = 10;
+        `);
+        current = 10;
+      }
+
+      if (current === 10) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryPressureReview = [
+          'documents', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryPressureReview) {
+          const issues = this.db.prepare(`
+            SELECT ri.id, ri.field_ref, ri.payload_json
+            FROM review_issues ri
+            WHERE ri.kind = 'field_conflict' AND ri.resolution_status = 'open'
+            ORDER BY ri.created_at, ri.id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyIssueMarkersDiffer = differences.length > 0
+              && differences.every((difference) => difference.fields.length > 0
+                && difference.fields.every((field) => field === 'issues'));
+            const hasCombinedPressure = candidates.some((candidate) => {
+              const names = [candidate.originalName, candidate.standardNameCandidate]
+                .filter((name): name is string => Boolean(name))
+                .map((name) => name.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN'));
+              return names.some((name) => name === '血压' || /\bblood pressure\b/.test(name))
+                && /^\d{1,3}(?:\.\d+)?\s*[/／]\s*\d{1,3}(?:\.\d+)?$/.test(candidate.value.rawText?.normalize('NFKC').trim() ?? '');
+            });
+            if (!onlyIssueMarkersDiffer || !hasCombinedPressure) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '血压成对结果已进入确定性拆分和重新核对', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 11;
+          PRAGMA user_version = 11;
+        `);
+        current = 11;
+      }
+
+      if (current === 11) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryContextualDateReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryContextualDateReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyIssueMarkersDiffer = differences.length > 0
+              && differences.every((difference) => difference.fields.length > 0
+                && difference.fields.every((field) => field === 'issues'));
+            const retryableDateContext = onlyIssueMarkersDiffer && differences.every((difference) => {
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate?.clinicalDate || candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                if (!span?.quote || span.readability !== 'clear' || !reference.quote || !span.quote.includes(reference.quote)) return false;
+                const dates = calendarDatesInText(span.quote);
+                return dates.length === 1 && dates[0] === candidate.clinicalDate;
+              });
+            });
+            if (!retryableDateContext) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '临床日期已由同一唯一日期来源片段补齐，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 12;
+          PRAGMA user_version = 12;
+        `);
+        current = 12;
+      }
+
+      if (current === 12) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryQualitativeCategoryReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryQualitativeCategoryReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyQualitativeValuesDiffer = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'value') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (candidate?.value.kind !== 'qualitative' || candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              const rawText = candidate.value.rawText;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote) return false;
+                return span.quote.includes(citedQuote) && citedQuote.includes(rawText);
+              });
+            });
+            if (!onlyQualitativeValuesDiffer) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '定性原文一致时允许补充单侧标准分类，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 13;
+          PRAGMA user_version = 13;
+        `);
+        current = 13;
+      }
+
+      if (current === 13) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetrySectionDateReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetrySectionDateReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const retryableSectionDateContext = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'issues') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate?.clinicalDate || candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              const rawText = candidate.value.rawText;
+              if (!rawText) return false;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote) return false;
+                if (!citedQuote.includes(rawText)) return false;
+                return hasUnambiguousContextualDateEvidence(span.quote, citedQuote, candidate.clinicalDate!);
+              });
+            });
+            if (!retryableSectionDateContext) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '项目已与前置检查日期形成唯一连续证据，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 14;
+          PRAGMA user_version = 14;
+        `);
+        current = 14;
+      }
+
+      if (current === 14) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryUltrasoundMethodReview = [
+          'documents', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryUltrasoundMethodReview) {
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyUltrasoundMethodLabelsDiffer = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'method') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              return Boolean(candidate
+                && isUltrasoundMethod(candidate.method)
+                && isUltrasoundMethod(`${candidate.originalName} ${candidate.standardNameCandidate ?? ''}`)
+                && !candidate.issues.some((item) => item.code.startsWith('blocking_')));
+            });
+            if (!onlyUltrasoundMethodLabelsDiffer) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '同一超声项目的方法别名已统一，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 15;
+          PRAGMA user_version = 15;
+        `);
+        current = 15;
+      }
+
+      if (current === 15) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryWhitespaceEvidenceReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryWhitespaceEvidenceReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyWhitespaceSplitReportedText = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'issues') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate || (candidate.value.kind !== 'text' && candidate.value.kind !== 'qualitative')) return false;
+              if (candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              const rawText = candidate.value.rawText.normalize('NFKC').toLocaleLowerCase('zh-CN');
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote || !span.quote.includes(citedQuote)) return false;
+                const cited = citedQuote.normalize('NFKC').toLocaleLowerCase('zh-CN');
+                if (cited.includes(rawText) || !compactEvidenceText(cited).includes(compactEvidenceText(rawText))) return false;
+                if (!candidate.clinicalDate) return true;
+                return calendarDatesInText(citedQuote).includes(candidate.clinicalDate);
+              });
+            });
+            if (!onlyWhitespaceSplitReportedText) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, 'PDF 排版空格造成的结果断字已按原文核对，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 16;
+          PRAGMA user_version = 16;
+        `);
+        current = 16;
+      }
+
+      if (current === 16) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryOptionalNormalSummaryReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryOptionalNormalSummaryReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyOneSidedNormalSummaries = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'presence') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate || !isOptionalNormalSummaryCandidate(candidate)) return false;
+              if (candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              const rawText = candidate.value.rawText;
+              if (!rawText) return false;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote || !span.quote.includes(citedQuote)) return false;
+                return compactEvidenceText(citedQuote).includes(compactEvidenceText(rawText));
+              });
+            });
+            if (!onlyOneSidedNormalSummaries) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '仅单轮出现的正常小结将保守省略，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 17;
+          PRAGMA user_version = 17;
+        `);
+        current = 17;
+      }
+
+      if (current === 17) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryOptionalEmptyUnknownReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryOptionalEmptyUnknownReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyOneSidedEmptyUnknowns = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'presence') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate || !isOptionalEmptyUnknownCandidate(candidate)) return false;
+              const normalizedName = compactEvidenceText(candidate.originalName);
+              if (!normalizedName) return false;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote || !span.quote.includes(citedQuote)) return false;
+                return compactEvidenceText(citedQuote).includes(normalizedName);
+              });
+            });
+            if (!onlyOneSidedEmptyUnknowns) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '仅单轮出现的空白未报告项目已保守省略，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 18;
+          PRAGMA user_version = 18;
+        `);
+        current = 18;
+      }
+
+      if (current === 18) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryWhitespaceOnlyCitationReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryWhitespaceOnlyCitationReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyWhitespaceOnlyCitationFailures = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'issues') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate || (candidate.value.kind !== 'text' && candidate.value.kind !== 'qualitative')) return false;
+              if (candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              const rawText = compactEvidenceText(candidate.value.rawText);
+              if (!rawText) return false;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote) return false;
+                if (span.quote.includes(citedQuote)) return false;
+                if (!compactEvidenceText(span.quote).includes(compactEvidenceText(citedQuote))) return false;
+                if (!compactEvidenceText(citedQuote).includes(rawText)) return false;
+                return !candidate.clinicalDate || calendarDatesInText(citedQuote).includes(candidate.clinicalDate);
+              });
+            });
+            if (!onlyWhitespaceOnlyCitationFailures) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, 'PDF 空白排版不同但字符一致的证据摘录已核对，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 19;
+          PRAGMA user_version = 19;
+        `);
+        current = 19;
+      }
+
+      if (current === 19) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryAbbreviatedCitationReview = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryAbbreviatedCitationReview) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyUniquelyAbbreviatedCitations = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'issues') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate || candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              const rawText = compactEvidenceText(candidate.value.rawText ?? '');
+              if (!rawText) return false;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote || span.quote.includes(citedQuote)) return false;
+                const expanded = uniquelyExpandedAbbreviatedQuote(span.quote, citedQuote);
+                if (!expanded || !compactEvidenceText(expanded).includes(rawText)) return false;
+                return !candidate.clinicalDate || calendarDatesInText(expanded).includes(candidate.clinicalDate);
+              });
+            });
+            if (!onlyUniquelyAbbreviatedCitations) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '同一来源内可唯一定位的省略证据已展开为连续原文，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 20;
+          PRAGMA user_version = 20;
+        `);
+        current = 20;
+      }
+
+      if (current === 20) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetrySectionAnchoredAbbreviatedCitation = [
+          'documents', 'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetrySectionAnchoredAbbreviatedCitation) {
+          const readSpan = this.db.prepare(`SELECT quote, readability FROM source_spans WHERE id = ?`);
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlySectionAnchoredAbbreviatedCitations = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'issues') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              if (!candidate || candidate.issues.some((item) => item.code.startsWith('blocking_'))) return false;
+              const rawText = compactEvidenceText(candidate.value.rawText ?? '');
+              if (!rawText) return false;
+              return candidate.evidence.some((reference) => {
+                const span = readSpan.get(reference.sourceSpanId) as { quote: string | null; readability: string } | undefined;
+                const citedQuote = reference.quote;
+                if (!span?.quote || span.readability !== 'clear' || !citedQuote || span.quote.includes(citedQuote)) return false;
+                const expanded = uniquelyExpandedAbbreviatedQuote(span.quote, citedQuote);
+                if (!expanded || !compactEvidenceText(expanded).includes(rawText)) return false;
+                return !candidate.clinicalDate || calendarDatesInText(expanded).includes(candidate.clinicalDate);
+              });
+            });
+            if (!onlySectionAnchoredAbbreviatedCitations) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '省略证据已在下一科室日期前唯一展开，资料重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 21;
+          PRAGMA user_version = 21;
+        `);
+        current = 21;
+      }
+
+      if (current === 21) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryOneSidedReferenceRangeReview = [
+          'documents', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRetryOneSidedReferenceRangeReview) {
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'field_conflict' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let payload: { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] } = {};
+            try {
+              payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+            } catch {
+              continue;
+            }
+            const candidates = payload.candidateOptions ?? [];
+            const differences = payload.candidateDiffs ?? [];
+            const onlyMissingReviewedReferenceRanges = differences.length > 0 && differences.every((difference) => {
+              if (difference.fields.length !== 1 || difference.fields[0] !== 'referenceRangeRaw') return false;
+              const candidate = candidates.find((item) => item.localKey === difference.localKey);
+              return Boolean(candidate
+                && candidate.referenceRangeRaw === null
+                && !candidate.issues.some((item) => item.code.startsWith('blocking_')));
+            });
+            if (!onlyMissingReviewedReferenceRanges) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '单侧参考范围已保守留空，原始测量值重新进入核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(documentId);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 22;
+          PRAGMA user_version = 22;
+        `);
+        current = 22;
+      }
+
+      if (current === 22) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryDerivedSafetyReview = [
+          'review_issues', 'audit_events', 'jobs'
+        ].every((table) => tables.has(table));
+        if (canRetryDerivedSafetyReview) {
+          const issues = this.db.prepare(`
+            SELECT id, field_ref
+            FROM review_issues
+            WHERE kind = 'derived_safety' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string }>;
+          for (const issue of issues) {
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`
+              UPDATE jobs
+              SET status = 'queued', updated_at = ?
+              WHERE status = 'waiting_user'
+                AND stage IN ('analyze', 'guidance', 'review_derived', 'publish')
+                AND EXISTS (
+                  SELECT 1 FROM json_each(json_extract(jobs.checkpoint_json, '$.documentIds'))
+                  WHERE value = ?
+                )
+            `).run(this.now().toISOString(), documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '否定式医学边界说明不再误判为诊断，派生分析重新进入安全核对队列', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 23;
+          PRAGMA user_version = 23;
+        `);
+        current = 23;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -3193,7 +4051,7 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
       CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
-      PRAGMA user_version = 9;
+      PRAGMA user_version = 23;
       `);
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');

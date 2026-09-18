@@ -55,8 +55,354 @@ function historicalPdfSpansMatch(stored: SourceSpan[], rebuilt: SourceManifest):
 
 type ReviewDiffField = ReviewCandidateDiff['fields'][number];
 
+type BloodPressureKind = 'systolic' | 'diastolic';
+
+function blockingIssueCodes(candidate: ObservationCandidate): string[] {
+  return [...new Set(candidate.issues
+    .map((issue) => issue.code)
+    .filter((code) => code.startsWith('blocking_')))].sort();
+}
+
+function pressureKind(candidate: ObservationCandidate): BloodPressureKind | null {
+  const name = `${candidate.originalName} ${candidate.standardNameCandidate ?? ''}`
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLocaleLowerCase('zh-CN');
+  if (/\b(systolic blood pressure|sbp)\b|收缩压/.test(name)) return 'systolic';
+  if (/\b(diastolic blood pressure|dbp)\b|舒张压/.test(name)) return 'diastolic';
+  return null;
+}
+
+function isBloodPressurePair(candidate: ObservationCandidate): boolean {
+  const names = [candidate.originalName, candidate.standardNameCandidate]
+    .filter((name): name is string => Boolean(name))
+    .map((name) => name.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN'));
+  return pressureKind(candidate) === null
+    && names.some((name) => name === '血压' || /\bblood pressure\b/.test(name));
+}
+
+function pressurePair(value: ObservationCandidate['value']): [string, string] | null {
+  const raw = value.rawText?.normalize('NFKC').trim() ?? '';
+  const match = /^(\d{1,3}(?:\.\d+)?)\s*[/\uff0f]\s*(\d{1,3}(?:\.\d+)?)$/.exec(raw);
+  return match ? [match[1]!, match[2]!] : null;
+}
+
+function normalizedPressureEvidence(
+  candidate: ObservationCandidate,
+  spansById: Map<string, SourceSpan>
+): { evidence: ObservationCandidate['evidence']; sourceText: string } | null {
+  const sourceSpans = candidate.evidence
+    .map((reference) => spansById.get(reference.sourceSpanId))
+    .filter((span): span is SourceSpan => Boolean(span?.quote && span.readability === 'clear'));
+  if (sourceSpans.length === 0) return null;
+  return {
+    evidence: candidate.evidence.map((reference) => {
+      const span = spansById.get(reference.sourceSpanId);
+      return span?.quote && span.readability === 'clear' ? { ...reference, quote: span.quote } : reference;
+    }),
+    sourceText: sourceSpans.map((span) => span.quote!).join('\n').normalize('NFKC').replace(/\s+/g, ' ')
+  };
+}
+
+function sourceNamesPressureValue(sourceText: string, kind: BloodPressureKind, value: string): boolean {
+  const label = kind === 'systolic' ? '(?:收缩压|systolic blood pressure|sbp)' : '(?:舒张压|diastolic blood pressure|dbp)';
+  const escapedValue = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`${label}[^0-9]{0,24}${escapedValue}(?![0-9.])`, 'i').test(sourceText);
+}
+
+function canonicalPressureCandidate(
+  candidate: ObservationCandidate,
+  kind: BloodPressureKind,
+  decimal: string,
+  evidence: ObservationCandidate['evidence']
+): ObservationCandidate {
+  const isSystolic = kind === 'systolic';
+  return {
+    ...candidate,
+    localKey: `bp-${kind}-${stableHash({
+      documentId: evidence[0]?.sourceSpanId,
+      clinicalDate: candidate.clinicalDate,
+      decimal
+    }).slice(0, 16)}`,
+    originalName: isSystolic ? '收缩压' : '舒张压',
+    standardNameCandidate: isSystolic ? '收缩压' : '舒张压',
+    value: { kind: 'numeric', rawText: decimal, decimal, comparator: 'eq' },
+    unitRaw: 'mmHg',
+    evidence
+  };
+}
+
+function mergeDuplicateCandidates(candidates: ObservationCandidate[]): ObservationCandidate[] {
+  const merged = new Map<string, ObservationCandidate>();
+  for (const candidate of candidates) {
+    const signature = stableHash({
+      originalName: normalizedComparableText(candidate.originalName),
+      value: comparableValue(candidate),
+      unit: normalizedComparableText(candidate.unitRaw),
+      clinicalDate: candidate.clinicalDate,
+      sourceSpanIds: [...new Set(candidate.evidence.map((reference) => reference.sourceSpanId))].sort()
+    });
+    const existing = merged.get(signature);
+    if (!existing) {
+      merged.set(signature, candidate);
+      continue;
+    }
+    const issueMap = new Map([...existing.issues, ...candidate.issues].map((issue) => [`${issue.code}\u0000${issue.message}`, issue]));
+    const evidenceMap = new Map(existing.evidence.map((reference) => [reference.sourceSpanId, reference]));
+    for (const reference of candidate.evidence) {
+      const current = evidenceMap.get(reference.sourceSpanId);
+      if (!current || (reference.quote?.length ?? 0) > (current.quote?.length ?? 0)) evidenceMap.set(reference.sourceSpanId, reference);
+    }
+    merged.set(signature, { ...existing, issues: [...issueMap.values()], evidence: [...evidenceMap.values()] });
+  }
+  return [...merged.values()];
+}
+
+function calendarDateMatches(text: string): Array<{ date: string; index: number; length: number }> {
+  const matches: Array<{ date: string; index: number; length: number }> = [];
+  const pattern = /(?<!\d)(\d{4})\s*(?:([-/.])\s*(\d{1,2})\s*\2\s*(\d{1,2})|年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?)(?!\d)/g;
+  for (const match of text.matchAll(pattern)) {
+    const year = Number(match[1]);
+    const month = Number(match[3] ?? match[5]);
+    const day = Number(match[4] ?? match[6]);
+    const parsed = new Date(Date.UTC(year, month - 1, day));
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) continue;
+    matches.push({
+      date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+      index: match.index,
+      length: match[0].length
+    });
+  }
+  return matches;
+}
+
+function labelledCalendarDateMatches(text: string): Array<{ date: string; index: number; length: number }> {
+  const matches: Array<{ date: string; index: number; length: number }> = [];
+  const pattern = /(?:检查|检验|采样|采集|体检|就诊|临床|报告)\s*日期\s*[：:]?\s*((?<!\d)(\d{4})\s*(?:([-/.])\s*(\d{1,2})\s*\3\s*(\d{1,2})|年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?)(?!\d))/g;
+  for (const match of text.matchAll(pattern)) {
+    const year = Number(match[2]);
+    const month = Number(match[4] ?? match[6]);
+    const day = Number(match[5] ?? match[7]);
+    const parsed = new Date(Date.UTC(year, month - 1, day));
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) continue;
+    matches.push({
+      date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+      index: match.index,
+      length: match[0].length
+    });
+  }
+  return matches;
+}
+
+function contextualDateEvidenceQuote(
+  spanQuote: string,
+  citedQuote: string,
+  clinicalDate: string
+): string | null {
+  const quoteIndex = spanQuote.indexOf(citedQuote);
+  if (quoteIndex < 0 || spanQuote.indexOf(citedQuote, quoteIndex + 1) >= 0) return null;
+
+  const allDates = calendarDateMatches(spanQuote);
+  if (allDates.length === 0) return null;
+  if (allDates.every((match) => match.date === clinicalDate)) {
+    const nearestDate = allDates
+      .map((match) => ({ ...match, distance: Math.abs(match.index - quoteIndex) }))
+      .sort((left, right) => left.distance - right.distance)[0]!;
+    if (nearestDate.distance > 2_000) return null;
+    const start = Math.min(nearestDate.index, quoteIndex);
+    const end = Math.max(nearestDate.index + nearestDate.length, quoteIndex + citedQuote.length);
+    return spanQuote.slice(start, end);
+  }
+
+  const nearestPrecedingDate = labelledCalendarDateMatches(spanQuote)
+    .filter((match) => match.index + match.length <= quoteIndex)
+    .sort((left, right) => right.index - left.index)[0];
+  if (!nearestPrecedingDate || nearestPrecedingDate.date !== clinicalDate) return null;
+  if (quoteIndex - (nearestPrecedingDate.index + nearestPrecedingDate.length) > 2_000) return null;
+  return spanQuote.slice(nearestPrecedingDate.index, quoteIndex + citedQuote.length);
+}
+
+function strengthenUnambiguousClinicalDateEvidence(
+  candidates: ObservationCandidate[],
+  sourceSpans: SourceSpan[]
+): ObservationCandidate[] {
+  const spansById = new Map(sourceSpans.map((span) => [span.id, span]));
+  return candidates.map((candidate) => {
+    const clinicalDate = candidate.clinicalDate;
+    if (!clinicalDate) return candidate;
+    const evidence = candidate.evidence.map((reference) => {
+      if (reference.quote && calendarDateMatches(reference.quote).some((match) => match.date === clinicalDate)) {
+        return reference;
+      }
+      const span = spansById.get(reference.sourceSpanId);
+      if (!span?.quote || span.readability !== 'clear' || !reference.quote) return reference;
+      const strengthenedQuote = contextualDateEvidenceQuote(span.quote, reference.quote, clinicalDate);
+      return strengthenedQuote ? { ...reference, quote: strengthenedQuote } : reference;
+    });
+    return { ...candidate, evidence };
+  });
+}
+
+function expandAbbreviatedEvidenceQuotes(
+  candidates: ObservationCandidate[],
+  sourceSpans: SourceSpan[]
+): ObservationCandidate[] {
+  const spansById = new Map(sourceSpans.map((span) => [span.id, span]));
+  return candidates.map((candidate) => ({
+    ...candidate,
+    evidence: candidate.evidence.map((reference) => {
+      const citedQuote = reference.quote;
+      const span = spansById.get(reference.sourceSpanId);
+      if (!citedQuote || !span?.quote || span.readability !== 'clear' || span.quote.includes(citedQuote)) return reference;
+      const parts = citedQuote.split(/(?:…|\.\.\.)/).map((part) => part.trim()).filter(Boolean);
+      if (parts.length !== 2) return reference;
+      const [prefix, suffix] = parts as [string, string];
+      const prefixIndex = span.quote.indexOf(prefix);
+      if (prefixIndex < 0 || span.quote.indexOf(prefix, prefixIndex + 1) >= 0) return reference;
+      const suffixIndex = span.quote.indexOf(suffix, prefixIndex + prefix.length);
+      if (suffixIndex < 0) return reference;
+      const nextSectionDate = labelledCalendarDateMatches(span.quote)
+        .find((match) => match.index > prefixIndex + prefix.length);
+      const sectionEnd = nextSectionDate?.index ?? span.quote.length;
+      if (suffixIndex + suffix.length > sectionEnd) return reference;
+      const repeatedSuffixIndex = span.quote.indexOf(suffix, suffixIndex + 1);
+      if (repeatedSuffixIndex >= 0 && repeatedSuffixIndex < sectionEnd) return reference;
+      const expanded = span.quote.slice(prefixIndex, suffixIndex + suffix.length);
+      return expanded.length <= 2_000 ? { ...reference, quote: expanded } : reference;
+    })
+  }));
+}
+
+function normalizeCandidates(candidates: ObservationCandidate[], sourceSpans: SourceSpan[]): ObservationCandidate[] {
+  return strengthenUnambiguousClinicalDateEvidence(
+    expandAbbreviatedEvidenceQuotes(normalizeBloodPressureCandidates(candidates, sourceSpans), sourceSpans),
+    sourceSpans
+  );
+}
+
+export function normalizeBloodPressureCandidates(
+  candidates: ObservationCandidate[],
+  sourceSpans: SourceSpan[]
+): ObservationCandidate[] {
+  const spansById = new Map(sourceSpans.map((span) => [span.id, span]));
+  const direct: ObservationCandidate[] = [];
+  const derived: ObservationCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const evidence = normalizedPressureEvidence(candidate, spansById);
+    const kind = pressureKind(candidate);
+    if (kind && candidate.value.kind === 'numeric' && evidence
+      && sourceNamesPressureValue(evidence.sourceText, kind, candidate.value.decimal)) {
+      direct.push(canonicalPressureCandidate(candidate, kind, candidate.value.decimal, evidence.evidence));
+      continue;
+    }
+
+    const pair = isBloodPressurePair(candidate) ? pressurePair(candidate.value) : null;
+    const hasMmhg = normalizedComparableText(candidate.unitRaw) === 'mmhg' || Boolean(evidence && /\bmm\s*hg\b/i.test(evidence.sourceText));
+    if (pair && evidence && hasMmhg
+      && sourceNamesPressureValue(evidence.sourceText, 'systolic', pair[0])
+      && sourceNamesPressureValue(evidence.sourceText, 'diastolic', pair[1])) {
+      derived.push(canonicalPressureCandidate(candidate, 'systolic', pair[0], evidence.evidence));
+      derived.push(canonicalPressureCandidate(candidate, 'diastolic', pair[1], evidence.evidence));
+      continue;
+    }
+    direct.push(candidate);
+  }
+  return mergeDuplicateCandidates([...direct, ...derived]);
+}
+
 function normalizedComparableText(value: string | null): string | null {
   return value === null ? null : value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
+}
+
+function normalizedComparableMethod(value: string): string {
+  const normalized = normalizedComparableText(value)!;
+  if (/(?:彩超|超声|b\s*超|ultrasound|sonograph|doppler)/i.test(normalized)) return 'ultrasound';
+  return normalized;
+}
+
+function isOptionalNormalSummary(candidate: ObservationCandidate): boolean {
+  const name = normalizedComparableText(candidate.originalName) ?? '';
+  if (!/(?:小结|总结|结论|印象|summary|impression)$/.test(name)) return false;
+  if (candidate.reportedAbnormalFlag !== null
+    && !/^(?:正常|未见异常|无异常|normal|no abnormality)$/.test(normalizedComparableText(candidate.reportedAbnormalFlag) ?? '')) {
+    return false;
+  }
+  if (candidate.value.kind !== 'qualitative' && candidate.value.kind !== 'text') return false;
+  return /^(?:未见异常|无异常|正常|no abnormality detected|normal)$/.test(
+    normalizedComparableText(candidate.value.rawText) ?? ''
+  );
+}
+
+function isOptionalEmptyUnknown(candidate: ObservationCandidate): boolean {
+  return candidate.value.kind === 'unknown'
+    && !(candidate.value.rawText ?? '').trim()
+    && candidate.reportedAbnormalFlag === null
+    && !candidate.issues.some((issue) => issue.code.startsWith('blocking_'));
+}
+
+function isOmittableOneSidedCandidate(candidate: ObservationCandidate): boolean {
+  return isOptionalNormalSummary(candidate) || isOptionalEmptyUnknown(candidate);
+}
+
+function omitOmittableOneSidedCandidates(
+  first: ExtractionResult,
+  second: ExtractionResult
+): { first: ExtractionResult; second: ExtractionResult } {
+  const firstNames = new Set(first.candidates.map((candidate) => normalizedComparableText(candidate.originalName)));
+  const secondNames = new Set(second.candidates.map((candidate) => normalizedComparableText(candidate.originalName)));
+  return {
+    first: {
+      ...first,
+      candidates: first.candidates.filter((candidate) => (
+        !isOmittableOneSidedCandidate(candidate) || secondNames.has(normalizedComparableText(candidate.originalName))
+      ))
+    },
+    second: {
+      ...second,
+      candidates: second.candidates.filter((candidate) => (
+        !isOmittableOneSidedCandidate(candidate) || firstNames.has(normalizedComparableText(candidate.originalName))
+      ))
+    }
+  };
+}
+
+function clearOneSidedReferenceRanges(
+  first: ExtractionResult,
+  second: ExtractionResult
+): { first: ExtractionResult; second: ExtractionResult } {
+  const firstByName = new Map<string | null, ObservationCandidate[]>();
+  const secondByName = new Map<string | null, ObservationCandidate[]>();
+  for (const candidate of first.candidates) {
+    const name = normalizedComparableText(candidate.originalName);
+    firstByName.set(name, [...(firstByName.get(name) ?? []), candidate]);
+  }
+  for (const candidate of second.candidates) {
+    const name = normalizedComparableText(candidate.originalName);
+    secondByName.set(name, [...(secondByName.get(name) ?? []), candidate]);
+  }
+  const shouldClear = (candidate: ObservationCandidate, own: Map<string | null, ObservationCandidate[]>, other: Map<string | null, ObservationCandidate[]>) => {
+    const name = normalizedComparableText(candidate.originalName);
+    const ownMatches = own.get(name) ?? [];
+    const otherMatches = other.get(name) ?? [];
+    return ownMatches.length === 1 && otherMatches.length === 1
+      && (candidate.referenceRangeRaw === null || otherMatches[0]!.referenceRangeRaw === null);
+  };
+  return {
+    first: {
+      ...first,
+      candidates: first.candidates.map((candidate) => shouldClear(candidate, firstByName, secondByName)
+        ? { ...candidate, referenceRangeRaw: null }
+        : candidate)
+    },
+    second: {
+      ...second,
+      candidates: second.candidates.map((candidate) => shouldClear(candidate, secondByName, firstByName)
+        ? { ...candidate, referenceRangeRaw: null }
+        : candidate)
+    }
+  };
 }
 
 function comparableValue(candidate: ObservationCandidate): unknown {
@@ -85,6 +431,16 @@ function comparableValue(candidate: ObservationCandidate): unknown {
   };
 }
 
+function candidateValuesConflict(first: ObservationCandidate, second: ObservationCandidate): boolean {
+  if (first.value.kind !== second.value.kind) return true;
+  if (first.value.kind === 'qualitative' && second.value.kind === 'qualitative') {
+    if (normalizedComparableText(first.value.rawText) !== normalizedComparableText(second.value.rawText)) return true;
+    if (first.value.category === null || second.value.category === null) return false;
+    return normalizedComparableText(first.value.category) !== normalizedComparableText(second.value.category);
+  }
+  return stableHash(comparableValue(first)) !== stableHash(comparableValue(second));
+}
+
 function candidateConflictFields(first: ObservationCandidate, second: ObservationCandidate): ReviewDiffField[] {
   const fields: ReviewDiffField[] = [];
   const compareText = (
@@ -99,17 +455,20 @@ function candidateConflictFields(first: ObservationCandidate, second: Observatio
 
   compareText('originalName', first.originalName, second.originalName);
   compareText('standardNameCandidate', first.standardNameCandidate, second.standardNameCandidate);
-  if (stableHash(comparableValue(first)) !== stableHash(comparableValue(second))) fields.push('value');
+  if (candidateValuesConflict(first, second)) fields.push('value');
   compareText('unitRaw', first.unitRaw, second.unitRaw);
   compareText('referenceRangeRaw', first.referenceRangeRaw, second.referenceRangeRaw);
   compareText('reportedAbnormalFlag', first.reportedAbnormalFlag, second.reportedAbnormalFlag);
   compareText('specimen', first.specimen, second.specimen, true);
-  compareText('method', first.method, second.method, true);
+  if (first.method !== null && second.method !== null
+    && normalizedComparableMethod(first.method) !== normalizedComparableMethod(second.method)) {
+    fields.push('method');
+  }
   compareText('bodySite', first.bodySite, second.bodySite, true);
   compareText('clinicalDate', first.clinicalDate, second.clinicalDate, true);
 
-  const firstIssueCodes = [...new Set(first.issues.map((issue) => issue.code))].sort();
-  const secondIssueCodes = [...new Set(second.issues.map((issue) => issue.code))].sort();
+  const firstIssueCodes = blockingIssueCodes(first);
+  const secondIssueCodes = blockingIssueCodes(second);
   if (stableHash(firstIssueCodes) !== stableHash(secondIssueCodes)) fields.push('issues');
   return fields;
 }
@@ -509,6 +868,10 @@ export class DocumentExtractionPipeline {
             reportedName ?? undefined
           );
         }
+        const normalizedExtracted: ExtractionResult = {
+          ...extracted,
+          candidates: normalizeCandidates(extracted.candidates, spans)
+        };
 
         const review = await this.runTurn(documentId, 'review_facts', {
           prompt: [
@@ -517,7 +880,7 @@ export class DocumentExtractionPipeline {
             'imageInputs 的 imageIndex 与随请求附带的图片顺序一一对应。',
             'coveredSourceSpanIds 必须逐一列出你实际检查过的本块全部来源片段。',
             `SOURCE_PACKAGE=${sourcePackage}`,
-            `CANDIDATE_TO_REVIEW=${JSON.stringify(extracted)}`
+            `CANDIDATE_TO_REVIEW=${JSON.stringify(normalizedExtracted)}`
           ].join('\n'),
           imagePaths,
           outputSchema,
@@ -542,14 +905,23 @@ export class DocumentExtractionPipeline {
             reportedName ?? undefined
           );
         }
-        const comparison = compareIndependentExtractions(extracted, reviewed);
+        const normalizedReviewed: ExtractionResult = {
+          ...reviewed,
+          candidates: normalizeCandidates(reviewed.candidates, spans)
+        };
+        const withoutOmittableOneSided = omitOmittableOneSidedCandidates(normalizedExtracted, normalizedReviewed);
+        const aligned = clearOneSidedReferenceRanges(
+          withoutOmittableOneSided.first,
+          withoutOmittableOneSided.second
+        );
+        const comparison = compareIndependentExtractions(aligned.first, aligned.second);
         if (!comparison.compatible) {
-          const reviewedKeys = new Set(reviewed.candidates.map((candidate) => candidate.localKey));
-          const missingCandidates = extracted.candidates.filter((candidate) => (
+          const reviewedKeys = new Set(aligned.second.candidates.map((candidate) => candidate.localKey));
+          const missingCandidates = aligned.first.candidates.filter((candidate) => (
             !reviewedKeys.has(candidate.localKey)
             && comparison.differences.some((difference) => difference.localKey === candidate.localKey && difference.fields.includes('presence'))
           ));
-          const reviewCandidates = [...reviewed.candidates, ...missingCandidates];
+          const reviewCandidates = [...aligned.second.candidates, ...missingCandidates];
           return this.needsReview(
             documentId,
             'field_conflict',
@@ -557,14 +929,14 @@ export class DocumentExtractionPipeline {
             'INDEPENDENT_REVIEW_MISMATCH',
             review.threadId,
             review.turnId,
-            reviewCandidates.length > 0 ? reviewCandidates : extracted.candidates,
+            reviewCandidates.length > 0 ? reviewCandidates : aligned.first.candidates,
             undefined,
             comparison.differences
           );
         }
-        reviewedCandidates.push(...reviewed.candidates);
-        reviewedSubjects.push(reviewed.subject);
-        coveredSourceSpanIds.push(...reviewed.coveredSourceSpanIds);
+        reviewedCandidates.push(...aligned.second.candidates);
+        reviewedSubjects.push(aligned.second.subject);
+        coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
         reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: review.turnId });
         if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
       }
