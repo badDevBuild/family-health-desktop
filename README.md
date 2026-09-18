@@ -19,6 +19,8 @@
 
 AI 处理不是纯本地操作。只有用户明确授权后，应用才会把所选报告内容发送给已登录的 Codex/OpenAI 服务。详细边界见 [隐私说明](docs/desktop/privacy-data-boundaries.md) 与 [威胁模型](docs/desktop/threat-model.md)。
 
+默认 AI 设置为 GPT-5.6-Sol + Medium。用户可以在应用设置中选择当前 Codex 账号实际可用的模型与推理强度；变更仅影响之后新启动的任务。
+
 ## 本地开发
 
 要求：Node.js 22、pnpm 10。

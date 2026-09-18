@@ -45,6 +45,7 @@ function installBridge(snapshot: DashboardSnapshot, overrides: Partial<HealthDes
       versions: { app: '0.1.0', electron: '38', chrome: '140', node: '22' },
       desktopBehavior: { stayInTray: null, openAtLogin: false, notificationsEnabled: true },
       displayPreferences: { fontScale: 'standard' as const, reduceMotion: false, dateStyle: 'friendly' as const },
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' as const },
       recoveryStatus: { pointCount: 0, totalBytes: 0, latestAt: null }
     }),
     onSnapshotChanged: noopSubscription,
@@ -249,6 +250,39 @@ describe('App member display editing', () => {
     await waitFor(() => expect(updateDisplayPreferences).toHaveBeenCalledWith({ fontScale: 'large', reduceMotion: true, dateStyle: 'numeric' }));
     await waitFor(() => expect(container.querySelector('.app-shell')?.className).toContain('font-large'));
     expect(container.querySelector('.app-shell')?.className).toContain('reduce-motion');
+  });
+
+  it('defaults to Sol medium and only offers reasoning efforts supported by the selected model', async () => {
+    const updateAiPreferences = vi.fn(async () => ({
+      ok: true as const,
+      data: { modelId: 'gpt-5.6-terra', reasoningEffort: 'high' as const }
+    }));
+    installBridge(createPersonalSnapshot(), {
+      getAiSettings: async () => ({
+        ok: true,
+        data: {
+          preferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+          models: [
+            { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', description: 'Sol', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: '快速' }, { reasoningEffort: 'medium', description: '平衡' }], defaultReasoningEffort: 'low', isDefault: true },
+            { id: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', description: 'Terra', supportedReasoningEfforts: [{ reasoningEffort: 'medium', description: '平衡' }, { reasoningEffort: 'high', description: '深入' }], defaultReasoningEffort: 'medium', isDefault: false }
+          ]
+        }
+      }),
+      updateAiPreferences
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '设置' }));
+    fireEvent.click(await screen.findByRole('button', { name: /AI 模型/ }));
+    expect(await screen.findByRole('dialog', { name: '模型与推理强度' })).toBeTruthy();
+    expect((screen.getByLabelText('模型') as HTMLSelectElement).value).toBe('gpt-5.6-sol');
+    expect((screen.getByLabelText('推理强度') as HTMLSelectElement).value).toBe('medium');
+    fireEvent.change(screen.getByLabelText('模型'), { target: { value: 'gpt-5.6-terra' } });
+    expect((screen.getByLabelText('推理强度') as HTMLSelectElement).value).toBe('medium');
+    fireEvent.change(screen.getByLabelText('推理强度'), { target: { value: 'high' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+
+    await waitFor(() => expect(updateAiPreferences).toHaveBeenCalledWith({ modelId: 'gpt-5.6-terra', reasoningEffort: 'high' }));
   });
 
   it('persists the notification preference with the desktop behavior settings', async () => {

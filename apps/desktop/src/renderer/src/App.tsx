@@ -30,7 +30,8 @@ import {
   UsersRound,
   X
 } from 'lucide-react';
-import type { ActionItem, CreateActionItemInput, CreateManualNoteInput, DashboardSnapshot, DeletedDocumentSummary, DiagnosticBundle, DisplayPreferences, ExportMemberSummaryInput, ImportFilesReceipt, InboxBindingSummary, InboxItem, JobSummary, ManualNote, Person, PersonSummary, ResolveReviewInput, ReviewIssue, UpdatePersonDisplayInput } from '@contracts';
+import { DEFAULT_AI_PREFERENCES } from '@contracts';
+import type { ActionItem, AiModelOption, AiPreferences, AiReasoningEffort, CreateActionItemInput, CreateManualNoteInput, DashboardSnapshot, DeletedDocumentSummary, DiagnosticBundle, DisplayPreferences, ExportMemberSummaryInput, ImportFilesReceipt, InboxBindingSummary, InboxItem, JobSummary, ManualNote, Person, PersonSummary, ResolveReviewInput, ReviewIssue, UpdatePersonDisplayInput } from '@contracts';
 import { createDemoSnapshot } from '../../../../../packages/test-fixtures/src/index.js';
 import { StatusBadge, type Tone } from './components/StatusBadge.js';
 import { TrendChart } from './components/TrendChart.js';
@@ -75,6 +76,15 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+const reasoningEffortLabels: Record<AiReasoningEffort, string> = {
+  low: '低', medium: '中等', high: '高', xhigh: '很高', max: '最高'
+};
+
+function modelPreferenceLabel(preferences: AiPreferences): string {
+  const model = preferences.modelId === 'gpt-5.6-sol' ? 'GPT-5.6-Sol' : preferences.modelId;
+  return `${model} · ${reasoningEffortLabels[preferences.reasoningEffort]}推理`;
 }
 
 function importReceiptMessage(receipt: ImportFilesReceipt): string {
@@ -661,7 +671,7 @@ function ExportSummaryDialog({ snapshot, selectedPersonId, onClose, onExport }: 
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-summary-title"><header><div><span className="eyebrow">本机资料摘要</span><h2 id="export-summary-title">导出成员摘要</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭导出摘要"><X size={19} /></button></header><p>摘要使用当前已保存内容和固定模板，不会为导出再次生成新的医疗解释。</p><div className="action-due-grid"><label>家庭成员<select value={personId} onChange={(event) => setPersonId(event.target.value)}>{snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}</select></label><label>导出格式<select value={format} onChange={(event) => setFormat(event.target.value as ExportMemberSummaryInput['format'])}><option value="pdf">PDF（适合打印）</option><option value="html">HTML（可用浏览器打开）</option><option value="json">JSON（结构化数据）</option></select></label></div><div className="action-due-grid"><label>开始日期（可选）<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} /></label><label>结束日期（可选）<input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} /></label></div>{!datesValid && <span className="field-error">结束日期不能早于开始日期。</span>}<div className="consent-facts"><span><FileCheck2 size={17} /> 包含所选成员的报告指标、本人补充、事项和已发布生活指南</span><span><ShieldCheck size={17} /> 默认不附原始报告，不包含其他家庭成员</span><span><Archive size={17} /> 文件只保存到你选择的本机位置，不会上传或代发</span></div><label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我已了解导出文件含个人健康信息，需要自行妥善保管</label><div className="dialog-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={!personId || !confirmed || !datesValid || busy} onClick={async () => { setBusy(true); try { if (await onExport({ personId, format, dateFrom: dateFrom || null, dateTo: dateTo || null, confirmedPrivacyNotice: true })) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <FileCheck2 size={18} />} 选择保存位置</button></div></section></div>;
 }
 
-function SettingsPage({ snapshot, desktopBehavior, displayPreferences, recoveryStatus, onAccount, onDirectories, onSchedule, onBackup, onDesktop, onDisplay, onPrivacy, onAbout }: { snapshot: DashboardSnapshot; desktopBehavior: DesktopBehavior; displayPreferences: DisplayPreferences; recoveryStatus: RecoveryStatus; onAccount(): void; onDirectories(): void; onSchedule(): void; onBackup(): void; onDesktop(): void; onDisplay(): void; onPrivacy(): void; onAbout(): void }) {
+function SettingsPage({ snapshot, desktopBehavior, displayPreferences, aiPreferences, recoveryStatus, onAccount, onAi, onDirectories, onSchedule, onBackup, onDesktop, onDisplay, onPrivacy, onAbout }: { snapshot: DashboardSnapshot; desktopBehavior: DesktopBehavior; displayPreferences: DisplayPreferences; aiPreferences: AiPreferences; recoveryStatus: RecoveryStatus; onAccount(): void; onAi(): void; onDirectories(): void; onSchedule(): void; onBackup(): void; onDesktop(): void; onDisplay(): void; onPrivacy(): void; onAbout(): void }) {
   const accountText = snapshot.account.status === 'connected'
     ? `已连接${snapshot.account.displayLabel ? ` · ${snapshot.account.displayLabel}` : ''}`
     : snapshot.account.status === 'connecting' ? '请在官方浏览器页面完成登录'
@@ -669,6 +679,7 @@ function SettingsPage({ snapshot, desktopBehavior, displayPreferences, recoveryS
   const accountAction = snapshot.account.status === 'connected' ? '刷新状态' : snapshot.account.status === 'connecting' ? '等待完成' : '连接账户';
   const settings = [
     { icon: Sparkles, title: '账户与 AI', text: accountText, action: accountAction },
+    { icon: Activity, title: 'AI 模型', text: `${modelPreferenceLabel(aiPreferences)} · 新任务生效`, action: '更改' },
     { icon: FolderHeart, title: '报告收件箱', text: snapshot.workspaceMode === 'personal' ? '只监控你明确授权的本机目录' : '个人工作区建立后可指定目录', action: '管理目录' },
     { icon: CalendarClock, title: '自动处理', text: snapshot.scheduleEnabled ? `每天 ${snapshot.scheduleLocalTime}（${snapshot.scheduleTimeZone}）· 下次 ${formatDateTime(snapshot.nextScheduledRun)}` : '尚未启用；不会自动发送资料', action: '调整时间' },
     { icon: Bell, title: '桌面行为', text: `${desktopBehavior.stayInTray === null ? '关闭窗口时询问是否驻留' : desktopBehavior.stayInTray ? '关闭后驻留后台' : '关闭窗口即退出'} · 处理通知：${desktopBehavior.notificationsEnabled ? '开启' : '关闭'}`, action: '更改' },
@@ -677,7 +688,33 @@ function SettingsPage({ snapshot, desktopBehavior, displayPreferences, recoveryS
     { icon: Archive, title: '备份与恢复', text: recoveryStatus.pointCount > 0 ? `${recoveryStatus.pointCount} 个本机恢复点 · ${formatBytes(recoveryStatus.totalBytes)} · 最近 ${formatDateTime(recoveryStatus.latestAt)}` : '尚无本机恢复点；首次正式写入前会自动创建', action: '创建加密备份' },
     { icon: CircleHelp, title: '关于与诊断', text: '版本、运行时、依赖许可与已知限制', action: '查看' }
   ];
-  return <div className="page-stack"><section className="page-title-row"><div><span className="eyebrow">设置</span><h1>运行方式和资料边界</h1><p>退出 Codex 不会删除健康档案；更换账户或扩大目录范围需要重新确认。</p></div></section><section className="panel settings-list">{settings.map(({ icon: Icon, title, text, action }) => <button key={title} onClick={title === '账户与 AI' ? onAccount : title === '报告收件箱' ? onDirectories : title === '自动处理' ? onSchedule : title === '桌面行为' ? onDesktop : title === '显示' ? onDisplay : title === '数据与隐私' ? onPrivacy : title === '备份与恢复' ? onBackup : onAbout}><span className="settings-icon"><Icon size={20} /></span><span><strong>{title}</strong><small>{text}</small></span><span className="settings-action">{action}<ChevronRight size={16} /></span></button>)}</section><section className="panel boundary-card"><div><ShieldCheck size={24} /><span><h3>真实边界</h3><p>资料保存在当前 OS 用户目录；AI 处理会通过你的 Codex 账户发送必要内容给 OpenAI。这不是全程离线推理，也不等于医学审核。</p></span></div><button className="secondary-button" onClick={onPrivacy}>查看数据处理说明</button></section></div>;
+  return <div className="page-stack"><section className="page-title-row"><div><span className="eyebrow">设置</span><h1>运行方式和资料边界</h1><p>退出 Codex 不会删除健康档案；更换账户或扩大目录范围需要重新确认。</p></div></section><section className="panel settings-list">{settings.map(({ icon: Icon, title, text, action }) => <button key={title} onClick={title === '账户与 AI' ? onAccount : title === 'AI 模型' ? onAi : title === '报告收件箱' ? onDirectories : title === '自动处理' ? onSchedule : title === '桌面行为' ? onDesktop : title === '显示' ? onDisplay : title === '数据与隐私' ? onPrivacy : title === '备份与恢复' ? onBackup : onAbout}><span className="settings-icon"><Icon size={20} /></span><span><strong>{title}</strong><small>{text}</small></span><span className="settings-action">{action}<ChevronRight size={16} /></span></button>)}</section><section className="panel boundary-card"><div><ShieldCheck size={24} /><span><h3>真实边界</h3><p>资料保存在当前 OS 用户目录；AI 处理会通过你的 Codex 账户发送必要内容给 OpenAI。这不是全程离线推理，也不等于医学审核。</p></span></div><button className="secondary-button" onClick={onPrivacy}>查看数据处理说明</button></section></div>;
+}
+
+function AiPreferencesDialog({ preferences, onClose, onSave }: { preferences: AiPreferences; onClose(): void; onSave(input: AiPreferences): Promise<boolean> }) {
+  const [models, setModels] = useState<AiModelOption[]>([]);
+  const [modelId, setModelId] = useState(preferences.modelId);
+  const [reasoningEffort, setReasoningEffort] = useState<AiReasoningEffort>(preferences.reasoningEffort);
+  const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void window.healthDesktop?.getAiSettings().then((result) => {
+      if (!active) return;
+      if (!result.ok || result.data.models.length === 0) {
+        setLoadFailed(true);
+        return;
+      }
+      setModels(result.data.models);
+      setModelId(result.data.preferences.modelId);
+      setReasoningEffort(result.data.preferences.reasoningEffort);
+    }).catch(() => { if (active) setLoadFailed(true); }).finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
+  const selectedModel = models.find((model) => model.id === modelId) ?? null;
+  const effortDescription = selectedModel?.supportedReasoningEfforts.find((item) => item.reasoningEffort === reasoningEffort)?.description ?? '';
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-preferences-title"><header><div><span className="eyebrow">AI 模型</span><h2 id="ai-preferences-title">模型与推理强度</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭 AI 模型设置"><X size={19} /></button></header>{loading ? <div className="table-empty"><LoaderCircle size={24} className="spin" /><strong>正在读取当前账号可用模型</strong></div> : loadFailed ? <div className="info-callout compact"><CircleHelp size={18} /><div><strong>暂时无法读取模型列表</strong><p>请确认 Codex 已连接后重试。为避免保存无效组合，本次不会更改现有设置。</p></div></div> : <><label>模型<select aria-label="模型" value={modelId} onChange={(event) => { const next = models.find((model) => model.id === event.target.value); if (!next) return; setModelId(next.id); setReasoningEffort(next.defaultReasoningEffort); }}>{models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label>{selectedModel?.description && <p>{selectedModel.description}</p>}<label>推理强度<select aria-label="推理强度" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as AiReasoningEffort)}>{selectedModel?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{reasoningEffortLabels[option.reasoningEffort]}</option>)}</select></label>{effortDescription && <p>{effortDescription}</p>}<div className="info-callout compact"><ShieldCheck size={18} /><div><strong>默认：GPT-5.6-Sol · 中等推理</strong><p>更高强度通常更慢并消耗更多额度。变更只影响之后新领取的任务；正在处理的任务会继续使用启动时冻结的设置。AI 结果仍会经过独立复核，也不等于医学审核。</p></div></div></>}<div className="dialog-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={loading || loadFailed || busy || !selectedModel} onClick={async () => { setBusy(true); try { if (await onSave({ modelId, reasoningEffort })) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 保存设置</button></div></section></div>;
 }
 
 function AccountDialog({ snapshot, onClose, onConnect, onRefresh, onLogout }: {
@@ -1150,6 +1187,7 @@ export default function App() {
   const [reviewDialog, setReviewDialog] = useState<ReviewIssue | null>(null);
   const [desktopDialogOpen, setDesktopDialogOpen] = useState(false);
   const [displayDialogOpen, setDisplayDialogOpen] = useState(false);
+  const [aiDialogOpen, setAiDialogOpen] = useState(false);
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
   const [actionDialogOpen, setActionDialogOpen] = useState(false);
   const [manualNoteDialogOpen, setManualNoteDialogOpen] = useState(false);
@@ -1159,10 +1197,11 @@ export default function App() {
   const [jobDetail, setJobDetail] = useState<JobSummary | null>(null);
   const [desktopBehavior, setDesktopBehavior] = useState<DesktopBehavior>({ stayInTray: null, openAtLogin: false, notificationsEnabled: true });
   const [displayPreferences, setDisplayPreferences] = useState<DisplayPreferences>({ fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' });
+  const [aiPreferences, setAiPreferences] = useState<AiPreferences>(DEFAULT_AI_PREFERENCES);
   const [recoveryStatus, setRecoveryStatus] = useState<RecoveryStatus>({ pointCount: 0, totalBytes: 0, latestAt: null });
 
   const modalOpen = workspaceDialogOpen || memberDialogOpen || memberEditDialogOpen || archivePerson !== null || archivedPeopleDialogOpen || documentToExclude !== null || documentToDelete !== null || deletedDocumentsDialogOpen || directoryDialogOpen || processConsentOpen
-    || scheduleDialogOpen || backupDialogOpen || desktopDialogOpen || displayDialogOpen || accountDialogOpen || actionDialogOpen || manualNoteDialogOpen || exportDialogOpen
+    || scheduleDialogOpen || backupDialogOpen || desktopDialogOpen || displayDialogOpen || aiDialogOpen || accountDialogOpen || actionDialogOpen || manualNoteDialogOpen || exportDialogOpen
     || privacyDialogOpen || aboutDialogOpen || reviewDialog !== null || cancelJob !== null || jobDetail !== null;
 
   useEffect(() => {
@@ -1198,6 +1237,7 @@ export default function App() {
         setBackupDialogOpen(false);
         setDesktopDialogOpen(false);
         setDisplayDialogOpen(false);
+        setAiDialogOpen(false);
         setAccountDialogOpen(false);
         setActionDialogOpen(false);
         setManualNoteDialogOpen(false);
@@ -1240,6 +1280,7 @@ export default function App() {
       setSnapshot(next);
       setDesktopBehavior(bootstrap.desktopBehavior);
       setDisplayPreferences(bootstrap.displayPreferences);
+      setAiPreferences(bootstrap.aiPreferences);
       setRecoveryStatus(bootstrap.recoveryStatus);
       setSelectedPersonId((current) => next.persons.some((person) => person.id === current) ? current : next.persons[0]?.id ?? '');
     }).catch(() => setToast('无法读取本地工作区，已显示虚构演示资料。'));
@@ -1337,7 +1378,7 @@ export default function App() {
         if (snapshot.workspaceMode !== 'personal') setToast('演示工作区不会保存事项；请先建立或切换到个人工作区。');
         else setActionDialogOpen(true);
       }} onUpdate={(item, status) => void handleActionStatus(item, status)} />;
-      case 'settings': return <SettingsPage snapshot={snapshot} desktopBehavior={desktopBehavior} displayPreferences={displayPreferences} recoveryStatus={recoveryStatus} onAccount={() => setAccountDialogOpen(true)} onDirectories={() => {
+      case 'settings': return <SettingsPage snapshot={snapshot} desktopBehavior={desktopBehavior} displayPreferences={displayPreferences} aiPreferences={aiPreferences} recoveryStatus={recoveryStatus} onAccount={() => setAccountDialogOpen(true)} onAi={() => setAiDialogOpen(true)} onDirectories={() => {
         if (snapshot.workspaceMode !== 'personal') {
           setWorkspaceDialogOpen(true);
           setToast('请先建立或切换到个人工作区。');
@@ -1721,6 +1762,18 @@ export default function App() {
     return true;
   }
 
+  async function handleAiPreferencesSave(input: AiPreferences): Promise<boolean> {
+    if (!window.healthDesktop) return false;
+    const result = await window.healthDesktop.updateAiPreferences(input);
+    if (!result.ok) {
+      setToast('AI 模型设置没有保存；请刷新 Codex 连接后重试。');
+      return false;
+    }
+    setAiPreferences(result.data);
+    setToast(`已设置为 ${modelPreferenceLabel(result.data)}；之后新启动的任务会使用这组设置。`);
+    return true;
+  }
+
   activeDateStyle = displayPreferences.dateStyle;
   const shellClasses = ['app-shell', evidence ? 'has-evidence' : '', displayPreferences.fontScale === 'large' ? 'font-large' : '', displayPreferences.reduceMotion ? 'reduce-motion' : ''].filter(Boolean).join(' ');
 
@@ -1750,6 +1803,7 @@ export default function App() {
       {backupDialogOpen && <BackupDialog onClose={() => setBackupDialogOpen(false)} onNotice={setToast} onRestored={(next) => { setSnapshot(next); setSelectedPersonId(next.persons[0]?.id ?? ''); setEvidence(null); }} />}
       {desktopDialogOpen && <DesktopBehaviorDialog behavior={desktopBehavior} onClose={() => setDesktopDialogOpen(false)} onSave={handleDesktopBehaviorSave} />}
       {displayDialogOpen && <DisplayPreferencesDialog preferences={displayPreferences} onClose={() => setDisplayDialogOpen(false)} onSave={handleDisplayPreferencesSave} />}
+      {aiDialogOpen && <AiPreferencesDialog preferences={aiPreferences} onClose={() => setAiDialogOpen(false)} onSave={handleAiPreferencesSave} />}
       {accountDialogOpen && <AccountDialog snapshot={snapshot} onClose={() => setAccountDialogOpen(false)} onConnect={() => void handleLogin()} onRefresh={handleLogin} onLogout={handleLogout} />}
       {actionDialogOpen && <ActionDialog snapshot={snapshot} selectedPersonId={selectedPersonId} onClose={() => setActionDialogOpen(false)} onCreate={handleCreateAction} />}
       {manualNoteDialogOpen && <ManualNoteDialog snapshot={snapshot} selectedPersonId={selectedPersonId} onClose={() => setManualNoteDialogOpen(false)} onCreate={handleCreateManualNote} />}

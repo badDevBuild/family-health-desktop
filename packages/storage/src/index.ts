@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import type { ActionItem, CreateManualNoteInput, DerivedSnapshotCandidate, ManualNote, ObservationCandidate, Person, SourceManifest } from '@contracts';
 
-export const WORKSPACE_SCHEMA_VERSION = 6;
+export const WORKSPACE_SCHEMA_VERSION = 7;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 export interface WorkspaceStoreOptions {
@@ -2083,14 +2083,14 @@ export class WorkspaceStore {
     if (result.changes !== 1) throw new Error('JOB_NOT_RUNNING');
   }
 
-  startJobAttempt(jobId: string, runtimeVersion: string | null): string {
+  startJobAttempt(jobId: string, runtimeVersion: string | null, model: string | null = null, reasoningEffort: string | null = null): string {
     const id = randomUUID();
     this.db.prepare(`
       INSERT INTO job_attempts (
-        id, job_id, runtime_version, model, thread_id, turn_id, status,
+        id, job_id, runtime_version, model, reasoning_effort, thread_id, turn_id, status,
         error_code, usage_json, started_at, finished_at
-      ) VALUES (?, ?, ?, NULL, NULL, NULL, 'running', NULL, NULL, ?, NULL)
-    `).run(id, jobId, runtimeVersion, this.now().toISOString());
+      ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 'running', NULL, NULL, ?, NULL)
+    `).run(id, jobId, runtimeVersion, model, reasoningEffort, this.now().toISOString());
     return id;
   }
 
@@ -2568,6 +2568,16 @@ export class WorkspaceStore {
         current = 6;
       }
 
+      if (current === 6) {
+        const hasJobAttempts = Boolean(this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_attempts'`).get());
+        if (hasJobAttempts) this.db.exec(`ALTER TABLE job_attempts ADD COLUMN reasoning_effort TEXT`);
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 7;
+          PRAGMA user_version = 7;
+        `);
+        current = 7;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -2706,7 +2716,7 @@ export class WorkspaceStore {
       ) STRICT;
       CREATE TABLE IF NOT EXISTS job_attempts (
         id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), runtime_version TEXT,
-        model TEXT, thread_id TEXT, turn_id TEXT, status TEXT NOT NULL, error_code TEXT,
+        model TEXT, reasoning_effort TEXT, thread_id TEXT, turn_id TEXT, status TEXT NOT NULL, error_code TEXT,
         usage_json TEXT, started_at TEXT NOT NULL, finished_at TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS review_issues (
@@ -2765,7 +2775,7 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
       CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
-      PRAGMA user_version = 6;
+      PRAGMA user_version = 7;
       `);
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');

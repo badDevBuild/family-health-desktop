@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync } from 'node:fs';
-import type { AccountState } from '@contracts';
+import { aiModelOptionSchema, aiReasoningEffortSchema, type AccountState, type AiModelOption, type AiPreferences } from '@contracts';
 import { spawnCodexAppServer, type CodexRpcClient } from '@codex';
 
 interface RuntimeClient extends EventEmitter {
@@ -50,6 +50,22 @@ interface TurnItem {
 interface TurnCompleted {
   threadId: string;
   turn: { id: string; status: string; items: TurnItem[]; error: unknown };
+}
+
+interface RuntimeModel {
+  model: string;
+  displayName: string;
+  description: string;
+  hidden: boolean;
+  supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>;
+  defaultReasoningEffort: string;
+  inputModalities: string[];
+  isDefault: boolean;
+}
+
+interface ModelListResponse {
+  data: RuntimeModel[];
+  nextCursor: string | null;
 }
 
 function initialState(runtimeVersion: string | null, available: boolean): AccountState {
@@ -171,10 +187,47 @@ export class CodexRuntimeManager extends EventEmitter {
     return this.refreshAccount();
   }
 
+  async listModels(): Promise<AiModelOption[]> {
+    await this.start();
+    if (!this.client) throw new Error('CODEX_RUNTIME_UNAVAILABLE');
+    const models: RuntimeModel[] = [];
+    let cursor: string | null = null;
+    do {
+      const response: ModelListResponse = await this.client.request<ModelListResponse>('model/list', {
+        cursor,
+        limit: 100,
+        includeHidden: false
+      });
+      models.push(...response.data);
+      cursor = response.nextCursor;
+    } while (cursor);
+
+    return models.flatMap((model) => {
+      if (model.hidden || !model.inputModalities.includes('text') || !model.inputModalities.includes('image')) return [];
+      const supportedReasoningEfforts = model.supportedReasoningEfforts.flatMap((option) => {
+        const parsed = aiReasoningEffortSchema.safeParse(option.reasoningEffort);
+        return parsed.success ? [{ reasoningEffort: parsed.data, description: option.description }] : [];
+      });
+      if (supportedReasoningEfforts.length === 0) return [];
+      const defaultEffort = aiReasoningEffortSchema.safeParse(model.defaultReasoningEffort);
+      return [aiModelOptionSchema.parse({
+        id: model.model,
+        displayName: model.displayName,
+        description: model.description,
+        supportedReasoningEfforts,
+        defaultReasoningEffort: defaultEffort.success && supportedReasoningEfforts.some((item) => item.reasoningEffort === defaultEffort.data)
+          ? defaultEffort.data
+          : supportedReasoningEfforts[0]!.reasoningEffort,
+        isDefault: model.isDefault
+      })];
+    });
+  }
+
   async runStructuredTurn<T>(input: {
     prompt: string;
     imagePaths?: string[];
     outputSchema: Record<string, unknown>;
+    aiPreferences: AiPreferences;
     timeoutMs?: number;
   }): Promise<{ threadId: string; turnId: string; output: T }> {
     await this.start();
@@ -183,6 +236,7 @@ export class CodexRuntimeManager extends EventEmitter {
     if (this.activeTurn) throw new Error('CODEX_CONCURRENCY_LIMIT');
     const thread = await this.client.request<{ thread: { id: string } }>('thread/start', {
       cwd: this.options.workingDirectory,
+      model: input.aiPreferences.modelId,
       runtimeWorkspaceRoots: [],
       approvalPolicy: 'never',
       sandbox: 'read-only',
@@ -202,6 +256,8 @@ export class CodexRuntimeManager extends EventEmitter {
     try {
       started = await this.client.request<{ turn: { id: string } }>('turn/start', {
         threadId: thread.thread.id,
+        model: input.aiPreferences.modelId,
+        effort: input.aiPreferences.reasoningEffort,
         input: [
           { type: 'text', text: input.prompt, text_elements: [] },
           ...(input.imagePaths ?? []).map((path) => ({ type: 'localImage', path, detail: 'original' }))

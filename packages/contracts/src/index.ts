@@ -538,6 +538,40 @@ export type DisplayPreferences = z.infer<typeof displayPreferencesSchema>;
 
 export const updateDisplayPreferencesInputSchema = displayPreferencesSchema;
 
+export const aiReasoningEffortSchema = z.enum(['low', 'medium', 'high', 'xhigh', 'max']);
+export type AiReasoningEffort = z.infer<typeof aiReasoningEffortSchema>;
+
+export const aiPreferencesSchema = z.object({
+  modelId: z.string().min(1),
+  reasoningEffort: aiReasoningEffortSchema
+}).strict();
+export type AiPreferences = z.infer<typeof aiPreferencesSchema>;
+export const DEFAULT_AI_PREFERENCES: AiPreferences = {
+  modelId: 'gpt-5.6-sol',
+  reasoningEffort: 'medium'
+};
+
+export const aiModelOptionSchema = z.object({
+  id: z.string().min(1),
+  displayName: z.string().min(1),
+  description: z.string(),
+  supportedReasoningEfforts: z.array(z.object({
+    reasoningEffort: aiReasoningEffortSchema,
+    description: z.string()
+  }).strict()).min(1),
+  defaultReasoningEffort: aiReasoningEffortSchema,
+  isDefault: z.boolean()
+}).strict();
+export type AiModelOption = z.infer<typeof aiModelOptionSchema>;
+
+export const aiSettingsSchema = z.object({
+  preferences: aiPreferencesSchema,
+  models: z.array(aiModelOptionSchema)
+}).strict();
+export type AiSettings = z.infer<typeof aiSettingsSchema>;
+
+export const updateAiPreferencesInputSchema = aiPreferencesSchema;
+
 export const dashboardSnapshotSchema = z.object({
   workspaceMode: z.enum(['demo', 'personal']),
   workspaceName: z.string(),

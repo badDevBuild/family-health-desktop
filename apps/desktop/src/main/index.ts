@@ -7,6 +7,8 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, No
 import { is } from '@electron-toolkit/utils';
 import {
   accountStateSchema,
+  aiPreferencesSchema,
+  aiSettingsSchema,
   archivePersonInputSchema,
   confirmInboxBindingInputSchema,
   cleanupReceiptSchema,
@@ -42,9 +44,11 @@ import {
   updateDesktopBehaviorInputSchema,
   updateDisplayPreferencesInputSchema,
   updateActionStatusInputSchema,
+  updateAiPreferencesInputSchema,
   updatePersonDisplayInputSchema
 } from '@contracts';
-import type { AccountState, ImportFilesReceipt } from '@contracts';
+import { DEFAULT_AI_PREFERENCES } from '@contracts';
+import type { AccountState, AiPreferences, ImportFilesReceipt } from '@contracts';
 import { assertSafeInboxDirectory, INGESTION_LIMITS, loadLibreOfficeConverter, renderHeicImagesToPngs, renderPdfPagesToPngs, type LegacyDocConverter } from '@ingestion';
 import { createDemoSnapshot } from '../../../../packages/test-fixtures/src/index.js';
 import { CodexRuntimeManager } from './codex-runtime.js';
@@ -94,6 +98,7 @@ interface DesktopState {
     reduceMotion: boolean;
     dateStyle: 'friendly' | 'numeric';
   };
+  aiPreferences: AiPreferences;
 }
 
 const allowedExternalHosts = new Set(['auth.openai.com', 'chatgpt.com', 'openai.com']);
@@ -349,10 +354,11 @@ function readDesktopState(): DesktopState {
       stayInTray: typeof parsed.stayInTray === 'boolean' ? parsed.stayInTray : null,
       openAtLogin: parsed.openAtLogin === true,
       notificationsEnabled: parsed.notificationsEnabled !== false,
-      displayPreferences: displayPreferencesSchema.catch({ fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' }).parse(parsed.displayPreferences)
+      displayPreferences: displayPreferencesSchema.catch({ fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' }).parse(parsed.displayPreferences),
+      aiPreferences: aiPreferencesSchema.catch(DEFAULT_AI_PREFERENCES).parse(parsed.aiPreferences)
     };
   } catch {
-    return { activeWorkspaceMode: 'demo', workspaceName: null, stayInTray: null, openAtLogin: false, notificationsEnabled: true, displayPreferences: { fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' } };
+    return { activeWorkspaceMode: 'demo', workspaceName: null, stayInTray: null, openAtLogin: false, notificationsEnabled: true, displayPreferences: { fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' }, aiPreferences: DEFAULT_AI_PREFERENCES };
   }
 }
 
@@ -383,7 +389,7 @@ function initializeRuntime(): void {
     codexHome: join(app.getPath('userData'), 'codex-home'),
     workingDirectory: join(app.getPath('userData'), 'runtime-work')
   });
-  jobRunner = new ProcessingJobRunner(runtimeManager);
+  jobRunner = new ProcessingJobRunner(runtimeManager, () => readDesktopState().aiPreferences);
   jobRunner.on('changed', emitSnapshotChanged);
   jobRunner.on('terminal', ({ status }: { status: string }) => {
     if (!readDesktopState().notificationsEnabled) return;
@@ -499,6 +505,7 @@ function registerIpc(): void {
         notificationsEnabled: desktopState.notificationsEnabled
       },
       displayPreferences: desktopState.displayPreferences,
+      aiPreferences: desktopState.aiPreferences,
       recoveryStatus
     };
   });
@@ -590,6 +597,40 @@ function registerIpc(): void {
     const displayPreferences = updateDisplayPreferencesInputSchema.parse(rawInput);
     writeDesktopState({ ...readDesktopState(), displayPreferences });
     return { ok: true, data: displayPreferences };
+  });
+
+  ipcMain.handle('ai:get-settings', async (event) => {
+    validateSender(event);
+    try {
+      if (!runtimeManager) throw new Error('CODEX_RUNTIME_UNAVAILABLE');
+      return {
+        ok: true,
+        data: aiSettingsSchema.parse({
+          preferences: readDesktopState().aiPreferences,
+          models: await runtimeManager.listModels()
+        })
+      };
+    } catch (error) {
+      return { ok: false, error: { code: error instanceof Error ? error.message : 'AI_SETTINGS_UNAVAILABLE', messageKey: 'ai.settings_unavailable', retryable: true, correlationId: randomUUID() } };
+    }
+  });
+
+  ipcMain.handle('ai:update-preferences', async (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      const preferences = updateAiPreferencesInputSchema.parse(rawInput);
+      if (!runtimeManager) throw new Error('CODEX_RUNTIME_UNAVAILABLE');
+      const models = await runtimeManager.listModels();
+      const model = models.find((item) => item.id === preferences.modelId);
+      if (!model) throw new Error('AI_MODEL_UNAVAILABLE');
+      if (!model.supportedReasoningEfforts.some((item) => item.reasoningEffort === preferences.reasoningEffort)) {
+        throw new Error('AI_REASONING_EFFORT_UNAVAILABLE');
+      }
+      writeDesktopState({ ...readDesktopState(), aiPreferences: preferences });
+      return { ok: true, data: preferences };
+    } catch (error) {
+      return { ok: false, error: { code: error instanceof Error ? error.message : 'AI_PREFERENCES_INVALID', messageKey: 'ai.preferences_invalid', retryable: false, correlationId: randomUUID() } };
+    }
   });
 
   ipcMain.handle('documents:get-evidence', async (event, rawInput: unknown) => {

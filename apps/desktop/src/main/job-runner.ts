@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type { WorkspaceStore } from '@storage';
 import { stableHash } from '@core';
+import { DEFAULT_AI_PREFERENCES, type AiPreferences } from '@contracts';
 import { CodexRuntimeManager } from './codex-runtime.js';
 import { DerivedHealthPipeline } from './derived-pipeline.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
@@ -10,7 +11,10 @@ export class ProcessingJobRunner extends EventEmitter {
   private running = false;
   private readonly leaseOwner = `desktop-${randomUUID()}`;
 
-  constructor(private readonly runtime: CodexRuntimeManager) {
+  constructor(
+    private readonly runtime: CodexRuntimeManager,
+    private readonly getAiPreferences: () => AiPreferences = () => DEFAULT_AI_PREFERENCES
+  ) {
     super();
   }
 
@@ -37,7 +41,13 @@ export class ProcessingJobRunner extends EventEmitter {
           this.emit('changed');
           continue;
         }
-        const attemptId = store.startJobAttempt(job.id, account.runtimeVersion);
+        // 每个任务领取时冻结模型设置，避免用户在处理中修改设置导致同一任务混用模型。
+        const aiPreferences = structuredClone(this.getAiPreferences());
+        const attemptId = store.startJobAttempt(job.id, account.runtimeVersion, aiPreferences.modelId, aiPreferences.reasoningEffort);
+        const jobRuntime = {
+          runStructuredTurn: <T>(input: Omit<Parameters<CodexRuntimeManager['runStructuredTurn']>[0], 'aiPreferences'>) =>
+            this.runtime.runStructuredTurn<T>({ ...input, aiPreferences })
+        };
         const executionGuard = {
           jobId: job.id,
           attemptId,
@@ -45,7 +55,7 @@ export class ProcessingJobRunner extends EventEmitter {
           accountFingerprint
         };
         try {
-          const pipeline = new DocumentExtractionPipeline(store, this.runtime, executionGuard);
+          const pipeline = new DocumentExtractionPipeline(store, jobRuntime, executionGuard);
           const resumeDerived = ['analyze', 'guidance', 'review_derived', 'publish'].includes(job.stage);
           let completedUnits = resumeDerived ? job.documentIds.length : 0;
           let needsReview = false;
@@ -73,10 +83,10 @@ export class ProcessingJobRunner extends EventEmitter {
           }
           if (!needsReview) {
             if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
-            const derived = await new DerivedHealthPipeline(store, this.runtime, (stage) => {
+            const derived = await new DerivedHealthPipeline(store, jobRuntime, (stage) => {
               store.updateJobStage(job.id, stage);
               this.emit('changed');
-            }, executionGuard, job.documentIds[0]!).process(job.personId);
+            }, executionGuard, job.documentIds[0]!, aiPreferences.modelId).process(job.personId);
             if (derived.threadId && derived.turnId) lastReceipt = { threadId: derived.threadId, turnId: derived.turnId };
             if (derived.status === 'needs_review') needsReview = true;
           }

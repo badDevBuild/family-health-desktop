@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(6);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(7);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -646,7 +646,12 @@ describe('WorkspaceStore', () => {
       initialStatus: 'queued', consentId
     });
     const job = store.claimNextQueuedJob('runner', 'account-fingerprint')!;
-    const attemptId = store.startJobAttempt(job.id, '0.145.0');
+    const attemptId = store.startJobAttempt(job.id, '0.145.0', 'gpt-5.6-sol', 'medium');
+    const auditDatabase = new Database(store.databasePath, { readonly: true });
+    expect(auditDatabase.prepare(`SELECT model, reasoning_effort FROM job_attempts WHERE id = ?`).get(attemptId)).toEqual({
+      model: 'gpt-5.6-sol', reasoning_effort: 'medium'
+    });
+    auditDatabase.close();
     store.updateJobProgress(job.id, 1);
     expect(store.requestJobCancellation(job.id)).toEqual({ running: true, alreadyTerminal: false });
     expect(store.isJobCancellationRequested(job.id)).toBe(true);

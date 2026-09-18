@@ -100,7 +100,8 @@ export class DerivedHealthPipeline {
     private readonly runtime: StructuredRuntime,
     private readonly onStage?: (stage: 'analyze' | 'review_derived' | 'publish') => void,
     private readonly executionGuard?: JobExecutionGuard,
-    private readonly transmissionDocumentId?: string
+    private readonly transmissionDocumentId?: string,
+    private readonly modelId = 'codex-account-default'
   ) {}
 
   private async runTurn(stage: string, input: Parameters<StructuredRuntime['runStructuredTurn']>[0]) {
@@ -167,7 +168,7 @@ export class DerivedHealthPipeline {
       expectedContextRevision: contextRevision,
       promptVersion: 'derived-v1',
       rulesVersion: 'derived-safety-v1',
-      modelId: 'codex-account-default',
+      modelId: this.modelId,
       ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
     });
     return { status: 'published', snapshotId: published.snapshotId, threadId: reviewed.threadId, turnId: reviewed.turnId };

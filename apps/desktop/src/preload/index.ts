@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AccountState, ActionItem, ArchivePersonInput, CleanupReceipt, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, ImportFilesReceipt, InboxBindingSummary, ManualNote, Person, ProcessNowInput, ResolveReviewInput, RestorePersonInput, Result, SetDocumentInclusionInput, UpdatePersonDisplayInput, UpdateScheduleInput } from '@contracts';
+import type { AccountState, ActionItem, AiPreferences, AiSettings, ArchivePersonInput, CleanupReceipt, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, ImportFilesReceipt, InboxBindingSummary, ManualNote, Person, ProcessNowInput, ResolveReviewInput, RestorePersonInput, Result, SetDocumentInclusionInput, UpdatePersonDisplayInput, UpdateScheduleInput } from '@contracts';
 
 export interface HealthDesktopBridge {
   getBootstrap(): Promise<{
@@ -7,6 +7,7 @@ export interface HealthDesktopBridge {
     versions: { app: string; electron: string; chrome: string; node: string };
     desktopBehavior: { stayInTray: boolean | null; openAtLogin: boolean; notificationsEnabled: boolean };
     displayPreferences: DisplayPreferences;
+    aiPreferences: AiPreferences;
     recoveryStatus: { pointCount: number; totalBytes: number; latestAt: string | null };
   }>;
   getSnapshot(): Promise<DashboardSnapshot>;
@@ -42,6 +43,8 @@ export interface HealthDesktopBridge {
   cancelRestore(): Promise<Result<{ cancelled: boolean }>>;
   updateDesktopBehavior(input: { stayInTray: boolean; openAtLogin: boolean; notificationsEnabled: boolean }): Promise<Result<{ stayInTray: boolean; openAtLogin: boolean; notificationsEnabled: boolean }>>;
   updateDisplayPreferences(input: DisplayPreferences): Promise<Result<DisplayPreferences>>;
+  getAiSettings(): Promise<Result<AiSettings>>;
+  updateAiPreferences(input: AiPreferences): Promise<Result<AiPreferences>>;
   updateSchedule(input: UpdateScheduleInput): Promise<Result<DashboardSnapshot>>;
   startLogin(): Promise<Result<{ loginStarted: boolean }>>;
   refreshAccount(): Promise<Result<AccountState>>;
@@ -97,6 +100,8 @@ const bridge: HealthDesktopBridge = {
   cancelRestore: () => ipcRenderer.invoke('backup:cancel-restore'),
   updateDesktopBehavior: (input) => ipcRenderer.invoke('desktop:update-behavior', input),
   updateDisplayPreferences: (input) => ipcRenderer.invoke('display:update-preferences', input),
+  getAiSettings: () => ipcRenderer.invoke('ai:get-settings'),
+  updateAiPreferences: (input) => ipcRenderer.invoke('ai:update-preferences', input),
   updateSchedule: (input) => ipcRenderer.invoke('schedule:update', input),
   startLogin: () => ipcRenderer.invoke('account:start-login'),
   refreshAccount: () => ipcRenderer.invoke('account:refresh'),

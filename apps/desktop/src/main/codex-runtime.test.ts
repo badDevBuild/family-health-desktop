@@ -15,6 +15,13 @@ class FakeClient extends EventEmitter {
     if (method === 'account/rateLimits/read') return { rateLimits: { primary: { usedPercent: 32, resetsAt: 2_000_000_000 }, secondary: null } } as T;
     if (method === 'account/login/start') return { type: 'chatgpt', loginId: 'login-1', authUrl: 'https://chatgpt.com/auth' } as T;
     if (method === 'account/logout') { this.authenticated = false; return {} as T; }
+    if (method === 'model/list') return {
+      data: [{
+        id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', description: '测试模型', hidden: false,
+        supportedReasoningEfforts: [{ reasoningEffort: 'low', description: '快速' }, { reasoningEffort: 'medium', description: '平衡' }],
+        defaultReasoningEffort: 'low', inputModalities: ['text', 'image'], isDefault: true
+      }], nextCursor: null
+    } as T;
     if (method === 'thread/start') return { thread: { id: 'thread-1' } } as T;
     if (method === 'turn/start') {
       queueMicrotask(() => this.emit('turn/completed', {
@@ -83,13 +90,16 @@ describe('CodexRuntimeManager', () => {
     const result = await manager.runStructuredTurn<{ ok: boolean }>({
       prompt: '只处理纯虚构资料',
       imagePaths: ['/isolated/fixture.png'],
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
       outputSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false }
     });
     expect(result.output).toEqual({ ok: true });
     const threadStart = client.requests.find((request) => request.method === 'thread/start');
     const turnStart = client.requests.find((request) => request.method === 'turn/start');
-    expect(threadStart?.params).toMatchObject({ approvalPolicy: 'never', sandbox: 'read-only', environments: [], dynamicTools: [] });
+    expect(threadStart?.params).toMatchObject({ model: 'gpt-5.6-sol', approvalPolicy: 'never', sandbox: 'read-only', environments: [], dynamicTools: [] });
     expect(turnStart?.params).toMatchObject({
+      model: 'gpt-5.6-sol',
+      effort: 'medium',
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'readOnly', networkAccess: false },
       environments: [],
@@ -98,6 +108,19 @@ describe('CodexRuntimeManager', () => {
         { type: 'localImage', path: '/isolated/fixture.png', detail: 'original' }
       ]
     });
+    manager.shutdown();
+  });
+
+  it('从当前 Codex 账户读取支持图像的模型与推理强度', async () => {
+    const { manager } = setup();
+    await expect(manager.listModels()).resolves.toEqual([{
+      id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', description: '测试模型',
+      supportedReasoningEfforts: [
+        { reasoningEffort: 'low', description: '快速' },
+        { reasoningEffort: 'medium', description: '平衡' }
+      ],
+      defaultReasoningEffort: 'low', isDefault: true
+    }]);
     manager.shutdown();
   });
 
