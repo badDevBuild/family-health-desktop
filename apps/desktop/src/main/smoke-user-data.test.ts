@@ -1,9 +1,10 @@
-import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { resolveSmokeUserDataDirectory } from './smoke-user-data.js';
 
 describe('发行工件冒烟工作区隔离', () => {
-  const temporaryRoot = '/private/tmp';
+  const temporaryRoot = tmpdir();
 
   it('没有专用参数时保持正常用户目录', () => {
     expect(resolveSmokeUserDataDirectory(['家庭健康看板'], temporaryRoot)).toBeNull();
@@ -18,10 +19,10 @@ describe('发行工件冒烟工作区隔离', () => {
   });
 
   it.each([
-    '/Users/example/Library/Application Support/family-health-desktop',
-    '/private/tmp/not-family-health',
-    '/private/tmp/family-health-app-smoke-parent/child',
-    '/private/tmp/family-health-app-smoke-parent/../outside'
+    resolve(temporaryRoot, '..', 'family-health-desktop'),
+    join(temporaryRoot, 'not-family-health'),
+    join(temporaryRoot, 'family-health-app-smoke-parent', 'child'),
+    join(temporaryRoot, 'family-health-app-smoke-parent', '..', 'outside')
   ])('拒绝可能命中真实工作区或越界的路径：%s', (target) => {
     expect(() => resolveSmokeUserDataDirectory([
       `--family-health-smoke-user-data=${target}`

@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import JSZip from 'jszip';
 import { assertImagePixelLimit, assertPathWithinRoot, assertSafeInboxDirectory, buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, isStableFile, readRasterDimensions, renderDocxImagesToFiles, renderHeicImagesToPngs, renderPdfPagesToPngs } from './index.js';
@@ -234,8 +234,11 @@ describe('格式和证据预处理', () => {
 
 describe('路径边界', () => {
   it('拒绝越出授权根目录的对象路径', () => {
-    expect(assertPathWithinRoot('/safe/vault', '/safe/vault/a/b')).toBe('/safe/vault/a/b');
-    expect(() => assertPathWithinRoot('/safe/vault', '/safe/other')).toThrow('PATH_OUTSIDE_AUTHORIZED_ROOT');
+    const authorizedRoot = resolve(tmpdir(), 'safe', 'vault');
+    const nestedPath = join(authorizedRoot, 'a', 'b');
+    const outsidePath = resolve(tmpdir(), 'safe', 'other');
+    expect(assertPathWithinRoot(authorizedRoot, nestedPath)).toBe(nestedPath);
+    expect(() => assertPathWithinRoot(authorizedRoot, outsidePath)).toThrow('PATH_OUTSIDE_AUTHORIZED_ROOT');
   });
 
   it('拒绝与内部工作区重叠的收件箱和符号链接', () => {

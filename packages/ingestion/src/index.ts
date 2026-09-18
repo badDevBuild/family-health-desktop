@@ -13,7 +13,12 @@ import type { SourceManifest, SourceSpan } from '@contracts';
 export * from './legacy-doc-converter.js';
 
 const require = createRequire(import.meta.url);
-const pdfStandardFontsPath = `${join(dirname(require.resolve('pdfjs-dist/package.json')), 'standard_fonts')}${sep}`;
+// pdf.js 要求资源根路径以正斜杠结尾；Node 的本地文件读取在 Windows
+// 同样接受正斜杠路径，因此这里保留文件系统路径而不是转换成 file:// URL。
+const pdfStandardFontsPath = `${join(
+  dirname(require.resolve('pdfjs-dist/package.json')),
+  'standard_fonts'
+).replaceAll('\\', '/')}/`;
 
 export const INGESTION_LIMITS = {
   maxFileBytes: 100 * 1024 * 1024,

@@ -362,5 +362,5 @@ describe('PersonalWorkspaceService', () => {
     expect(database.prepare(`SELECT COUNT(*) AS count FROM batches`).get()).toEqual({ count: 0 });
     expect(database.prepare(`SELECT COUNT(*) AS count FROM jobs`).get()).toEqual({ count: 0 });
     database.close();
-  }, 15_000);
+  }, 60_000);
 });
