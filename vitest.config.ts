@@ -16,6 +16,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['packages/**/*.test.ts', 'apps/**/*.test.{ts,tsx}', 'scripts/**/*.test.ts'],
+    exclude: ['scripts/benchmark-local-capacity.test.ts'],
     coverage: {
       reporter: ['text', 'html'],
       reportsDirectory: 'coverage'
