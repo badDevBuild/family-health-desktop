@@ -12,6 +12,7 @@ interface StructuredRuntime {
     prompt: string;
     imagePaths?: string[];
     outputSchema: Record<string, unknown>;
+    allowWebSearch?: boolean;
     timeoutMs?: number;
   }): Promise<{ threadId: string; turnId: string; output: unknown }>;
 }

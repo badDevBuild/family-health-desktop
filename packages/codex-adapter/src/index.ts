@@ -189,7 +189,6 @@ export function spawnCodexAppServer(options: {
     '--stdio',
     '--strict-config',
     '-c', 'web_search="disabled"',
-    '--disable', 'standalone_web_search',
     '--disable', 'shell_tool',
     '--disable', 'unified_exec',
     '--disable', 'browser_use',

@@ -676,8 +676,18 @@ describe('WorkspaceStore', () => {
     });
     const failedJob = store.claimNextQueuedJob('runner', 'account-fingerprint')!;
     expect(failedJob.id).toBe(secondBatch.jobIds[0]);
+    const failedAttemptId = store.startJobAttempt(failedJob.id, '0.145.0', 'gpt-5.6-sol', 'medium');
     store.updateJobStage(failedJob.id, 'analyze');
+    store.finishJobAttempt({
+      attemptId: failedAttemptId,
+      status: 'failed',
+      errorCode: "CODEX_RPC_ERROR:-32600:failed to load configuration: unknown configuration field 'tools.view_image'"
+    });
     store.finishJob(failedJob.id, 'failed');
+    expect(store.listStoredJobs()[0]).toMatchObject({
+      status: 'failed',
+      statusText: '当前版本的 Codex 配置不兼容，请安装更新后重试'
+    });
     store.retryFailedJob(failedJob.id);
     store.setQueuePaused(true);
     expect(store.isQueuePaused()).toBe(true);

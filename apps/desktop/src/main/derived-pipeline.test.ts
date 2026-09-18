@@ -73,9 +73,11 @@ describe('DerivedHealthPipeline', () => {
     };
     let turn = 0;
     const prompts: string[] = [];
+    const webSearchFlags: Array<boolean | undefined> = [];
     const result = await new DerivedHealthPipeline(service.store, {
       runStructuredTurn: async (input) => {
         prompts.push(input.prompt);
+        webSearchFlags.push(input.allowWebSearch);
         return { threadId: 'derived-thread', turnId: `derived-turn-${++turn}`, output: turn === 1 ? candidate : review };
       }
     }).process(personId);
@@ -87,6 +89,8 @@ describe('DerivedHealthPipeline', () => {
     });
     expect(prompts[0]).toContain('本人补充：近期作息不规律');
     expect(prompts[0]).toContain('userReportedNotes');
+    expect(prompts[0]).toContain('搜索词必须去标识化');
+    expect(webSearchFlags).toEqual([true, true]);
     service.store.createManualNote({
       personId, kind: 'free_text', immutableText: '新增背景需刷新派生说明', effectiveDate: null,
       structuredFields: {}, expectedContextRevision: 1

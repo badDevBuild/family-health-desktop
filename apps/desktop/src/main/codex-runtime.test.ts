@@ -83,7 +83,7 @@ describe('CodexRuntimeManager', () => {
     manager.shutdown();
   });
 
-  it('结构化任务强制无工具、无网络、只读沙箱', async () => {
+  it('事实提取关闭 Web Search，并保持命令网络与本机工具不可用', async () => {
     const { manager, client } = setup();
     client.authenticated = true;
     await manager.start();
@@ -96,7 +96,11 @@ describe('CodexRuntimeManager', () => {
     expect(result.output).toEqual({ ok: true });
     const threadStart = client.requests.find((request) => request.method === 'thread/start');
     const turnStart = client.requests.find((request) => request.method === 'turn/start');
-    expect(threadStart?.params).toMatchObject({ model: 'gpt-5.6-sol', approvalPolicy: 'never', sandbox: 'read-only', environments: [], dynamicTools: [] });
+    expect(threadStart?.params).toMatchObject({
+      model: 'gpt-5.6-sol', approvalPolicy: 'never', sandbox: 'read-only', environments: [], dynamicTools: [],
+      config: { web_search: 'disabled' }
+    });
+    expect((threadStart?.params as { config?: Record<string, unknown> }).config).not.toHaveProperty('tools');
     expect(turnStart?.params).toMatchObject({
       model: 'gpt-5.6-sol',
       effort: 'medium',
@@ -108,6 +112,27 @@ describe('CodexRuntimeManager', () => {
         { type: 'localImage', path: '/isolated/fixture.png', detail: 'original' }
       ]
     });
+    manager.shutdown();
+  });
+
+  it('派生分析只开启内置实时 Web Search，命令网络仍保持关闭', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    await manager.start();
+    await manager.runStructuredTurn<{ ok: boolean }>({
+      prompt: '只处理纯虚构、去标识化资料',
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      allowWebSearch: true,
+      outputSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false }
+    });
+    const threadStart = client.requests.find((request) => request.method === 'thread/start');
+    const turnStart = client.requests.find((request) => request.method === 'turn/start');
+    expect(threadStart?.params).toMatchObject({
+      config: { web_search: 'live' },
+      developerInstructions: expect.stringContaining('de-identified')
+    });
+    expect((threadStart?.params as { config?: Record<string, unknown> }).config).not.toHaveProperty('tools');
+    expect(turnStart?.params).toMatchObject({ sandboxPolicy: { type: 'readOnly', networkAccess: false } });
     manager.shutdown();
   });
 

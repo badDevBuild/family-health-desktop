@@ -17,7 +17,7 @@
 
 本仓库只包含应用源代码、设计文档、合成测试数据和构建配置，不应包含任何真实健康资料、数据库、备份、账号凭据、登录状态、本机绝对路径或已构建安装包。
 
-AI 处理不是纯本地操作。只有用户明确授权后，应用才会把所选报告内容发送给已登录的 Codex/OpenAI 服务。详细边界见 [隐私说明](docs/desktop/privacy-data-boundaries.md) 与 [威胁模型](docs/desktop/threat-model.md)。
+AI 处理不是纯本地操作。只有用户明确授权后，应用才会把所选报告内容发送给已登录的 Codex/OpenAI 服务。事实提取与核对禁用网页搜索；综合分析与安全复核可使用 Codex 内置 Web Search 查询去标识化的通用医学背景。详细边界见 [隐私说明](docs/desktop/privacy-data-boundaries.md) 与 [威胁模型](docs/desktop/threat-model.md)。
 
 默认 AI 设置为 GPT-5.6-Sol + Medium。用户可以在应用设置中选择当前 Codex 账号实际可用的模型与推理强度；变更仅影响之后新启动的任务。
 

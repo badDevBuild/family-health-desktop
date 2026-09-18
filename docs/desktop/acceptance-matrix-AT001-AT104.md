@@ -16,11 +16,11 @@
 | AT003 | NOT_RUN | App 使用私有 `CODEX_HOME` | 需同机其他 Codex 登录会话的隔离实测 |
 | AT004 | NOT_RUN | 图像 turn 已接入，扫描 PDF 会生成受控 PNG | 需真实账户与三平台图像回执 |
 | AT005 | NOT_RUN | Schema turn、中断和终态处理已实现 | 需真实结构化输出和中断实测 |
-| AT006 | BLOCKED | 运行时强制只读、无网络、无工具；本地 canary 边界有测试 | 需真实模型对抗回合和受控进程/网络观测 |
-| AT007 | BLOCKED | App Server 启动显式禁用 shell、web、browser、plugins、MCP 等 | 需真实模型与三平台恶意样例 |
+| AT006 | BLOCKED | 事实阶段禁用 Web Search；派生阶段只开启内置实时 Web Search。两者命令沙箱均只读、无网络，本地 canary 边界有测试 | 需真实模型对抗回合、搜索词去标识化观测和受控进程/网络观测 |
+| AT007 | BLOCKED | App Server 启动显式禁用 shell、browser、apps、plugins、MCP 等；仅派生阶段可用内置 Web Search | 需真实模型与三平台恶意样例 |
 | AT008 | BLOCKED | arm64 HEIC 已验证；旧 DOC 固定哈希/版本转换适配器已实现，官方 26.8.0.3 合成 DOC→PDF→证据实探通过 | 官方 arm64 App 严格 codesign 失败而未打包；仍需签名可分发构件、Intel Mac/Windows 实机与许可复核 |
 | AT009 | BLOCKED | 未登录真实 model/list 可读；额度缺失显示“未知” | 需真实账户额度回执 |
-| AT010 | PASS | `schemas/codex/0.145.0`、`runtime-lock.json`、stdio 协议夹具和真实 initialize 回路 | — |
+| AT010 | PASS | `schemas/codex/0.145.0`、`runtime-lock.json`、stdio 协议夹具、真实 initialize 回路，以及搜索禁用/实时两种配置的锁定版 `thread/start` 探针 | — |
 | AT011 | PASS | arm64 空白/未登录成品可启动、看演示、建成员 | — |
 | AT012 | PASS | 演示与个人工作区分离，切换回归测试通过 | — |
 | AT013 | PASS | 未登录可维护本机档案；发送前需独立授权 | — |

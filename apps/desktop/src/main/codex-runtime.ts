@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync } from 'node:fs';
 import { aiModelOptionSchema, aiReasoningEffortSchema, type AccountState, type AiModelOption, type AiPreferences } from '@contracts';
 import { spawnCodexAppServer, type CodexRpcClient } from '@codex';
+import { createHealthThreadStartParams } from './codex-thread-config.js';
 
 interface RuntimeClient extends EventEmitter {
   initialize(): Promise<unknown>;
@@ -228,29 +229,19 @@ export class CodexRuntimeManager extends EventEmitter {
     imagePaths?: string[];
     outputSchema: Record<string, unknown>;
     aiPreferences: AiPreferences;
+    allowWebSearch?: boolean;
     timeoutMs?: number;
   }): Promise<{ threadId: string; turnId: string; output: T }> {
     await this.start();
     if (!this.client) throw new Error('CODEX_RUNTIME_UNAVAILABLE');
     if (this.state.status !== 'connected') throw new Error('CODEX_AUTH_REQUIRED');
     if (this.activeTurn) throw new Error('CODEX_CONCURRENCY_LIMIT');
-    const thread = await this.client.request<{ thread: { id: string } }>('thread/start', {
-      cwd: this.options.workingDirectory,
-      model: input.aiPreferences.modelId,
-      runtimeWorkspaceRoots: [],
-      approvalPolicy: 'never',
-      sandbox: 'read-only',
-      developerInstructions: 'Return only data matching the supplied output schema. Do not call tools, access files, or provide diagnosis or prescriptions.',
-      config: {
-        web_search: 'disabled',
-        tools: { web_search: false, view_image: false }
-      },
-      ephemeral: true,
-      historyMode: 'paginated',
-      environments: [],
-      dynamicTools: [],
-      selectedCapabilityRoots: []
-    });
+    const allowWebSearch = input.allowWebSearch === true;
+    const thread = await this.client.request<{ thread: { id: string } }>('thread/start', createHealthThreadStartParams({
+      workingDirectory: this.options.workingDirectory,
+      aiPreferences: input.aiPreferences,
+      allowWebSearch
+    }));
     const completion = this.waitForTurn(thread.thread.id, input.timeoutMs ?? this.options.requestTimeoutMs ?? 120_000);
     let started: { turn: { id: string } };
     try {

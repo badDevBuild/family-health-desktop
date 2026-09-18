@@ -2115,7 +2115,14 @@ export class WorkspaceStore {
   listStoredJobs(): StoredJobSummary[] {
     const rows = this.db.prepare(`
       SELECT j.id, j.stage, j.status, j.checkpoint_json, j.updated_at,
-             b.created_at AS batch_created_at, p.display_name AS person_label
+             b.created_at AS batch_created_at, p.display_name AS person_label,
+             (
+               SELECT ja.error_code
+               FROM job_attempts ja
+               WHERE ja.job_id = j.id
+               ORDER BY ja.started_at DESC, ja.id DESC
+               LIMIT 1
+             ) AS latest_error_code
       FROM jobs j
       LEFT JOIN batches b ON b.id = j.batch_id
       LEFT JOIN persons p ON p.id = j.person_id
@@ -2129,6 +2136,10 @@ export class WorkspaceStore {
         waiting_quota: '等待额度恢复', waiting_user: '等待你的确认', retry_wait: '等待重试',
         succeeded: '已完成', failed: '处理失败', cancelled: '已取消'
       };
+      const latestErrorCode = row.latest_error_code === null ? null : String(row.latest_error_code);
+      const failedStatusText = latestErrorCode?.includes('failed to load configuration')
+        ? '当前版本的 Codex 配置不兼容，请安装更新后重试'
+        : labels.failed;
       return {
         id: String(row.id),
         batchLabel: `手动处理 · ${new Date(String(row.batch_created_at)).toLocaleString('zh-CN')}`,
@@ -2137,7 +2148,7 @@ export class WorkspaceStore {
         status,
         completedUnits: checkpoint.completedUnits ?? 0,
         totalUnits: Math.max(checkpoint.documentIds?.length ?? 1, 1),
-        statusText: status === 'running' && checkpoint.cancelRequested ? '正在安全停止' : labels[status],
+        statusText: status === 'running' && checkpoint.cancelRequested ? '正在安全停止' : status === 'failed' ? failedStatusText : labels[status],
         updatedAt: String(row.updated_at)
       };
     });

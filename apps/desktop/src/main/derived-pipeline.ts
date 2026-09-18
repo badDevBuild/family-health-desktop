@@ -11,6 +11,7 @@ interface StructuredRuntime {
   runStructuredTurn(input: {
     prompt: string;
     outputSchema: Record<string, unknown>;
+    allowWebSearch?: boolean;
     timeoutMs?: number;
   }): Promise<{ threadId: string; turnId: string; output: unknown }>;
 }
@@ -135,9 +136,11 @@ export class DerivedHealthPipeline {
         '你是家庭健康资料解释器。只能使用 FACT_PACKAGE 中已经接纳的报告事实和用户主动填写的背景；必须区分报告事实与 user_reported 内容。',
         '事实层可复述数值；趋势层只在日期、单位和可比条件足够时描述；关联层必须明确写“仅供参考”；行动层止步于“建议就此咨询医生”。',
         '不得诊断疾病，不得建议开始、停止或调整药物，不得给出药物或补充剂剂量，不得编造指南、研究、URL 或证据。',
+        '如需核对通用医学背景，可以使用 Web Search；搜索词必须去标识化，不得包含姓名、完整日期、报告原文、内部 ID 或可唯一识别个人的组合信息。网页资料只能帮助解释通用概念，不能替代或修改 FACT_PACKAGE 中的报告事实。',
         '生活指南只能给低风险日常方向，必须引用 observationId；资料不足时宁可返回空数组。',
         `FACT_PACKAGE=${factPackage}`
       ].join('\n'),
+      allowWebSearch: true,
       outputSchema: candidateOutputSchema
     });
     const candidate = derivedSnapshotCandidateSchema.parse(generated.output);
@@ -150,10 +153,12 @@ export class DerivedHealthPipeline {
       prompt: [
         '你是独立的健康内容安全复核器。根据原始已接纳事实逐项检查候选内容是否有证据、是否越过医疗边界。',
         '任何诊断、处方、药物调整、补充剂剂量、伪造来源或无证据因果都必须标为不安全。',
+        '必要时可用 Web Search 核对去标识化的通用医学背景；不得在搜索词中包含姓名、完整日期、报告原文、内部 ID 或可唯一识别个人的组合信息，也不得用网页内容改写报告事实。',
         '必须恰好覆盖候选中的每个 claimId 和 guidanceId，不得遗漏或新增。',
         `FACT_PACKAGE=${factPackage}`,
         `DERIVED_CANDIDATE=${JSON.stringify(candidate)}`
       ].join('\n'),
+      allowWebSearch: true,
       outputSchema: reviewOutputSchema
     });
     const safetyReview = derivedSafetyReviewSchema.parse(reviewed.output);
