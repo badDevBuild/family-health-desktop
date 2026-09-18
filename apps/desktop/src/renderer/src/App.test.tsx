@@ -24,6 +24,7 @@ function createPersonalSnapshot(): DashboardSnapshot {
     }],
     organs: [],
     trends: [],
+    timeline: [],
     guidance: [],
     inbox: [],
     jobs: [],
@@ -82,7 +83,7 @@ describe('App member display editing', () => {
     snapshot.inbox = [{
       id: 'document-1', displayName: '纯虚构报告.txt', discoveredAt: '2026-09-18T00:00:00.000Z',
       personId: 'personal-person-1', personLabel: '测试成员', status: 'completed', format: '纯文本',
-      sourceLabel: '手动导入', sentToAi: false, issue: null
+      sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null
     }];
     installBridge(snapshot);
     render(<App />);
@@ -155,6 +156,7 @@ describe('App member display editing', () => {
       format: '纯文本',
       sourceLabel: '手动导入',
       sentToAi: false,
+      aiTransmissionStatus: 'not_sent',
       issue: null
     }));
     installBridge(snapshot);
@@ -209,8 +211,8 @@ describe('App member display editing', () => {
       quota: { ...snapshot.account.quota, status: 'available' }
     };
     snapshot.inbox = [
-      { id: 'ready-1', displayName: '选中的报告.txt', discoveredAt: '2026-09-18T00:00:00.000Z', personId: 'personal-person-1', personLabel: '测试成员', status: 'queued', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, issue: null },
-      { id: 'unassigned-1', displayName: '待归属.txt', discoveredAt: '2026-09-18T00:00:01.000Z', personId: null, personLabel: null, status: 'needs_review', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, issue: '待确认' }
+      { id: 'ready-1', displayName: '选中的报告.txt', discoveredAt: '2026-09-18T00:00:00.000Z', personId: 'personal-person-1', personLabel: '测试成员', status: 'queued', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null },
+      { id: 'unassigned-1', displayName: '待归属.txt', discoveredAt: '2026-09-18T00:00:01.000Z', personId: null, personLabel: null, status: 'needs_review', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: '待确认' }
     ];
     const processNow = vi.fn(async () => ({ ok: true as const, data: { batchId: 'batch-1' }, revision: 1 }));
     installBridge(snapshot, { processNow });

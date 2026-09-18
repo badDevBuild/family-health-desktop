@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { DerivedSafetyReview, DerivedSnapshotCandidate, ExtractionResult } from '@contracts';
+import type { AccountState, DerivedSafetyReview, DerivedSnapshotCandidate, ExtractionResult } from '@contracts';
 import { DerivedHealthPipeline } from './derived-pipeline.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
@@ -18,19 +18,20 @@ async function setup() {
   roots.push(root);
   const service = new PersonalWorkspaceService(root, '测试工作区', () => new Date('2026-09-18T00:00:00Z'));
   const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
-  await service.importFiles([{ path: '/tmp/虚构报告.txt', bytes: Buffer.from('LDL-C 4.2 mmol/L，参考范围 0-3.4 mmol/L') }], personId);
+  await service.importFiles([{ path: '/tmp/虚构报告.txt', bytes: Buffer.from('2026-09-17 LDL-C 4.2 mmol/L，参考范围 0-3.4 mmol/L') }], personId);
   const documentId = service.getSnapshot(null).inbox[0]!.id;
   const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
   const extraction: ExtractionResult = {
     schemaVersion: 1,
     documentId,
+    subject: { reportedName: null, evidence: [], confidence: 'absent' },
     coveredSourceSpanIds: [spanId],
     candidates: [{
       localKey: 'ldl-1', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
       value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
       unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4 mmol/L', reportedAbnormalFlag: '偏高',
       specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
-      evidence: [{ sourceSpanId: spanId, quote: 'LDL-C 4.2 mmol/L' }], issues: []
+      evidence: [{ sourceSpanId: spanId, quote: '2026-09-17 LDL-C 4.2 mmol/L' }], issues: []
     }]
   };
   await new DocumentExtractionPipeline(service.store, {
@@ -43,6 +44,10 @@ async function setup() {
 describe('DerivedHealthPipeline', () => {
   it('只有证据完整且安全复核通过时发布派生快照', async () => {
     const { service, personId, observationId } = await setup();
+    service.store.createManualNote({
+      personId, kind: 'history', immutableText: '本人补充：近期作息不规律', effectiveDate: '2026-09-16',
+      structuredFields: {}, expectedContextRevision: 0
+    });
     const candidate: DerivedSnapshotCandidate = {
       schemaVersion: 1,
       personId,
@@ -67,11 +72,12 @@ describe('DerivedHealthPipeline', () => {
       guidanceReviews: [{ guidanceId: 'guide-1', supported: true, safe: true, issue: null }]
     };
     let turn = 0;
+    const prompts: string[] = [];
     const result = await new DerivedHealthPipeline(service.store, {
-      runStructuredTurn: async () => ({
-        threadId: 'derived-thread', turnId: `derived-turn-${++turn}`,
-        output: turn === 1 ? candidate : review
-      })
+      runStructuredTurn: async (input) => {
+        prompts.push(input.prompt);
+        return { threadId: 'derived-thread', turnId: `derived-turn-${++turn}`, output: turn === 1 ? candidate : review };
+      }
     }).process(personId);
     expect(result).toMatchObject({ status: 'published' });
     expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);
@@ -79,6 +85,19 @@ describe('DerivedHealthPipeline', () => {
       persons: [expect.objectContaining({ derivedStatus: 'current', assessmentSummary: candidate.claims[0]!.explanation })],
       guidance: [expect.objectContaining({ id: 'guide-1', personId })]
     });
+    expect(prompts[0]).toContain('本人补充：近期作息不规律');
+    expect(prompts[0]).toContain('userReportedNotes');
+    service.store.createManualNote({
+      personId, kind: 'free_text', immutableText: '新增背景需刷新派生说明', effectiveDate: null,
+      structuredFields: {}, expectedContextRevision: 1
+    });
+    const account: AccountState = {
+      status: 'connected', displayLabel: 'fixture@example.test',
+      quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },
+      runtimeVersion: 'fixture-runtime', lastCheckedAt: '2026-09-18T00:00:00Z'
+    };
+    service.processNow({ accountState: account, consentVersion: 1 });
+    expect(service.store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     service.close();
   });
 

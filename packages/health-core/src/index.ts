@@ -26,6 +26,64 @@ export function validateCoverage(manifest: SourceManifest): string[] {
   return problems;
 }
 
+function normalizeEvidenceText(value: string): string {
+  return value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function evidenceContentProblems(candidate: ObservationCandidate, manifest: SourceManifest): string[] {
+  const spans = new Map(manifest.spans.map((span) => [span.id, span]));
+  const problems: string[] = [];
+  const supportedText: string[] = [];
+  for (const reference of candidate.evidence) {
+    const span = spans.get(reference.sourceSpanId);
+    if (!span) continue;
+    if (span.quote && span.readability === 'clear') {
+      if (!reference.quote) {
+        problems.push(`evidence_quote_required:${reference.sourceSpanId}`);
+        continue;
+      }
+      const source = normalizeEvidenceText(span.quote);
+      const cited = normalizeEvidenceText(reference.quote);
+      if (!cited || !source.includes(cited)) {
+        problems.push(`evidence_quote_mismatch:${reference.sourceSpanId}`);
+        continue;
+      }
+      supportedText.push(cited);
+    }
+  }
+  if (candidate.value.kind === 'numeric' && supportedText.length > 0) {
+    const expected = Number(candidate.value.decimal);
+    const numericEvidence = supportedText.flatMap((text) => text.match(/-?(?:\d+(?:\.\d+)?|\.\d+)/g) ?? []).map(Number);
+    if (!numericEvidence.some((value) => Number.isFinite(value) && value === expected)) {
+      problems.push('numeric_value_not_in_evidence');
+    }
+    const comparatorTokens: Record<typeof candidate.value.comparator, string[]> = {
+      eq: [], lt: ['<', '小于'], lte: ['<=', '≤', '不高于'], gt: ['>', '大于'], gte: ['>=', '≥', '不低于']
+    };
+    const requiredComparator = comparatorTokens[candidate.value.comparator];
+    if (requiredComparator.length > 0 && !supportedText.some((text) => requiredComparator.some((token) => text.includes(token)))) {
+      problems.push('numeric_comparator_not_in_evidence');
+    }
+  }
+  if ((candidate.value.kind === 'qualitative' || candidate.value.kind === 'text') && supportedText.length > 0) {
+    const raw = normalizeEvidenceText(candidate.value.rawText);
+    if (raw && !supportedText.some((text) => text.includes(raw))) problems.push('reported_value_not_in_evidence');
+  }
+  if (candidate.clinicalDate && supportedText.length > 0) {
+    const [year, month, day] = candidate.clinicalDate.split('-').map(Number);
+    const dateForms = [
+      candidate.clinicalDate,
+      `${year}/${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')}`,
+      `${year}.${String(month).padStart(2, '0')}.${String(day).padStart(2, '0')}`,
+      `${year}年${month}月${day}日`
+    ].map(normalizeEvidenceText);
+    if (!supportedText.some((text) => dateForms.some((form) => text.includes(form)))) {
+      problems.push('clinical_date_not_in_evidence');
+    }
+  }
+  return [...new Set(problems)];
+}
+
 export function evaluateObservationCandidate(
   candidate: ObservationCandidate,
   manifest: SourceManifest,
@@ -42,6 +100,11 @@ export function evaluateObservationCandidate(
   const invalidEvidence = candidate.evidence.filter((ref) => !knownSpans.has(ref.sourceSpanId));
   if (invalidEvidence.length > 0) {
     return { decision: 'reject', reasons: ['evidence_mismatch'] };
+  }
+
+  const contentProblems = evidenceContentProblems(candidate, manifest);
+  if (contentProblems.length > 0) {
+    return { decision: 'reject', reasons: contentProblems };
   }
 
   const coverageProblems = validateCoverage(manifest);
@@ -117,4 +180,3 @@ export function determineInvalidation(change: ChangeKind): {
       return { facts: false, trends: false, derived: false };
   }
 }
-

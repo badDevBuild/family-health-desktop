@@ -16,7 +16,7 @@ const manifest: SourceManifest = {
   totalUnits: 2,
   coveredUnitIndexes: [0, 1],
   spans: [
-    { id: 'span-1', documentId: 'doc-1', spanKind: 'page', page: 1, blockId: null, lineStart: null, lineEnd: null, quote: 'LDL 4.2', readability: 'clear' },
+    { id: 'span-1', documentId: 'doc-1', spanKind: 'page', page: 1, blockId: null, lineStart: null, lineEnd: null, quote: '2026-09-12 LDL 4.2', readability: 'clear' },
     { id: 'span-2', documentId: 'doc-1', spanKind: 'page', page: 2, blockId: null, lineStart: null, lineEnd: null, quote: null, readability: 'clear' }
   ],
   normalizerVersion: '1',
@@ -36,7 +36,7 @@ const candidate: ObservationCandidate = {
   method: null,
   bodySite: null,
   clinicalDate: '2026-09-12',
-  evidence: [{ sourceSpanId: 'span-1', quote: 'LDL 4.2' }],
+  evidence: [{ sourceSpanId: 'span-1', quote: '2026-09-12 LDL 4.2' }],
   issues: []
 };
 
@@ -69,4 +69,3 @@ describe('任务与失效规则', () => {
     expect(determineInvalidation('clinical_context')).toEqual({ facts: false, trends: false, derived: true });
   });
 });
-

@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(5);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(6);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -159,6 +159,28 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('完整保存 SourceManifest 的覆盖缺口与转换警告', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({ bytes: Buffer.from('覆盖缺口'), mediaType: 'text/plain', displayName: '缺口.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'manifest-gap', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '缺口.txt', totalUnits: 3, coveredUnitIndexes: [0, 2],
+      spans: [
+        { id: 'gap-0', documentId: document.documentId, spanKind: 'line', page: null, blockId: null, lineStart: 1, lineEnd: 1, quote: '第一段', readability: 'clear' },
+        { id: 'gap-2', documentId: document.documentId, spanKind: 'line', page: null, blockId: null, lineStart: 3, lineEnd: 3, quote: '第三段', readability: 'partial' }
+      ],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: ['synthetic_conversion_warning'],
+      createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    expect(store.getDocumentExtractionBundle(document.documentId).manifest).toMatchObject({
+      id: 'manifest-gap', totalUnits: 3, coveredUnitIndexes: [0, 2],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: expect.arrayContaining(['synthetic_conversion_warning'])
+    });
+    store.close();
+  });
+
   it('显示信息与临床上下文使用独立 revision', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '同名成员', relation: '本人' });
@@ -168,7 +190,7 @@ describe('WorkspaceStore', () => {
       relation: '家人',
       birthYear: 1990,
       expectedDisplayRevision: 1
-    })).toMatchObject({ displayName: '新昵称', relation: '家人', birthYear: 1990, displayRevision: 2, clinicalContextRevision: 0 });
+    })).toMatchObject({ displayName: '新昵称', relation: '家人', birthYear: 1990, displayRevision: 2, clinicalContextRevision: 1 });
     expect(() => store.updatePersonDisplay({
       personId: person.id,
       displayName: '迟到昵称',
@@ -176,8 +198,8 @@ describe('WorkspaceStore', () => {
       birthYear: 1990,
       expectedDisplayRevision: 1
     })).toThrow(RevisionConflictError);
-    expect(store.updateClinicalContext(person.id, { allergies: ['虚构过敏史'] }, 0)).toBe(1);
-    expect(store.listPersons()[0]).toMatchObject({ displayRevision: 2, clinicalContextRevision: 1 });
+    expect(store.updateClinicalContext(person.id, { allergies: ['虚构过敏史'] }, 1)).toBe(2);
+    expect(store.listPersons()[0]).toMatchObject({ displayRevision: 2, clinicalContextRevision: 2 });
     store.close();
   });
 
@@ -300,8 +322,8 @@ describe('WorkspaceStore', () => {
       outputHash: 'output', reviewRef: null, decision: 'accept'
     });
     store.publishFacts({
-      personId: person.id, expectedRevision: 0, changeSetHash: 'e'.repeat(64), summary: '虚构报告事实',
-      observations: [{ conceptKey: 'LDL-C', rawText: '3.8', valueKind: 'numeric', decimalValue: '3.8', qualifier: 'eq', unit: 'mmol/L', referenceRange: '0-3.4', clinicalDate: '2026-09-18', abnormalFlag: 'high', documentId: document.documentId, sourceSpanId: spanId, acceptanceId }]
+      personId: person.id, documentId: document.documentId, documentCommitKey: 'd'.repeat(64), expectedRevision: 0, changeSetHash: 'e'.repeat(64), summary: '虚构报告事实',
+      observations: [{ conceptKey: 'LDL-C', rawText: '3.8', valueKind: 'numeric', decimalValue: '3.8', qualifier: 'eq', unit: 'mmol/L', referenceRange: '0-3.4', clinicalDate: '2026-09-18', abnormalFlag: 'high', documentId: document.documentId, sourceSpanId: spanId, acceptanceId, specimen: null, method: null, bodySite: null, evidence: [{ sourceSpanId: spanId, quote: 'LDL 3.8 mmol/L' }] }]
     });
     expect(store.listAcceptedObservations()).toHaveLength(1);
     const sourcePath = join(store.vaultDirectory, source.vaultRelativePath);
@@ -381,8 +403,14 @@ describe('WorkspaceStore', () => {
   it('CAS 拒绝迟到发布，幂等键阻止重复提交', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({ bytes: Buffer.from('幂等测试'), mediaType: 'text/plain', displayName: '幂等.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const source2 = store.putSourceObject({ bytes: Buffer.from('并发测试'), mediaType: 'text/plain', displayName: '并发.txt' });
+    const document2 = store.registerImportedDocument({ sourceObjectId: source2.id, personId: person.id });
     const input = {
       personId: person.id,
+      documentId: document.documentId,
+      documentCommitKey: 'c'.repeat(64),
       expectedRevision: 0,
       changeSetHash: 'a'.repeat(64),
       summary: '虚构资料更新',
@@ -392,7 +420,7 @@ describe('WorkspaceStore', () => {
     const second = store.publishFacts(input);
     expect(first).toMatchObject({ revision: 1, idempotent: false });
     expect(second).toMatchObject({ revision: 1, idempotent: true });
-    expect(() => store.publishFacts({ ...input, changeSetHash: 'b'.repeat(64), expectedRevision: 0 }))
+    expect(() => store.publishFacts({ ...input, documentId: document2.documentId, documentCommitKey: 'f'.repeat(64), changeSetHash: 'b'.repeat(64), expectedRevision: 0 }))
       .toThrow(RevisionConflictError);
     expect(store.integrityCheck()).toBe('ok');
     store.close();
@@ -478,6 +506,33 @@ describe('WorkspaceStore', () => {
     store.updateJobProgress(job!.id, 1);
     store.finishJob(job!.id, 'succeeded');
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'succeeded', completedUnits: 1, totalUnits: 1 });
+    store.close();
+  });
+
+  it('授权撤回后，运行中尝试的最终事务也不得提交', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({ bytes: Buffer.from('授权撤回测试'), mediaType: 'text/plain', displayName: '撤回.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const accountFingerprint = 'account-fixture';
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint, version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00.000Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'guard-test' }]
+    });
+    const job = store.claimNextQueuedJob('lease-owner', accountFingerprint)!;
+    const attemptId = store.startJobAttempt(job.id, 'fixture-runtime');
+    const executionGuard = { jobId: job.id, attemptId, consentId, accountFingerprint };
+    expect(() => store.assertJobExecutionActive(executionGuard, document.documentId)).not.toThrow();
+    store.revokeAllAiAuthorizations();
+    expect(() => store.publishFacts({
+      personId: person.id, documentId: document.documentId, documentCommitKey: '9'.repeat(64),
+      expectedRevision: 0, changeSetHash: '8'.repeat(64), summary: '不应提交', observations: [], executionGuard
+    })).toThrow('CONSENT_REVOKED');
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.isDocumentCommitted(document.documentId)).toBe(false);
     store.close();
   });
 

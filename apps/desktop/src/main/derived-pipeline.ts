@@ -5,7 +5,7 @@ import {
   type DerivedSafetyReview,
   type DerivedSnapshotCandidate
 } from '@contracts';
-import type { AcceptedObservationSummary, WorkspaceStore } from '@storage';
+import type { AcceptedObservationSummary, JobExecutionGuard, WorkspaceStore } from '@storage';
 
 interface StructuredRuntime {
   runStructuredTurn(input: {
@@ -24,10 +24,27 @@ const reviewOutputSchema = z.toJSONSchema(derivedSafetyReviewSchema, { target: '
 const prohibitedMedicalPattern = /(确诊|诊断为|患有|你有[^，。；]{0,12}(?:病|症)|必须服用|开始服用|停止服用|停药|加量|减量|换药|开药|处方)/i;
 const dosagePattern = /\d+(?:\.\d+)?\s*(?:mg|mcg|μg|iu|毫克|微克|国际单位)\b/i;
 
-function buildFactPackage(personId: string, factRevision: number, observations: AcceptedObservationSummary[]): string {
+function buildFactPackage(
+  personId: string,
+  factRevision: number,
+  observations: AcceptedObservationSummary[],
+  context: ReturnType<WorkspaceStore['getDerivedContext']>
+): string {
   return JSON.stringify({
     personId,
     factRevision,
+    personContext: {
+      birthYear: context.person.birthYear,
+      genderContext: context.person.genderContext,
+      clinicalContextRevision: context.person.clinicalContextRevision
+    },
+    userReportedNotes: context.notes.map((note) => ({
+      noteId: note.id,
+      kind: note.kind,
+      text: note.immutableText,
+      effectiveDate: note.effectiveDate,
+      structuredFields: note.structuredFields
+    })),
     observations: observations.map((observation) => ({
       observationId: observation.id,
       concept: observation.conceptKey,
@@ -36,7 +53,10 @@ function buildFactPackage(personId: string, factRevision: number, observations: 
       referenceRange: observation.referenceRange,
       clinicalDate: observation.clinicalDate,
       reportedAbnormalFlag: observation.abnormalFlag,
-      sourceQuote: observation.sourceQuote
+      sourceQuote: observation.sourceQuote,
+      specimen: observation.specimen,
+      method: observation.method,
+      bodySite: observation.bodySite
     }))
   });
 }
@@ -78,19 +98,40 @@ export class DerivedHealthPipeline {
   constructor(
     private readonly store: WorkspaceStore,
     private readonly runtime: StructuredRuntime,
-    private readonly onStage?: (stage: 'analyze' | 'review_derived' | 'publish') => void
+    private readonly onStage?: (stage: 'analyze' | 'review_derived' | 'publish') => void,
+    private readonly executionGuard?: JobExecutionGuard,
+    private readonly transmissionDocumentId?: string
   ) {}
+
+  private async runTurn(stage: string, input: Parameters<StructuredRuntime['runStructuredTurn']>[0]) {
+    if (!this.executionGuard || !this.transmissionDocumentId) return this.runtime.runStructuredTurn(input);
+    this.store.assertJobExecutionActive(this.executionGuard, this.transmissionDocumentId);
+    const transmissionId = this.store.beginAiTransmission({
+      guard: this.executionGuard,
+      documentId: this.transmissionDocumentId,
+      stage
+    });
+    try {
+      const result = await this.runtime.runStructuredTurn(input);
+      this.store.assertJobExecutionActive(this.executionGuard, this.transmissionDocumentId);
+      this.store.finishAiTransmission(transmissionId, 'completed');
+      return result;
+    } catch (error) {
+      this.store.finishAiTransmission(transmissionId, 'unknown');
+      throw error;
+    }
+  }
 
   async process(personId: string): Promise<DerivedPipelineResult> {
     const observations = this.store.listAcceptedObservations(personId);
     if (observations.length === 0) throw new Error('DERIVED_FACTS_REQUIRED');
     const factRevision = this.store.getFactRevision(personId);
     const contextRevision = this.store.getClinicalContextRevision(personId);
-    const factPackage = buildFactPackage(personId, factRevision, observations);
+    const factPackage = buildFactPackage(personId, factRevision, observations, this.store.getDerivedContext(personId));
     this.onStage?.('analyze');
-    const generated = await this.runtime.runStructuredTurn({
+    const generated = await this.runTurn('analyze', {
       prompt: [
-        '你是家庭健康资料解释器。只能使用 FACT_PACKAGE 中已经接纳的报告事实。',
+        '你是家庭健康资料解释器。只能使用 FACT_PACKAGE 中已经接纳的报告事实和用户主动填写的背景；必须区分报告事实与 user_reported 内容。',
         '事实层可复述数值；趋势层只在日期、单位和可比条件足够时描述；关联层必须明确写“仅供参考”；行动层止步于“建议就此咨询医生”。',
         '不得诊断疾病，不得建议开始、停止或调整药物，不得给出药物或补充剂剂量，不得编造指南、研究、URL 或证据。',
         '生活指南只能给低风险日常方向，必须引用 observationId；资料不足时宁可返回空数组。',
@@ -104,7 +145,7 @@ export class DerivedHealthPipeline {
     if (localIssues.length > 0) return this.needsReview(observations, localIssues.join(','), generated.threadId, generated.turnId);
 
     this.onStage?.('review_derived');
-    const reviewed = await this.runtime.runStructuredTurn({
+    const reviewed = await this.runTurn('review_derived', {
       prompt: [
         '你是独立的健康内容安全复核器。根据原始已接纳事实逐项检查候选内容是否有证据、是否越过医疗边界。',
         '任何诊断、处方、药物调整、补充剂剂量、伪造来源或无证据因果都必须标为不安全。',
@@ -126,7 +167,8 @@ export class DerivedHealthPipeline {
       expectedContextRevision: contextRevision,
       promptVersion: 'derived-v1',
       rulesVersion: 'derived-safety-v1',
-      modelId: 'codex-account-default'
+      modelId: 'codex-account-default',
+      ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
     });
     return { status: 'published', snapshotId: published.snapshotId, threadId: reviewed.threadId, turnId: reviewed.turnId };
   }

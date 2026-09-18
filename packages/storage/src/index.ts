@@ -2,9 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
-import type { ActionItem, CreateManualNoteInput, DerivedSnapshotCandidate, ManualNote, Person, SourceManifest } from '@contracts';
+import type { ActionItem, CreateManualNoteInput, DerivedSnapshotCandidate, ManualNote, ObservationCandidate, Person, SourceManifest } from '@contracts';
 
-export const WORKSPACE_SCHEMA_VERSION = 5;
+export const WORKSPACE_SCHEMA_VERSION = 6;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 export interface WorkspaceStoreOptions {
@@ -86,8 +86,17 @@ export interface ActiveInboxBinding extends InboxBindingSummary {
 export interface DocumentExtractionBundle {
   documentId: string;
   personId: string;
+  personDisplayName: string;
+  personAssignmentBasis: 'user_selected' | 'folder_binding' | 'legacy';
   sourcePath: string;
   manifest: SourceManifest;
+}
+
+export interface JobExecutionGuard {
+  jobId: string;
+  attemptId: string;
+  consentId: string;
+  accountFingerprint: string;
 }
 
 export interface DocumentConversionInput {
@@ -106,6 +115,7 @@ export interface OpenExtractionReviewIssue {
   kind: 'field_conflict' | 'coverage_gap' | 'overwrite_protected' | 'derived_safety';
   severity: 'blocking' | 'warning';
   evidenceRefs: string[];
+  candidateOptions: ObservationCandidate[];
 }
 
 export interface StoredJobSummary {
@@ -148,6 +158,8 @@ export interface ScheduledReadyGroup {
 
 export interface PublishFactsInput {
   personId: string;
+  documentId: string;
+  documentCommitKey: string;
   expectedRevision: number;
   changeSetHash: string;
   summary: string;
@@ -164,7 +176,13 @@ export interface PublishFactsInput {
     documentId: string;
     sourceSpanId: string;
     acceptanceId: string;
+    specimen: string | null;
+    method: string | null;
+    bodySite: string | null;
+    evidence: Array<{ sourceSpanId: string; quote: string | null }>;
   }>;
+  executionGuard?: JobExecutionGuard;
+  resolvedReviewIssueId?: string;
 }
 
 export interface AcceptedObservationSummary {
@@ -183,6 +201,10 @@ export interface AcceptedObservationSummary {
   sourceQuote: string | null;
   sourceLabel: string;
   documentId: string;
+  specimen: string | null;
+  method: string | null;
+  bodySite: string | null;
+  evidence: Array<{ sourceSpanId: string; quote: string | null }>;
   createdAt: string;
 }
 
@@ -320,12 +342,25 @@ export class WorkspaceStore {
     const transaction = this.db.transaction(() => {
       const actual = this.getPersonRevision(input.personId, 'display_revision');
       if (actual !== input.expectedDisplayRevision) throw new RevisionConflictError(input.expectedDisplayRevision, actual);
+      const current = this.db.prepare(`SELECT birth_year, clinical_context_revision FROM persons WHERE id = ? AND archived_at IS NULL`)
+        .get(input.personId) as { birth_year: number | null; clinical_context_revision: number } | undefined;
+      if (!current) throw new Error('PERSON_NOT_FOUND');
+      const birthYearChanged = current.birth_year !== input.birthYear;
       const update = this.db.prepare(`
         UPDATE persons
-        SET display_name = ?, relation = ?, birth_year = ?, display_revision = ?
+        SET display_name = ?, relation = ?, birth_year = ?, display_revision = ?,
+            clinical_context_revision = clinical_context_revision + ?
         WHERE id = ? AND display_revision = ? AND archived_at IS NULL
-      `).run(displayName, relation, input.birthYear, actual + 1, input.personId, actual);
+      `).run(displayName, relation, input.birthYear, actual + 1, birthYearChanged ? 1 : 0, input.personId, actual);
       if (update.changes !== 1) throw new RevisionConflictError(actual, this.getPersonRevision(input.personId, 'display_revision'));
+      if (birthYearChanged) {
+        const nextContextRevision = current.clinical_context_revision + 1;
+        this.db.prepare(`
+          INSERT INTO person_context_revisions (person_id, revision, payload_json, source_kind, changed_at)
+          VALUES (?, ?, ?, 'user_reported', ?)
+        `).run(input.personId, nextContextRevision, JSON.stringify({ operation: 'birth_year_changed', birthYear: input.birthYear }), changedAt);
+        this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      }
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'person_display_updated', ?, 'Member display profile updated by user', ?)
@@ -718,7 +753,7 @@ export class WorkspaceStore {
     return stored.id;
   }
 
-  registerImportedDocument(input: { sourceObjectId: string; personId: string | null }): ImportedDocumentReceipt {
+  registerImportedDocument(input: { sourceObjectId: string; personId: string | null; assignmentBasis?: 'user_selected' | 'folder_binding' }): ImportedDocumentReceipt {
     const existing = this.db.prepare(`
       SELECT id, person_id FROM documents WHERE source_object_id = ? ORDER BY created_at LIMIT 1
     `).get(input.sourceObjectId) as { id: string; person_id: string | null } | undefined;
@@ -732,13 +767,14 @@ export class WorkspaceStore {
     this.db.prepare(`
       INSERT INTO documents (
         id, source_object_id, person_id, document_kind, status,
-        acceptance_id, excluded_from_analysis, created_at
-      ) VALUES (?, ?, ?, 'health_report', ?, NULL, 0, ?)
+        acceptance_id, excluded_from_analysis, person_assignment_basis, created_at
+      ) VALUES (?, ?, ?, 'health_report', ?, NULL, 0, ?, ?)
     `).run(
       documentId,
       input.sourceObjectId,
       crossPersonConflict ? null : input.personId,
       status,
+      input.assignmentBasis ?? 'user_selected',
       this.now().toISOString()
     );
     this.db.prepare(`
@@ -792,6 +828,17 @@ export class WorkspaceStore {
       const existing = this.db.prepare(`SELECT COUNT(*) AS count FROM source_spans WHERE document_id = ?`)
         .get(document.id) as { count: number };
       if (existing.count > 0) throw new Error('SOURCE_MANIFEST_ALREADY_EXISTS');
+      this.db.prepare(`
+        INSERT INTO source_manifests (
+          document_id, manifest_id, source_object_id, sha256, media_type,
+          original_display_name, total_units, covered_unit_indexes_json,
+          normalizer_version, conversion_warnings_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        document.id, manifest.id, manifest.sourceObjectId, manifest.sha256, manifest.mediaType,
+        manifest.originalDisplayName, manifest.totalUnits, JSON.stringify(manifest.coveredUnitIndexes),
+        manifest.normalizerVersion, JSON.stringify(manifest.conversionWarnings), manifest.createdAt
+      );
       const statement = this.db.prepare(`
         INSERT INTO source_spans (
           id, document_id, span_kind, page_number, block_id, line_start, line_end,
@@ -957,7 +1004,8 @@ export class WorkspaceStore {
           const snapshotRows = this.db.prepare(`SELECT id FROM derived_snapshots WHERE person_id = ?`).all(document.person_id) as Array<{ id: string }>;
           for (const snapshot of snapshotRows) this.db.prepare(`DELETE FROM snapshot_evidence WHERE snapshot_id = ?`).run(snapshot.id);
           this.db.prepare(`DELETE FROM derived_snapshots WHERE person_id = ?`).run(document.person_id);
-          this.db.prepare(`DELETE FROM publication_events WHERE person_id = ?`).run(document.person_id);
+          this.db.prepare(`DELETE FROM document_commits WHERE document_id = ?`).run(input.documentId);
+          this.db.prepare(`DELETE FROM publication_events WHERE person_id = ? AND id NOT IN (SELECT publication_id FROM document_commits)`).run(document.person_id);
         }
         if (observationIds.length > 0) {
           for (const observationId of observationIds) {
@@ -985,6 +1033,8 @@ export class WorkspaceStore {
         this.db.prepare(`DELETE FROM encounter_documents WHERE document_id = ?`).run(input.documentId);
         this.db.prepare(`DELETE FROM encounters WHERE id NOT IN (SELECT encounter_id FROM encounter_documents) AND id NOT IN (SELECT encounter_id FROM observations WHERE encounter_id IS NOT NULL)`).run();
         this.db.prepare(`DELETE FROM source_spans WHERE document_id = ?`).run(input.documentId);
+        this.db.prepare(`DELETE FROM source_manifests WHERE document_id = ?`).run(input.documentId);
+        this.db.prepare(`DELETE FROM ai_transmissions WHERE document_id = ?`).run(input.documentId);
         this.db.prepare(`DELETE FROM exclusions WHERE document_id = ?`).run(input.documentId);
         this.db.prepare(`DELETE FROM document_conversions WHERE document_id = ?`).run(input.documentId);
         this.db.prepare(`DELETE FROM documents WHERE id = ?`).run(input.documentId);
@@ -1049,11 +1099,17 @@ export class WorkspaceStore {
 
   getDocumentExtractionBundle(documentId: string): DocumentExtractionBundle {
     const document = this.db.prepare(`
-      SELECT d.id, d.person_id, so.id AS source_object_id, so.sha256, so.media_type,
+      SELECT d.id, d.person_id, d.person_assignment_basis, p.display_name AS person_display_name,
+             so.id AS source_object_id, so.sha256, so.media_type,
              so.vault_relative_path, so.created_at,
              converted.media_type AS converted_media_type,
              converted.vault_relative_path AS converted_vault_relative_path,
              dc.converter_id, dc.converter_version, dc.executable_sha256, dc.warnings_json,
+             sm.manifest_id, sm.media_type AS manifest_media_type,
+             sm.original_display_name AS manifest_display_name, sm.total_units,
+             sm.covered_unit_indexes_json, sm.normalizer_version AS manifest_normalizer_version,
+             sm.conversion_warnings_json AS manifest_conversion_warnings_json,
+             sm.created_at AS manifest_created_at,
              (
                SELECT display_name FROM source_occurrences occ
                WHERE occ.source_object_id = d.source_object_id
@@ -1061,8 +1117,10 @@ export class WorkspaceStore {
              ) AS display_name
       FROM documents d
       JOIN source_objects so ON so.id = d.source_object_id
+      JOIN persons p ON p.id = d.person_id
       LEFT JOIN document_conversions dc ON dc.document_id = d.id
       LEFT JOIN source_objects converted ON converted.id = dc.converted_source_object_id
+      LEFT JOIN source_manifests sm ON sm.document_id = d.id
       WHERE d.id = ?
     `).get(documentId) as Record<string, unknown> | undefined;
     if (!document) throw new Error('DOCUMENT_NOT_FOUND');
@@ -1088,25 +1146,32 @@ export class WorkspaceStore {
     return {
       documentId,
       personId: String(document.person_id),
+      personDisplayName: String(document.person_display_name),
+      personAssignmentBasis: String(document.person_assignment_basis) as DocumentExtractionBundle['personAssignmentBasis'],
       sourcePath: join(this.vaultDirectory, String(document.converted_vault_relative_path ?? document.vault_relative_path)),
       manifest: {
-        id: `manifest-${documentId}`,
+        id: String(document.manifest_id ?? `manifest-${documentId}`),
         sourceObjectId: String(document.source_object_id),
         sha256: String(document.sha256),
-        mediaType: String(document.converted_media_type ?? document.media_type),
-        originalDisplayName: String(document.display_name ?? '未命名资料'),
-        totalUnits: spans.length,
-        coveredUnitIndexes: spans.map((_, index) => index),
+        mediaType: String(document.manifest_media_type ?? document.converted_media_type ?? document.media_type),
+        originalDisplayName: String(document.manifest_display_name ?? document.display_name ?? '未命名资料'),
+        totalUnits: Number(document.total_units ?? spans.length),
+        coveredUnitIndexes: document.covered_unit_indexes_json
+          ? JSON.parse(String(document.covered_unit_indexes_json)) as number[]
+          : [],
         spans,
-        normalizerVersion: String(rows[0]!.normalizer_version),
+        normalizerVersion: String(document.manifest_normalizer_version ?? rows[0]!.normalizer_version),
         conversionWarnings: [
+          ...(document.manifest_conversion_warnings_json
+            ? JSON.parse(String(document.manifest_conversion_warnings_json)) as string[]
+            : ['historical_manifest_metadata_unavailable']),
           ...(document.converter_id
             ? [`converted_view:${String(document.converter_id)}:${String(document.converter_version)}`]
             : []),
           ...(document.warnings_json ? JSON.parse(String(document.warnings_json)) as string[] : []),
           ...(spans.some((span) => span.readability !== 'clear') ? ['one_or_more_units_need_visual_review'] : [])
         ],
-        createdAt: String(document.created_at)
+        createdAt: String(document.manifest_created_at ?? document.created_at)
       }
     };
   }
@@ -1187,17 +1252,20 @@ export class WorkspaceStore {
     severity: 'blocking' | 'warning';
     evidenceRefs: string[];
     preserveDocumentStatus?: boolean;
+    candidateOptions?: ObservationCandidate[];
   }): string {
     const id = randomUUID();
     const transaction = this.db.transaction(() => {
       this.db.prepare(`
         INSERT INTO review_issues (
           id, job_id, field_ref, kind, severity, evidence_refs_json,
-          resolution_status, resolution_revision, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?)
+          resolution_status, resolution_revision, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)
       `).run(
         id, input.jobId ?? null, `document:${input.documentId}`, input.kind,
-        input.severity, JSON.stringify(input.evidenceRefs), this.now().toISOString()
+        input.severity, JSON.stringify(input.evidenceRefs),
+        input.candidateOptions ? JSON.stringify({ candidateOptions: input.candidateOptions }) : null,
+        this.now().toISOString()
       );
       if (!input.preserveDocumentStatus) {
         this.db.prepare(`UPDATE documents SET status = 'needs_review' WHERE id = ?`).run(input.documentId);
@@ -1209,7 +1277,7 @@ export class WorkspaceStore {
 
   listOpenExtractionReviewIssues(): OpenExtractionReviewIssue[] {
     const rows = this.db.prepare(`
-      SELECT ri.id, ri.kind, ri.severity, ri.evidence_refs_json,
+      SELECT ri.id, ri.kind, ri.severity, ri.evidence_refs_json, ri.payload_json,
              d.id AS document_id, d.person_id
       FROM review_issues ri
       JOIN documents d ON ri.field_ref = 'document:' || d.id
@@ -1222,8 +1290,27 @@ export class WorkspaceStore {
       personId: row.person_id === null ? null : String(row.person_id),
       kind: String(row.kind) as OpenExtractionReviewIssue['kind'],
       severity: String(row.severity) as OpenExtractionReviewIssue['severity'],
-      evidenceRefs: JSON.parse(String(row.evidence_refs_json)) as string[]
+      evidenceRefs: JSON.parse(String(row.evidence_refs_json)) as string[],
+      candidateOptions: row.payload_json
+        ? (JSON.parse(String(row.payload_json)) as { candidateOptions?: ObservationCandidate[] }).candidateOptions ?? []
+        : []
     }));
+  }
+
+  markReviewIssueCorrected(issueId: string, documentId: string): void {
+    const transaction = this.db.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE review_issues SET resolution_status = 'resolved', resolution_revision = 1
+        WHERE id = ? AND field_ref = 'document:' || ? AND resolution_status = 'open' AND kind = 'field_conflict'
+      `).run(issueId, documentId);
+      if (result.changes !== 1) throw new Error('REVIEW_ISSUE_NOT_OPEN');
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'review_issue.corrected', ?, '用户核对原始依据后修正并接纳事实', ?)
+      `).run(randomUUID(), issueId, this.now().toISOString());
+      this.resumeWaitingJobsAfterReview(documentId);
+    });
+    transaction();
   }
 
   assignDocumentPerson(documentId: string, personId: string): void {
@@ -1231,7 +1318,7 @@ export class WorkspaceStore {
       const person = this.db.prepare(`SELECT id FROM persons WHERE id = ? AND archived_at IS NULL`).get(personId) as { id: string } | undefined;
       if (!person) throw new Error('PERSON_NOT_FOUND');
       const updated = this.db.prepare(`
-        UPDATE documents SET person_id = ?, status = 'queued'
+        UPDATE documents SET person_id = ?, status = 'queued', person_assignment_basis = 'user_selected'
         WHERE id = ? AND person_id IS NULL AND status = 'needs_review'
       `).run(personId, documentId);
       if (updated.changes !== 1) throw new Error('DOCUMENT_ASSIGNMENT_CONFLICT');
@@ -1294,6 +1381,26 @@ export class WorkspaceStore {
       WHERE status = 'queued' AND person_id IS NOT NULL
       ORDER BY created_at, id
     `).all() as ReadyDocument[];
+  }
+
+  listDerivedRefreshTargets(): Array<{ personId: string; documentId: string }> {
+    const rows = this.db.prepare(`
+      SELECT p.id AS person_id, MIN(d.id) AS document_id
+      FROM persons p
+      JOIN observations o ON o.person_id = p.id
+      JOIN source_spans ss ON ss.id = (
+        SELECT r.source_span_id FROM observation_revisions r
+        WHERE r.observation_id = o.id AND r.revision = o.current_revision
+      )
+      JOIN documents d ON d.id = ss.document_id AND d.excluded_from_analysis = 0
+      LEFT JOIN derived_snapshots current_snapshot
+        ON current_snapshot.person_id = p.id AND current_snapshot.status = 'current'
+        AND current_snapshot.fact_revision = COALESCE((SELECT fact_revision FROM person_revisions pr WHERE pr.person_id = p.id), 0)
+        AND current_snapshot.context_revision = p.clinical_context_revision
+      WHERE p.archived_at IS NULL AND current_snapshot.id IS NULL
+      GROUP BY p.id
+    `).all() as Array<{ person_id: string; document_id: string }>;
+    return rows.map((row) => ({ personId: row.person_id, documentId: row.document_id }));
   }
 
   private resumeWaitingJobsAfterReview(documentId: string): void {
@@ -1635,7 +1742,7 @@ export class WorkspaceStore {
 
   createWaitingAuthBatch(input: {
     cutoff: string;
-    groups: Array<{ personId: string; documentIds: string[]; inputSignature: string }>;
+    groups: Array<{ personId: string; documentIds: string[]; inputSignature: string; stage?: StoredJobSummary['stage'] }>;
     initialStatus?: 'queued' | 'waiting_auth';
     consentId?: string | null;
   }): { batchId: string; jobIds: string[]; idempotent: boolean } {
@@ -1677,9 +1784,9 @@ export class WorkspaceStore {
             id, batch_id, person_id, stage, input_signature, status,
             lease_owner, lease_expires_at, attempt_count, idempotency_key,
             checkpoint_json, created_at, updated_at
-          ) VALUES (?, ?, ?, 'extract', ?, ?, NULL, NULL, 0, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?)
         `).run(
-          jobId, batchId, group.personId, group.inputSignature,
+          jobId, batchId, group.personId, group.stage ?? 'extract', group.inputSignature,
           initialStatus,
           `manual:${group.inputSignature}`,
           JSON.stringify({ documentIds: group.documentIds, completedUnits: 0, consentId: input.consentId ?? null, authorizationType: 'manual' }),
@@ -1838,6 +1945,80 @@ export class WorkspaceStore {
     return checkpoint.cancelRequested === true;
   }
 
+  assertJobExecutionActive(guard: JobExecutionGuard, documentId?: string): void {
+    const row = this.db.prepare(`
+      SELECT j.status, j.checkpoint_json, a.status AS attempt_status,
+             c.revoked_at, c.account_fingerprint
+      FROM jobs j
+      JOIN job_attempts a ON a.job_id = j.id AND a.id = ?
+      LEFT JOIN consents c ON c.id = ?
+      WHERE j.id = ?
+    `).get(guard.attemptId, guard.consentId, guard.jobId) as {
+      status: string;
+      checkpoint_json: string | null;
+      attempt_status: string;
+      revoked_at: string | null;
+      account_fingerprint: string | null;
+    } | undefined;
+    if (!row || row.status !== 'running' || row.attempt_status !== 'running') throw new Error('JOB_EXECUTION_INACTIVE');
+    const checkpoint = row.checkpoint_json ? JSON.parse(row.checkpoint_json) as {
+      consentId?: string;
+      documentIds?: string[];
+      cancelRequested?: boolean;
+    } : {};
+    if (checkpoint.cancelRequested) throw new Error('JOB_CANCELLED');
+    if (checkpoint.consentId !== guard.consentId || row.revoked_at !== null) throw new Error('CONSENT_REVOKED');
+    if (row.account_fingerprint !== guard.accountFingerprint) throw new Error('ACCOUNT_FINGERPRINT_MISMATCH');
+    if (documentId && !checkpoint.documentIds?.includes(documentId)) throw new Error('DOCUMENT_OUTSIDE_CONSENT_SCOPE');
+  }
+
+  beginAiTransmission(input: { guard: JobExecutionGuard; documentId: string; stage: string }): string {
+    this.assertJobExecutionActive(input.guard, input.documentId);
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO ai_transmissions (id, job_id, attempt_id, consent_id, document_id, stage, status, started_at, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, NULL)
+    `).run(id, input.guard.jobId, input.guard.attemptId, input.guard.consentId, input.documentId, input.stage, this.now().toISOString());
+    return id;
+  }
+
+  finishAiTransmission(id: string, status: 'acknowledged' | 'completed' | 'unknown'): void {
+    const result = this.db.prepare(`
+      UPDATE ai_transmissions SET status = ?, finished_at = ? WHERE id = ? AND status = 'sending'
+    `).run(status, this.now().toISOString(), id);
+    if (result.changes !== 1) throw new Error('AI_TRANSMISSION_NOT_OPEN');
+  }
+
+  getDocumentAiTransmissionStatus(documentId: string): 'not_sent' | 'sending' | 'acknowledged' | 'completed' | 'unknown' {
+    const row = this.db.prepare(`
+      SELECT status FROM ai_transmissions WHERE document_id = ? ORDER BY started_at DESC, id DESC LIMIT 1
+    `).get(documentId) as { status: 'sending' | 'acknowledged' | 'completed' | 'unknown' } | undefined;
+    return row?.status ?? 'not_sent';
+  }
+
+  listDocumentAiTransmissionStatuses(documentIds: string[]): Map<string, 'not_sent' | 'sending' | 'acknowledged' | 'completed' | 'unknown'> {
+    const statuses = new Map<string, 'not_sent' | 'sending' | 'acknowledged' | 'completed' | 'unknown'>(
+      documentIds.map((documentId) => [documentId, 'not_sent'])
+    );
+    if (documentIds.length === 0) return statuses;
+    const rows = this.db.prepare(`
+      SELECT t.document_id, t.status
+      FROM ai_transmissions t
+      JOIN (
+        SELECT document_id, MAX(started_at || id) AS latest
+        FROM ai_transmissions
+        WHERE document_id IN (${documentIds.map(() => '?').join(',')})
+        GROUP BY document_id
+      ) latest ON latest.document_id = t.document_id AND latest.latest = t.started_at || t.id
+    `).all(...documentIds) as Array<{ document_id: string; status: 'sending' | 'acknowledged' | 'completed' | 'unknown' }>;
+    for (const row of rows) statuses.set(row.document_id, row.status);
+    return statuses;
+  }
+
+  isDocumentCommitted(documentId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM document_commits WHERE document_id = ?`).get(documentId));
+  }
+
   retryFailedJob(jobId: string): void {
     const result = this.db.prepare(`
       UPDATE jobs
@@ -1989,6 +2170,7 @@ export class WorkspaceStore {
       SELECT o.id, o.person_id, o.concept_key, o.created_at,
              r.value_kind, r.raw_text, r.decimal_value, r.qualifier, r.unit,
              r.reference_range, r.abnormal_flag, r.source_span_id,
+             r.specimen, r.method, r.body_site, r.evidence_json,
              e.clinical_date, ss.quote AS source_quote, d.id AS document_id,
              (
                SELECT occ.display_name
@@ -2021,8 +2203,18 @@ export class WorkspaceStore {
       sourceQuote: row.source_quote === null ? null : String(row.source_quote),
       sourceLabel: String(row.source_label ?? '已导入资料'),
       documentId: String(row.document_id),
+      specimen: row.specimen === null ? null : String(row.specimen),
+      method: row.method === null ? null : String(row.method),
+      bodySite: row.body_site === null ? null : String(row.body_site),
+      evidence: JSON.parse(String(row.evidence_json ?? '[]')) as Array<{ sourceSpanId: string; quote: string | null }>,
       createdAt: String(row.created_at)
     }));
+  }
+
+  getDerivedContext(personId: string): { person: Person; notes: ManualNote[] } {
+    const person = this.listPersons().find((item) => item.id === personId && item.archivedAt === null);
+    if (!person) throw new Error('PERSON_NOT_FOUND');
+    return { person, notes: this.listManualNotes(personId) };
   }
 
   getClinicalContextRevision(personId: string): number {
@@ -2036,6 +2228,7 @@ export class WorkspaceStore {
     promptVersion: string;
     rulesVersion: string;
     modelId: string;
+    executionGuard?: JobExecutionGuard;
   }): { snapshotId: string; idempotent: boolean } {
     const { candidate } = input;
     if (candidate.factRevision !== input.expectedFactRevision) throw new Error('DERIVED_FACT_REVISION_MISMATCH');
@@ -2053,6 +2246,7 @@ export class WorkspaceStore {
     if (existing) return { snapshotId: existing.id, idempotent: true };
 
     const transaction = this.db.transaction(() => {
+      if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard);
       const actualFactRevision = this.getFactRevision(candidate.personId);
       const actualContextRevision = this.getClinicalContextRevision(candidate.personId);
       if (actualFactRevision !== input.expectedFactRevision) {
@@ -2146,11 +2340,18 @@ export class WorkspaceStore {
 
   publishFacts(input: PublishFactsInput): { publicationId: string; revision: number; idempotent: boolean } {
     const existing = this.db.prepare(`
-      SELECT id, new_revision FROM publication_events WHERE change_set_hash = ?
-    `).get(input.changeSetHash) as { id: string; new_revision: number } | undefined;
-    if (existing) return { publicationId: existing.id, revision: existing.new_revision, idempotent: true };
+      SELECT publication_id, revision FROM document_commits
+      WHERE document_id = ? OR commit_key = ?
+    `).get(input.documentId, input.documentCommitKey) as { publication_id: string; revision: number } | undefined;
+    if (existing) return { publicationId: existing.publication_id, revision: existing.revision, idempotent: true };
 
     const transaction = this.db.transaction(() => {
+      if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard, input.documentId);
+      const committed = this.db.prepare(`
+        SELECT publication_id, revision FROM document_commits
+        WHERE document_id = ? OR commit_key = ?
+      `).get(input.documentId, input.documentCommitKey) as { publication_id: string; revision: number } | undefined;
+      if (committed) return { publicationId: committed.publication_id, revision: committed.revision, idempotent: true };
       const actual = this.getFactRevision(input.personId);
       if (actual !== input.expectedRevision) throw new RevisionConflictError(input.expectedRevision, actual);
       const nextRevision = actual + 1;
@@ -2184,12 +2385,13 @@ export class WorkspaceStore {
           INSERT INTO observation_revisions (
             observation_id, revision, value_kind, raw_text, decimal_value,
             qualifier, unit, reference_range, abnormal_flag, source_span_id,
-            acceptance_id, created_at
-          ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            acceptance_id, specimen, method, body_site, evidence_json, created_at
+          ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           observationId, observation.valueKind, observation.rawText, observation.decimalValue,
           observation.qualifier, observation.unit, observation.referenceRange, observation.abnormalFlag,
-          observation.sourceSpanId, observation.acceptanceId, this.now().toISOString()
+          observation.sourceSpanId, observation.acceptanceId, observation.specimen, observation.method,
+          observation.bodySite, JSON.stringify(observation.evidence), this.now().toISOString()
         );
       }
 
@@ -2204,6 +2406,18 @@ export class WorkspaceStore {
           id, person_id, expected_revision, new_revision, change_set_hash, summary, committed_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(publicationId, input.personId, actual, nextRevision, input.changeSetHash, input.summary, this.now().toISOString());
+      this.db.prepare(`
+        INSERT INTO document_commits (document_id, commit_key, publication_id, revision, committed_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(input.documentId, input.documentCommitKey, publicationId, nextRevision, this.now().toISOString());
+      this.db.prepare(`UPDATE documents SET status = 'completed' WHERE id = ?`).run(input.documentId);
+      if (input.resolvedReviewIssueId) {
+        const resolved = this.db.prepare(`
+          UPDATE review_issues SET resolution_status = 'resolved', resolution_revision = 1
+          WHERE id = ? AND field_ref = 'document:' || ? AND resolution_status = 'open' AND kind = 'field_conflict'
+        `).run(input.resolvedReviewIssueId, input.documentId);
+        if (resolved.changes !== 1) throw new Error('REVIEW_ISSUE_NOT_OPEN');
+      }
       return { publicationId, revision: nextRevision, idempotent: false };
     });
     return transaction();
@@ -2317,6 +2531,43 @@ export class WorkspaceStore {
         current = 5;
       }
 
+      if (current === 5) {
+        const hasTable = (name: string) => Boolean(this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name));
+        if (hasTable('documents')) this.db.exec(`ALTER TABLE documents ADD COLUMN person_assignment_basis TEXT NOT NULL DEFAULT 'legacy'`);
+        if (hasTable('observation_revisions')) this.db.exec(`
+          ALTER TABLE observation_revisions ADD COLUMN specimen TEXT;
+          ALTER TABLE observation_revisions ADD COLUMN method TEXT;
+          ALTER TABLE observation_revisions ADD COLUMN body_site TEXT;
+          ALTER TABLE observation_revisions ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]';
+        `);
+        if (hasTable('review_issues')) this.db.exec(`ALTER TABLE review_issues ADD COLUMN payload_json TEXT`);
+        this.db.exec(`
+          CREATE TABLE source_manifests (
+            document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+            manifest_id TEXT NOT NULL, source_object_id TEXT NOT NULL REFERENCES source_objects(id),
+            sha256 TEXT NOT NULL, media_type TEXT NOT NULL, original_display_name TEXT NOT NULL,
+            total_units INTEGER NOT NULL, covered_unit_indexes_json TEXT NOT NULL,
+            normalizer_version TEXT NOT NULL, conversion_warnings_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE document_commits (
+            document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+            commit_key TEXT NOT NULL UNIQUE, publication_id TEXT NOT NULL REFERENCES publication_events(id),
+            revision INTEGER NOT NULL, committed_at TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE ai_transmissions (
+            id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+            attempt_id TEXT NOT NULL REFERENCES job_attempts(id), consent_id TEXT NOT NULL REFERENCES consents(id),
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            stage TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT
+          ) STRICT;
+          CREATE INDEX idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
+          UPDATE workspaces SET schema_version = 6;
+          PRAGMA user_version = 6;
+        `);
+        current = 6;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -2361,12 +2612,21 @@ export class WorkspaceStore {
         id TEXT PRIMARY KEY, source_object_id TEXT NOT NULL REFERENCES source_objects(id),
         person_id TEXT REFERENCES persons(id), document_kind TEXT NOT NULL, status TEXT NOT NULL,
         acceptance_id TEXT, excluded_from_analysis INTEGER NOT NULL DEFAULT 0,
+        person_assignment_basis TEXT NOT NULL DEFAULT 'legacy',
         created_at TEXT NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS source_spans (
         id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id), span_kind TEXT NOT NULL,
         page_number INTEGER, block_id TEXT, line_start INTEGER, line_end INTEGER,
         quote TEXT, readability TEXT NOT NULL, normalizer_version TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS source_manifests (
+        document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+        manifest_id TEXT NOT NULL, source_object_id TEXT NOT NULL REFERENCES source_objects(id),
+        sha256 TEXT NOT NULL, media_type TEXT NOT NULL, original_display_name TEXT NOT NULL,
+        total_units INTEGER NOT NULL, covered_unit_indexes_json TEXT NOT NULL,
+        normalizer_version TEXT NOT NULL, conversion_warnings_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS document_conversions (
         document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
@@ -2399,7 +2659,8 @@ export class WorkspaceStore {
         observation_id TEXT NOT NULL REFERENCES observations(id), revision INTEGER NOT NULL,
         value_kind TEXT NOT NULL, raw_text TEXT NOT NULL, decimal_value TEXT, qualifier TEXT,
         unit TEXT, reference_range TEXT, abnormal_flag TEXT NOT NULL DEFAULT 'unknown', source_span_id TEXT NOT NULL,
-        acceptance_id TEXT NOT NULL, supersedes INTEGER, created_at TEXT NOT NULL,
+        acceptance_id TEXT NOT NULL, specimen TEXT, method TEXT, body_site TEXT,
+        evidence_json TEXT NOT NULL DEFAULT '[]', supersedes INTEGER, created_at TEXT NOT NULL,
         PRIMARY KEY(observation_id, revision)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS clinical_statements (
@@ -2451,12 +2712,23 @@ export class WorkspaceStore {
       CREATE TABLE IF NOT EXISTS review_issues (
         id TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id), field_ref TEXT, kind TEXT NOT NULL,
         severity TEXT NOT NULL, evidence_refs_json TEXT NOT NULL, resolution_status TEXT NOT NULL,
-        resolution_revision INTEGER, created_at TEXT NOT NULL
+        resolution_revision INTEGER, payload_json TEXT, created_at TEXT NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS publication_events (
         id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
         expected_revision INTEGER NOT NULL, new_revision INTEGER NOT NULL,
         change_set_hash TEXT NOT NULL UNIQUE, summary TEXT NOT NULL, committed_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS document_commits (
+        document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+        commit_key TEXT NOT NULL UNIQUE, publication_id TEXT NOT NULL REFERENCES publication_events(id),
+        revision INTEGER NOT NULL, committed_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS ai_transmissions (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+        attempt_id TEXT NOT NULL REFERENCES job_attempts(id), consent_id TEXT NOT NULL REFERENCES consents(id),
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS schedules (
         id TEXT PRIMARY KEY, enabled INTEGER NOT NULL, local_time TEXT NOT NULL,
@@ -2492,7 +2764,8 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_observations_person ON observations(person_id, concept_key);
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
-      PRAGMA user_version = 5;
+      CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
+      PRAGMA user_version = 6;
       `);
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');

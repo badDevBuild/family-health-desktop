@@ -124,15 +124,16 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
         ]
       }
     ],
+    timeline: [],
     guidance: [
       { id: 'guide-1', personId: 'person-lin-ming', title: '保持规律步行', detail: '可以从每周多次、身体感觉舒适的步行开始；如运动时不适，请先咨询医生。', consultProfessional: true, evidenceCount: 2 },
       { id: 'guide-2', personId: 'person-lin-ming', title: '调整日常饮食结构', detail: '优先增加蔬菜和优质蛋白，主食按日常活动量适度调整。', consultProfessional: false, evidenceCount: 2 }
     ],
     inbox: [
-      { id: 'inbox-1', displayName: '年度体检_2026.pdf', discoveredAt: '2026-09-17T01:16:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'PDF · 12 页', sourceLabel: '林明的报告文件夹', sentToAi: false, issue: null },
-      { id: 'inbox-2', displayName: '血常规.jpg', discoveredAt: '2026-09-17T01:20:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'JPEG', sourceLabel: '林明的报告文件夹', sentToAi: false, issue: null },
-      { id: 'inbox-3', displayName: '门诊报告.docx', discoveredAt: '2026-09-17T01:25:00+00:00', personId: null, personLabel: null, status: 'needs_review', format: 'Word', sourceLabel: '公共待归属', sentToAi: false, issue: '文档姓名与已绑定成员无法唯一匹配' },
-      { id: 'inbox-4', displayName: '2025年度体检副本.pdf', discoveredAt: '2026-09-16T06:30:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'duplicate', format: 'PDF · 10 页', sourceLabel: '手动导入', sentToAi: false, issue: '内容与已保存资料相同，未重复处理' }
+      { id: 'inbox-1', displayName: '年度体检_2026.pdf', discoveredAt: '2026-09-17T01:16:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'PDF · 12 页', sourceLabel: '林明的报告文件夹', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null },
+      { id: 'inbox-2', displayName: '血常规.jpg', discoveredAt: '2026-09-17T01:20:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'JPEG', sourceLabel: '林明的报告文件夹', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null },
+      { id: 'inbox-3', displayName: '门诊报告.docx', discoveredAt: '2026-09-17T01:25:00+00:00', personId: null, personLabel: null, status: 'needs_review', format: 'Word', sourceLabel: '公共待归属', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: '文档姓名与已绑定成员无法唯一匹配' },
+      { id: 'inbox-4', displayName: '2025年度体检副本.pdf', discoveredAt: '2026-09-16T06:30:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'duplicate', format: 'PDF · 10 页', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: '内容与已保存资料相同，未重复处理' }
     ],
     jobs: [
       { id: 'job-1', batchLabel: '今天 09:40 手动处理', personLabel: '林明', stage: 'review_facts', status: 'running', completedUnits: 4, totalUnits: 10, statusText: '正在核对第 5 页，共 10 页', updatedAt: '2026-09-17T02:30:00+00:00', canCancel: true, canRetry: false },
@@ -140,7 +141,7 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
       { id: 'job-3', batchLabel: '9 月 15 日自动批次', personLabel: null, stage: 'identify', status: 'waiting_user', completedUnits: 1, totalUnits: 2, statusText: '等待确认所属成员', updatedAt: '2026-09-15T12:06:00+00:00', canCancel: true, canRetry: false }
     ],
     reviews: [
-      { id: 'review-1', personId: null, documentId: 'document-inbox-3', kind: 'person_conflict', severity: 'blocking', title: '确认门诊报告属于谁', description: '报告里的姓名与文件夹信息不能唯一匹配。确认之前不会把内容写入任何成员档案。', evidenceRefs: ['span-docx-heading'], resolutionStatus: 'open' }
+      { id: 'review-1', personId: null, documentId: 'document-inbox-3', kind: 'person_conflict', severity: 'blocking', title: '确认门诊报告属于谁', description: '报告里的姓名与文件夹信息不能唯一匹配。确认之前不会把内容写入任何成员档案。', evidenceRefs: ['span-docx-heading'], candidateOptions: [], resolutionStatus: 'open' }
     ],
     actions: [
       { id: 'action-1', personId: 'person-lin-ming', title: '向医生咨询血脂变化', detail: '结合近三次 LDL 记录与本次报告参考范围，询问是否需要进一步评估。', origin: 'ai_proposed', status: 'proposed', dueDate: null, dueText: '下次就诊时', evidenceLabel: '基于 2024–2026 三次体检记录', userRevision: 1, updatedAt: '2026-09-17T02:20:00+00:00' },

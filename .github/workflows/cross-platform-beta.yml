@@ -2,6 +2,9 @@ name: Cross-platform beta build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   pull_request:
     paths:
       - 'apps/**'

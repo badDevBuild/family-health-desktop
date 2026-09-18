@@ -22,7 +22,7 @@
     "pretest": "pnpm native:node",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm verify:build",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm docs:check && pnpm build && pnpm verify:build",
     "verify:build": "node scripts/verify-built-app.mjs",
     "protocol:generate": "node scripts/generate-codex-schema.mjs",
     "runtime:probe": "tsx scripts/probe-codex-runtime.ts",
@@ -31,7 +31,8 @@
     "benchmark:local": "vitest run --config vitest.benchmark.config.ts",
     "gold:materialize": "node --experimental-strip-types scripts/materialize-synthetic-gold.ts",
     "scan:release": "node scripts/scan-release-artifact.mjs",
-    "scan:public": "node scripts/scan-public-repository.mjs"
+    "scan:public": "node scripts/scan-public-repository.mjs",
+    "docs:check": "node scripts/check-doc-links.mjs"
   },
   "dependencies": {
     "@napi-rs/canvas": "0.1.100",

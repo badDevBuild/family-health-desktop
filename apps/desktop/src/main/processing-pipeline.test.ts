@@ -19,12 +19,13 @@ async function setup() {
   roots.push(root);
   const service = new PersonalWorkspaceService(root, '测试工作区', () => new Date('2026-09-18T00:00:00Z'));
   const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
-  await service.importFiles([{ path: '/tmp/虚构报告.txt', bytes: Buffer.from('低密度脂蛋白胆固醇 4.2 mmol/L，参考范围 0-3.4 mmol/L') }], personId);
+  await service.importFiles([{ path: '/tmp/虚构报告.txt', bytes: Buffer.from('2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L，参考范围 0-3.4 mmol/L') }], personId);
   const documentId = service.getSnapshot(null).inbox[0]!.id;
   const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
   const output: ExtractionResult = {
     schemaVersion: 1,
     documentId,
+    subject: { reportedName: null, evidence: [], confidence: 'absent' },
     coveredSourceSpanIds: [spanId],
     candidates: [{
       localKey: 'ldl-1',
@@ -38,7 +39,7 @@ async function setup() {
       method: null,
       bodySite: null,
       clinicalDate: '2026-09-17',
-      evidence: [{ sourceSpanId: spanId, quote: '低密度脂蛋白胆固醇 4.2 mmol/L' }],
+      evidence: [{ sourceSpanId: spanId, quote: '2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L' }],
       issues: []
     }]
   };
@@ -81,6 +82,7 @@ describe('DocumentExtractionPipeline', () => {
     const output: ExtractionResult = {
       schemaVersion: 1,
       documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
       coveredSourceSpanIds: manifest.spans.map((span) => span.id),
       candidates: [{
         localKey: 'visual-fixture-1', originalName: '虚构图示数值', standardNameCandidate: null,
@@ -120,6 +122,7 @@ describe('DocumentExtractionPipeline', () => {
     const output: ExtractionResult = {
       schemaVersion: 1,
       documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
       coveredSourceSpanIds: [spanId],
       candidates: [{
         localKey: 'visual-ldl-1', originalName: '低密度脂蛋白胆固醇', standardNameCandidate: 'LDL-C',
@@ -180,7 +183,8 @@ describe('DocumentExtractionPipeline', () => {
     });
     expect(service.getSnapshot(null)).toMatchObject({
       persons: [expect.objectContaining({ id: personId, attentionCount: 1, lastDocumentDate: '2026-09-17' })],
-      trends: [expect.objectContaining({ personId, name: 'LDL-C', points: [expect.objectContaining({ numericValue: 4.2, referenceHigh: 3.4, abnormalFlag: 'high' })] })]
+      trends: [expect.objectContaining({ personId, name: 'LDL-C', points: [expect.objectContaining({ numericValue: 4.2, referenceHigh: 3.4, abnormalFlag: 'high' })] })],
+      timeline: [expect.objectContaining({ personId, type: 'health_report', date: '2026-09-17', documentId })]
     });
     service.close();
   });
@@ -198,6 +202,11 @@ describe('DocumentExtractionPipeline', () => {
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
     expect(service.store.getFactRevision(personId)).toBe(0);
     expect(service.getSnapshot(null).inbox[0]).toMatchObject({ status: 'needs_review' });
+    const issue = service.store.listOpenExtractionReviewIssues()[0]!;
+    expect(issue.candidateOptions).toHaveLength(1);
+    service.acceptCorrectedFacts({ issueId: issue.id, documentId, candidates: issue.candidateOptions });
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    expect(service.getSnapshot(null).inbox[0]).toMatchObject({ status: 'completed' });
     service.close();
   });
 
@@ -211,6 +220,43 @@ describe('DocumentExtractionPipeline', () => {
     });
     await expect(pipeline.process(documentId)).resolves.toMatchObject({
       status: 'needs_review', reason: 'EXTRACTION_COVERAGE_INCOMPLETE'
+    });
+    expect(service.store.getFactRevision(personId)).toBe(0);
+    service.close();
+  });
+
+  it('报告显示姓名与目标成员不一致时阻止自动归档', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const conflicting = {
+      ...output,
+      subject: {
+        reportedName: '其他成员',
+        confidence: 'explicit' as const,
+        evidence: [{ sourceSpanId: output.coveredSourceSpanIds[0]!, quote: '2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L' }]
+      }
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'identity-thread', turnId: 'identity-turn', output: conflicting })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'PERSON_IDENTITY_NOT_CONFIRMED' });
+    expect(service.store.getFactRevision(personId)).toBe(0);
+    service.close();
+  });
+
+  it('候选数值与所引原文不一致时阻止入库', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const forged = {
+      ...output,
+      candidates: output.candidates.map((candidate) => ({
+        ...candidate,
+        value: { kind: 'numeric' as const, rawText: '999', decimal: '999', comparator: 'eq' as const }
+      }))
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'evidence-thread', turnId: 'evidence-turn', output: forged })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({
+      status: 'needs_review', reason: expect.stringContaining('numeric_value_not_in_evidence')
     });
     expect(service.store.getFactRevision(personId)).toBe(0);
     service.close();

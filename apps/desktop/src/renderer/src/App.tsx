@@ -30,7 +30,7 @@ import {
   UsersRound,
   X
 } from 'lucide-react';
-import type { ActionItem, CreateActionItemInput, CreateManualNoteInput, DashboardSnapshot, DeletedDocumentSummary, DiagnosticBundle, DisplayPreferences, ExportMemberSummaryInput, ImportFilesReceipt, InboxBindingSummary, InboxItem, JobSummary, ManualNote, Person, PersonSummary, ReviewIssue, UpdatePersonDisplayInput } from '@contracts';
+import type { ActionItem, CreateActionItemInput, CreateManualNoteInput, DashboardSnapshot, DeletedDocumentSummary, DiagnosticBundle, DisplayPreferences, ExportMemberSummaryInput, ImportFilesReceipt, InboxBindingSummary, InboxItem, JobSummary, ManualNote, Person, PersonSummary, ResolveReviewInput, ReviewIssue, UpdatePersonDisplayInput } from '@contracts';
 import { createDemoSnapshot } from '../../../../../packages/test-fixtures/src/index.js';
 import { StatusBadge, type Tone } from './components/StatusBadge.js';
 import { TrendChart } from './components/TrendChart.js';
@@ -478,33 +478,9 @@ function PersonalTimelineView({ snapshot, personId, onOpenEvidence }: {
   onOpenEvidence(evidence: Evidence): void;
 }) {
   const [visibleCount, setVisibleCount] = useState(50);
-  const grouped = new Map<string, {
-    date: string;
-    documentId: string | null;
-    sourceSpanId: string | null;
-    sourceLabel: string;
-    facts: string[];
-  }>();
-  for (const series of snapshot.trends.filter((item) => item.personId === personId)) {
-    for (const point of series.points) {
-      const key = `${point.date}\u0000${point.documentId ?? point.sourceLabel}`;
-      const event = grouped.get(key) ?? {
-        date: point.date, documentId: point.documentId, sourceSpanId: point.sourceSpanId,
-        sourceLabel: point.sourceLabel, facts: []
-      };
-      event.facts.push(`${series.name} ${point.displayValue}${series.unit ? ` ${series.unit}` : ''}`);
-      grouped.set(key, event);
-    }
-  }
-  const reportEvents = [...grouped.values()].map((event) => ({ ...event, eventKind: 'report' as const }));
-  const noteEvents = snapshot.notes.filter((note) => note.personId === personId).map((note) => ({
-    ...note,
-    date: note.effectiveDate,
-    eventKind: 'note' as const
-  }));
-  const events = [...reportEvents, ...noteEvents].sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''));
+  const events = snapshot.timeline.filter((event) => event.personId === personId);
   const visibleEvents = events.slice(0, visibleCount);
-  return <section className="panel timeline-panel"><div className="panel__heading"><div><span className="eyebrow">时间轴</span><h2>报告与本人补充记录</h2></div><StatusBadge tone="neutral">先显示 {Math.min(visibleCount, events.length)} / {events.length} 条</StatusBadge></div>{events.length > 0 ? <><div className="timeline-list">{visibleEvents.map((event) => event.eventKind === 'report' ? <button key={`report-${event.date}-${event.documentId ?? event.sourceLabel}`} onClick={() => onOpenEvidence({ title: event.sourceLabel, label: event.sourceLabel, quote: event.facts.slice(0, 6).join('；'), meta: `${event.date} · ${event.facts.length} 条已接纳事实`, sourceSpanId: event.sourceSpanId, documentId: event.documentId })}><time>{event.date}</time><i /><span><StatusBadge tone="success">报告记录</StatusBadge><strong>{event.sourceLabel}</strong><small>{event.facts.slice(0, 3).join('；')}{event.facts.length > 3 ? ` 等 ${event.facts.length} 条` : ''}</small></span><ChevronRight size={17} /></button> : <button key={`note-${event.id}`} onClick={() => onOpenEvidence({ title: manualNoteLabels[event.kind], label: '本人补充 · user_reported', quote: event.immutableText, meta: `${event.effectiveDate ?? '日期未知'} · 版本 ${event.revision}` })}><time>{event.effectiveDate ?? '日期未知'}</time><i /><span><StatusBadge tone="info">本人补充</StatusBadge><strong>{manualNoteLabels[event.kind]}</strong><small>{event.immutableText}</small></span><ChevronRight size={17} /></button>)}</div>{events.length > visibleCount && <div className="dialog-actions"><button className="secondary-button" onClick={() => setVisibleCount((count) => count + 50)}>再显示 {Math.min(50, events.length - visibleCount)} 条记录</button></div>}</> : <div className="table-empty"><Clock3 size={24} /><strong>还没有时间线记录</strong><span>未知日期会单独显示，不会使用导入时间代替临床日期。</span></div>}</section>;
+  return <section className="panel timeline-panel"><div className="panel__heading"><div><span className="eyebrow">时间轴</span><h2>报告与本人补充记录</h2></div><StatusBadge tone="neutral">先显示 {Math.min(visibleCount, events.length)} / {events.length} 条</StatusBadge></div>{events.length > 0 ? <><div className="timeline-list">{visibleEvents.map((event) => <button key={event.id} onClick={() => onOpenEvidence({ title: event.title, label: event.sourceLabel, quote: event.summary, meta: `${event.dateLabel} · ${event.type === 'manual_note' ? '本人补充' : '报告记录'}`, sourceSpanId: event.sourceSpanId, documentId: event.documentId })}><time>{event.dateLabel}</time><i /><span><StatusBadge tone={event.type === 'manual_note' ? 'info' : 'success'}>{event.type === 'manual_note' ? '本人补充' : '报告记录'}</StatusBadge><strong>{event.title}</strong><small>{event.summary}</small></span><ChevronRight size={17} /></button>)}</div>{events.length > visibleCount && <div className="dialog-actions"><button className="secondary-button" onClick={() => setVisibleCount((count) => count + 50)}>再显示 {Math.min(50, events.length - visibleCount)} 条记录</button></div>}</> : <div className="table-empty"><Clock3 size={24} /><strong>还没有时间线记录</strong><span>未知日期会单独显示，不会使用导入时间代替临床日期。</span></div>}</section>;
 }
 
 function PersonalDocumentsView({ snapshot, personId, onOpenEvidence, onImport, onExclude, onReinclude, onDelete, onDeletedDocuments }: {
@@ -840,13 +816,19 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   snapshot: DashboardSnapshot;
   onClose(): void;
   onEvidence(): void;
-  onResolve(input: { action: 'assign_person'; documentId: string; personId: string } | { action: 'archive_only' | 'dismiss_derived'; issueId: string; documentId: string }): Promise<boolean>;
+  onResolve(input: ResolveReviewInput): Promise<boolean>;
 }) {
   const [personId, setPersonId] = useState(snapshot.persons[0]?.id ?? '');
   const [busy, setBusy] = useState(false);
+  const [candidates, setCandidates] = useState(review.candidateOptions);
   const isAssignment = review.kind === 'person_conflict';
   const isDerived = review.kind === 'derived_safety';
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog review-resolution-dialog" role="dialog" aria-modal="true" aria-labelledby="review-resolution-title"><header><div><span className="eyebrow">例外核对</span><h2 id="review-resolution-title">{review.title}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭例外核对"><X size={19} /></button></header><p>{review.description}</p><button className="evidence-link" onClick={onEvidence}><FileCheck2 size={17} /> 查看原始依据</button>{isAssignment ? <label>这份资料属于<select value={personId} onChange={(event) => setPersonId(event.target.value)}>{snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}</select></label> : <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{isDerived ? '报告事实不会被删除' : '原始资料会继续保留'}</strong><p>{isDerived ? '只是不发布这次未通过安全复核的分析和生活指南。' : '选择仅归档后，这份资料不会进入趋势或后续分析。'}</p></div></div>}<div className="dialog-actions"><button className="secondary-button" onClick={onClose}>稍后处理</button><button className="primary-button" disabled={busy || (isAssignment && !personId)} onClick={async () => { setBusy(true); try { const ok = await onResolve(isAssignment ? { action: 'assign_person', documentId: review.documentId, personId } : { action: isDerived ? 'dismiss_derived' : 'archive_only', issueId: review.id, documentId: review.documentId }); if (ok) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}{isAssignment ? '确认归属' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}</button></div></section></div>;
+  const canCorrect = review.kind === 'field_conflict' && candidates.length > 0
+    && candidates.every((candidate) => candidate.value.kind !== 'numeric' || /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(candidate.value.decimal));
+  const updateCandidate = (index: number, updater: (candidate: (typeof candidates)[number]) => (typeof candidates)[number]) => {
+    setCandidates((current) => current.map((candidate, candidateIndex) => candidateIndex === index ? updater(candidate) : candidate));
+  };
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog review-resolution-dialog" role="dialog" aria-modal="true" aria-labelledby="review-resolution-title"><header><div><span className="eyebrow">例外核对</span><h2 id="review-resolution-title">{review.title}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭例外核对"><X size={19} /></button></header><p>{review.description}</p><button className="evidence-link" onClick={onEvidence}><FileCheck2 size={17} /> 查看原始依据</button>{isAssignment ? <label>这份资料属于<select value={personId} onChange={(event) => setPersonId(event.target.value)}>{snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}</select></label> : canCorrect ? <div className="manual-note-list">{candidates.map((candidate, index) => <article key={candidate.localKey}><label>项目名<input value={candidate.originalName} onChange={(event) => updateCandidate(index, (current) => ({ ...current, originalName: event.target.value }))} /></label><label>结果<input value={candidate.value.rawText ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label><label>单位<input value={candidate.unitRaw ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, unitRaw: event.target.value || null }))} /></label><label>临床日期<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label></article>)}</div> : <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{isDerived ? '报告事实不会被删除' : '原始资料会继续保留'}</strong><p>{isDerived ? '只是不发布这次未通过安全复核的分析和生活指南。' : '选择仅归档后，这份资料不会进入趋势或后续分析。'}</p></div></div>}<div className="dialog-actions"><button className="secondary-button" onClick={onClose}>稍后处理</button><button className="primary-button" disabled={busy || (isAssignment && !personId) || (review.kind === 'field_conflict' && !canCorrect)} onClick={async () => { setBusy(true); try { const resolution: ResolveReviewInput = isAssignment ? { action: 'assign_person', documentId: review.documentId, personId } : canCorrect ? { action: 'accept_correction', issueId: review.id, documentId: review.documentId, candidates } : { action: isDerived ? 'dismiss_derived' : 'archive_only', issueId: review.id, documentId: review.documentId }; const ok = await onResolve(resolution); if (ok) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}{isAssignment ? '确认归属' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}</button></div></section></div>;
 }
 
 function EvidencePanel({ evidence, demo, onClose }: { evidence: Evidence | null; demo: boolean; onClose(): void }) {
@@ -1121,18 +1103,20 @@ function ProcessConsentDialog({ snapshot, documentIds, onClose, onConfirm, onLog
   const [busy, setBusy] = useState(false);
   const selectedSet = documentIds ? new Set(documentIds) : null;
   const readyCount = snapshot.inbox.filter((item) => item.status === 'queued' && item.personId && (!selectedSet || selectedSet.has(item.id))).length;
+  const derivedRefreshCount = documentIds ? 0 : snapshot.persons.filter((person) => person.acceptedFactCount > 0 && person.derivedStatus !== 'current').length;
+  const processingCount = readyCount + derivedRefreshCount;
   const connected = snapshot.account.status === 'connected';
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="member-dialog process-consent-dialog" role="dialog" aria-modal="true" aria-labelledby="process-consent-title">
         <header><div><span className="eyebrow">本次手动处理</span><h2 id="process-consent-title">确认发送范围</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭处理确认"><X size={19} /></button></header>
-        <p>将把 {readyCount} 份{documentIds ? '选中的' : ''}已归属资料中的必要内容发送给 <strong>OpenAI/Codex</strong>，用于事实提取、独立复核、综合分析和生活指南。原始资料仍保存在本机。</p>
+        <p>将处理 {readyCount} 份{documentIds ? '选中的' : ''}已归属资料{derivedRefreshCount > 0 ? `，并为 ${derivedRefreshCount} 位成员刷新已过期的综合说明` : ''}。必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>
         <div className="consent-facts"><span><ShieldCheck size={17} /> 不发送其他成员或未归属资料</span><span><FileCheck2 size={17} /> 事实和派生说明分别复核、分别入库</span><span><Sparkles size={17} /> 使用当前 Codex 账户额度，额度规则可能变化</span></div>
         <label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我确认本次接收方、用途和资料范围</label>
         {!connected && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>Codex 尚未连接</strong><p>先完成官方登录，才会建立本次处理授权和任务。</p></div></div>}
         <div className="dialog-actions">
           <button className="secondary-button" onClick={onClose}>取消</button>
-          {!connected ? <button className="primary-button" onClick={onLogin}>连接 Codex</button> : <button className="primary-button" disabled={!confirmed || busy || readyCount === 0} onClick={async () => {
+          {!connected ? <button className="primary-button" onClick={onLogin}>连接 Codex</button> : <button className="primary-button" disabled={!confirmed || busy || processingCount === 0} onClick={async () => {
             setBusy(true);
             try { if (await onConfirm()) onClose(); }
             finally { setBusy(false); }
@@ -1319,7 +1303,7 @@ export default function App() {
     });
   }
 
-  async function handleResolveReview(input: { action: 'assign_person'; documentId: string; personId: string } | { action: 'archive_only' | 'dismiss_derived'; issueId: string; documentId: string }): Promise<boolean> {
+  async function handleResolveReview(input: ResolveReviewInput): Promise<boolean> {
     if (!window.healthDesktop) return false;
     const result = await window.healthDesktop.resolveReview(input);
     if (!result.ok) {
@@ -1330,7 +1314,9 @@ export default function App() {
     setSnapshot(next);
     setToast(input.action === 'assign_person'
       ? '成员归属已确认，资料已进入待处理队列。'
-      : input.action === 'archive_only' ? '资料已仅归档，不会进入分析。' : '报告事实已保留，本次未通过复核的说明不会发布。');
+      : input.action === 'archive_only' ? '资料已仅归档，不会进入分析。'
+      : input.action === 'accept_correction' ? '修正后的事实已保存，并保留原始证据链。'
+      : '报告事实已保留，本次未通过复核的说明不会发布。');
     return true;
   }
 

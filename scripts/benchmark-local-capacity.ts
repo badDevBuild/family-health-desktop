@@ -72,7 +72,7 @@ export async function runLocalCapacityBenchmark() {
         outputHash: sha256(`capacity-output-${memberIndex}`), reviewRef: null, decision: 'accept'
       });
       service.store.publishFacts({
-        personId, expectedRevision: 0, changeSetHash: sha256(`capacity-change-${memberIndex}`),
+        personId, documentId: refs[0]!.documentId, documentCommitKey: sha256(`capacity-commit-${memberIndex}`), expectedRevision: 0, changeSetHash: sha256(`capacity-change-${memberIndex}`),
         summary: '纯合成容量数据',
         observations: Array.from({ length: observationsPerMember }, (_, observationIndex) => {
           const ref = refs[observationIndex % refs.length]!;
@@ -81,7 +81,9 @@ export async function runLocalCapacityBenchmark() {
             valueKind: 'numeric' as const, decimalValue: String(observationIndex % 500), qualifier: null,
             unit: 'unit', referenceRange: '0-500', clinicalDate: dateFor(observationIndex),
             abnormalFlag: 'normal' as const, documentId: ref.documentId,
-            sourceSpanId: ref.sourceSpanId, acceptanceId
+            sourceSpanId: ref.sourceSpanId, acceptanceId,
+            specimen: null, method: null, bodySite: null,
+            evidence: [{ sourceSpanId: ref.sourceSpanId, quote: `纯合成证据 ${(observationIndex % documentsPerMember) + 1}` }]
           };
         })
       });

@@ -670,6 +670,8 @@ function registerIpc(): void {
       const input = resolveReviewInputSchema.parse(rawInput);
       if (input.action === 'assign_person') {
         personalWorkspace.store.assignDocumentPerson(input.documentId, input.personId);
+      } else if (input.action === 'accept_correction') {
+        personalWorkspace.acceptCorrectedFacts(input);
       } else {
         personalWorkspace.store.resolveReviewIssue(input);
       }

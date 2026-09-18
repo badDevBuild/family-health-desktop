@@ -10,6 +10,8 @@ coverage/
 *.tsbuildinfo
 .DS_Store
 family-health-desktop-spec-v1.zip
+family-health-desktop-review-evidence-*/
+family-health-desktop-review-evidence-*.zip
 *.dmg
 *.exe
 *.blockmap

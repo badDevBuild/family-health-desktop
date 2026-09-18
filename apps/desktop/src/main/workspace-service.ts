@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
-import type { AccountState, ArchivePersonInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, ImportFilesReceipt, InboxBindingSummary, RestorePersonInput, SetDocumentInclusionInput, UpdatePersonDisplayInput, UpdateScheduleInput } from '@contracts';
+import type { AccountState, ArchivePersonInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, ImportFilesReceipt, InboxBindingSummary, ObservationCandidate, RestorePersonInput, SetDocumentInclusionInput, UpdatePersonDisplayInput, UpdateScheduleInput } from '@contracts';
 import { dashboardSnapshotSchema } from '@contracts';
-import { stableHash } from '@core';
+import { evaluateObservationCandidate, stableHash } from '@core';
 import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
@@ -51,7 +51,10 @@ function buildTrendSeries(observations: AcceptedObservationSummary[]) {
   const groups = new Map<string, AcceptedObservationSummary[]>();
   for (const observation of observations) {
     if (observation.valueKind !== 'numeric' || !observation.clinicalDate) continue;
-    const key = `${observation.personId}\u0000${observation.conceptKey}\u0000${observation.unit ?? ''}`;
+    const contextKey = [observation.specimen, observation.method, observation.bodySite]
+      .map((value) => value?.trim().toLocaleLowerCase('zh-CN') ?? '未记录')
+      .join('|');
+    const key = `${observation.personId}\u0000${observation.conceptKey}\u0000${observation.unit ?? ''}\u0000${contextKey}`;
     const group = groups.get(key) ?? [];
     group.push(observation);
     groups.set(key, group);
@@ -78,12 +81,12 @@ function buildTrendSeries(observations: AcceptedObservationSummary[]) {
       })
       .sort((a, b) => a.date.localeCompare(b.date));
     return {
-      id: `trend-${stableHash({ personId: first.personId, concept: first.conceptKey, unit: first.unit }).slice(0, 20)}`,
+      id: `trend-${stableHash({ personId: first.personId, concept: first.conceptKey, unit: first.unit, specimen: first.specimen, method: first.method, bodySite: first.bodySite }).slice(0, 20)}`,
       personId: first.personId,
       name: first.conceptKey,
       unit: first.unit,
       interpretation: points.length > 1 ? `已有 ${points.length} 次带日期的数值记录。` : '目前只有 1 次带日期的数值记录，暂不能判断趋势。',
-      comparisonNote: '仅按相同单位分组；采样条件和检测方法是否可比，仍以各次原报告为准。',
+      comparisonNote: `已按相同单位、标本、方法和部位分组；未记录的比较条件不会与已知条件混合。`,
       points
     };
   });
@@ -101,6 +104,16 @@ function formatLabel(mediaType: string): string {
     'text/plain': '纯文本'
   };
   return labels[mediaType] ?? mediaType;
+}
+
+function normalizeAbnormalFlag(value: string | null) {
+  const normalized = value?.trim().toLowerCase();
+  if (['high', 'h', '偏高', '升高', '↑'].includes(normalized ?? '')) return 'high' as const;
+  if (['low', 'l', '偏低', '降低', '↓'].includes(normalized ?? '')) return 'low' as const;
+  if (['positive', '+', '阳性'].includes(normalized ?? '')) return 'positive' as const;
+  if (['negative', '-', '阴性'].includes(normalized ?? '')) return 'negative' as const;
+  if (['normal', '正常', '未见异常'].includes(normalized ?? '')) return 'normal' as const;
+  return 'unknown' as const;
 }
 
 export class PersonalWorkspaceService {
@@ -171,6 +184,57 @@ export class PersonalWorkspaceService {
 
   createManualNote(input: CreateManualNoteInput) {
     return this.store.createManualNote(input);
+  }
+
+  acceptCorrectedFacts(input: { issueId: string; documentId: string; candidates: ObservationCandidate[] }) {
+    const bundle = this.store.getDocumentExtractionBundle(input.documentId);
+    const observations = input.candidates.map((candidate) => {
+      const outcome = evaluateObservationCandidate(candidate, bundle.manifest, {
+        personConsistent: bundle.personAssignmentBasis !== 'legacy',
+        overwritesUserLockedValue: false
+      });
+      if (outcome.decision === 'reject' || outcome.decision === 'needs_review') {
+        throw new Error(`CORRECTION_INVALID:${outcome.reasons.join(',')}`);
+      }
+      const acceptanceId = this.store.saveAcceptanceDecision({
+        method: 'user_resolution', actor: 'user', rulesVersion: 'health-acceptance-v2',
+        inputSignature: stableHash({ documentId: input.documentId, candidate }),
+        outputHash: stableHash({ candidate, outcome }), reviewRef: input.issueId, decision: outcome.decision
+      });
+      const firstEvidence = candidate.evidence[0]!;
+      return {
+        conceptKey: candidate.standardNameCandidate ?? candidate.originalName,
+        rawText: candidate.value.rawText ?? '',
+        valueKind: candidate.value.kind,
+        decimalValue: candidate.value.kind === 'numeric' ? candidate.value.decimal : null,
+        qualifier: candidate.value.kind === 'numeric' ? candidate.value.comparator : candidate.value.kind === 'qualitative' ? candidate.value.category : null,
+        unit: candidate.unitRaw,
+        referenceRange: candidate.referenceRangeRaw,
+        clinicalDate: candidate.clinicalDate,
+        abnormalFlag: normalizeAbnormalFlag(candidate.reportedAbnormalFlag),
+        documentId: input.documentId,
+        sourceSpanId: firstEvidence.sourceSpanId,
+        acceptanceId,
+        specimen: candidate.specimen,
+        method: candidate.method,
+        bodySite: candidate.bodySite,
+        evidence: candidate.evidence
+      };
+    });
+    return this.store.publishFacts({
+      personId: bundle.personId,
+      documentId: input.documentId,
+      documentCommitKey: stableHash({
+        documentId: input.documentId, sourceSha256: bundle.manifest.sha256,
+        normalizerVersion: bundle.manifest.normalizerVersion,
+        extractionSchemaVersion: 1, rulesVersion: 'health-acceptance-v2'
+      }),
+      expectedRevision: this.store.getFactRevision(bundle.personId),
+      changeSetHash: stableHash({ documentId: input.documentId, candidates: input.candidates, rulesVersion: 'health-acceptance-v2', actor: 'user' }),
+      summary: `用户核对原始依据后修正并接纳 ${observations.length} 条事实`,
+      observations,
+      resolvedReviewIssueId: input.issueId
+    });
   }
 
   updateActionStatus(input: { actionId: string; status: 'proposed' | 'discussed' | 'planned' | 'completed' | 'dismissed'; expectedRevision: number }) {
@@ -290,25 +354,34 @@ export class PersonalWorkspaceService {
     documentIds?: string[];
   }): { batchId: string; idempotent: boolean } {
     const selectedIds = options?.documentIds ? new Set(options.documentIds) : null;
-    const byPerson = new Map<string, string[]>();
+    const byPerson = new Map<string, { documentIds: string[]; stage: 'extract' | 'analyze' }>();
     for (const document of this.store.listReadyDocuments()) {
       if (selectedIds && !selectedIds.has(document.id)) continue;
-      const documents = byPerson.get(document.personId) ?? [];
-      documents.push(document.id);
-      byPerson.set(document.personId, documents);
+      const group = byPerson.get(document.personId) ?? { documentIds: [], stage: 'extract' as const };
+      group.documentIds.push(document.id);
+      byPerson.set(document.personId, group);
     }
-    if (byPerson.size === 0) throw new Error('NO_READY_DOCUMENTS');
+    if (!selectedIds) {
+      for (const target of this.store.listDerivedRefreshTargets()) {
+        if (!byPerson.has(target.personId)) {
+          byPerson.set(target.personId, { documentIds: [target.documentId], stage: 'analyze' });
+        }
+      }
+    }
+    if (byPerson.size === 0) throw new Error('NO_PROCESSING_WORK');
     if (options && (options.accountState.status !== 'connected' || !options.accountState.displayLabel)) {
       throw new Error('AUTH_REQUIRED');
     }
-    const groups = [...byPerson.entries()].map(([personId, documentIds]) => ({
+    const groups = [...byPerson.entries()].map(([personId, group]) => ({
       personId,
-      documentIds,
+      documentIds: group.documentIds,
+      stage: group.stage,
       inputSignature: stableHash({
-        stage: 'extract',
+        stage: group.stage,
         personId,
-        documentIds: [...documentIds].sort(),
+        documentIds: [...group.documentIds].sort(),
         factRevision: this.store.getFactRevision(personId),
+        contextRevision: this.store.getClinicalContextRevision(personId),
         promptVersion: 'extract-v1',
         rulesVersion: 'acceptance-v1'
       })
@@ -358,7 +431,11 @@ export class PersonalWorkspaceService {
           originalPath: file.path,
           displayName
         });
-        const document = this.store.registerImportedDocument({ sourceObjectId: source.id, personId });
+        const document = this.store.registerImportedDocument({
+          sourceObjectId: source.id,
+          personId,
+          assignmentBasis: bindingId ? 'folder_binding' : 'user_selected'
+        });
         if (document.duplicate) {
           receipt.duplicateCount += 1;
           continue;
@@ -467,6 +544,7 @@ export class PersonalWorkspaceService {
         clinicalContextRevision: person.clinicalContextRevision
       };
     });
+    const transmissionStatuses = this.store.listDocumentAiTransmissionStatuses(imported.map((document) => document.id));
     const inbox = imported.map((document) => ({
       id: document.id,
       displayName: document.displayName,
@@ -476,7 +554,8 @@ export class PersonalWorkspaceService {
       status: document.status,
       format: formatLabel(document.mediaType),
       sourceLabel: document.sourceLabel,
-      sentToAi: false,
+      sentToAi: transmissionStatuses.get(document.id) !== 'not_sent',
+      aiTransmissionStatus: transmissionStatuses.get(document.id) ?? 'not_sent',
       issue: document.issue
     }));
     const assignmentReviews = imported
@@ -490,6 +569,7 @@ export class PersonalWorkspaceService {
         title: `确认“${document.displayName}”属于谁`,
         description: '这份资料尚未可靠关联到家庭成员。确认之前不会发送给 AI。',
         evidenceRefs: [],
+        candidateOptions: [],
         resolutionStatus: 'open' as const
       }));
     const extractionIssues = this.store.listOpenExtractionReviewIssues()
@@ -510,6 +590,7 @@ export class PersonalWorkspaceService {
           ? '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
           : '为避免把不确定内容写入健康档案，这份资料已暂停并等待你的核对。',
         evidenceRefs: issue.evidenceRefs,
+        candidateOptions: issue.candidateOptions,
         resolutionStatus: 'open' as const
       }))
     ];
@@ -556,6 +637,42 @@ export class PersonalWorkspaceService {
         };
       })),
       trends: buildTrendSeries(acceptedObservations),
+      timeline: [
+        ...[...acceptedObservations.reduce((groups, observation) => {
+          const group = groups.get(observation.documentId) ?? [];
+          group.push(observation);
+          groups.set(observation.documentId, group);
+          return groups;
+        }, new Map<string, AcceptedObservationSummary[]>()).values()].map((sameDocument) => {
+          const observation = sameDocument[0]!;
+          const date = sameDocument.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort()[0] ?? null;
+          const names = [...new Set(sameDocument.map((item) => item.conceptKey))];
+          return {
+            id: `event-document-${observation.documentId}`,
+            personId: observation.personId,
+            date,
+            dateLabel: date ?? '报告日期待确认',
+            type: 'health_report' as const,
+            title: observation.sourceLabel,
+            summary: `${sameDocument.length} 条已接纳记录：${names.slice(0, 3).join('、')}${names.length > 3 ? '等' : ''}`,
+            sourceLabel: observation.sourceLabel,
+            documentId: observation.documentId,
+            sourceSpanId: observation.sourceSpanId
+          };
+        }),
+        ...this.store.listManualNotes().filter((note) => activePersonIds.has(note.personId)).map((note) => ({
+          id: `event-note-${note.id}`,
+          personId: note.personId,
+          date: note.effectiveDate,
+          dateLabel: note.effectiveDate ?? new Date(note.recordedAt).toISOString().slice(0, 10),
+          type: 'manual_note' as const,
+          title: '本人补充',
+          summary: note.immutableText,
+          sourceLabel: '用户填写',
+          documentId: null,
+          sourceSpanId: null
+        }))
+      ].sort((a, b) => (b.date ?? '').localeCompare(a.date ?? '')),
       guidance: [...derivedByPerson.values()].filter((snapshot) => activePersonIds.has(snapshot.personId)).flatMap((snapshot) => snapshot.payload.lifestyleGuidance.map((guidance) => ({
         id: guidance.id,
         personId: snapshot.personId,

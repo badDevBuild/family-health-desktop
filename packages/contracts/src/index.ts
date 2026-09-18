@@ -2,7 +2,11 @@ import { z } from 'zod';
 
 export const idSchema = z.string().min(1).max(120);
 export const utcTimestampSchema = z.string().datetime({ offset: true });
-export const localDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+export const localDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year!, month! - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month! - 1 && date.getUTCDate() === day;
+}, 'Invalid calendar date');
 
 export const resultErrorSchema = z.object({
   code: z.string().min(1),
@@ -81,6 +85,11 @@ export type ObservationCandidate = z.infer<typeof observationCandidateSchema>;
 export const extractionResultSchema = z.object({
   schemaVersion: z.literal(1),
   documentId: idSchema,
+  subject: z.object({
+    reportedName: z.string().trim().min(1).max(120).nullable(),
+    evidence: z.array(evidenceRefSchema),
+    confidence: z.enum(['explicit', 'absent', 'uncertain'])
+  }).strict(),
   coveredSourceSpanIds: z.array(idSchema),
   candidates: z.array(observationCandidateSchema)
 }).strict();
@@ -365,6 +374,7 @@ export const reviewIssueSchema = z.object({
   title: z.string().min(1),
   description: z.string().min(1),
   evidenceRefs: z.array(idSchema),
+  candidateOptions: z.array(observationCandidateSchema),
   resolutionStatus: z.enum(['open', 'resolved', 'deferred'])
 }).strict();
 
@@ -465,10 +475,26 @@ export const inboxItemSchema = z.object({
   format: z.string(),
   sourceLabel: z.string(),
   sentToAi: z.boolean(),
+  aiTransmissionStatus: z.enum(['not_sent', 'sending', 'acknowledged', 'completed', 'unknown']),
   issue: z.string().nullable()
 }).strict();
 
 export type InboxItem = z.infer<typeof inboxItemSchema>;
+
+export const timelineEventSchema = z.object({
+  id: idSchema,
+  personId: idSchema,
+  date: localDateSchema.nullable(),
+  dateLabel: z.string(),
+  type: z.enum(['health_report', 'manual_note']),
+  title: z.string(),
+  summary: z.string(),
+  sourceLabel: z.string(),
+  documentId: idSchema.nullable(),
+  sourceSpanId: idSchema.nullable()
+}).strict();
+
+export type TimelineEvent = z.infer<typeof timelineEventSchema>;
 
 export const jobSummarySchema = z.object({
   id: idSchema,
@@ -527,6 +553,7 @@ export const dashboardSnapshotSchema = z.object({
   persons: z.array(personSummarySchema),
   organs: z.array(organSummarySchema),
   trends: z.array(trendSeriesSchema),
+  timeline: z.array(timelineEventSchema),
   guidance: z.array(lifestyleGuidanceSummarySchema),
   inbox: z.array(inboxItemSchema),
   jobs: z.array(jobSummarySchema),
@@ -762,6 +789,12 @@ export const resolveReviewInputSchema = z.discriminatedUnion('action', [
     action: z.literal('dismiss_derived'),
     issueId: idSchema,
     documentId: idSchema
+  }).strict(),
+  z.object({
+    action: z.literal('accept_correction'),
+    issueId: idSchema,
+    documentId: idSchema,
+    candidates: z.array(observationCandidateSchema).min(1).max(500)
   }).strict()
 ]);
 

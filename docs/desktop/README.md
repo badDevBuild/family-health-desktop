@@ -11,6 +11,12 @@
 - [本地容量基准](performance-results-2026-09-18.md)：500 文档 / 5 万指标的当前 Mac 实测。
 - [纯合成金标与安全故障数据集](synthetic-evaluation-dataset.md)：40 个来源包、1,000 个标注字段、8 个留出来源和 18 个故障样例的固定口径。
 - [ADR-001](adr/ADR-001-electron-workspace.md)：Electron 工作区架构选择。
+- [桌面端架构](architecture.md)：进程、包边界、数据流与关键不变量。
+- [安全设计](security-design.md)：授权、执行栅栏、本地规则与备份控制。
+- [隐私与数据边界](privacy-data-boundaries.md)：哪些数据留在本机，什么情况会发送。
+- [威胁模型](threat-model.md)：资产、信任边界、主要威胁与剩余风险。
+- [发行验收清单](release-acceptance-checklist.md)：公开发行前必须完成的硬门禁。
+- [GPT-6 Pro 评审修复记录](review-remediation-2026-09-18.md)：R01–R12 的复现结论、修复门禁与未冒充关闭的运行时风险。
 
 常用验证：
 

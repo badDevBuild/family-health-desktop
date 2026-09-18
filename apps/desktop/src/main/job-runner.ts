@@ -38,14 +38,27 @@ export class ProcessingJobRunner extends EventEmitter {
           continue;
         }
         const attemptId = store.startJobAttempt(job.id, account.runtimeVersion);
+        const executionGuard = {
+          jobId: job.id,
+          attemptId,
+          consentId: job.consentId,
+          accountFingerprint
+        };
         try {
-          const pipeline = new DocumentExtractionPipeline(store, this.runtime);
+          const pipeline = new DocumentExtractionPipeline(store, this.runtime, executionGuard);
           const resumeDerived = ['analyze', 'guidance', 'review_derived', 'publish'].includes(job.stage);
           let completedUnits = resumeDerived ? job.documentIds.length : 0;
           let needsReview = false;
           let lastReceipt: { threadId: string; turnId: string } | null = null;
           if (!resumeDerived) {
             for (const documentId of job.documentIds) {
+              store.assertJobExecutionActive(executionGuard, documentId);
+              if (store.isDocumentCommitted(documentId)) {
+                completedUnits += 1;
+                store.updateJobProgress(job.id, completedUnits);
+                this.emit('changed');
+                continue;
+              }
               const result = await pipeline.process(documentId);
               if (result.threadId && result.turnId) lastReceipt = { threadId: result.threadId, turnId: result.turnId };
               completedUnits += 1;
@@ -63,7 +76,7 @@ export class ProcessingJobRunner extends EventEmitter {
             const derived = await new DerivedHealthPipeline(store, this.runtime, (stage) => {
               store.updateJobStage(job.id, stage);
               this.emit('changed');
-            }).process(job.personId);
+            }, executionGuard, job.documentIds[0]!).process(job.personId);
             if (derived.threadId && derived.turnId) lastReceipt = { threadId: derived.threadId, turnId: derived.turnId };
             if (derived.status === 'needs_review') needsReview = true;
           }
@@ -77,6 +90,8 @@ export class ProcessingJobRunner extends EventEmitter {
           const state = this.runtime.getState();
           const status = store.isJobCancellationRequested(job.id)
             ? 'cancelled'
+            : code.includes('CONSENT') || code.includes('DOCUMENT_OUTSIDE_CONSENT_SCOPE')
+              ? 'waiting_user'
             : state.status !== 'connected' || code.includes('AUTH')
             ? 'waiting_auth'
             : state.quota.status === 'exhausted' || code.includes('QUOTA')
