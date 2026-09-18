@@ -128,6 +128,7 @@ export class PersonalWorkspaceService {
   ) {
     this.store = new WorkspaceStore({ rootDirectory, now });
     this.store.recoverInterruptedJobs();
+    this.store.revokeUnreferencedManualProcessingConsents();
   }
 
   close(): void {
@@ -354,21 +355,27 @@ export class PersonalWorkspaceService {
     documentIds?: string[];
   }): { batchId: string; idempotent: boolean } {
     const selectedIds = options?.documentIds ? new Set(options.documentIds) : null;
+    const processingDocumentIds = options ? this.store.listProcessingDocumentIds() : new Set<string>();
+    if (selectedIds && [...selectedIds].some((documentId) => processingDocumentIds.has(documentId))) {
+      throw new Error('DOCUMENT_ALREADY_IN_PROCESSING');
+    }
     const byPerson = new Map<string, { documentIds: string[]; stage: 'extract' | 'analyze' }>();
     for (const document of this.store.listReadyDocuments()) {
       if (selectedIds && !selectedIds.has(document.id)) continue;
+      if (processingDocumentIds.has(document.id)) continue;
       const group = byPerson.get(document.personId) ?? { documentIds: [], stage: 'extract' as const };
       group.documentIds.push(document.id);
       byPerson.set(document.personId, group);
     }
     if (!selectedIds) {
       for (const target of this.store.listDerivedRefreshTargets()) {
+        if (processingDocumentIds.has(target.documentId)) continue;
         if (!byPerson.has(target.personId)) {
           byPerson.set(target.personId, { documentIds: [target.documentId], stage: 'analyze' });
         }
       }
     }
-    if (byPerson.size === 0) throw new Error('NO_PROCESSING_WORK');
+    if (byPerson.size === 0) throw new Error('NO_READY_DOCUMENTS');
     if (options && (options.accountState.status !== 'connected' || !options.accountState.displayLabel)) {
       throw new Error('AUTH_REQUIRED');
     }
@@ -394,13 +401,18 @@ export class PersonalWorkspaceService {
         version: options.consentVersion
       })
       : null;
-    const created = this.store.createWaitingAuthBatch({
-      cutoff: this.now().toISOString(),
-      groups,
-      initialStatus: options ? 'queued' : 'waiting_auth',
-      consentId
-    });
-    return { batchId: created.batchId, idempotent: created.idempotent };
+    try {
+      const created = this.store.createWaitingAuthBatch({
+        cutoff: this.now().toISOString(),
+        groups,
+        initialStatus: options ? 'queued' : 'waiting_auth',
+        consentId
+      });
+      return { batchId: created.batchId, idempotent: created.idempotent };
+    } catch (error) {
+      if (consentId) this.store.revokeConsent(consentId);
+      throw error;
+    }
   }
 
   async importFiles(files: Array<{ path: string; bytes: Uint8Array }>, personId: string | null, bindingId: string | null = null): Promise<ImportFilesReceipt> {
@@ -509,12 +521,14 @@ export class PersonalWorkspaceService {
     const storedPersons = this.store.listPersons();
     const activePersonIds = new Set(storedPersons.filter((person) => person.archivedAt === null).map((person) => person.id));
     const imported = this.store.listImportedDocuments().filter((document) => document.personId === null || activePersonIds.has(document.personId));
+    const processingDocumentIds = this.store.listProcessingDocumentIds();
     const acceptedObservations = this.store.listAcceptedObservations().filter((observation) => activePersonIds.has(observation.personId));
     const derivedByPerson = new Map(this.store.listCurrentDerivedSnapshots().map((snapshot) => [snapshot.personId, snapshot]));
     const latestDerivedByPerson = new Map(this.store.listLatestDerivedSnapshots().map((snapshot) => [snapshot.personId, snapshot]));
     const persons = storedPersons.filter((person) => person.archivedAt === null).map((person) => {
       const documentCount = counts.get(person.id) ?? 0;
-      const pendingCount = imported.filter((document) => document.personId === person.id && document.status === 'queued').length;
+      const pendingCount = imported.filter((document) => document.personId === person.id && document.status === 'queued' && !processingDocumentIds.has(document.id)).length;
+      const processingCount = imported.filter((document) => document.personId === person.id && processingDocumentIds.has(document.id)).length;
       const facts = acceptedObservations.filter((observation) => observation.personId === person.id);
       const attentionCount = facts.filter((observation) => ['high', 'low', 'positive'].includes(observation.abnormalFlag)).length;
       const datedFacts = facts.filter((observation) => observation.clinicalDate).map((observation) => observation.clinicalDate!);
@@ -534,10 +548,12 @@ export class PersonalWorkspaceService {
         dataQuality: documentCount > 0 ? 'partial' as const : 'insufficient' as const,
         freshnessLabel: facts.length > 0
           ? `已接纳 ${facts.length} 条有来源事实`
-          : documentCount > 0 ? `${documentCount} 份资料等待处理` : '尚未导入资料',
+          : processingCount > 0 ? `${processingCount} 份资料已进入处理中心`
+            : documentCount > 0 ? `${documentCount} 份资料等待处理` : '尚未导入资料',
         changeSummary: derived?.payload.claims[0]?.title ?? (facts.length > 0
           ? `最近处理已保存 ${facts.length} 条报告事实；健康解释仍需单独生成和复核`
-          : documentCount > 0 ? '资料已安全保存在本机，尚未形成健康结论' : '可以先添加一份体检或门诊资料'),
+          : processingCount > 0 ? '资料已安全保存在本机，请到处理中心查看进度或恢复失败任务'
+            : documentCount > 0 ? '资料已安全保存在本机，尚未形成健康结论' : '可以先添加一份体检或门诊资料'),
         derivedStatus: derived?.status ?? 'unavailable' as const,
         assessmentSummary: derived?.status === 'current' ? derived.payload.claims[0]?.explanation ?? null : null,
         displayRevision: person.displayRevision,
@@ -556,6 +572,7 @@ export class PersonalWorkspaceService {
       sourceLabel: document.sourceLabel,
       sentToAi: transmissionStatuses.get(document.id) !== 'not_sent',
       aiTransmissionStatus: transmissionStatuses.get(document.id) ?? 'not_sent',
+      inProcessingCenter: processingDocumentIds.has(document.id),
       issue: document.issue
     }));
     const assignmentReviews = imported
@@ -610,7 +627,7 @@ export class PersonalWorkspaceService {
       scheduleTimeZone: schedule.timeZone,
       scheduleRevision: schedule.revision,
       queuePaused: this.store.isQueuePaused(),
-      pendingInboxCount: inbox.filter((item) => ['queued', 'needs_review'].includes(item.status)).length,
+      pendingInboxCount: inbox.filter((item) => !item.inProcessingCenter && ['queued', 'needs_review'].includes(item.status)).length,
       openReviewCount: reviews.length,
       persons,
       organs: persons.flatMap((person) => organNames.map(([id, name]) => {
@@ -684,7 +701,8 @@ export class PersonalWorkspaceService {
       inbox,
       jobs: this.store.listStoredJobs().map((job) => ({
         ...job,
-        canCancel: !['succeeded', 'cancelled'].includes(job.status) && job.statusText !== '正在安全停止',
+        canCancel: ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status)
+          && job.statusText !== '正在安全停止',
         canRetry: job.status === 'failed'
       })),
       reviews,

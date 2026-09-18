@@ -509,6 +509,19 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('会撤回未关联任务的手动处理授权', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({ bytes: Buffer.from('虚构资料'), mediaType: 'text/plain', displayName: 'fixture.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    expect(store.revokeUnreferencedManualProcessingConsents()).toBe(1);
+    expect(store.revokeUnreferencedManualProcessingConsents()).toBe(0);
+    store.close();
+  });
+
   it('授权撤回后，运行中尝试的最终事务也不得提交', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '测试成员' });

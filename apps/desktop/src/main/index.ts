@@ -1081,7 +1081,7 @@ function registerIpc(): void {
       return { ok: true, data: { batchId: result.batchId }, revision: result.idempotent ? 0 : 1 };
     } catch (error) {
       const code = error instanceof Error ? error.message : 'PROCESS_FAILED';
-      return { ok: false, error: { code, messageKey: code === 'NO_READY_DOCUMENTS' ? 'jobs.no_ready_documents' : code === 'AUTH_REQUIRED' ? 'jobs.auth_required' : 'jobs.process_failed', retryable: code === 'AUTH_REQUIRED', action: code === 'AUTH_REQUIRED' ? 'login' : undefined, correlationId: randomUUID() } };
+      return { ok: false, error: { code, messageKey: code === 'NO_READY_DOCUMENTS' || code === 'DOCUMENT_ALREADY_IN_PROCESSING' ? 'jobs.no_ready_documents' : code === 'AUTH_REQUIRED' ? 'jobs.auth_required' : 'jobs.process_failed', retryable: code === 'AUTH_REQUIRED', action: code === 'AUTH_REQUIRED' ? 'login' : undefined, correlationId: randomUUID() } };
     }
   });
 

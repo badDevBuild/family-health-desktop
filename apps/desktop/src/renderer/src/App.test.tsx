@@ -84,7 +84,7 @@ describe('App member display editing', () => {
     snapshot.inbox = [{
       id: 'document-1', displayName: '纯虚构报告.txt', discoveredAt: '2026-09-18T00:00:00.000Z',
       personId: 'personal-person-1', personLabel: '测试成员', status: 'completed', format: '纯文本',
-      sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null
+      sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: true, issue: null
     }];
     installBridge(snapshot);
     render(<App />);
@@ -158,6 +158,7 @@ describe('App member display editing', () => {
       sourceLabel: '手动导入',
       sentToAi: false,
       aiTransmissionStatus: 'not_sent',
+      inProcessingCenter: false,
       issue: null
     }));
     installBridge(snapshot);
@@ -168,6 +169,24 @@ describe('App member display editing', () => {
     expect(screen.queryByText('合成报告51.txt')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '再显示 5 份资料' }));
     expect(await screen.findByText('合成报告55.txt')).toBeTruthy();
+  });
+
+  it('资料进入处理中心后从收件箱移走，并给出明确去向', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.inbox = [{
+      id: 'processing-document', displayName: '处理中报告.pdf', discoveredAt: '2026-09-18T00:00:00.000Z',
+      personId: 'personal-person-1', personLabel: '测试成员', status: 'queued', format: 'PDF', sourceLabel: '手动导入',
+      sentToAi: true, aiTransmissionStatus: 'unknown', inProcessingCenter: true, issue: null
+    }];
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '报告收件箱' }));
+    expect(screen.queryByText('处理中报告.pdf')).toBeNull();
+    expect(screen.getByText('新资料已全部移交')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '立即处理全部' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '前往处理中心' }));
+    expect(await screen.findByRole('heading', { name: '每一步都能看懂、能恢复' })).toBeTruthy();
   });
 
   it('requires explicit confirmation before logout and keeps the local workspace visible', async () => {
@@ -212,8 +231,8 @@ describe('App member display editing', () => {
       quota: { ...snapshot.account.quota, status: 'available' }
     };
     snapshot.inbox = [
-      { id: 'ready-1', displayName: '选中的报告.txt', discoveredAt: '2026-09-18T00:00:00.000Z', personId: 'personal-person-1', personLabel: '测试成员', status: 'queued', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null },
-      { id: 'unassigned-1', displayName: '待归属.txt', discoveredAt: '2026-09-18T00:00:01.000Z', personId: null, personLabel: null, status: 'needs_review', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: '待确认' }
+      { id: 'ready-1', displayName: '选中的报告.txt', discoveredAt: '2026-09-18T00:00:00.000Z', personId: 'personal-person-1', personLabel: '测试成员', status: 'queued', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: null },
+      { id: 'unassigned-1', displayName: '待归属.txt', discoveredAt: '2026-09-18T00:00:01.000Z', personId: null, personLabel: null, status: 'needs_review', format: '纯文本', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: '待确认' }
     ];
     const processNow = vi.fn(async () => ({ ok: true as const, data: { batchId: 'batch-1' }, revision: 1 }));
     installBridge(snapshot, { processNow });

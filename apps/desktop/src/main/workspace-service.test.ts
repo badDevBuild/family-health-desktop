@@ -113,7 +113,42 @@ describe('PersonalWorkspaceService', () => {
     const repeated = service.processNow();
     expect(batch.idempotent).toBe(false);
     expect(repeated).toMatchObject({ batchId: batch.batchId, idempotent: true });
-    expect(service.getSnapshot(null).jobs[0]).toMatchObject({ status: 'waiting_auth', stage: 'extract' });
+    expect(service.getSnapshot(null)).toMatchObject({
+      pendingInboxCount: 0,
+      inbox: [expect.objectContaining({ inProcessingCenter: true })],
+      jobs: [expect.objectContaining({ status: 'waiting_auth', stage: 'extract' })]
+    });
+    service.close();
+  });
+
+  it('已进入处理中心的失败资料不再建立新批次', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{ path: '/tmp/虚构长报告.txt', bytes: Buffer.from('纯虚构报告') }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const accountState = {
+      status: 'connected' as const,
+      displayLabel: 'masked@example.com',
+      quota: { status: 'available' as const, primaryUsedPercent: 1, secondaryUsedPercent: null, resetsAt: null },
+      runtimeVersion: 'test-runtime',
+      lastCheckedAt: '2026-09-18T01:00:00Z'
+    };
+    service.processNow({ accountState, consentVersion: 1, documentIds: [documentId] });
+    const fingerprint = stableHash({ provider: 'codex-chatgpt', displayLabel: accountState.displayLabel });
+    const job = service.store.claimNextQueuedJob('test-runner', fingerprint)!;
+    const attemptId = service.store.startJobAttempt(job.id, 'test-runtime');
+    service.store.finishJobAttempt({ attemptId, status: 'failed', errorCode: 'CODEX_TURN_TIMEOUT' });
+    service.store.finishJob(job.id, 'failed');
+
+    expect(() => service.processNow({ accountState, consentVersion: 1, documentIds: [documentId] }))
+      .toThrow('DOCUMENT_ALREADY_IN_PROCESSING');
+    expect(service.getSnapshot(accountState)).toMatchObject({
+      pendingInboxCount: 0,
+      inbox: [expect.objectContaining({ id: documentId, inProcessingCenter: true })],
+      jobs: [expect.objectContaining({
+        status: 'failed', statusText: expect.stringContaining('等待超时'), canCancel: false, canRetry: true
+      })]
+    });
     service.close();
   });
 

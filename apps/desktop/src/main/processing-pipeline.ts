@@ -242,6 +242,8 @@ export class DocumentExtractionPipeline {
     if (!isImage && !isPdf && !hasDocxVisualEvidence && bundle.manifest.spans.every((span) => !span.quote)) {
       return this.needsReview(documentId, 'coverage_gap', bundle.manifest.spans.map((span) => span.id), 'SOURCE_CONTENT_UNREADABLE');
     }
+    // 在输入预算允许时保持整篇处理，以便模型联系摘要、检验页与结论页。
+    // 只有视觉页数、片段数或字节预算触发硬限制时才保护性分块。
     const chunks = partitionSourceSpans(bundle.manifest.spans);
     const reviewedCandidates: ObservationCandidate[] = [];
     const coveredSourceSpanIds: string[] = [];
@@ -341,7 +343,8 @@ export class DocumentExtractionPipeline {
             `SOURCE_PACKAGE=${sourcePackage}`
           ].join('\n'),
           imagePaths,
-          outputSchema
+          outputSchema,
+          timeoutMs: 600_000
         });
         const extracted = extractionResultSchema.parse(extract.output);
         if (extracted.documentId !== documentId) throw new Error('EXTRACTION_DOCUMENT_MISMATCH');
@@ -362,7 +365,8 @@ export class DocumentExtractionPipeline {
             `CANDIDATE_TO_REVIEW=${JSON.stringify(extracted)}`
           ].join('\n'),
           imagePaths,
-          outputSchema
+          outputSchema,
+          timeoutMs: 600_000
         });
         const reviewed = extractionResultSchema.parse(review.output);
         lastReceipt = { threadId: review.threadId, turnId: review.turnId };

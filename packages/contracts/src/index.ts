@@ -476,6 +476,7 @@ export const inboxItemSchema = z.object({
   sourceLabel: z.string(),
   sentToAi: z.boolean(),
   aiTransmissionStatus: z.enum(['not_sent', 'sending', 'acknowledged', 'completed', 'unknown']),
+  inProcessingCenter: z.boolean(),
   issue: z.string().nullable()
 }).strict();
 

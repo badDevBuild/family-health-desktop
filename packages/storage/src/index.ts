@@ -1824,6 +1824,60 @@ export class WorkspaceStore {
     return id;
   }
 
+  revokeConsent(consentId: string): void {
+    this.db.prepare(`UPDATE consents SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`)
+      .run(this.now().toISOString(), consentId);
+  }
+
+  revokeUnreferencedManualProcessingConsents(): number {
+    const active = this.db.prepare(`
+      SELECT id FROM consents
+      WHERE purpose = 'manual_health_report_processing' AND revoked_at IS NULL
+    `).all() as Array<{ id: string }>;
+    const referenced = new Set<string>();
+    const jobs = this.db.prepare(`SELECT checkpoint_json FROM jobs WHERE checkpoint_json IS NOT NULL`)
+      .all() as Array<{ checkpoint_json: string }>;
+    for (const job of jobs) {
+      try {
+        const consentId = (JSON.parse(job.checkpoint_json) as { consentId?: unknown }).consentId;
+        if (typeof consentId === 'string') referenced.add(consentId);
+      } catch {
+        // 损坏的任务检查点不能成为撤回其他授权的依据。
+      }
+    }
+    const timestamp = this.now().toISOString();
+    const revoke = this.db.prepare(`UPDATE consents SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`);
+    let revoked = 0;
+    const transaction = this.db.transaction(() => {
+      for (const consent of active) {
+        if (!referenced.has(consent.id)) revoked += revoke.run(timestamp, consent.id).changes;
+      }
+    });
+    transaction();
+    return revoked;
+  }
+
+  listProcessingDocumentIds(): Set<string> {
+    const rows = this.db.prepare(`
+      SELECT checkpoint_json FROM jobs
+      WHERE status != 'cancelled' AND checkpoint_json IS NOT NULL
+    `).all() as Array<{ checkpoint_json: string }>;
+    const documentIds = new Set<string>();
+    for (const row of rows) {
+      try {
+        const checkpoint = JSON.parse(row.checkpoint_json) as { documentIds?: unknown };
+        if (Array.isArray(checkpoint.documentIds)) {
+          for (const documentId of checkpoint.documentIds) {
+            if (typeof documentId === 'string') documentIds.add(documentId);
+          }
+        }
+      } catch {
+        // 无法解析的旧任务不应该影响其他资料的可见性。
+      }
+    }
+    return documentIds;
+  }
+
   claimNextQueuedJob(leaseOwner: string, accountFingerprint: string, leaseMs = 15 * 60_000): JobExecution | null {
     const transaction = this.db.transaction(() => {
       if (this.isQueuePaused()) return null;
@@ -2141,6 +2195,8 @@ export class WorkspaceStore {
         ? '当前版本的 Codex 配置不兼容，请安装更新后重试'
         : latestErrorCode === 'CODEX_OUTPUT_SCHEMA_INVALID'
           ? '结构化输出格式不兼容，请安装更新后重试'
+          : latestErrorCode === 'CODEX_TURN_TIMEOUT'
+            ? '报告内容较多，本次等待超时；资料已保留，可安全重试'
           : latestErrorCode === 'CODEX_CONNECTION_FAILED'
             ? '连接 Codex 时中断，请检查网络后重试'
             : labels.failed;

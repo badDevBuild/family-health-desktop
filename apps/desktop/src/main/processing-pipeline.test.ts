@@ -97,6 +97,7 @@ describe('DocumentExtractionPipeline', () => {
     const pipeline = new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async (input) => {
         expect(input.imagePaths).toHaveLength(1);
+        expect(input.timeoutMs).toBe(600_000);
         expect(existsSync(input.imagePaths![0]!)).toBe(true);
         expect(input.prompt).toContain(imageSpan.id);
         observedPaths.push(input.imagePaths![0]!);
@@ -157,6 +158,14 @@ describe('DocumentExtractionPipeline', () => {
     const chunks = partitionPdfSpans(spans);
     expect(chunks.map((chunk) => chunk.length)).toEqual([8, 8, 1]);
     expect(chunks.flat().map((span) => span.id)).toEqual(spans.map((span) => span.id));
+  });
+
+  it('PDF 文字层清晰且未触发硬上限时保持整篇处理', () => {
+    const spans = Array.from({ length: 17 }, (_, index) => ({
+      id: `text-page-${index + 1}`, documentId: 'doc', spanKind: 'page' as const, page: index + 1,
+      blockId: null, lineStart: null, lineEnd: null, quote: '虚构体检文字', readability: 'clear' as const
+    }));
+    expect(partitionPdfSpans(spans).map((chunk) => chunk.length)).toEqual([17]);
   });
 
   it('文本片段也按统一的每轮数量预算分块', () => {

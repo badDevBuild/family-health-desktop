@@ -130,10 +130,10 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
       { id: 'guide-2', personId: 'person-lin-ming', title: '调整日常饮食结构', detail: '优先增加蔬菜和优质蛋白，主食按日常活动量适度调整。', consultProfessional: false, evidenceCount: 2 }
     ],
     inbox: [
-      { id: 'inbox-1', displayName: '年度体检_2026.pdf', discoveredAt: '2026-09-17T01:16:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'PDF · 12 页', sourceLabel: '林明的报告文件夹', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null },
-      { id: 'inbox-2', displayName: '血常规.jpg', discoveredAt: '2026-09-17T01:20:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'JPEG', sourceLabel: '林明的报告文件夹', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: null },
-      { id: 'inbox-3', displayName: '门诊报告.docx', discoveredAt: '2026-09-17T01:25:00+00:00', personId: null, personLabel: null, status: 'needs_review', format: 'Word', sourceLabel: '公共待归属', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: '文档姓名与已绑定成员无法唯一匹配' },
-      { id: 'inbox-4', displayName: '2025年度体检副本.pdf', discoveredAt: '2026-09-16T06:30:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'duplicate', format: 'PDF · 10 页', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', issue: '内容与已保存资料相同，未重复处理' }
+      { id: 'inbox-1', displayName: '年度体检_2026.pdf', discoveredAt: '2026-09-17T01:16:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'PDF · 12 页', sourceLabel: '林明的报告文件夹', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: null },
+      { id: 'inbox-2', displayName: '血常规.jpg', discoveredAt: '2026-09-17T01:20:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'queued', format: 'JPEG', sourceLabel: '林明的报告文件夹', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: null },
+      { id: 'inbox-3', displayName: '门诊报告.docx', discoveredAt: '2026-09-17T01:25:00+00:00', personId: null, personLabel: null, status: 'needs_review', format: 'Word', sourceLabel: '公共待归属', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: '文档姓名与已绑定成员无法唯一匹配' },
+      { id: 'inbox-4', displayName: '2025年度体检副本.pdf', discoveredAt: '2026-09-16T06:30:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'duplicate', format: 'PDF · 10 页', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: '内容与已保存资料相同，未重复处理' }
     ],
     jobs: [
       { id: 'job-1', batchLabel: '今天 09:40 手动处理', personLabel: '林明', stage: 'review_facts', status: 'running', completedUnits: 4, totalUnits: 10, statusText: '正在核对第 5 页，共 10 页', updatedAt: '2026-09-17T02:30:00+00:00', canCancel: true, canRetry: false },
