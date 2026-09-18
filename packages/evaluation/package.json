@@ -1,0 +1,11 @@
+{
+  "name": "@family-health/evaluation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@napi-rs/canvas": "0.1.100",
+    "jszip": "3.10.2"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "paths": {
+      "@contracts": ["./packages/contracts/src/index.ts"],
+      "@core": ["./packages/health-core/src/index.ts"]
+    },
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": false,
+    "types": ["vite/client", "vitest/globals"]
+  },
+  "include": [
+    "apps/desktop/src/renderer/src/**/*.ts",
+    "apps/desktop/src/renderer/src/**/*.tsx",
+    "packages/contracts/**/*.ts",
+    "packages/test-fixtures/**/*.ts"
+  ]
+}

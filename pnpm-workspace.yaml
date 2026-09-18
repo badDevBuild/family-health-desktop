@@ -1,0 +1,12 @@
+packages:
+  - apps/*
+  - packages/*
+
+# 发行矩阵需要把目标平台的 optional 原生包同时放进依赖图；实际执行和签名仍在对应目标机完成。
+supportedArchitectures:
+  os:
+    - darwin
+    - win32
+  cpu:
+    - arm64
+    - x64

@@ -1,0 +1,32 @@
+appId: com.familyhealth.desktop
+productName: 家庭健康看板
+afterPack: scripts/after-pack.mjs
+npmRebuild: false
+directories:
+  output: release
+files:
+  - out/**/*
+  - package.json
+  - docs/THIRD_PARTY_NOTICES.md
+extraResources:
+  - from: .runtime-stage/codex
+    to: runtime/codex
+  - from: .runtime-stage/libreoffice
+    to: runtime/libreoffice
+asarUnpack:
+  - node_modules/better-sqlite3/**/*
+  - node_modules/@napi-rs/canvas*/**/*
+mac:
+  icon: build/icon.png
+  category: public.app-category.healthcare-fitness
+  target:
+    - target: dmg
+  hardenedRuntime: true
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+publish: null

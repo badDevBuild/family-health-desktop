@@ -1,0 +1,81 @@
+name: Cross-platform beta build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'electron-builder.yml'
+      - '.github/workflows/cross-platform-beta.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            os: macos-latest
+            package_command: pnpm package:mac:arm64
+            artifact_name: family-health-macos-arm64
+            unpacked_path: release/mac-arm64/家庭健康看板.app
+            scan_target: darwin-arm64
+          - label: macOS x64
+            os: macos-15-intel
+            package_command: pnpm package:mac:x64
+            artifact_name: family-health-macos-x64
+            unpacked_path: release/mac/家庭健康看板.app
+            scan_target: darwin-x64
+          - label: Windows x64
+            os: windows-latest
+            package_command: pnpm package:win:x64
+            artifact_name: family-health-windows-x64
+            unpacked_path: release/win-unpacked
+            scan_target: win32-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.1
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install locked Codex runtime source
+        run: npm install --global @openai/codex@0.145.0
+
+      - name: Run static checks and automated tests
+        run: pnpm check
+
+      - name: Build unsigned target package
+        run: ${{ matrix.package_command }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Scan packaged runtime boundary
+        shell: bash
+        run: node scripts/scan-release-artifact.mjs "${{ matrix.unpacked_path }}" "${{ matrix.scan_target }}"
+
+      - name: Upload unsigned test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release/**
+          if-no-files-found: error
+          retention-days: 7

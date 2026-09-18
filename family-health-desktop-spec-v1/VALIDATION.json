@@ -1,0 +1,63 @@
+{
+  "scope": "Document-package structural validation only; no product tests executed.",
+  "date": "2026-09-17",
+  "checks": {
+    "markdown_utf8": true,
+    "balanced_fences": true,
+    "sources_resolved": true,
+    "source_definitions_24": true,
+    "chapter_sequence_0_to_26": true,
+    "104_unique_acceptance_cases": true,
+    "21_tasks_T00_to_T20": true,
+    "acceptance_references_resolved": true,
+    "task_references_resolved": true,
+    "no_web_tool_markers": true,
+    "html_has_no_external_assets": true,
+    "all_local_document_links_exist": true
+  },
+  "passed": true,
+  "counts": {
+    "main_chapters": 27,
+    "tasks": 21,
+    "acceptance_cases": 104,
+    "sources": 24
+  },
+  "files": [
+    {
+      "name": "03-Codex实施任务书.md",
+      "bytes": 24141,
+      "characters": 11868
+    },
+    {
+      "name": "02-验收测试清单.md",
+      "bytes": 24317,
+      "characters": 11448
+    },
+    {
+      "name": "01-需求与实施方案.md",
+      "bytes": 109187,
+      "characters": 52123
+    },
+    {
+      "name": "00-阅读与交付说明.md",
+      "bytes": 2588,
+      "characters": 1143
+    },
+    {
+      "name": "家庭健康看板-完整方案.html",
+      "bytes": 194577,
+      "characters": 110452
+    }
+  ],
+  "html_render_check": {
+    "title": "家庭健康看板｜需求与实施完整方案",
+    "tables": 32,
+    "headings": 187,
+    "brokenAnchors": [],
+    "externalAssets": 0,
+    "documentOverflow": false,
+    "mobileOverflow": false,
+    "rendered": true,
+    "note": "Local generated document rendering only; not a health product UI or App test."
+  }
+}

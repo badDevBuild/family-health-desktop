@@ -1,0 +1,23 @@
+{
+  "status": "passed",
+  "startedAt": "2026-09-17T18:30:48.186Z",
+  "platform": "darwin",
+  "arch": "arm64",
+  "runtimeVersion": "codex-cli 0.145.0",
+  "privateCodexHome": true,
+  "realLoginAttempted": false,
+  "realHealthDataUsed": false,
+  "initialize": "passed",
+  "initializedNotification": "sent",
+  "accountRead": {
+    "authenticated": false,
+    "requiresOpenaiAuth": true
+  },
+  "modelList": {
+    "count": 5,
+    "availableWithoutLogin": true
+  },
+  "stderrSummary": [],
+  "finishedAt": "2026-09-17T18:30:48.279Z",
+  "elapsedMs": 93
+}

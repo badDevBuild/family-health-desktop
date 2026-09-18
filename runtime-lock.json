@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "status": "g0-partial-cross-platform-artifacts",
+  "generatedAt": "2026-09-18T09:37:38+08:00",
+  "runtime": {
+    "version": "0.145.0",
+    "sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+    "platform": "darwin",
+    "arch": "arm64",
+    "bundled": true,
+    "bundledTargets": [
+      "darwin-arm64",
+      "darwin-x64",
+      "win32-x64"
+    ]
+  },
+  "protocol": {
+    "generatedWithExperimental": true,
+    "typescriptDirectory": "schemas/codex/0.145.0/ts",
+    "jsonSchemaDirectory": "schemas/codex/0.145.0/json",
+    "v1BundleSha256": "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68",
+    "v2BundleSha256": "8a61d804d6da2b52ac11a00992024eff723f7ee4fcce31510fbc308fdf565fc6"
+  },
+  "verification": {
+    "schemaGeneration": "passed-on-developer-machine",
+    "stdioInitialize": "passed-with-private-unauthenticated-codex-home",
+    "chatgptLogin": "not-run",
+    "imageInput": "not-run",
+    "structuredOutput": "not-run",
+    "interrupt": "not-run",
+    "permissionBoundary": "not-run",
+    "macArm64Package": "unsigned-dmg-and-unpacked-app-passed",
+    "macX64Package": "unsigned-dmg-packaged-and-rosetta-smoke-passed-target-machine-pending",
+    "windowsX64Package": "unsigned-nsis-and-unpacked-app-static-scan-passed-target-machine-pending"
+  },
+  "packagingArtifacts": {
+    "directory": "release",
+    "macArm64DmgSha256": "d72461a543ec2034b37b7138e2c8b261ec1fc6498737810534a5c1719fc3da40",
+    "macX64DmgSha256": "91d005383bb37185d309c144099b3a0e653edd0b3ac81a05b0f6f43309124777",
+    "windowsX64NsisSha256": "2733a74d6f4143f42f28e68bd8dc2b41ad78d9940bb9c34599e67ee8fa078875",
+    "sqliteNativeSha256": {
+      "darwin-arm64": "252525b37ab070c03ef7b1457b30e5f5792a07b74e34ff12bfbd5059c29b3c36",
+      "darwin-x64": "fa63a771f59495f477233fa2b9de566e21097da5e062d2723e1d2ab3c5d6f1ed",
+      "win32-x64": "69d712b1a0a8d94e45b9ebd75de13fea01fafad5edf883ec6b0c2fba76e445a4"
+    }
+  }
+}
