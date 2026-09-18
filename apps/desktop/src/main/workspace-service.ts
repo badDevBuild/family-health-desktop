@@ -611,6 +611,13 @@ export class PersonalWorkspaceService {
         resolutionStatus: 'open' as const
       }))
     ];
+    const storedJobs = this.store.listStoredJobs();
+    const latestJobByDocument = new Map<string, string>();
+    for (const job of storedJobs) {
+      for (const documentId of job.documentIds) {
+        if (!latestJobByDocument.has(documentId)) latestJobByDocument.set(documentId, job.id);
+      }
+    }
     return dashboardSnapshotSchema.parse({
       workspaceMode: 'personal',
       workspaceName: this.workspaceName,
@@ -699,12 +706,17 @@ export class PersonalWorkspaceService {
         evidenceCount: guidance.evidenceObservationIds.length
       }))),
       inbox,
-      jobs: this.store.listStoredJobs().map((job) => ({
-        ...job,
-        canCancel: ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status)
-          && job.statusText !== '正在安全停止',
-        canRetry: job.status === 'failed'
-      })),
+      jobs: storedJobs.map((job) => {
+        const superseded = job.documentIds.some((documentId) => latestJobByDocument.get(documentId) !== job.id);
+        const { documentIds: _documentIds, ...summary } = job;
+        return {
+          ...summary,
+          statusText: superseded ? '已有较新的处理任务，请使用上方任务继续' : job.statusText,
+          canCancel: !superseded && ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status)
+            && job.statusText !== '正在安全停止',
+          canRetry: !superseded && job.status === 'failed'
+        };
+      }),
       reviews,
       actions: this.store.listActionItems().filter((action) => activePersonIds.has(action.personId)),
       notes: this.store.listManualNotes().filter((note) => activePersonIds.has(note.personId)),

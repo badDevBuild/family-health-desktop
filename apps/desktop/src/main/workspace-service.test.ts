@@ -142,12 +142,23 @@ describe('PersonalWorkspaceService', () => {
 
     expect(() => service.processNow({ accountState, consentVersion: 1, documentIds: [documentId] }))
       .toThrow('DOCUMENT_ALREADY_IN_PROCESSING');
-    expect(service.getSnapshot(accountState)).toMatchObject({
+    service.store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T01:00:00Z', initialStatus: 'queued', consentId: job.consentId,
+      groups: [{ personId, documentIds: [documentId], inputSignature: 'newer-timeout-task' }]
+    });
+    const newerJob = service.store.claimNextQueuedJob('test-runner-2', fingerprint)!;
+    const newerAttemptId = service.store.startJobAttempt(newerJob.id, 'test-runtime');
+    service.store.finishJobAttempt({ attemptId: newerAttemptId, status: 'failed', errorCode: 'CODEX_TURN_TIMEOUT' });
+    service.store.finishJob(newerJob.id, 'failed');
+
+    const snapshot = service.getSnapshot(accountState);
+    expect(snapshot).toMatchObject({
       pendingInboxCount: 0,
       inbox: [expect.objectContaining({ id: documentId, inProcessingCenter: true })],
-      jobs: [expect.objectContaining({
-        status: 'failed', statusText: expect.stringContaining('等待超时'), canCancel: false, canRetry: true
-      })]
+      jobs: [
+        expect.objectContaining({ status: 'failed', statusText: expect.stringContaining('等待超时'), canCancel: false, canRetry: true }),
+        expect.objectContaining({ status: 'failed', statusText: expect.stringContaining('较新的处理任务'), canCancel: false, canRetry: false })
+      ]
     });
     service.close();
   });

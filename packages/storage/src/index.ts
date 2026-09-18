@@ -120,6 +120,7 @@ export interface OpenExtractionReviewIssue {
 
 export interface StoredJobSummary {
   id: string;
+  documentIds: string[];
   batchLabel: string;
   personLabel: string | null;
   stage: 'extract' | 'review_facts' | 'analyze' | 'guidance' | 'review_derived' | 'publish';
@@ -2180,7 +2181,7 @@ export class WorkspaceStore {
       FROM jobs j
       LEFT JOIN batches b ON b.id = j.batch_id
       LEFT JOIN persons p ON p.id = j.person_id
-      ORDER BY j.created_at DESC, j.id DESC
+      ORDER BY j.created_at DESC, j.rowid DESC
     `).all() as Array<Record<string, unknown>>;
     return rows.map((row) => {
       const checkpoint = row.checkpoint_json ? JSON.parse(String(row.checkpoint_json)) as { documentIds?: string[]; completedUnits?: number; cancelRequested?: boolean } : {};
@@ -2202,6 +2203,7 @@ export class WorkspaceStore {
             : labels.failed;
       return {
         id: String(row.id),
+        documentIds: checkpoint.documentIds ?? [],
         batchLabel: `手动处理 · ${new Date(String(row.batch_created_at)).toLocaleString('zh-CN')}`,
         personLabel: row.person_label === null ? null : String(row.person_label),
         stage: String(row.stage) as StoredJobSummary['stage'],
