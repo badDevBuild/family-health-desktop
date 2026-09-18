@@ -349,6 +349,27 @@ export const acceptanceDecisionSchema = z.object({
 
 export type AcceptanceDecision = z.infer<typeof acceptanceDecisionSchema>;
 
+export const reviewCandidateDiffSchema = z.object({
+  localKey: idSchema,
+  itemName: z.string().min(1),
+  fields: z.array(z.enum([
+    'presence',
+    'originalName',
+    'standardNameCandidate',
+    'value',
+    'unitRaw',
+    'referenceRangeRaw',
+    'reportedAbnormalFlag',
+    'specimen',
+    'method',
+    'bodySite',
+    'clinicalDate',
+    'issues'
+  ])).min(1)
+}).strict();
+
+export type ReviewCandidateDiff = z.infer<typeof reviewCandidateDiffSchema>;
+
 export const actionItemSchema = z.object({
   id: idSchema,
   personId: idSchema,
@@ -375,6 +396,7 @@ export const reviewIssueSchema = z.object({
   description: z.string().min(1),
   evidenceRefs: z.array(idSchema),
   candidateOptions: z.array(observationCandidateSchema),
+  candidateDiffs: z.array(reviewCandidateDiffSchema),
   reportedName: z.string().min(1).nullable(),
   resolutionStatus: z.enum(['open', 'resolved', 'deferred'])
 }).strict();
@@ -821,6 +843,11 @@ export const resolveReviewInputSchema = z.discriminatedUnion('action', [
     issueId: idSchema,
     documentId: idSchema,
     personId: idSchema
+  }).strict(),
+  z.object({
+    action: z.literal('retry_review'),
+    issueId: idSchema,
+    documentId: idSchema
   }).strict(),
   z.object({
     action: z.literal('archive_only'),

@@ -609,6 +609,61 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('旧版事实核对可以安全回到队列且不会提前写入事实', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({ bytes: Buffer.from('虚构报告 4.2 mmol/L'), mediaType: 'text/plain', displayName: '旧版核对.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'd'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: [],
+      candidateOptions: [{
+        localKey: 'ldl-legacy', originalName: '低密度脂蛋白胆固醇', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: null,
+        evidence: [{ sourceSpanId: 'legacy-span', quote: '4.2 mmol/L' }], issues: []
+      }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+
+    store.retryExtractionReview({ issueId, documentId: document.documentId });
+
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+
+    const currentIssueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: [],
+      candidateOptions: [{
+        localKey: 'current-conflict', originalName: '低密度脂蛋白胆固醇', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric', rawText: '4.3', decimal: '4.3', comparator: 'eq' },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: null,
+        evidence: [{ sourceSpanId: 'current-span', quote: '4.3 mmol/L' }], issues: []
+      }],
+      candidateDiffs: [{ localKey: 'current-conflict', itemName: '低密度脂蛋白胆固醇', fields: ['value'] }]
+    });
+    expect(() => store.retryExtractionReview({ issueId: currentIssueId, documentId: document.documentId })).toThrow('REVIEW_ACTION_INVALID');
+    store.close();
+  });
+
   it('日程设置使用 revision，且同一时区日程槽只创建一次授权批次', () => {
     const store = makeStore();
     const initial = store.getOrCreateSchedule('Asia/Shanghai', '2026-09-18T12:00:00.000Z');

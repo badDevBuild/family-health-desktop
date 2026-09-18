@@ -850,6 +850,21 @@ function ReviewBanner({ review, onOpen }: { review: ReviewIssue; onOpen(): void 
   return <button className="review-banner" onClick={onOpen}><span className="review-banner__icon"><CircleHelp size={21} /></span><span><strong>{review.title}</strong><small>{review.description}</small></span><StatusBadge tone="warning">需要你的确认</StatusBadge><ChevronRight size={18} /></button>;
 }
 
+const reviewDiffFieldLabels: Record<ReviewIssue['candidateDiffs'][number]['fields'][number], string> = {
+  presence: '是否存在这项',
+  originalName: '报告项目名',
+  standardNameCandidate: '标准项目名',
+  value: '结果',
+  unitRaw: '单位',
+  referenceRangeRaw: '参考范围',
+  reportedAbnormalFlag: '报告异常标记',
+  specimen: '标本',
+  method: '检验方法',
+  bodySite: '检查部位',
+  clinicalDate: '临床日期',
+  issues: '数据问题'
+};
+
 function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResolve }: {
   review: ReviewIssue;
   snapshot: DashboardSnapshot;
@@ -866,7 +881,14 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
     ? snapshot.persons.find((person) => person.id === review.personId) ?? null
     : null;
   const isDerived = review.kind === 'derived_safety';
-  const canCorrect = review.kind === 'field_conflict' && candidates.length > 0
+  const isFieldConflict = review.kind === 'field_conflict';
+  const isLegacyFieldReview = isFieldConflict && candidates.length > 0 && review.candidateDiffs.length === 0;
+  const differenceByLocalKey = new Map(review.candidateDiffs.map((difference) => [difference.localKey, difference]));
+  const visibleCandidates = candidates
+    .map((candidate, index) => ({ candidate, index, difference: differenceByLocalKey.get(candidate.localKey) }))
+    .filter((item) => item.difference);
+  const hasVisibleConflicts = isFieldConflict && !isLegacyFieldReview && visibleCandidates.length > 0;
+  const canCorrect = hasVisibleConflicts
     && candidates.every((candidate) => candidate.value.kind !== 'numeric' || /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(candidate.value.decimal));
   const updateCandidate = (index: number, updater: (candidate: (typeof candidates)[number]) => (typeof candidates)[number]) => {
     setCandidates((current) => current.map((candidate, candidateIndex) => candidateIndex === index ? updater(candidate) : candidate));
@@ -874,7 +896,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const canSubmit = !busy
     && (!isAssignment || Boolean(personId))
     && (!isIdentityConfirmation || Boolean(targetPerson))
-    && (review.kind !== 'field_conflict' || canCorrect);
+    && (!isFieldConflict || isLegacyFieldReview || canCorrect);
 
   async function submitResolution() {
     setBusy(true);
@@ -883,6 +905,8 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
         ? { action: 'assign_person', documentId: review.documentId, personId }
         : isIdentityConfirmation && targetPerson
           ? { action: 'confirm_identity', issueId: review.id, documentId: review.documentId, personId: targetPerson.id }
+          : isLegacyFieldReview
+            ? { action: 'retry_review', issueId: review.id, documentId: review.documentId }
           : canCorrect
             ? { action: 'accept_correction', issueId: review.id, documentId: review.documentId, candidates }
             : { action: isDerived ? 'dismiss_derived' : 'archive_only', issueId: review.id, documentId: review.documentId };
@@ -900,32 +924,39 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
           <div><span className="eyebrow">例外核对</span><h2 id="review-resolution-title">{review.title}</h2></div>
           <button className="icon-button" onClick={onClose} aria-label="关闭例外核对"><X size={19} /></button>
         </header>
-        <p>{review.description}</p>
-        <button className="evidence-link" onClick={onEvidence}><FileCheck2 size={17} /> 查看原始依据</button>
-        {isAssignment ? (
-          <label>这份资料属于
-            <select value={personId} onChange={(event) => setPersonId(event.target.value)}>
-              {snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}
-            </select>
-          </label>
-        ) : isIdentityConfirmation && targetPerson ? (
-          <>
-            <dl className="identity-confirmation">
-              <div><dt>报告姓名</dt><dd>{review.reportedName}</dd></div>
-              <div><dt>将归入</dt><dd>{targetPerson.displayName}{targetPerson.relation ? ` · ${targetPerson.relation}` : ''}</dd></div>
-            </dl>
-            <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。</p></div></div>
-          </>
-        ) : canCorrect ? (
-          <div className="manual-note-list">{candidates.map((candidate, index) => <article key={candidate.localKey}><label>项目名<input value={candidate.originalName} onChange={(event) => updateCandidate(index, (current) => ({ ...current, originalName: event.target.value }))} /></label><label>结果<input value={candidate.value.rawText ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label><label>单位<input value={candidate.unitRaw ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, unitRaw: event.target.value || null }))} /></label><label>临床日期<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label></article>)}</div>
-        ) : (
-          <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{isDerived ? '报告事实不会被删除' : '原始资料会继续保留'}</strong><p>{isDerived ? '只是不发布这次未通过安全复核的分析和生活指南。' : '选择仅归档后，这份资料不会进入趋势或后续分析。'}</p></div></div>
-        )}
+        <div className="review-resolution-scroll">
+          <p className="review-resolution-intro">{review.description}</p>
+          <button className="evidence-link" onClick={onEvidence}><FileCheck2 size={17} /> 查看原始依据</button>
+          {isAssignment ? (
+            <label>这份资料属于
+              <select value={personId} onChange={(event) => setPersonId(event.target.value)}>
+                {snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}
+              </select>
+            </label>
+          ) : isIdentityConfirmation && targetPerson ? (
+            <>
+              <dl className="identity-confirmation">
+                <div><dt>报告姓名</dt><dd>{review.reportedName}</dd></div>
+                <div><dt>将归入</dt><dd>{targetPerson.displayName}{targetPerson.relation ? ` · ${targetPerson.relation}` : ''}</dd></div>
+              </dl>
+              <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。</p></div></div>
+            </>
+          ) : isLegacyFieldReview ? (
+            <div className="info-callout compact"><RefreshCw size={18} /><div><strong>不需要逐项检查这 {candidates.length} 项内容</strong><p>旧版把标本、日期或证据摘录的写法差异也当成冲突。点击重新核对后，系统会用新规则再处理；只有数值、项目、单位等核心事实真正不一致时才会再次询问你。</p></div></div>
+          ) : hasVisibleConflicts ? (
+            <>
+              <div className="info-callout compact"><CircleHelp size={18} /><div><strong>为什么需要确认</strong><p>两轮独立读取在下列核心字段上给出了不同结果。请只对照原始报告检查这些差异项；其余一致项目无需逐项确认。</p></div></div>
+              <div className="manual-note-list review-difference-list">{visibleCandidates.map(({ candidate, index, difference }) => <article key={candidate.localKey}><div className="review-difference-fields"><strong>两轮不一致：</strong><span>{difference!.fields.map((field) => reviewDiffFieldLabels[field]).join('、')}</span></div><label>项目名<input value={candidate.originalName} onChange={(event) => updateCandidate(index, (current) => ({ ...current, originalName: event.target.value }))} /></label><label>结果<input value={candidate.value.rawText ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label><label>单位<input value={candidate.unitRaw ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, unitRaw: event.target.value || null }))} /></label><label>临床日期<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label></article>)}</div>
+            </>
+          ) : (
+            <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{isDerived ? '报告事实不会被删除' : '原始资料会继续保留'}</strong><p>{isDerived ? '只是不发布这次未通过安全复核的分析和生活指南。' : '选择仅归档后，这份资料不会进入趋势或后续分析。'}</p></div></div>
+          )}
+        </div>
         <div className="dialog-actions">
           <button className="secondary-button" onClick={onClose}>稍后处理</button>
           <button className="primary-button" disabled={!canSubmit} onClick={() => void submitResolution()}>
             {busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}
-            {isAssignment ? '确认归属' : isIdentityConfirmation ? '确认是同一人' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}
+            {isAssignment ? '确认归属' : isIdentityConfirmation ? '确认是同一人' : isLegacyFieldReview ? '按新规则重新核对' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}
           </button>
         </div>
       </section>
@@ -1421,6 +1452,7 @@ export default function App() {
     setToast(input.action === 'assign_person'
       ? '成员归属已确认，资料已进入待处理队列。'
       : input.action === 'confirm_identity' ? '身份关系已确认，任务将从事实提取重新核对并继续。'
+      : input.action === 'retry_review' ? '已关闭旧版核对事项，报告正在按新规则重新核对。'
       : input.action === 'archive_only' ? '资料已仅归档，不会进入分析。'
       : input.action === 'accept_correction' ? '修正后的事实已保存，并保留原始证据链。'
       : '报告事实已保留，本次未通过复核的说明不会发布。');

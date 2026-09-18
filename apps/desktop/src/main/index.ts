@@ -715,6 +715,8 @@ function registerIpc(): void {
         personalWorkspace.store.confirmDocumentIdentity(input);
       } else if (input.action === 'accept_correction') {
         personalWorkspace.acceptCorrectedFacts(input);
+      } else if (input.action === 'retry_review') {
+        personalWorkspace.store.retryExtractionReview(input);
       } else {
         personalWorkspace.store.resolveReviewIssue(input);
       }

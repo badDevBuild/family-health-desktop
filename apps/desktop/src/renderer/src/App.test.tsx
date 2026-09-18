@@ -196,7 +196,7 @@ describe('App member display editing', () => {
       id: 'identity-review-1', personId: 'personal-person-1', documentId: 'document-identity-1',
       kind: 'person_conflict', severity: 'blocking', title: '确认报告姓名与成员身份',
       description: '报告写的是“测试姓名甲”，当前准备归入已选成员。请确认两者是否为同一人。',
-      evidenceRefs: ['identity-span-1'], candidateOptions: [], reportedName: '测试姓名甲', resolutionStatus: 'open'
+      evidenceRefs: ['identity-span-1'], candidateOptions: [], candidateDiffs: [], reportedName: '测试姓名甲', resolutionStatus: 'open'
     }];
     snapshot.openReviewCount = 1;
     const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'confirm_identity' as const } }));
@@ -214,6 +214,83 @@ describe('App member display editing', () => {
       action: 'confirm_identity', issueId: 'identity-review-1', documentId: 'document-identity-1', personId: 'personal-person-1'
     }));
     expect(await screen.findByText('身份关系已确认，任务将从事实提取重新核对并继续。')).toBeTruthy();
+  });
+
+  it('旧版全量核对不再展示 77 个输入项，而是一键按新规则重跑', async () => {
+    const snapshot = createPersonalSnapshot();
+    const candidateOptions = Array.from({ length: 77 }, (_, index) => ({
+      localKey: `legacy-${index + 1}`,
+      originalName: `虚构项目 ${index + 1}`,
+      standardNameCandidate: null,
+      value: { kind: 'numeric' as const, rawText: String(index + 1), decimal: String(index + 1), comparator: 'eq' as const },
+      unitRaw: null,
+      referenceRangeRaw: null,
+      reportedAbnormalFlag: null,
+      specimen: null,
+      method: null,
+      bodySite: null,
+      clinicalDate: null,
+      evidence: [{ sourceSpanId: 'legacy-span', quote: String(index + 1) }],
+      issues: []
+    }));
+    snapshot.reviews = [{
+      id: 'legacy-review-1', personId: 'personal-person-1', documentId: 'legacy-document-1',
+      kind: 'field_conflict', severity: 'blocking', title: '按新规则重新核对这份报告',
+      description: '这项核对由旧版逐字段完全一致规则产生。', evidenceRefs: ['legacy-span'],
+      candidateOptions, candidateDiffs: [], reportedName: null, resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'retry_review' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /按新规则重新核对这份报告/ }));
+    expect(await screen.findByText(/不需要逐项检查这 77 项内容/)).toBeTruthy();
+    expect(screen.queryByDisplayValue('虚构项目 1')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '按新规则重新核对' }));
+
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'retry_review', issueId: 'legacy-review-1', documentId: 'legacy-document-1'
+    }));
+    expect(await screen.findByText('已关闭旧版核对事项，报告正在按新规则重新核对。')).toBeTruthy();
+  });
+
+  it('真正的核心冲突只展示差异项并保留滚动内容区', async () => {
+    const snapshot = createPersonalSnapshot();
+    const candidates = ['收缩压', '舒张压', '身高'].map((name, index) => ({
+      localKey: `candidate-${index + 1}`,
+      originalName: name,
+      standardNameCandidate: name,
+      value: { kind: 'numeric' as const, rawText: String(100 + index), decimal: String(100 + index), comparator: 'eq' as const },
+      unitRaw: index < 2 ? 'mmHg' : 'cm',
+      referenceRangeRaw: null,
+      reportedAbnormalFlag: null,
+      specimen: null,
+      method: null,
+      bodySite: null,
+      clinicalDate: '2026-09-18',
+      evidence: [{ sourceSpanId: 'conflict-span', quote: `${name} ${100 + index}` }],
+      issues: []
+    }));
+    snapshot.reviews = [{
+      id: 'difference-review-1', personId: 'personal-person-1', documentId: 'difference-document-1',
+      kind: 'field_conflict', severity: 'blocking', title: '发现 1 项核心事实差异',
+      description: '两轮核对共有 3 项候选，其中 1 项核心字段不一致。只需核对下方差异项。',
+      evidenceRefs: ['conflict-span'], candidateOptions: candidates,
+      candidateDiffs: [{ localKey: 'candidate-1', itemName: '收缩压', fields: ['value'] }],
+      reportedName: null, resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    installBridge(snapshot);
+    const { container } = render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /发现 1 项核心事实差异/ }));
+    expect(await screen.findByDisplayValue('收缩压')).toBeTruthy();
+    expect(screen.queryByDisplayValue('舒张压')).toBeNull();
+    expect(screen.queryByDisplayValue('身高')).toBeNull();
+    expect(screen.getByText('两轮不一致：')).toBeTruthy();
+    expect(screen.getAllByText('结果').length).toBeGreaterThanOrEqual(1);
+    expect(container.querySelector('.review-resolution-scroll')).toBeTruthy();
   });
 
   it('requires explicit confirmation before logout and keeps the local workspace visible', async () => {

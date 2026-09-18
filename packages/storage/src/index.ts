@@ -2,7 +2,16 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
-import type { ActionItem, CreateManualNoteInput, DerivedSnapshotCandidate, ManualNote, ObservationCandidate, Person, SourceManifest } from '@contracts';
+import type {
+  ActionItem,
+  CreateManualNoteInput,
+  DerivedSnapshotCandidate,
+  ManualNote,
+  ObservationCandidate,
+  Person,
+  ReviewCandidateDiff,
+  SourceManifest
+} from '@contracts';
 
 export const WORKSPACE_SCHEMA_VERSION = 8;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
@@ -122,6 +131,7 @@ export interface OpenExtractionReviewIssue {
   severity: 'blocking' | 'warning';
   evidenceRefs: string[];
   candidateOptions: ObservationCandidate[];
+  candidateDiffs: ReviewCandidateDiff[];
   reportedName: string | null;
 }
 
@@ -1271,6 +1281,7 @@ export class WorkspaceStore {
     evidenceRefs: string[];
     preserveDocumentStatus?: boolean;
     candidateOptions?: ObservationCandidate[];
+    candidateDiffs?: ReviewCandidateDiff[];
     reportedName?: string;
   }): string {
     const id = randomUUID();
@@ -1283,9 +1294,10 @@ export class WorkspaceStore {
       `).run(
         id, input.jobId ?? null, `document:${input.documentId}`, input.kind,
         input.severity, JSON.stringify(input.evidenceRefs),
-        input.candidateOptions || input.reportedName
+        input.candidateOptions || input.candidateDiffs || input.reportedName
           ? JSON.stringify({
               ...(input.candidateOptions ? { candidateOptions: input.candidateOptions } : {}),
+              ...(input.candidateDiffs ? { candidateDiffs: input.candidateDiffs } : {}),
               ...(input.reportedName ? { reportedName: input.reportedName } : {})
             })
           : null,
@@ -1310,7 +1322,11 @@ export class WorkspaceStore {
     `).all() as Array<Record<string, unknown>>;
     return rows.map((row) => {
       const payload = row.payload_json
-        ? JSON.parse(String(row.payload_json)) as { candidateOptions?: ObservationCandidate[]; reportedName?: string }
+        ? JSON.parse(String(row.payload_json)) as {
+            candidateOptions?: ObservationCandidate[];
+            candidateDiffs?: ReviewCandidateDiff[];
+            reportedName?: string;
+          }
         : {};
       return {
         id: String(row.id),
@@ -1320,9 +1336,47 @@ export class WorkspaceStore {
         severity: String(row.severity) as OpenExtractionReviewIssue['severity'],
         evidenceRefs: JSON.parse(String(row.evidence_refs_json)) as string[],
         candidateOptions: payload.candidateOptions ?? [],
+        candidateDiffs: payload.candidateDiffs ?? [],
         reportedName: payload.reportedName ?? null
       };
     });
+  }
+
+  retryExtractionReview(input: { issueId: string; documentId: string }): void {
+    const transaction = this.db.transaction(() => {
+      const issue = this.db.prepare(`
+        SELECT id, kind, resolution_status, payload_json FROM review_issues
+        WHERE id = ? AND field_ref = 'document:' || ?
+      `).get(input.issueId, input.documentId) as {
+        id: string;
+        kind: string;
+        resolution_status: string;
+        payload_json: string | null;
+      } | undefined;
+      if (!issue || issue.resolution_status !== 'open' || issue.kind !== 'field_conflict') {
+        throw new Error('REVIEW_ISSUE_NOT_OPEN');
+      }
+      const payload = issue.payload_json
+        ? JSON.parse(issue.payload_json) as { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] }
+        : {};
+      if (!payload.candidateOptions?.length || (payload.candidateDiffs?.length ?? 0) > 0) {
+        throw new Error('REVIEW_ACTION_INVALID');
+      }
+      const document = this.db.prepare(`SELECT status FROM documents WHERE id = ?`).get(input.documentId) as { status: string } | undefined;
+      if (!document || document.status !== 'needs_review') throw new Error('DOCUMENT_REVIEW_STATE_CONFLICT');
+
+      this.db.prepare(`
+        UPDATE review_issues SET resolution_status = 'resolved', resolution_revision = 1
+        WHERE id = ?
+      `).run(input.issueId);
+      this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ?`).run(input.documentId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'review_issue.requeued', ?, '旧版核对事项已关闭，资料按当前规则重新核对', ?)
+      `).run(randomUUID(), input.issueId, this.now().toISOString());
+      this.resumeWaitingJobsAfterReview(input.documentId);
+    });
+    transaction();
   }
 
   markReviewIssueCorrected(issueId: string, documentId: string): void {

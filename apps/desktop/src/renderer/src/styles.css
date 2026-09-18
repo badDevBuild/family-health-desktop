@@ -442,6 +442,13 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .identity-confirmation dt { color: var(--warm-500); font-size: 16px; }
 .identity-confirmation dd { margin: 0; color: var(--warm-900); font-size: 17px; font-weight: 700; }
 .review-resolution-dialog .identity-confirmation + .info-callout p { font-size: 14px; line-height: 1.6; }
+.review-resolution-dialog { width: min(680px, calc(100vw - 48px)); max-height: calc(100vh - 48px); grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
+.review-resolution-scroll { min-height: 0; display: grid; gap: 14px; overflow: auto; overscroll-behavior: contain; padding: 2px 5px 2px 1px; }
+.review-resolution-intro { margin: -3px 0 2px; color: var(--warm-600); font-size: 16px; line-height: 1.6; }
+.review-resolution-dialog > .dialog-actions { margin-top: 0; padding-top: 12px; border-top: 1px solid var(--warm-200); background: var(--warm-50); }
+.review-difference-list { margin-top: 0; }
+.review-difference-fields { align-items: flex-start !important; padding-bottom: 4px; color: var(--warm-600); font-size: 13px; line-height: 1.5; }
+.review-difference-fields strong { flex: 0 0 auto; color: var(--warning); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 3px; }
 .field-error { color: var(--alert); font-size: 12px; }
 .spin { animation: spin 1.3s linear infinite; }

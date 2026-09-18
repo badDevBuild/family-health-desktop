@@ -215,9 +215,65 @@ describe('DocumentExtractionPipeline', () => {
     expect(service.getSnapshot(null).inbox[0]).toMatchObject({ status: 'needs_review' });
     const issue = service.store.listOpenExtractionReviewIssues()[0]!;
     expect(issue.candidateOptions).toHaveLength(1);
+    expect(issue.candidateDiffs).toEqual([expect.objectContaining({ itemName: '低密度脂蛋白胆固醇', fields: ['presence'] })]);
     service.acceptCorrectedFacts({ issueId: issue.id, documentId, candidates: issue.candidateOptions });
     expect(service.store.getFactRevision(personId)).toBe(1);
     expect(service.getSnapshot(null).inbox[0]).toMatchObject({ status: 'completed' });
+    service.close();
+  });
+
+  it('两轮仅证据摘录或单侧可选元数据不同时继续发布', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const first: ExtractionResult = {
+      ...output,
+      candidates: output.candidates.map((candidate) => ({ ...candidate, specimen: '血' }))
+    };
+    const second: ExtractionResult = {
+      ...output,
+      candidates: output.candidates.map((candidate) => ({
+        ...candidate,
+        clinicalDate: null,
+        evidence: candidate.evidence.map((reference) => ({ ...reference, quote: '低密度脂蛋白胆固醇 4.2 mmol/L' }))
+      }))
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `soft-diff-thread-${turn}`,
+        turnId: `soft-diff-turn-${++turn}`,
+        output: turn === 1 ? first : second
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('核心数值不一致时只记录真正的差异字段并保持未发布', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const conflicting: ExtractionResult = {
+      ...output,
+      candidates: output.candidates.map((candidate) => ({
+        ...candidate,
+        value: { kind: 'numeric', rawText: '4.3', decimal: '4.3', comparator: 'eq' }
+      }))
+    };
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `hard-diff-thread-${turn}`,
+        turnId: `hard-diff-turn-${++turn}`,
+        output: turn === 1 ? output : conflicting
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
+    expect(service.store.getFactRevision(personId)).toBe(0);
+    const issue = service.store.listOpenExtractionReviewIssues()[0]!;
+    expect(issue.candidateDiffs).toEqual([{ localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['value'] }]);
+    expect(issue.candidateOptions[0]!.value).toMatchObject({ decimal: '4.3' });
     service.close();
   });
 

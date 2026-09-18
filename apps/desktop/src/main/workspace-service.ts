@@ -587,6 +587,7 @@ export class PersonalWorkspaceService {
         description: '这份资料尚未可靠关联到家庭成员。确认之前不会发送给 AI。',
         evidenceRefs: [],
         candidateOptions: [],
+        candidateDiffs: [],
         reportedName: null,
         resolutionStatus: 'open' as const
       }));
@@ -595,26 +596,38 @@ export class PersonalWorkspaceService {
     const extractionDocumentIds = new Set(extractionIssues.map((issue) => issue.documentId));
     const reviews = [
       ...assignmentReviews.filter((issue) => !extractionDocumentIds.has(issue.documentId)),
-      ...extractionIssues.map((issue) => ({
-        id: issue.id,
-        personId: issue.personId,
-        documentId: issue.documentId,
-        kind: issue.kind,
-        severity: issue.severity,
-        title: issue.kind === 'person_conflict'
-          ? '确认报告姓名与成员身份'
-          : issue.kind === 'field_conflict' ? '两次事实核对结果不一致'
-          : issue.kind === 'derived_safety' ? '健康说明未通过安全复核' : '资料覆盖需要人工确认',
-        description: issue.kind === 'person_conflict'
-          ? `报告写的是“${issue.reportedName ?? '未识别姓名'}”，当前准备归入已选成员。请确认两者是否为同一人。`
-          : issue.kind === 'derived_safety'
-          ? '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
-          : '为避免把不确定内容写入健康档案，这份资料已暂停并等待你的核对。',
-        evidenceRefs: issue.evidenceRefs,
-        candidateOptions: issue.candidateOptions,
-        reportedName: issue.reportedName,
-        resolutionStatus: 'open' as const
-      }))
+      ...extractionIssues.map((issue) => {
+        const legacyFieldReview = issue.kind === 'field_conflict'
+          && issue.candidateOptions.length > 0
+          && issue.candidateDiffs.length === 0;
+        const differenceCount = issue.candidateDiffs.length;
+        return {
+          id: issue.id,
+          personId: issue.personId,
+          documentId: issue.documentId,
+          kind: issue.kind,
+          severity: issue.severity,
+          title: issue.kind === 'person_conflict'
+            ? '确认报告姓名与成员身份'
+            : legacyFieldReview ? '按新规则重新核对这份报告'
+            : issue.kind === 'field_conflict' ? `发现 ${differenceCount} 项核心事实差异`
+            : issue.kind === 'derived_safety' ? '健康说明未通过安全复核' : '资料覆盖需要人工确认',
+          description: issue.kind === 'person_conflict'
+            ? `报告写的是“${issue.reportedName ?? '未识别姓名'}”，当前准备归入已选成员。请确认两者是否为同一人。`
+            : issue.kind === 'derived_safety'
+            ? '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
+            : legacyFieldReview
+              ? '这项核对由旧版逐字段完全一致规则产生。重新核对后，只在核心事实真正冲突时再请你确认。'
+              : issue.kind === 'field_conflict'
+                ? `两轮核对共有 ${issue.candidateOptions.length} 项候选，其中 ${differenceCount} 项核心字段不一致。只需核对下方差异项。`
+                : '为避免把不确定内容写入健康档案，这份资料已暂停并等待你的核对。',
+          evidenceRefs: issue.evidenceRefs,
+          candidateOptions: issue.candidateOptions,
+          candidateDiffs: issue.candidateDiffs,
+          reportedName: issue.reportedName,
+          resolutionStatus: 'open' as const
+        };
+      })
     ];
     const storedJobs = this.store.listStoredJobs();
     const latestJobByDocument = new Map<string, string>();

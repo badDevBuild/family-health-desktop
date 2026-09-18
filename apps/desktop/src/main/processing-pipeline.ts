@@ -2,7 +2,13 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { extractionResultSchema, type ExtractionResult, type ObservationCandidate, type SourceSpan } from '@contracts';
+import {
+  extractionResultSchema,
+  type ExtractionResult,
+  type ObservationCandidate,
+  type ReviewCandidateDiff,
+  type SourceSpan
+} from '@contracts';
 import { evaluateObservationCandidate, stableHash } from '@core';
 import { INGESTION_LIMITS, renderDocxImagesToFiles, renderHeicImagesToPngs, renderPdfPagesToPngs } from '@ingestion';
 import type { JobExecutionGuard, WorkspaceStore } from '@storage';
@@ -28,31 +34,107 @@ interface ImageMapping {
   sourceSpanIds: string[];
 }
 
-function comparableCandidate(candidate: ObservationCandidate): unknown {
+type ReviewDiffField = ReviewCandidateDiff['fields'][number];
+
+function normalizedComparableText(value: string | null): string | null {
+  return value === null ? null : value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
+}
+
+function comparableValue(candidate: ObservationCandidate): unknown {
+  if (candidate.value.kind === 'numeric') {
+    const numeric = Number(candidate.value.decimal);
+    return {
+      kind: candidate.value.kind,
+      decimal: Number.isFinite(numeric) ? numeric : candidate.value.decimal,
+      comparator: candidate.value.comparator
+    };
+  }
+  if (candidate.value.kind === 'text') {
+    return { kind: candidate.value.kind, rawText: normalizedComparableText(candidate.value.rawText) };
+  }
+  if (candidate.value.kind === 'qualitative') {
+    return {
+      kind: candidate.value.kind,
+      rawText: normalizedComparableText(candidate.value.rawText),
+      category: normalizedComparableText(candidate.value.category)
+    };
+  }
   return {
-    originalName: candidate.originalName,
-    standardNameCandidate: candidate.standardNameCandidate,
-    value: candidate.value,
-    unitRaw: candidate.unitRaw,
-    referenceRangeRaw: candidate.referenceRangeRaw,
-    reportedAbnormalFlag: candidate.reportedAbnormalFlag,
-    specimen: candidate.specimen,
-    method: candidate.method,
-    bodySite: candidate.bodySite,
-    clinicalDate: candidate.clinicalDate,
-    evidence: [...candidate.evidence]
-      .map((item) => ({ ...item, quote: item.quote?.normalize('NFKC').replace(/\s+/g, ' ').trim() ?? null }))
-      .sort((a, b) => a.sourceSpanId.localeCompare(b.sourceSpanId)),
-    issues: [...candidate.issues].sort((a, b) => a.code.localeCompare(b.code))
+    kind: candidate.value.kind,
+    rawText: normalizedComparableText(candidate.value.rawText),
+    reason: normalizedComparableText(candidate.value.reason)
   };
 }
 
-function comparableHash(result: ExtractionResult): string {
-  return stableHash({
-    subject: result.subject,
-    coveredSourceSpanIds: [...result.coveredSourceSpanIds].sort(),
-    candidates: result.candidates.map(comparableCandidate).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-  });
+function candidateConflictFields(first: ObservationCandidate, second: ObservationCandidate): ReviewDiffField[] {
+  const fields: ReviewDiffField[] = [];
+  const compareText = (
+    field: Exclude<ReviewDiffField, 'presence' | 'value' | 'issues'>,
+    firstValue: string | null,
+    secondValue: string | null,
+    allowOneSided = false
+  ) => {
+    if (allowOneSided && (firstValue === null || secondValue === null)) return;
+    if (normalizedComparableText(firstValue) !== normalizedComparableText(secondValue)) fields.push(field);
+  };
+
+  compareText('originalName', first.originalName, second.originalName);
+  compareText('standardNameCandidate', first.standardNameCandidate, second.standardNameCandidate);
+  if (stableHash(comparableValue(first)) !== stableHash(comparableValue(second))) fields.push('value');
+  compareText('unitRaw', first.unitRaw, second.unitRaw);
+  compareText('referenceRangeRaw', first.referenceRangeRaw, second.referenceRangeRaw);
+  compareText('reportedAbnormalFlag', first.reportedAbnormalFlag, second.reportedAbnormalFlag);
+  compareText('specimen', first.specimen, second.specimen, true);
+  compareText('method', first.method, second.method, true);
+  compareText('bodySite', first.bodySite, second.bodySite, true);
+  compareText('clinicalDate', first.clinicalDate, second.clinicalDate, true);
+
+  const firstIssueCodes = [...new Set(first.issues.map((issue) => issue.code))].sort();
+  const secondIssueCodes = [...new Set(second.issues.map((issue) => issue.code))].sort();
+  if (stableHash(firstIssueCodes) !== stableHash(secondIssueCodes)) fields.push('issues');
+  return fields;
+}
+
+/**
+ * 独立复核用于发现临床事实冲突，而不是要求两轮输出的证据摘录和可选元数据逐字一致。
+ * 一侧缺少标本、方法、部位或日期时，后续证据规则仍会逐项校验第二轮候选，因此不阻断。
+ */
+export function compareIndependentExtractions(
+  first: ExtractionResult,
+  second: ExtractionResult
+): { compatible: boolean; differences: ReviewCandidateDiff[] } {
+  const unmatchedSecond = new Set(second.candidates.map((_, index) => index));
+  const differences: ReviewCandidateDiff[] = [];
+
+  for (const firstCandidate of first.candidates) {
+    const sameName = [...unmatchedSecond].filter((index) => (
+      normalizedComparableText(second.candidates[index]!.originalName) === normalizedComparableText(firstCandidate.originalName)
+    ));
+    if (sameName.length === 0) {
+      differences.push({ localKey: firstCandidate.localKey, itemName: firstCandidate.originalName, fields: ['presence'] });
+      continue;
+    }
+
+    const ranked = sameName
+      .map((index) => ({ index, fields: candidateConflictFields(firstCandidate, second.candidates[index]!) }))
+      .sort((a, b) => a.fields.length - b.fields.length || a.index - b.index);
+    const match = ranked[0]!;
+    unmatchedSecond.delete(match.index);
+    if (match.fields.length > 0) {
+      const reviewedCandidate = second.candidates[match.index]!;
+      differences.push({
+        localKey: reviewedCandidate.localKey,
+        itemName: reviewedCandidate.originalName,
+        fields: match.fields
+      });
+    }
+  }
+
+  for (const index of unmatchedSecond) {
+    const candidate = second.candidates[index]!;
+    differences.push({ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['presence'] });
+  }
+  return { compatible: differences.length === 0, differences };
 }
 
 function normalizedPersonName(value: string): string {
@@ -416,8 +498,25 @@ export class DocumentExtractionPipeline {
             reportedName ?? undefined
           );
         }
-        if (comparableHash(extracted) !== comparableHash(reviewed)) {
-          return this.needsReview(documentId, 'field_conflict', expectedSpanIds, 'INDEPENDENT_REVIEW_MISMATCH', review.threadId, review.turnId, reviewed.candidates.length > 0 ? reviewed.candidates : extracted.candidates);
+        const comparison = compareIndependentExtractions(extracted, reviewed);
+        if (!comparison.compatible) {
+          const reviewedKeys = new Set(reviewed.candidates.map((candidate) => candidate.localKey));
+          const missingCandidates = extracted.candidates.filter((candidate) => (
+            !reviewedKeys.has(candidate.localKey)
+            && comparison.differences.some((difference) => difference.localKey === candidate.localKey && difference.fields.includes('presence'))
+          ));
+          const reviewCandidates = [...reviewed.candidates, ...missingCandidates];
+          return this.needsReview(
+            documentId,
+            'field_conflict',
+            expectedSpanIds,
+            'INDEPENDENT_REVIEW_MISMATCH',
+            review.threadId,
+            review.turnId,
+            reviewCandidates.length > 0 ? reviewCandidates : extracted.candidates,
+            undefined,
+            comparison.differences
+          );
         }
         reviewedCandidates.push(...reviewed.candidates);
         reviewedSubjects.push(reviewed.subject);
@@ -466,7 +565,11 @@ export class DocumentExtractionPipeline {
           outcome.decision === 'reject' ? outcome.reasons.join(',') : outcome.reasons.join(','),
           lastReceipt.threadId,
           lastReceipt.turnId,
-          reviewed.candidates
+          reviewed.candidates,
+          undefined,
+          outcome.decision === 'reject'
+            ? [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['issues'] }]
+            : undefined
         );
       }
       accepted.push(candidateToObservation(candidate, acceptanceId, documentId));
@@ -500,7 +603,8 @@ export class DocumentExtractionPipeline {
     threadId?: string,
     turnId?: string,
     candidateOptions?: ObservationCandidate[],
-    reportedName?: string
+    reportedName?: string,
+    candidateDiffs?: ReviewCandidateDiff[]
   ): ExtractionPipelineResult {
     const issueId = this.store.saveExtractionReviewIssue({
       documentId,
@@ -508,7 +612,8 @@ export class DocumentExtractionPipeline {
       severity: 'blocking',
       evidenceRefs,
       ...(candidateOptions ? { candidateOptions } : {}),
-      ...(reportedName ? { reportedName } : {})
+      ...(reportedName ? { reportedName } : {}),
+      ...(candidateDiffs ? { candidateDiffs } : {})
     });
     return {
       status: 'needs_review', documentId, issueId, reason,
