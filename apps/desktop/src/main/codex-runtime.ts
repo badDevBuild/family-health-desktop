@@ -44,6 +44,7 @@ interface LoginResponse {
 }
 
 interface TurnItem {
+  id?: string;
   type: string;
   text?: string;
   phase?: string | null;
@@ -52,6 +53,30 @@ interface TurnItem {
 interface TurnCompleted {
   threadId: string;
   turn: { id: string; status: string; items: TurnItem[]; error: unknown };
+}
+
+interface ItemLifecycleNotification {
+  threadId: string;
+  turnId: string;
+  item: TurnItem;
+}
+
+interface AgentMessageDeltaNotification {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  delta: string;
+}
+
+interface CompletedTurnCapture {
+  notification: TurnCompleted;
+  completedMessages: TurnItem[];
+  streamedMessages: TurnItem[];
+}
+
+function latestAgentMessage(items: TurnItem[]): TurnItem | undefined {
+  return [...items].reverse().find((item) => item.type === 'agentMessage' && item.phase === 'final_answer' && Boolean(item.text))
+    ?? [...items].reverse().find((item) => item.type === 'agentMessage' && Boolean(item.text));
 }
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -288,10 +313,12 @@ export class CodexRuntimeManager extends EventEmitter {
     this.activeTurn = { threadId: thread.thread.id, turnId: started.turn.id };
     completion.setTurnId(started.turn.id);
     try {
-      const notification = await completion.promise;
+      const capture = await completion.promise;
+      const notification = capture.notification;
       if (notification.turn.status !== 'completed') throw new Error(turnFailureCode(notification));
-      const message = [...notification.turn.items].reverse().find((item) => item.type === 'agentMessage' && item.phase === 'final_answer')
-        ?? [...notification.turn.items].reverse().find((item) => item.type === 'agentMessage');
+      const message = latestAgentMessage(capture.completedMessages)
+        ?? latestAgentMessage(notification.turn.items)
+        ?? latestAgentMessage(capture.streamedMessages);
       if (!message?.text) throw new Error('CODEX_STRUCTURED_OUTPUT_MISSING');
       return { threadId: notification.threadId, turnId: notification.turn.id, output: JSON.parse(message.text) as T };
     } finally {
@@ -341,12 +368,16 @@ export class CodexRuntimeManager extends EventEmitter {
     await this.refreshAccount();
   }
 
-  private waitForTurn(threadId: string, timeoutMs: number): { promise: Promise<TurnCompleted>; setTurnId(turnId: string): void; cancel(): void } {
+  private waitForTurn(threadId: string, timeoutMs: number): { promise: Promise<CompletedTurnCapture>; setTurnId(turnId: string): void; cancel(): void } {
     let expectedTurnId: string | null = null;
     let earlyCompletion: TurnCompleted | null = null;
-    let resolvePromise!: (value: TurnCompleted) => void;
+    let resolvePromise!: (value: CompletedTurnCapture) => void;
     let rejectPromise!: (error: Error) => void;
     let cleanupExternal: () => void = () => undefined;
+    const completedMessages = new Map<string, Map<string, TurnItem>>();
+    const streamedMessageText = new Map<string, Map<string, string>>();
+    const streamedMessagePhase = new Map<string, Map<string, string | null>>();
+    const streamedMessageOrder = new Map<string, string[]>();
     if (!this.client) {
       return {
         promise: Promise.reject(new Error('CODEX_RUNTIME_UNAVAILABLE')),
@@ -355,15 +386,55 @@ export class CodexRuntimeManager extends EventEmitter {
       };
     }
     const client = this.client;
-    const promise = new Promise<TurnCompleted>((resolve, reject) => {
+    const captureFor = (notification: TurnCompleted): CompletedTurnCapture => {
+      const turnId = notification.turn.id;
+      const completed = [...(completedMessages.get(turnId)?.values() ?? [])];
+      const textByItem = streamedMessageText.get(turnId);
+      const phaseByItem = streamedMessagePhase.get(turnId);
+      const streamed = (streamedMessageOrder.get(turnId) ?? []).flatMap((itemId) => {
+        const text = textByItem?.get(itemId);
+        return text ? [{ id: itemId, type: 'agentMessage', phase: phaseByItem?.get(itemId) ?? null, text }] : [];
+      });
+      return { notification, completedMessages: completed, streamedMessages: streamed };
+    };
+    const promise = new Promise<CompletedTurnCapture>((resolve, reject) => {
       resolvePromise = resolve;
       rejectPromise = reject;
+      const rememberMessageOrder = (turnId: string, itemId: string) => {
+        const order = streamedMessageOrder.get(turnId) ?? [];
+        if (!order.includes(itemId)) order.push(itemId);
+        streamedMessageOrder.set(turnId, order);
+      };
+      const onItemStarted = (notification: ItemLifecycleNotification) => {
+        if (notification.threadId !== threadId || notification.item.type !== 'agentMessage' || !notification.item.id) return;
+        const phases = streamedMessagePhase.get(notification.turnId) ?? new Map<string, string | null>();
+        phases.set(notification.item.id, notification.item.phase ?? null);
+        streamedMessagePhase.set(notification.turnId, phases);
+        rememberMessageOrder(notification.turnId, notification.item.id);
+      };
+      const onItemCompleted = (notification: ItemLifecycleNotification) => {
+        if (notification.threadId !== threadId || notification.item.type !== 'agentMessage' || !notification.item.id) return;
+        const messages = completedMessages.get(notification.turnId) ?? new Map<string, TurnItem>();
+        messages.set(notification.item.id, notification.item);
+        completedMessages.set(notification.turnId, messages);
+        const phases = streamedMessagePhase.get(notification.turnId) ?? new Map<string, string | null>();
+        phases.set(notification.item.id, notification.item.phase ?? null);
+        streamedMessagePhase.set(notification.turnId, phases);
+        rememberMessageOrder(notification.turnId, notification.item.id);
+      };
+      const onAgentMessageDelta = (notification: AgentMessageDeltaNotification) => {
+        if (notification.threadId !== threadId || typeof notification.delta !== 'string') return;
+        const messages = streamedMessageText.get(notification.turnId) ?? new Map<string, string>();
+        messages.set(notification.itemId, `${messages.get(notification.itemId) ?? ''}${notification.delta}`);
+        streamedMessageText.set(notification.turnId, messages);
+        rememberMessageOrder(notification.turnId, notification.itemId);
+      };
       const onCompleted = (notification: TurnCompleted) => {
         if (notification.threadId !== threadId) return;
         if (expectedTurnId === null) { earlyCompletion = notification; return; }
         if (notification.turn.id !== expectedTurnId) return;
         cleanup();
-        resolve(notification);
+        resolve(captureFor(notification));
       };
       const onExit = () => {
         cleanup();
@@ -377,10 +448,16 @@ export class CodexRuntimeManager extends EventEmitter {
       const cleanup = () => {
         clearTimeout(timer);
         client.off('turn/completed', onCompleted);
+        client.off('item/started', onItemStarted);
+        client.off('item/completed', onItemCompleted);
+        client.off('item/agentMessage/delta', onAgentMessageDelta);
         client.off('processExit', onExit);
       };
       cleanupExternal = cleanup;
       client.on('turn/completed', onCompleted);
+      client.on('item/started', onItemStarted);
+      client.on('item/completed', onItemCompleted);
+      client.on('item/agentMessage/delta', onAgentMessageDelta);
       client.on('processExit', onExit);
     });
     return {
@@ -389,7 +466,7 @@ export class CodexRuntimeManager extends EventEmitter {
         expectedTurnId = turnId;
         if (earlyCompletion?.turn.id === turnId) {
           cleanupExternal();
-          resolvePromise(earlyCompletion);
+          resolvePromise(captureFor(earlyCompletion));
         } else if (earlyCompletion) {
           cleanupExternal();
           rejectPromise(new Error('CODEX_TURN_ID_MISMATCH'));

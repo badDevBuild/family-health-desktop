@@ -8,6 +8,7 @@ import { CodexRuntimeManager } from './codex-runtime.js';
 class FakeClient extends EventEmitter {
   requests: Array<{ method: string; params: unknown }> = [];
   authenticated = false;
+  turnNotifications: Array<{ method: string; params: unknown }> | null = null;
   turnCompletion = {
     threadId: 'thread-1',
     turn: { id: 'turn-1', status: 'completed', error: null as unknown, items: [{ type: 'agentMessage', phase: 'final_answer', text: '{"ok":true}' }] }
@@ -28,7 +29,13 @@ class FakeClient extends EventEmitter {
     } as T;
     if (method === 'thread/start') return { thread: { id: 'thread-1' } } as T;
     if (method === 'turn/start') {
-      queueMicrotask(() => this.emit('turn/completed', this.turnCompletion));
+      queueMicrotask(() => {
+        if (this.turnNotifications) {
+          for (const notification of this.turnNotifications) this.emit(notification.method, notification.params);
+        } else {
+          this.emit('turn/completed', this.turnCompletion);
+        }
+      });
       return { turn: { id: 'turn-1' } } as T;
     }
     return {} as T;
@@ -136,6 +143,64 @@ describe('CodexRuntimeManager', () => {
       properties: { value: { anyOf: [{ type: 'string' }, { type: 'null' }] } }
     });
     expect(JSON.stringify(sentSchema)).not.toContain('oneOf');
+    manager.shutdown();
+  });
+
+  it('完成通知不携带条目时，从 item/completed 接收权威结构化输出', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    client.turnNotifications = [
+      {
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 1,
+          item: { id: 'item-1', type: 'agentMessage', phase: 'final_answer', text: '{"ok":true}' }
+        }
+      },
+      {
+        method: 'turn/completed',
+        params: {
+          threadId: 'thread-1',
+          turn: { id: 'turn-1', status: 'completed', error: null, items: [], itemsView: 'notLoaded' }
+        }
+      }
+    ];
+    await manager.start();
+    await expect(manager.runStructuredTurn<{ ok: boolean }>({
+      prompt: '只处理纯虚构资料',
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      outputSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false }
+    })).resolves.toMatchObject({ output: { ok: true } });
+    manager.shutdown();
+  });
+
+  it('item/completed 缺失时可从按顺序接收的消息增量恢复输出', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    client.turnNotifications = [
+      {
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1', startedAtMs: 1,
+          item: { id: 'item-1', type: 'agentMessage', phase: 'final_answer', text: '' }
+        }
+      },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: '{"ok":' } },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: 'true}' } },
+      {
+        method: 'turn/completed',
+        params: {
+          threadId: 'thread-1',
+          turn: { id: 'turn-1', status: 'completed', error: null, items: [], itemsView: 'notLoaded' }
+        }
+      }
+    ];
+    await manager.start();
+    await expect(manager.runStructuredTurn<{ ok: boolean }>({
+      prompt: '只处理纯虚构资料',
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      outputSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false }
+    })).resolves.toMatchObject({ output: { ok: true } });
     manager.shutdown();
   });
 
