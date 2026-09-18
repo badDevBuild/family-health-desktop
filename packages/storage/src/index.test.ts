@@ -684,7 +684,7 @@ describe('WorkspaceStore', () => {
       errorCode: "CODEX_RPC_ERROR:-32600:failed to load configuration: unknown configuration field 'tools.view_image'"
     });
     store.finishJob(failedJob.id, 'failed');
-    expect(store.listStoredJobs()[0]).toMatchObject({
+    expect(store.listStoredJobs().find((storedJob) => storedJob.id === failedJob.id)).toMatchObject({
       status: 'failed',
       statusText: '当前版本的 Codex 配置不兼容，请安装更新后重试'
     });
