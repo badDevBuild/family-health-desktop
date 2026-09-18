@@ -1,12 +1,31 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { createHealthThreadStartParams } from '../apps/desktop/src/main/codex-thread-config.js';
 import { spawnCodexAppServer } from '../packages/codex-adapter/src/index.js';
 
 const expectedRuntimeVersion = '0.145.0';
-const executable = process.env.CODEX_EXECUTABLE ?? 'codex';
+const targetByPlatform = {
+  'darwin-arm64': { packageName: '@openai/codex-darwin-arm64', triple: 'aarch64-apple-darwin', executableName: 'codex' },
+  'darwin-x64': { packageName: '@openai/codex-darwin-x64', triple: 'x86_64-apple-darwin', executableName: 'codex' },
+  'win32-x64': { packageName: '@openai/codex-win32-x64', triple: 'x86_64-pc-windows-msvc', executableName: 'codex.exe' }
+} as const;
+
+function resolveLockedCodexExecutable(): string {
+  if (process.env.CODEX_EXECUTABLE) return process.env.CODEX_EXECUTABLE;
+  const target = targetByPlatform[`${process.platform}-${process.arch}` as keyof typeof targetByPlatform];
+  if (!target) throw new Error(`CODEX_RUNTIME_UNSUPPORTED:${process.platform}-${process.arch}`);
+  const projectRequire = createRequire(import.meta.url);
+  const codexRequire = createRequire(projectRequire.resolve('@openai/codex/package.json'));
+  const platformPackage = codexRequire.resolve(`${target.packageName}/package.json`);
+  const executablePath = join(dirname(platformPackage), 'vendor', target.triple, 'bin', target.executableName);
+  if (!existsSync(executablePath)) throw new Error(`CODEX_RUNTIME_MISSING:${target.packageName}`);
+  return executablePath;
+}
+
+const executable = resolveLockedCodexExecutable();
 const runtimeVersion = execFileSync(executable, ['--version'], { encoding: 'utf8' }).trim();
 if (!runtimeVersion.includes(expectedRuntimeVersion)) {
   throw new Error(`CODEX_RUNTIME_VERSION_MISMATCH:${runtimeVersion}`);
