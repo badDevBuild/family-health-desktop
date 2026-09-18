@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { aiModelOptionSchema, aiReasoningEffortSchema, type AccountState, type AiModelOption, type AiPreferences } from '@contracts';
 import { spawnCodexAppServer, type CodexRpcClient } from '@codex';
 import { createHealthThreadStartParams } from './codex-thread-config.js';
+import { toCodexOutputSchema } from './structured-output-schema.js';
 
 interface RuntimeClient extends EventEmitter {
   initialize(): Promise<unknown>;
@@ -51,6 +52,26 @@ interface TurnItem {
 interface TurnCompleted {
   threadId: string;
   turn: { id: string; status: string; items: TurnItem[]; error: unknown };
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function turnFailureCode(notification: TurnCompleted): string {
+  const outer = recordValue(notification.turn.error);
+  const detail = recordValue(outer?.error) ?? outer;
+  const serviceCode = typeof detail?.code === 'string' ? detail.code : null;
+  const message = typeof detail?.message === 'string' ? detail.message : '';
+  if (serviceCode === 'invalid_json_schema' || message.includes('Invalid schema for response_format')) {
+    return 'CODEX_OUTPUT_SCHEMA_INVALID';
+  }
+  if (/connection reset|failed to connect|stream disconnected/i.test(message)) {
+    return 'CODEX_CONNECTION_FAILED';
+  }
+  return `CODEX_TURN_${notification.turn.status.toUpperCase()}`;
 }
 
 interface RuntimeModel {
@@ -258,7 +279,7 @@ export class CodexRuntimeManager extends EventEmitter {
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'readOnly', networkAccess: false },
         environments: [],
-        outputSchema: input.outputSchema
+        outputSchema: toCodexOutputSchema(input.outputSchema)
       });
     } catch (error) {
       completion.cancel();
@@ -268,7 +289,7 @@ export class CodexRuntimeManager extends EventEmitter {
     completion.setTurnId(started.turn.id);
     try {
       const notification = await completion.promise;
-      if (notification.turn.status !== 'completed') throw new Error(`CODEX_TURN_${notification.turn.status.toUpperCase()}`);
+      if (notification.turn.status !== 'completed') throw new Error(turnFailureCode(notification));
       const message = [...notification.turn.items].reverse().find((item) => item.type === 'agentMessage' && item.phase === 'final_answer')
         ?? [...notification.turn.items].reverse().find((item) => item.type === 'agentMessage');
       if (!message?.text) throw new Error('CODEX_STRUCTURED_OUTPUT_MISSING');

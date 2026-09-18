@@ -694,6 +694,11 @@ describe('WorkspaceStore', () => {
     expect(store.claimNextQueuedJob('paused-runner', 'account-fingerprint')).toBeNull();
     store.setQueuePaused(false);
     expect(store.claimNextQueuedJob('runner-retry', 'account-fingerprint')).toMatchObject({ id: failedJob.id, stage: 'analyze', attemptCount: 2 });
+    const schemaAttemptId = store.startJobAttempt(failedJob.id, '0.145.0', 'gpt-5.6-sol', 'medium');
+    store.finishJobAttempt({ attemptId: schemaAttemptId, status: 'failed', errorCode: 'CODEX_OUTPUT_SCHEMA_INVALID' });
+    store.finishJob(failedJob.id, 'failed');
+    expect(store.listStoredJobs().find((storedJob) => storedJob.id === failedJob.id)?.statusText)
+      .toBe('结构化输出格式不兼容，请安装更新后重试');
     store.close();
   });
 });

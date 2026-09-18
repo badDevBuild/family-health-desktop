@@ -8,6 +8,10 @@ import { CodexRuntimeManager } from './codex-runtime.js';
 class FakeClient extends EventEmitter {
   requests: Array<{ method: string; params: unknown }> = [];
   authenticated = false;
+  turnCompletion = {
+    threadId: 'thread-1',
+    turn: { id: 'turn-1', status: 'completed', error: null as unknown, items: [{ type: 'agentMessage', phase: 'final_answer', text: '{"ok":true}' }] }
+  };
   async initialize() { return {}; }
   async request<T>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params });
@@ -24,10 +28,7 @@ class FakeClient extends EventEmitter {
     } as T;
     if (method === 'thread/start') return { thread: { id: 'thread-1' } } as T;
     if (method === 'turn/start') {
-      queueMicrotask(() => this.emit('turn/completed', {
-        threadId: 'thread-1',
-        turn: { id: 'turn-1', status: 'completed', error: null, items: [{ type: 'agentMessage', phase: 'final_answer', text: '{"ok":true}' }] }
-      }));
+      queueMicrotask(() => this.emit('turn/completed', this.turnCompletion));
       return { turn: { id: 'turn-1' } } as T;
     }
     return {} as T;
@@ -112,6 +113,48 @@ describe('CodexRuntimeManager', () => {
         { type: 'localImage', path: '/isolated/fixture.png', detail: 'original' }
       ]
     });
+    manager.shutdown();
+  });
+
+  it('向 Codex 发送结构化输出前把嵌套 oneOf 转为 anyOf', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    await manager.start();
+    await manager.runStructuredTurn<{ ok: boolean }>({
+      prompt: '只处理纯虚构资料',
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      outputSchema: {
+        type: 'object',
+        properties: { value: { oneOf: [{ type: 'string' }, { type: 'null' }] } },
+        required: ['value'],
+        additionalProperties: false
+      }
+    });
+    const turnStart = client.requests.find((request) => request.method === 'turn/start');
+    const sentSchema = (turnStart?.params as { outputSchema?: Record<string, unknown> }).outputSchema;
+    expect(sentSchema).toMatchObject({
+      properties: { value: { anyOf: [{ type: 'string' }, { type: 'null' }] } }
+    });
+    expect(JSON.stringify(sentSchema)).not.toContain('oneOf');
+    manager.shutdown();
+  });
+
+  it('保留结构化输出服务端错误的稳定错误码', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    client.turnCompletion = {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1', status: 'failed', items: [],
+        error: { error: { code: 'invalid_json_schema', message: 'Invalid schema for response_format' } }
+      }
+    };
+    await manager.start();
+    await expect(manager.runStructuredTurn({
+      prompt: '只处理纯虚构资料',
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false }
+    })).rejects.toThrow('CODEX_OUTPUT_SCHEMA_INVALID');
     manager.shutdown();
   });
 

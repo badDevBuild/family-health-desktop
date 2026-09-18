@@ -2120,7 +2120,7 @@ export class WorkspaceStore {
                SELECT ja.error_code
                FROM job_attempts ja
                WHERE ja.job_id = j.id
-               ORDER BY ja.started_at DESC, ja.id DESC
+               ORDER BY ja.started_at DESC, ja.rowid DESC
                LIMIT 1
              ) AS latest_error_code
       FROM jobs j
@@ -2139,7 +2139,11 @@ export class WorkspaceStore {
       const latestErrorCode = row.latest_error_code === null ? null : String(row.latest_error_code);
       const failedStatusText = latestErrorCode?.includes('failed to load configuration')
         ? '当前版本的 Codex 配置不兼容，请安装更新后重试'
-        : labels.failed;
+        : latestErrorCode === 'CODEX_OUTPUT_SCHEMA_INVALID'
+          ? '结构化输出格式不兼容，请安装更新后重试'
+          : latestErrorCode === 'CODEX_CONNECTION_FAILED'
+            ? '连接 Codex 时中断，请检查网络后重试'
+            : labels.failed;
       return {
         id: String(row.id),
         batchLabel: `手动处理 · ${new Date(String(row.batch_created_at)).toLocaleString('zh-CN')}`,
