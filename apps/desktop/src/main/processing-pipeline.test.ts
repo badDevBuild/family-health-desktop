@@ -19,14 +19,16 @@ async function setup() {
   roots.push(root);
   const service = new PersonalWorkspaceService(root, '测试工作区', () => new Date('2026-09-18T00:00:00Z'));
   const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
-  await service.importFiles([{ path: '/tmp/虚构报告.txt', bytes: Buffer.from('2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L，参考范围 0-3.4 mmol/L') }], personId);
+  await service.importFiles([{ path: '/tmp/虚构报告.txt', bytes: Buffer.from('姓名：测试姓名甲 性别：男\n2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L，参考范围 0-3.4 mmol/L') }], personId);
   const documentId = service.getSnapshot(null).inbox[0]!.id;
-  const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
+  const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
+  const subjectSpanId = spans.find((span) => span.quote?.includes('测试姓名甲'))!.id;
+  const measurementSpanId = spans.find((span) => span.quote?.includes('低密度脂蛋白'))!.id;
   const output: ExtractionResult = {
     schemaVersion: 1,
     documentId,
     subject: { reportedName: null, evidence: [], confidence: 'absent' },
-    coveredSourceSpanIds: [spanId],
+    coveredSourceSpanIds: spans.map((span) => span.id),
     candidates: [{
       localKey: 'ldl-1',
       originalName: '低密度脂蛋白胆固醇',
@@ -39,11 +41,11 @@ async function setup() {
       method: null,
       bodySite: null,
       clinicalDate: '2026-09-17',
-      evidence: [{ sourceSpanId: spanId, quote: '2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L' }],
+      evidence: [{ sourceSpanId: measurementSpanId, quote: '2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L' }],
       issues: []
     }]
   };
-  return { service, personId, documentId, output };
+  return { service, personId, documentId, output, subjectSpanId };
 }
 
 function createScannedLikePdf(): Uint8Array {
@@ -234,14 +236,14 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
-  it('报告显示姓名与目标成员不一致时阻止自动归档', async () => {
-    const { service, personId, documentId, output } = await setup();
+  it('报告姓名与成员昵称不同时要求身份确认，确认后按原姓名再次核对并发布', async () => {
+    const { service, personId, documentId, output, subjectSpanId } = await setup();
     const conflicting = {
       ...output,
       subject: {
-        reportedName: '其他成员',
+        reportedName: '测试姓名甲',
         confidence: 'explicit' as const,
-        evidence: [{ sourceSpanId: output.coveredSourceSpanIds[0]!, quote: '2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L' }]
+        evidence: [{ sourceSpanId: subjectSpanId, quote: '姓名：测试姓名甲 性别：男' }]
       }
     };
     const pipeline = new DocumentExtractionPipeline(service.store, {
@@ -249,6 +251,15 @@ describe('DocumentExtractionPipeline', () => {
     });
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'PERSON_IDENTITY_NOT_CONFIRMED' });
     expect(service.store.getFactRevision(personId)).toBe(0);
+    const issue = service.store.listOpenExtractionReviewIssues()[0]!;
+    expect(issue).toMatchObject({ kind: 'person_conflict', personId, reportedName: '测试姓名甲' });
+    service.store.confirmDocumentIdentity({ issueId: issue.id, documentId, personId });
+    expect(service.store.getDocumentExtractionBundle(documentId)).toMatchObject({
+      personAssignmentBasis: 'identity_confirmed',
+      confirmedReportedName: '测试姓名甲'
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1, revision: 1 });
+    expect(service.store.getFactRevision(personId)).toBe(1);
     service.close();
   });
 

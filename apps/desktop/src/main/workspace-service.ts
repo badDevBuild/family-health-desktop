@@ -587,6 +587,7 @@ export class PersonalWorkspaceService {
         description: '这份资料尚未可靠关联到家庭成员。确认之前不会发送给 AI。',
         evidenceRefs: [],
         candidateOptions: [],
+        reportedName: null,
         resolutionStatus: 'open' as const
       }));
     const extractionIssues = this.store.listOpenExtractionReviewIssues()
@@ -600,14 +601,18 @@ export class PersonalWorkspaceService {
         documentId: issue.documentId,
         kind: issue.kind,
         severity: issue.severity,
-        title: issue.kind === 'field_conflict'
-          ? '两次事实核对结果不一致'
+        title: issue.kind === 'person_conflict'
+          ? '确认报告姓名与成员身份'
+          : issue.kind === 'field_conflict' ? '两次事实核对结果不一致'
           : issue.kind === 'derived_safety' ? '健康说明未通过安全复核' : '资料覆盖需要人工确认',
-        description: issue.kind === 'derived_safety'
+        description: issue.kind === 'person_conflict'
+          ? `报告写的是“${issue.reportedName ?? '未识别姓名'}”，当前准备归入已选成员。请确认两者是否为同一人。`
+          : issue.kind === 'derived_safety'
           ? '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
           : '为避免把不确定内容写入健康档案，这份资料已暂停并等待你的核对。',
         evidenceRefs: issue.evidenceRefs,
         candidateOptions: issue.candidateOptions,
+        reportedName: issue.reportedName,
         resolutionStatus: 'open' as const
       }))
     ];

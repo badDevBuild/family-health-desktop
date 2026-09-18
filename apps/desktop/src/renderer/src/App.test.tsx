@@ -189,6 +189,33 @@ describe('App member display editing', () => {
     expect(await screen.findByRole('heading', { name: '每一步都能看懂、能恢复' })).toBeTruthy();
   });
 
+  it('清楚展示报告姓名与目标成员，并用专门操作确认同一人', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.persons[0]!.displayName = '书书';
+    snapshot.reviews = [{
+      id: 'identity-review-1', personId: 'personal-person-1', documentId: 'document-identity-1',
+      kind: 'person_conflict', severity: 'blocking', title: '确认报告姓名与成员身份',
+      description: '报告写的是“测试姓名甲”，当前准备归入已选成员。请确认两者是否为同一人。',
+      evidenceRefs: ['identity-span-1'], candidateOptions: [], reportedName: '测试姓名甲', resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'confirm_identity' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /确认报告姓名与成员身份/ }));
+    expect(await screen.findByRole('dialog', { name: '确认报告姓名与成员身份' })).toBeTruthy();
+    expect(screen.getByText('测试姓名甲')).toBeTruthy();
+    expect(screen.getByText('书书 · 本人')).toBeTruthy();
+    expect(screen.getByText(/不会修改成员名称，也不是医学结论/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '确认是同一人' }));
+
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'confirm_identity', issueId: 'identity-review-1', documentId: 'document-identity-1', personId: 'personal-person-1'
+    }));
+    expect(await screen.findByText('身份关系已确认，任务将从事实提取重新核对并继续。')).toBeTruthy();
+  });
+
   it('requires explicit confirmation before logout and keeps the local workspace visible', async () => {
     const connected = createPersonalSnapshot();
     connected.account = {

@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(7);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(8);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -178,6 +178,41 @@ describe('WorkspaceStore', () => {
       id: 'manifest-gap', totalUnits: 3, coveredUnitIndexes: [0, 2],
       normalizerVersion: 'manifest-test-v1', conversionWarnings: expect.arrayContaining(['synthetic_conversion_warning'])
     });
+    store.close();
+  });
+
+  it('schema v8 将旧身份冲突升级为可确认关系，并在确认后保留报告姓名', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v7-identity-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '书书', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('姓 名 ： 测试姓名甲 性 别 ： 男'), mediaType: 'text/plain', displayName: '体检报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'manifest-identity', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'text/plain',
+      originalDisplayName: '体检报告.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ id: 'identity-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: null, lineStart: 1, lineEnd: 1, quote: '姓 名 ： 测试姓名甲 性 别 ： 男', readability: 'clear' }],
+      normalizerVersion: 'manifest-test-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: ['identity-span']
+    });
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 7; PRAGMA user_version = 7;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ id: issueId, kind: 'person_conflict', reportedName: '测试姓名甲' })
+    ]);
+    store.confirmDocumentIdentity({ issueId, documentId: document.documentId, personId: person.id });
+    expect(store.getDocumentExtractionBundle(document.documentId)).toMatchObject({
+      personAssignmentBasis: 'identity_confirmed', confirmedReportedName: '测试姓名甲'
+    });
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
     store.close();
   });
 

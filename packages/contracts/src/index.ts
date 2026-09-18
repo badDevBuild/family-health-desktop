@@ -375,6 +375,7 @@ export const reviewIssueSchema = z.object({
   description: z.string().min(1),
   evidenceRefs: z.array(idSchema),
   candidateOptions: z.array(observationCandidateSchema),
+  reportedName: z.string().min(1).nullable(),
   resolutionStatus: z.enum(['open', 'resolved', 'deferred'])
 }).strict();
 
@@ -812,6 +813,12 @@ export type EvidencePreview = z.infer<typeof evidencePreviewSchema>;
 export const resolveReviewInputSchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('assign_person'),
+    documentId: idSchema,
+    personId: idSchema
+  }).strict(),
+  z.object({
+    action: z.literal('confirm_identity'),
+    issueId: idSchema,
     documentId: idSchema,
     personId: idSchema
   }).strict(),

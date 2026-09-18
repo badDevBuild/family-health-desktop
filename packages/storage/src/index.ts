@@ -4,8 +4,13 @@ import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import type { ActionItem, CreateManualNoteInput, DerivedSnapshotCandidate, ManualNote, ObservationCandidate, Person, SourceManifest } from '@contracts';
 
-export const WORKSPACE_SCHEMA_VERSION = 7;
+export const WORKSPACE_SCHEMA_VERSION = 8;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
+
+function extractReportedNameFromIdentityEvidence(quote: string): string | null {
+  const match = quote.normalize('NFKC').match(/姓\s*名\s*[：:]\s*([^\s，,；;。]{1,20}?)(?=\s*性\s*别\s*[：:])/);
+  return match?.[1]?.trim() || null;
+}
 
 export interface WorkspaceStoreOptions {
   rootDirectory: string;
@@ -87,7 +92,8 @@ export interface DocumentExtractionBundle {
   documentId: string;
   personId: string;
   personDisplayName: string;
-  personAssignmentBasis: 'user_selected' | 'folder_binding' | 'legacy';
+  personAssignmentBasis: 'user_selected' | 'folder_binding' | 'identity_confirmed' | 'legacy';
+  confirmedReportedName: string | null;
   sourcePath: string;
   manifest: SourceManifest;
 }
@@ -112,10 +118,11 @@ export interface OpenExtractionReviewIssue {
   id: string;
   documentId: string;
   personId: string | null;
-  kind: 'field_conflict' | 'coverage_gap' | 'overwrite_protected' | 'derived_safety';
+  kind: 'person_conflict' | 'field_conflict' | 'coverage_gap' | 'overwrite_protected' | 'derived_safety';
   severity: 'blocking' | 'warning';
   evidenceRefs: string[];
   candidateOptions: ObservationCandidate[];
+  reportedName: string | null;
 }
 
 export interface StoredJobSummary {
@@ -793,7 +800,15 @@ export class WorkspaceStore {
                SELECT display_name FROM source_occurrences occ
                WHERE occ.source_object_id = d.source_object_id
                ORDER BY occ.last_seen DESC LIMIT 1
-             ) AS display_name
+             ) AS display_name,
+             (
+               SELECT json_extract(ri.payload_json, '$.reportedName')
+               FROM review_issues ri
+               WHERE ri.field_ref = 'document:' || d.id
+                 AND ri.kind = 'person_conflict'
+                 AND ri.resolution_status = 'resolved'
+               ORDER BY ri.created_at DESC, ri.id DESC LIMIT 1
+             ) AS confirmed_reported_name
       FROM documents d
       JOIN source_objects so ON so.id = d.source_object_id
       LEFT JOIN persons p ON p.id = d.person_id
@@ -1100,7 +1115,8 @@ export class WorkspaceStore {
 
   getDocumentExtractionBundle(documentId: string): DocumentExtractionBundle {
     const document = this.db.prepare(`
-      SELECT d.id, d.person_id, d.person_assignment_basis, p.display_name AS person_display_name,
+      SELECT d.id, d.person_id, d.person_assignment_basis, d.confirmed_reported_name,
+             p.display_name AS person_display_name,
              so.id AS source_object_id, so.sha256, so.media_type,
              so.vault_relative_path, so.created_at,
              converted.media_type AS converted_media_type,
@@ -1149,6 +1165,7 @@ export class WorkspaceStore {
       personId: String(document.person_id),
       personDisplayName: String(document.person_display_name),
       personAssignmentBasis: String(document.person_assignment_basis) as DocumentExtractionBundle['personAssignmentBasis'],
+      confirmedReportedName: document.confirmed_reported_name == null ? null : String(document.confirmed_reported_name),
       sourcePath: join(this.vaultDirectory, String(document.converted_vault_relative_path ?? document.vault_relative_path)),
       manifest: {
         id: String(document.manifest_id ?? `manifest-${documentId}`),
@@ -1249,11 +1266,12 @@ export class WorkspaceStore {
   saveExtractionReviewIssue(input: {
     documentId: string;
     jobId?: string | null;
-    kind: 'field_conflict' | 'coverage_gap' | 'overwrite_protected' | 'derived_safety';
+    kind: 'person_conflict' | 'field_conflict' | 'coverage_gap' | 'overwrite_protected' | 'derived_safety';
     severity: 'blocking' | 'warning';
     evidenceRefs: string[];
     preserveDocumentStatus?: boolean;
     candidateOptions?: ObservationCandidate[];
+    reportedName?: string;
   }): string {
     const id = randomUUID();
     const transaction = this.db.transaction(() => {
@@ -1265,7 +1283,12 @@ export class WorkspaceStore {
       `).run(
         id, input.jobId ?? null, `document:${input.documentId}`, input.kind,
         input.severity, JSON.stringify(input.evidenceRefs),
-        input.candidateOptions ? JSON.stringify({ candidateOptions: input.candidateOptions }) : null,
+        input.candidateOptions || input.reportedName
+          ? JSON.stringify({
+              ...(input.candidateOptions ? { candidateOptions: input.candidateOptions } : {}),
+              ...(input.reportedName ? { reportedName: input.reportedName } : {})
+            })
+          : null,
         this.now().toISOString()
       );
       if (!input.preserveDocumentStatus) {
@@ -1285,17 +1308,21 @@ export class WorkspaceStore {
       WHERE ri.resolution_status = 'open'
       ORDER BY ri.created_at, ri.id
     `).all() as Array<Record<string, unknown>>;
-    return rows.map((row) => ({
-      id: String(row.id),
-      documentId: String(row.document_id),
-      personId: row.person_id === null ? null : String(row.person_id),
-      kind: String(row.kind) as OpenExtractionReviewIssue['kind'],
-      severity: String(row.severity) as OpenExtractionReviewIssue['severity'],
-      evidenceRefs: JSON.parse(String(row.evidence_refs_json)) as string[],
-      candidateOptions: row.payload_json
-        ? (JSON.parse(String(row.payload_json)) as { candidateOptions?: ObservationCandidate[] }).candidateOptions ?? []
-        : []
-    }));
+    return rows.map((row) => {
+      const payload = row.payload_json
+        ? JSON.parse(String(row.payload_json)) as { candidateOptions?: ObservationCandidate[]; reportedName?: string }
+        : {};
+      return {
+        id: String(row.id),
+        documentId: String(row.document_id),
+        personId: row.person_id === null ? null : String(row.person_id),
+        kind: String(row.kind) as OpenExtractionReviewIssue['kind'],
+        severity: String(row.severity) as OpenExtractionReviewIssue['severity'],
+        evidenceRefs: JSON.parse(String(row.evidence_refs_json)) as string[],
+        candidateOptions: payload.candidateOptions ?? [],
+        reportedName: payload.reportedName ?? null
+      };
+    });
   }
 
   markReviewIssueCorrected(issueId: string, documentId: string): void {
@@ -1327,6 +1354,50 @@ export class WorkspaceStore {
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'document.person_assigned', ?, '用户确认资料所属成员，已进入待处理队列', ?)
       `).run(randomUUID(), documentId, this.now().toISOString());
+    });
+    transaction();
+  }
+
+  confirmDocumentIdentity(input: { issueId: string; documentId: string; personId: string }): void {
+    const transaction = this.db.transaction(() => {
+      const issue = this.db.prepare(`
+        SELECT ri.kind, ri.resolution_status, ri.payload_json, d.person_id
+        FROM review_issues ri
+        JOIN documents d ON ri.field_ref = 'document:' || d.id
+        WHERE ri.id = ? AND d.id = ?
+      `).get(input.issueId, input.documentId) as {
+        kind: string;
+        resolution_status: string;
+        payload_json: string | null;
+        person_id: string | null;
+      } | undefined;
+      if (!issue || issue.resolution_status !== 'open' || issue.kind !== 'person_conflict') {
+        throw new Error('REVIEW_ISSUE_NOT_OPEN');
+      }
+      if (issue.person_id !== input.personId) throw new Error('DOCUMENT_IDENTITY_CONFLICT');
+      const payload = issue.payload_json
+        ? JSON.parse(issue.payload_json) as { reportedName?: string }
+        : {};
+      const reportedName = payload.reportedName?.trim();
+      if (!reportedName) throw new Error('REPORTED_NAME_REQUIRED');
+
+      const updated = this.db.prepare(`
+        UPDATE documents
+        SET status = 'queued', person_assignment_basis = 'identity_confirmed', confirmed_reported_name = ?
+        WHERE id = ? AND person_id = ? AND status = 'needs_review'
+      `).run(reportedName, input.documentId, input.personId);
+      if (updated.changes !== 1) throw new Error('DOCUMENT_IDENTITY_CONFLICT');
+      this.db.prepare(`
+        UPDATE review_issues
+        SET resolution_status = 'resolved', resolution_revision = 1,
+            payload_json = json_set(payload_json, '$.identityConfirmed', json('true'))
+        WHERE id = ?
+      `).run(input.issueId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'review_issue.identity_confirmed', ?, '用户确认报告姓名与当前成员为同一人，任务重新进入核对队列', ?)
+      `).run(randomUUID(), input.issueId, this.now().toISOString());
+      this.resumeWaitingJobsAfterReview(input.documentId);
     });
     transaction();
   }
@@ -2651,6 +2722,40 @@ export class WorkspaceStore {
         current = 7;
       }
 
+      if (current === 7) {
+        const hasDocuments = Boolean(this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'documents'`).get());
+        const documentColumns = hasDocuments ? this.db.pragma('table_info(documents)') as Array<{ name: string }> : [];
+        if (hasDocuments && !documentColumns.some((column) => column.name === 'confirmed_reported_name')) {
+          this.db.exec(`ALTER TABLE documents ADD COLUMN confirmed_reported_name TEXT`);
+        }
+        const hasReviewIssues = Boolean(this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_issues'`).get());
+        const hasSourceSpans = Boolean(this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_spans'`).get());
+        if (hasReviewIssues && hasSourceSpans) {
+          const identityCandidates = this.db.prepare(`
+            SELECT id, evidence_refs_json
+            FROM review_issues
+            WHERE resolution_status = 'open' AND kind = 'field_conflict' AND payload_json IS NULL
+          `).all() as Array<{ id: string; evidence_refs_json: string }>;
+          const readQuote = this.db.prepare(`SELECT quote FROM source_spans WHERE id = ?`);
+          const promoteIssue = this.db.prepare(`
+            UPDATE review_issues SET kind = 'person_conflict', payload_json = ? WHERE id = ?
+          `);
+          for (const issue of identityCandidates) {
+            const evidenceRefs = JSON.parse(issue.evidence_refs_json) as string[];
+            const reportedName = evidenceRefs
+              .map((sourceSpanId) => readQuote.get(sourceSpanId) as { quote: string | null } | undefined)
+              .map((row) => row?.quote ? extractReportedNameFromIdentityEvidence(row.quote) : null)
+              .find((name): name is string => Boolean(name));
+            if (reportedName) promoteIssue.run(JSON.stringify({ reportedName }), issue.id);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 8;
+          PRAGMA user_version = 8;
+        `);
+        current = 8;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -2696,6 +2801,7 @@ export class WorkspaceStore {
         person_id TEXT REFERENCES persons(id), document_kind TEXT NOT NULL, status TEXT NOT NULL,
         acceptance_id TEXT, excluded_from_analysis INTEGER NOT NULL DEFAULT 0,
         person_assignment_basis TEXT NOT NULL DEFAULT 'legacy',
+        confirmed_reported_name TEXT,
         created_at TEXT NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS source_spans (
@@ -2848,7 +2954,7 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
       CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
-      PRAGMA user_version = 7;
+      PRAGMA user_version = 8;
       `);
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');

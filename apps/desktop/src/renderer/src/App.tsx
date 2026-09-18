@@ -860,14 +860,77 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const [personId, setPersonId] = useState(snapshot.persons[0]?.id ?? '');
   const [busy, setBusy] = useState(false);
   const [candidates, setCandidates] = useState(review.candidateOptions);
-  const isAssignment = review.kind === 'person_conflict';
+  const isAssignment = review.kind === 'person_conflict' && review.personId === null;
+  const isIdentityConfirmation = review.kind === 'person_conflict' && review.personId !== null && review.reportedName !== null;
+  const targetPerson = isIdentityConfirmation
+    ? snapshot.persons.find((person) => person.id === review.personId) ?? null
+    : null;
   const isDerived = review.kind === 'derived_safety';
   const canCorrect = review.kind === 'field_conflict' && candidates.length > 0
     && candidates.every((candidate) => candidate.value.kind !== 'numeric' || /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(candidate.value.decimal));
   const updateCandidate = (index: number, updater: (candidate: (typeof candidates)[number]) => (typeof candidates)[number]) => {
     setCandidates((current) => current.map((candidate, candidateIndex) => candidateIndex === index ? updater(candidate) : candidate));
   };
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog review-resolution-dialog" role="dialog" aria-modal="true" aria-labelledby="review-resolution-title"><header><div><span className="eyebrow">例外核对</span><h2 id="review-resolution-title">{review.title}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭例外核对"><X size={19} /></button></header><p>{review.description}</p><button className="evidence-link" onClick={onEvidence}><FileCheck2 size={17} /> 查看原始依据</button>{isAssignment ? <label>这份资料属于<select value={personId} onChange={(event) => setPersonId(event.target.value)}>{snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}</select></label> : canCorrect ? <div className="manual-note-list">{candidates.map((candidate, index) => <article key={candidate.localKey}><label>项目名<input value={candidate.originalName} onChange={(event) => updateCandidate(index, (current) => ({ ...current, originalName: event.target.value }))} /></label><label>结果<input value={candidate.value.rawText ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label><label>单位<input value={candidate.unitRaw ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, unitRaw: event.target.value || null }))} /></label><label>临床日期<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label></article>)}</div> : <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{isDerived ? '报告事实不会被删除' : '原始资料会继续保留'}</strong><p>{isDerived ? '只是不发布这次未通过安全复核的分析和生活指南。' : '选择仅归档后，这份资料不会进入趋势或后续分析。'}</p></div></div>}<div className="dialog-actions"><button className="secondary-button" onClick={onClose}>稍后处理</button><button className="primary-button" disabled={busy || (isAssignment && !personId) || (review.kind === 'field_conflict' && !canCorrect)} onClick={async () => { setBusy(true); try { const resolution: ResolveReviewInput = isAssignment ? { action: 'assign_person', documentId: review.documentId, personId } : canCorrect ? { action: 'accept_correction', issueId: review.id, documentId: review.documentId, candidates } : { action: isDerived ? 'dismiss_derived' : 'archive_only', issueId: review.id, documentId: review.documentId }; const ok = await onResolve(resolution); if (ok) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}{isAssignment ? '确认归属' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}</button></div></section></div>;
+  const canSubmit = !busy
+    && (!isAssignment || Boolean(personId))
+    && (!isIdentityConfirmation || Boolean(targetPerson))
+    && (review.kind !== 'field_conflict' || canCorrect);
+
+  async function submitResolution() {
+    setBusy(true);
+    try {
+      const resolution: ResolveReviewInput = isAssignment
+        ? { action: 'assign_person', documentId: review.documentId, personId }
+        : isIdentityConfirmation && targetPerson
+          ? { action: 'confirm_identity', issueId: review.id, documentId: review.documentId, personId: targetPerson.id }
+          : canCorrect
+            ? { action: 'accept_correction', issueId: review.id, documentId: review.documentId, candidates }
+            : { action: isDerived ? 'dismiss_derived' : 'archive_only', issueId: review.id, documentId: review.documentId };
+      const ok = await onResolve(resolution);
+      if (ok) onClose();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="member-dialog review-resolution-dialog" role="dialog" aria-modal="true" aria-labelledby="review-resolution-title">
+        <header>
+          <div><span className="eyebrow">例外核对</span><h2 id="review-resolution-title">{review.title}</h2></div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭例外核对"><X size={19} /></button>
+        </header>
+        <p>{review.description}</p>
+        <button className="evidence-link" onClick={onEvidence}><FileCheck2 size={17} /> 查看原始依据</button>
+        {isAssignment ? (
+          <label>这份资料属于
+            <select value={personId} onChange={(event) => setPersonId(event.target.value)}>
+              {snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}
+            </select>
+          </label>
+        ) : isIdentityConfirmation && targetPerson ? (
+          <>
+            <dl className="identity-confirmation">
+              <div><dt>报告姓名</dt><dd>{review.reportedName}</dd></div>
+              <div><dt>将归入</dt><dd>{targetPerson.displayName}{targetPerson.relation ? ` · ${targetPerson.relation}` : ''}</dd></div>
+            </dl>
+            <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。</p></div></div>
+          </>
+        ) : canCorrect ? (
+          <div className="manual-note-list">{candidates.map((candidate, index) => <article key={candidate.localKey}><label>项目名<input value={candidate.originalName} onChange={(event) => updateCandidate(index, (current) => ({ ...current, originalName: event.target.value }))} /></label><label>结果<input value={candidate.value.rawText ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label><label>单位<input value={candidate.unitRaw ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, unitRaw: event.target.value || null }))} /></label><label>临床日期<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label></article>)}</div>
+        ) : (
+          <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{isDerived ? '报告事实不会被删除' : '原始资料会继续保留'}</strong><p>{isDerived ? '只是不发布这次未通过安全复核的分析和生活指南。' : '选择仅归档后，这份资料不会进入趋势或后续分析。'}</p></div></div>
+        )}
+        <div className="dialog-actions">
+          <button className="secondary-button" onClick={onClose}>稍后处理</button>
+          <button className="primary-button" disabled={!canSubmit} onClick={() => void submitResolution()}>
+            {busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}
+            {isAssignment ? '确认归属' : isIdentityConfirmation ? '确认是同一人' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function EvidencePanel({ evidence, demo, onClose }: { evidence: Evidence | null; demo: boolean; onClose(): void }) {
@@ -1357,6 +1420,7 @@ export default function App() {
     setSnapshot(next);
     setToast(input.action === 'assign_person'
       ? '成员归属已确认，资料已进入待处理队列。'
+      : input.action === 'confirm_identity' ? '身份关系已确认，任务将从事实提取重新核对并继续。'
       : input.action === 'archive_only' ? '资料已仅归档，不会进入分析。'
       : input.action === 'accept_correction' ? '修正后的事实已保存，并保留原始证据链。'
       : '报告事实已保留，本次未通过复核的说明不会发布。');

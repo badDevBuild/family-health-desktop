@@ -436,6 +436,12 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .backup-dialog > .check-label { min-height: 44px; display: flex; align-items: center; gap: 9px; color: var(--warm-700); font-size: 13px; }
 .backup-dialog > .check-label input { width: 18px; height: 18px; padding: 0; accent-color: var(--primary); }
 .info-callout.compact { padding: 11px 12px; }
+.identity-confirmation { display: grid; margin: 2px 0; overflow: hidden; border: 1px solid var(--warm-200); border-radius: 13px; background: #fff; }
+.identity-confirmation > div { display: grid; grid-template-columns: 112px minmax(0, 1fr); align-items: center; gap: 14px; min-height: 52px; padding: 0 14px; border-bottom: 1px solid var(--warm-200); }
+.identity-confirmation > div:last-child { border-bottom: 0; }
+.identity-confirmation dt { color: var(--warm-500); font-size: 16px; }
+.identity-confirmation dd { margin: 0; color: var(--warm-900); font-size: 17px; font-weight: 700; }
+.review-resolution-dialog .identity-confirmation + .info-callout p { font-size: 14px; line-height: 1.6; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 3px; }
 .field-error { color: var(--alert); font-size: 12px; }
 .spin { animation: spin 1.3s linear infinite; }

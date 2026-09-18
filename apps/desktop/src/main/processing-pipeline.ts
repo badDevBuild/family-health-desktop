@@ -59,15 +59,11 @@ function normalizedPersonName(value: string): string {
   return value.normalize('NFKC').replace(/[\s·•・·]/g, '').toLocaleLowerCase('zh-CN');
 }
 
-function subjectIsConsistent(
+function subjectEvidenceIsValid(
   result: ExtractionResult,
   bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
 ): boolean {
-  if (result.subject.confidence === 'absent' && result.subject.reportedName === null) {
-    return bundle.personAssignmentBasis === 'user_selected' || bundle.personAssignmentBasis === 'folder_binding';
-  }
   if (result.subject.confidence !== 'explicit' || !result.subject.reportedName || result.subject.evidence.length === 0) return false;
-  if (normalizedPersonName(result.subject.reportedName) !== normalizedPersonName(bundle.personDisplayName)) return false;
   const spans = new Map(bundle.manifest.spans.map((span) => [span.id, span]));
   return result.subject.evidence.every((reference) => {
     const span = spans.get(reference.sourceSpanId);
@@ -76,6 +72,29 @@ function subjectIsConsistent(
     const quote = reference.quote.normalize('NFKC').replace(/\s+/g, ' ').trim();
     return source.includes(quote) && normalizedPersonName(quote).includes(normalizedPersonName(result.subject.reportedName!));
   });
+}
+
+function subjectIsConsistent(
+  result: ExtractionResult,
+  bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
+): boolean {
+  if (result.subject.confidence === 'absent' && result.subject.reportedName === null) {
+    return bundle.personAssignmentBasis === 'user_selected' || bundle.personAssignmentBasis === 'folder_binding';
+  }
+  if (!subjectEvidenceIsValid(result, bundle)) return false;
+  const expectedName = bundle.confirmedReportedName ?? bundle.personDisplayName;
+  return normalizedPersonName(result.subject.reportedName!) === normalizedPersonName(expectedName);
+}
+
+function conflictingReportedName(
+  result: ExtractionResult,
+  bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
+): string | null {
+  if (!subjectEvidenceIsValid(result, bundle) || !result.subject.reportedName) return null;
+  const expectedName = bundle.confirmedReportedName ?? bundle.personDisplayName;
+  return normalizedPersonName(result.subject.reportedName) === normalizedPersonName(expectedName)
+    ? null
+    : result.subject.reportedName;
 }
 
 function hasCompleteCoverage(result: ExtractionResult, expectedSpanIds: string[]): boolean {
@@ -352,7 +371,17 @@ export class DocumentExtractionPipeline {
           return this.needsReview(documentId, 'coverage_gap', expectedSpanIds, 'EXTRACTION_COVERAGE_INCOMPLETE', extract.threadId, extract.turnId);
         }
         if (!subjectIsConsistent(extracted, bundle)) {
-          return this.needsReview(documentId, 'field_conflict', extracted.subject.evidence.map((item) => item.sourceSpanId), 'PERSON_IDENTITY_NOT_CONFIRMED', extract.threadId, extract.turnId);
+          const reportedName = conflictingReportedName(extracted, bundle);
+          return this.needsReview(
+            documentId,
+            reportedName ? 'person_conflict' : 'field_conflict',
+            extracted.subject.evidence.map((item) => item.sourceSpanId),
+            'PERSON_IDENTITY_NOT_CONFIRMED',
+            extract.threadId,
+            extract.turnId,
+            undefined,
+            reportedName ?? undefined
+          );
         }
 
         const review = await this.runTurn(documentId, 'review_facts', {
@@ -375,7 +404,17 @@ export class DocumentExtractionPipeline {
           return this.needsReview(documentId, 'coverage_gap', expectedSpanIds, 'REVIEW_COVERAGE_INCOMPLETE', review.threadId, review.turnId);
         }
         if (!subjectIsConsistent(reviewed, bundle)) {
-          return this.needsReview(documentId, 'field_conflict', reviewed.subject.evidence.map((item) => item.sourceSpanId), 'PERSON_IDENTITY_NOT_CONFIRMED', review.threadId, review.turnId);
+          const reportedName = conflictingReportedName(reviewed, bundle);
+          return this.needsReview(
+            documentId,
+            reportedName ? 'person_conflict' : 'field_conflict',
+            reviewed.subject.evidence.map((item) => item.sourceSpanId),
+            'PERSON_IDENTITY_NOT_CONFIRMED',
+            review.threadId,
+            review.turnId,
+            undefined,
+            reportedName ?? undefined
+          );
         }
         if (comparableHash(extracted) !== comparableHash(reviewed)) {
           return this.needsReview(documentId, 'field_conflict', expectedSpanIds, 'INDEPENDENT_REVIEW_MISMATCH', review.threadId, review.turnId, reviewed.candidates.length > 0 ? reviewed.candidates : extracted.candidates);
@@ -455,19 +494,21 @@ export class DocumentExtractionPipeline {
 
   private needsReview(
     documentId: string,
-    kind: 'field_conflict' | 'coverage_gap',
+    kind: 'person_conflict' | 'field_conflict' | 'coverage_gap',
     evidenceRefs: string[],
     reason: string,
     threadId?: string,
     turnId?: string,
-    candidateOptions?: ObservationCandidate[]
+    candidateOptions?: ObservationCandidate[],
+    reportedName?: string
   ): ExtractionPipelineResult {
     const issueId = this.store.saveExtractionReviewIssue({
       documentId,
       kind,
       severity: 'blocking',
       evidenceRefs,
-      ...(candidateOptions ? { candidateOptions } : {})
+      ...(candidateOptions ? { candidateOptions } : {}),
+      ...(reportedName ? { reportedName } : {})
     });
     return {
       status: 'needs_review', documentId, issueId, reason,

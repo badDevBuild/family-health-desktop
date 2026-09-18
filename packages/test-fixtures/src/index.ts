@@ -141,7 +141,7 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
       { id: 'job-3', batchLabel: '9 月 15 日自动批次', personLabel: null, stage: 'identify', status: 'waiting_user', completedUnits: 1, totalUnits: 2, statusText: '等待确认所属成员', updatedAt: '2026-09-15T12:06:00+00:00', canCancel: true, canRetry: false }
     ],
     reviews: [
-      { id: 'review-1', personId: null, documentId: 'document-inbox-3', kind: 'person_conflict', severity: 'blocking', title: '确认门诊报告属于谁', description: '报告里的姓名与文件夹信息不能唯一匹配。确认之前不会把内容写入任何成员档案。', evidenceRefs: ['span-docx-heading'], candidateOptions: [], resolutionStatus: 'open' }
+      { id: 'review-1', personId: null, documentId: 'document-inbox-3', kind: 'person_conflict', severity: 'blocking', title: '确认门诊报告属于谁', description: '报告里的姓名与文件夹信息不能唯一匹配。确认之前不会把内容写入任何成员档案。', evidenceRefs: ['span-docx-heading'], candidateOptions: [], reportedName: null, resolutionStatus: 'open' }
     ],
     actions: [
       { id: 'action-1', personId: 'person-lin-ming', title: '向医生咨询血脂变化', detail: '结合近三次 LDL 记录与本次报告参考范围，询问是否需要进一步评估。', origin: 'ai_proposed', status: 'proposed', dueDate: null, dueText: '下次就诊时', evidenceLabel: '基于 2024–2026 三次体检记录', userRevision: 1, updatedAt: '2026-09-17T02:20:00+00:00' },
