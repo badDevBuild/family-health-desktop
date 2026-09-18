@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,10 +8,11 @@ import {
   type ExtractionResult,
   type ObservationCandidate,
   type ReviewCandidateDiff,
+  type SourceManifest,
   type SourceSpan
 } from '@contracts';
 import { evaluateObservationCandidate, stableHash } from '@core';
-import { INGESTION_LIMITS, renderDocxImagesToFiles, renderHeicImagesToPngs, renderPdfPagesToPngs } from '@ingestion';
+import { buildPdfManifest, INGESTION_LIMITS, renderDocxImagesToFiles, renderHeicImagesToPngs, renderPdfPagesToPngs } from '@ingestion';
 import type { JobExecutionGuard, WorkspaceStore } from '@storage';
 
 interface StructuredRuntime {
@@ -32,6 +34,23 @@ interface ImageMapping {
   imageIndex: number;
   page: number | null;
   sourceSpanIds: string[];
+}
+
+function historicalPdfSpansMatch(stored: SourceSpan[], rebuilt: SourceManifest): boolean {
+  if (rebuilt.totalUnits !== stored.length || rebuilt.spans.length !== stored.length) return false;
+  return stored.every((span, index) => {
+    const current = rebuilt.spans[index];
+    return current !== undefined
+      && span.spanKind === 'page'
+      && current.spanKind === 'page'
+      && span.page === index + 1
+      && current.page === span.page
+      && span.blockId === current.blockId
+      && span.lineStart === current.lineStart
+      && span.lineEnd === current.lineEnd
+      && span.quote === current.quote
+      && span.readability === current.readability;
+  });
 }
 
 type ReviewDiffField = ReviewCandidateDiff['fields'][number];
@@ -326,7 +345,32 @@ export class DocumentExtractionPipeline {
   }
 
   async process(documentId: string): Promise<ExtractionPipelineResult> {
-    const bundle = this.store.getDocumentExtractionBundle(documentId);
+    let bundle = this.store.getDocumentExtractionBundle(documentId);
+    if (bundle.manifest.conversionWarnings.includes('historical_manifest_metadata_unavailable')) {
+      if (bundle.manifest.mediaType !== 'application/pdf') throw new Error('LEGACY_MANIFEST_RECOVERY_UNSAFE');
+      const bytes = readFileSync(bundle.sourcePath);
+      const actualHash = createHash('sha256').update(bytes).digest('hex');
+      if (actualHash !== bundle.manifest.sha256) throw new Error('LEGACY_PDF_SOURCE_HASH_MISMATCH');
+      const rebuilt = await buildPdfManifest({
+        sourceObjectId: bundle.manifest.sourceObjectId,
+        documentId,
+        sha256: actualHash,
+        displayName: bundle.manifest.originalDisplayName,
+        bytes,
+        createdAt: bundle.manifest.createdAt
+      });
+      if (rebuilt.normalizerVersion !== bundle.manifest.normalizerVersion
+        || !historicalPdfSpansMatch(bundle.manifest.spans, rebuilt)) {
+        throw new Error('LEGACY_PDF_MANIFEST_RECOVERY_UNSAFE');
+      }
+      this.store.reconstructLegacyPdfManifest({
+        documentId,
+        sha256: actualHash,
+        totalPages: rebuilt.totalUnits,
+        normalizerVersion: rebuilt.normalizerVersion
+      });
+      bundle = this.store.getDocumentExtractionBundle(documentId);
+    }
     const isImage = bundle.manifest.mediaType.startsWith('image/');
     const isHeic = ['image/heic', 'image/heif'].includes(bundle.manifest.mediaType);
     const isPdf = bundle.manifest.mediaType === 'application/pdf';

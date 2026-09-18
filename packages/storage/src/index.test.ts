@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(8);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(9);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -213,6 +213,72 @@ describe('WorkspaceStore', () => {
     });
     expect(store.listOpenExtractionReviewIssues()).toEqual([]);
     expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    store.close();
+  });
+
+  it('schema v9 只重试可恢复的旧 PDF 覆盖误拦截，必须由原文件复核后才补全清单', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v8-pdf-manifest-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('旧版 PDF 占位内容'), mediaType: 'application/pdf', displayName: '旧版体检报告.pdf' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'legacy-pdf-manifest', sourceObjectId: source.id, sha256: source.sha256, mediaType: 'application/pdf',
+      originalDisplayName: '旧版体检报告.pdf', totalUnits: 2, coveredUnitIndexes: [0, 1],
+      spans: [
+        { id: 'legacy-page-1', documentId: document.documentId, spanKind: 'page', page: 1, blockId: null, lineStart: null, lineEnd: null, quote: '第一页内容', readability: 'clear' },
+        { id: 'legacy-page-2', documentId: document.documentId, spanKind: 'page', page: 2, blockId: null, lineStart: null, lineEnd: null, quote: '第二页内容', readability: 'clear' }
+      ],
+      normalizerVersion: 'pdfjs-5.4-text-v1', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z'
+    });
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'coverage_gap',
+      severity: 'blocking',
+      evidenceRefs: ['legacy-page-1'],
+      candidateOptions: [{
+        localKey: 'candidate-1', originalName: '收缩压', standardNameCandidate: null,
+        value: { kind: 'numeric', rawText: '107', decimal: '107', comparator: 'eq' },
+        unitRaw: 'mmHg', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+        evidence: [{ sourceSpanId: 'legacy-page-1', quote: '第一页内容' }], issues: []
+      }]
+    });
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`
+      DELETE FROM source_manifests WHERE document_id = '${document.documentId}';
+      UPDATE workspaces SET schema_version = 8;
+      PRAGMA user_version = 8;
+    `);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:01:00Z') });
+    const pendingRecovery = store.getDocumentExtractionBundle(document.documentId);
+    expect(pendingRecovery.manifest.coveredUnitIndexes).toEqual([]);
+    expect(pendingRecovery.manifest.conversionWarnings).toContain('historical_manifest_metadata_unavailable');
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+
+    expect(() => store.reconstructLegacyPdfManifest({
+      documentId: document.documentId,
+      sha256: source.sha256,
+      totalPages: 3,
+      normalizerVersion: 'pdfjs-5.4-text-v1'
+    })).toThrow('LEGACY_PDF_MANIFEST_RECOVERY_UNSAFE');
+    expect(store.reconstructLegacyPdfManifest({
+      documentId: document.documentId,
+      sha256: source.sha256,
+      totalPages: 2,
+      normalizerVersion: 'pdfjs-5.4-text-v1'
+    })).toBe(true);
+    expect(store.getDocumentExtractionBundle(document.documentId).manifest).toMatchObject({
+      totalUnits: 2,
+      coveredUnitIndexes: [0, 1],
+      conversionWarnings: ['historical_manifest_reconstructed_from_verified_pdf']
+    });
     store.close();
   });
 

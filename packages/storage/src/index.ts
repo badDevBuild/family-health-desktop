@@ -13,7 +13,7 @@ import type {
   SourceManifest
 } from '@contracts';
 
-export const WORKSPACE_SCHEMA_VERSION = 8;
+export const WORKSPACE_SCHEMA_VERSION = 9;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 function extractReportedNameFromIdentityEvidence(quote: string): string | null {
@@ -884,6 +884,102 @@ export class WorkspaceStore {
       `).run(randomUUID(), document.id, `已建立 ${manifest.spans.length} 条证据定位`, this.now().toISOString());
     });
     transaction();
+  }
+
+  reconstructLegacyPdfManifest(input: {
+    documentId: string;
+    sha256: string;
+    totalPages: number;
+    normalizerVersion: string;
+  }): boolean {
+    const transaction = this.db.transaction(() => {
+      const document = this.db.prepare(`
+        SELECT d.id, d.source_object_id, d.created_at,
+               so.sha256, so.media_type,
+               (
+                 SELECT display_name FROM source_occurrences occ
+                 WHERE occ.source_object_id = d.source_object_id
+                 ORDER BY occ.last_seen DESC LIMIT 1
+               ) AS display_name,
+               EXISTS(SELECT 1 FROM document_conversions dc WHERE dc.document_id = d.id) AS has_conversion,
+               EXISTS(SELECT 1 FROM source_manifests sm WHERE sm.document_id = d.id) AS has_manifest
+        FROM documents d
+        JOIN source_objects so ON so.id = d.source_object_id
+        WHERE d.id = ?
+      `).get(input.documentId) as {
+        id: string;
+        source_object_id: string;
+        created_at: string;
+        sha256: string;
+        media_type: string;
+        display_name: string | null;
+        has_conversion: number;
+        has_manifest: number;
+      } | undefined;
+      if (!document) throw new Error('DOCUMENT_NOT_FOUND');
+      if (document.has_manifest === 1) return false;
+      if (document.has_conversion === 1 || document.media_type !== 'application/pdf') {
+        throw new Error('LEGACY_PDF_MANIFEST_RECOVERY_UNSAFE');
+      }
+      if (document.sha256 !== input.sha256) throw new Error('LEGACY_PDF_SOURCE_HASH_MISMATCH');
+      if (!Number.isInteger(input.totalPages) || input.totalPages < 1) {
+        throw new Error('LEGACY_PDF_PAGE_COUNT_INVALID');
+      }
+
+      const spans = this.db.prepare(`
+        SELECT span_kind, page_number, quote, readability, normalizer_version
+        FROM source_spans
+        WHERE document_id = ?
+        ORDER BY page_number, id
+      `).all(document.id) as Array<{
+        span_kind: string;
+        page_number: number | null;
+        quote: string | null;
+        readability: string;
+        normalizer_version: string;
+      }>;
+      const pages = spans.map((span) => span.page_number);
+      const matchesVerifiedPdf = spans.length === input.totalPages
+        && spans.every((span, index) => span.span_kind === 'page'
+          && span.page_number === index + 1
+          && span.quote !== null
+          && span.quote.trim().length > 0
+          && span.readability === 'clear'
+          && span.normalizer_version === input.normalizerVersion)
+        && new Set(pages).size === input.totalPages;
+      if (!matchesVerifiedPdf) throw new Error('LEGACY_PDF_MANIFEST_RECOVERY_UNSAFE');
+
+      this.db.prepare(`
+        INSERT INTO source_manifests (
+          document_id, manifest_id, source_object_id, sha256, media_type,
+          original_display_name, total_units, covered_unit_indexes_json,
+          normalizer_version, conversion_warnings_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        document.id,
+        `reconstructed-manifest-${document.id}`,
+        document.source_object_id,
+        document.sha256,
+        document.media_type,
+        document.display_name ?? '旧版导入资料',
+        input.totalPages,
+        JSON.stringify(Array.from({ length: input.totalPages }, (_, index) => index)),
+        input.normalizerVersion,
+        JSON.stringify(['historical_manifest_reconstructed_from_verified_pdf']),
+        this.now().toISOString()
+      );
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'source_manifest.reconstructed', ?, ?, ?)
+      `).run(
+        randomUUID(),
+        document.id,
+        `重新校验原始 PDF 后恢复 ${input.totalPages} 页旧版来源清单`,
+        this.now().toISOString()
+      );
+      return true;
+    });
+    return transaction();
   }
 
   setDocumentStatus(documentId: string, status: 'queued' | 'needs_review' | 'blocked' | 'completed'): void {
@@ -2810,6 +2906,95 @@ export class WorkspaceStore {
         current = 8;
       }
 
+      if (current === 8) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRecoverLegacyPdfIssues = [
+          'documents', 'source_objects', 'source_manifests', 'document_conversions',
+          'source_spans', 'review_issues', 'audit_events', 'jobs', 'job_attempts'
+        ].every((table) => tables.has(table));
+        if (canRecoverLegacyPdfIssues) {
+          const legacyDocuments = this.db.prepare(`
+          SELECT d.id, so.media_type,
+                 EXISTS(SELECT 1 FROM document_conversions dc WHERE dc.document_id = d.id) AS has_conversion
+          FROM documents d
+          JOIN source_objects so ON so.id = d.source_object_id
+          LEFT JOIN source_manifests sm ON sm.document_id = d.id
+          WHERE sm.document_id IS NULL
+          ORDER BY d.created_at, d.id
+          `).all() as Array<{
+            id: string;
+            media_type: string;
+            has_conversion: number;
+          }>;
+
+          for (const document of legacyDocuments) {
+            if (document.has_conversion === 1 || document.media_type !== 'application/pdf') continue;
+            const spans = this.db.prepare(`
+            SELECT id, span_kind, page_number, quote, readability, normalizer_version
+            FROM source_spans
+            WHERE document_id = ?
+            ORDER BY page_number, id
+            `).all(document.id) as Array<{
+              id: string;
+              span_kind: string;
+              page_number: number | null;
+              quote: string | null;
+              readability: string;
+              normalizer_version: string;
+            }>;
+            if (spans.length === 0) continue;
+            const normalizerVersions = new Set(spans.map((span) => span.normalizer_version));
+            const pages = spans.map((span) => span.page_number);
+            const isContiguousClearPageManifest = normalizerVersions.size === 1
+              && spans.every((span) => span.span_kind === 'page'
+                && span.page_number !== null
+                && span.quote !== null
+                && span.quote.trim().length > 0
+                && span.readability === 'clear')
+              && new Set(pages).size === spans.length
+              && pages.every((page, index) => page === index + 1);
+            if (!isContiguousClearPageManifest) continue;
+
+            const coverageIssues = this.db.prepare(`
+            SELECT id, payload_json FROM review_issues
+            WHERE field_ref = 'document:' || ?
+              AND kind = 'coverage_gap'
+              AND resolution_status = 'open'
+            `).all(document.id) as Array<{ id: string; payload_json: string | null }>;
+            for (const issue of coverageIssues) {
+              let payload: { candidateOptions?: ObservationCandidate[] } = {};
+              try {
+                payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+              } catch {
+                continue;
+              }
+              const candidates = payload.candidateOptions ?? [];
+              const hasBlockingCandidateIssue = candidates.some((candidate) => (
+                candidate.issues.some((candidateIssue) => candidateIssue.code.startsWith('blocking_'))
+              ));
+              if (candidates.length === 0 || hasBlockingCandidateIssue) continue;
+              this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+              `).run(issue.id);
+              this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(document.id);
+              this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '已识别旧版来源清单误拦截，资料重新进入原文件校验队列', ?)
+              `).run(randomUUID(), issue.id, this.now().toISOString());
+              this.resumeWaitingJobsAfterReview(document.id);
+            }
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 9;
+          PRAGMA user_version = 9;
+        `);
+        current = 9;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -3008,7 +3193,7 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
       CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
-      PRAGMA user_version = 8;
+      PRAGMA user_version = 9;
       `);
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');

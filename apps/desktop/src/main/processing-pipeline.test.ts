@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
 import { PersonalWorkspaceService } from './workspace-service.js';
@@ -69,7 +70,76 @@ function createScannedLikePdf(): Uint8Array {
   return Buffer.from(body, 'latin1');
 }
 
+function createTextPdf(text: string): Uint8Array {
+  const escaped = text.replace(/[()\\]/g, (character) => `\\${character}`);
+  const content = `BT /F1 12 Tf 10 70 Td (${escaped}) Tj ET`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`
+  ];
+  let body = '%PDF-1.4\n';
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(body));
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  body += offsets.slice(1).map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`).join('');
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  return Buffer.from(body, 'latin1');
+}
+
 describe('DocumentExtractionPipeline', () => {
+  it('旧版 PDF 缺少清单元数据时重读原文件核对，不再误拦截为覆盖缺口', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-legacy-pdf-pipeline-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '旧版 PDF 工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const receipt = await service.importFiles([{
+      path: '/tmp/legacy-report.pdf',
+      bytes: createTextPdf('LDL 4.2 mmol/L')
+    }], personId);
+    expect(receipt.rejected).toEqual([]);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const database = new Database(service.store.databasePath);
+    database.prepare('DELETE FROM source_manifests WHERE document_id = ?').run(documentId);
+    database.close();
+    expect(service.store.getDocumentExtractionBundle(documentId).manifest.conversionWarnings)
+      .toContain('historical_manifest_metadata_unavailable');
+
+    const output: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'legacy-ldl', originalName: 'LDL', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: null,
+        evidence: [{ sourceSpanId: span.id, quote: 'LDL 4.2 mmol/L' }], issues: []
+      }]
+    };
+    let turns = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'legacy-thread', turnId: `legacy-turn-${++turns}`, output })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(turns).toBe(2);
+    expect(service.store.getDocumentExtractionBundle(documentId).manifest).toMatchObject({
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      conversionWarnings: ['historical_manifest_reconstructed_from_verified_pdf']
+    });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
   it('DOCX 嵌入图会带着对应 source span 进入两次独立视觉读取，完成后清理', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-docx-pipeline-'));
     roots.push(root);
