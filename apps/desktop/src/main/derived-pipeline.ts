@@ -90,6 +90,12 @@ function deterministicSafetyIssues(candidate: DerivedSnapshotCandidate, observat
   return issues;
 }
 
+function canRepairDerivedStructure(issues: string[]): boolean {
+  return issues.length > 0 && issues.every((issue) => (
+    issue.startsWith('evidence_mismatch:') || issue.startsWith('boundary_note_required:')
+  ));
+}
+
 function reviewIssues(candidate: DerivedSnapshotCandidate, review: DerivedSafetyReview): string[] {
   const expectedClaims = new Set(candidate.claims.map((claim) => claim.id));
   const expectedGuidance = new Set(candidate.lifestyleGuidance.map((guidance) => guidance.id));
@@ -102,6 +108,29 @@ function reviewIssues(candidate: DerivedSnapshotCandidate, review: DerivedSafety
   for (const item of review.claimReviews) if (!item.supported || !item.safe) issues.push(`claim_rejected:${item.claimId}`);
   for (const item of review.guidanceReviews) if (!item.supported || !item.safe) issues.push(`guidance_rejected:${item.guidanceId}`);
   return issues;
+}
+
+function canOmitRejectedDerivedItems(issues: string[]): boolean {
+  return issues.length > 0 && issues.every((issue) => (
+    issue.startsWith('claim_rejected:') || issue.startsWith('guidance_rejected:')
+  ));
+}
+
+function omitRejectedDerivedItems(
+  candidate: DerivedSnapshotCandidate,
+  review: DerivedSafetyReview
+): DerivedSnapshotCandidate {
+  const approvedClaimIds = new Set(review.claimReviews
+    .filter((item) => item.supported && item.safe)
+    .map((item) => item.claimId));
+  const approvedGuidanceIds = new Set(review.guidanceReviews
+    .filter((item) => item.supported && item.safe)
+    .map((item) => item.guidanceId));
+  return {
+    ...candidate,
+    claims: candidate.claims.filter((item) => approvedClaimIds.has(item.id)),
+    lifestyleGuidance: candidate.lifestyleGuidance.filter((item) => approvedGuidanceIds.has(item.id))
+  };
 }
 
 export class DerivedHealthPipeline {
@@ -152,9 +181,27 @@ export class DerivedHealthPipeline {
       allowWebSearch: true,
       outputSchema: candidateOutputSchema
     });
-    const candidate = derivedSnapshotCandidateSchema.parse(generated.output);
+    let candidate = derivedSnapshotCandidateSchema.parse(generated.output);
     if (candidate.personId !== personId || candidate.factRevision !== factRevision) throw new Error('DERIVED_SCOPE_MISMATCH');
-    const localIssues = deterministicSafetyIssues(candidate, observations);
+    let localIssues = deterministicSafetyIssues(candidate, observations);
+    if (canRepairDerivedStructure(localIssues)) {
+      const repaired = await this.runTurn('repair_derived', {
+        prompt: [
+          '你是健康说明的结构修复器。只修复下列机器校验错误，并返回完整的 DERIVED_CANDIDATE；不得新增报告事实、诊断、处方、药物调整或剂量。',
+          'evidence_mismatch：只能改用 FACT_PACKAGE 中真实存在且确实支持该说明的 observationId；没有充分依据的条目必须删除，不得猜测或编造 ID。',
+          'boundary_note_required：association 与 action 层必须补充明确的边界说明，例如“仅供参考，不等于诊断”或“建议就此咨询医生”。',
+          '保持 personId、factRevision 和 schemaVersion 不变。不得使用网页搜索；只能依据 FACT_PACKAGE 修复。',
+          `VALIDATION_ERRORS=${JSON.stringify(localIssues)}`,
+          `FACT_PACKAGE=${factPackage}`,
+          `DERIVED_CANDIDATE=${JSON.stringify(candidate)}`
+        ].join('\n'),
+        allowWebSearch: false,
+        outputSchema: candidateOutputSchema
+      });
+      candidate = derivedSnapshotCandidateSchema.parse(repaired.output);
+      if (candidate.personId !== personId || candidate.factRevision !== factRevision) throw new Error('DERIVED_REPAIR_SCOPE_MISMATCH');
+      localIssues = deterministicSafetyIssues(candidate, observations);
+    }
     if (localIssues.length > 0) return this.needsReview(observations, localIssues.join(','), generated.threadId, generated.turnId);
 
     this.onStage?.('review_derived');
@@ -173,7 +220,11 @@ export class DerivedHealthPipeline {
     const safetyReview = derivedSafetyReviewSchema.parse(reviewed.output);
     if (safetyReview.personId !== personId || safetyReview.factRevision !== factRevision) throw new Error('DERIVED_REVIEW_SCOPE_MISMATCH');
     const independentIssues = reviewIssues(candidate, safetyReview);
-    if (independentIssues.length > 0) return this.needsReview(observations, independentIssues.join(','), reviewed.threadId, reviewed.turnId);
+    if (canOmitRejectedDerivedItems(independentIssues)) {
+      candidate = omitRejectedDerivedItems(candidate, safetyReview);
+    } else if (independentIssues.length > 0) {
+      return this.needsReview(observations, independentIssues.join(','), reviewed.threadId, reviewed.turnId);
+    }
 
     this.onStage?.('publish');
     const published = this.store.publishDerivedSnapshot({

@@ -157,4 +157,83 @@ describe('DerivedHealthPipeline', () => {
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();
   });
+
+  it('自动修复派生说明的内部证据 ID 与边界备注后再进行独立安全复核', async () => {
+    const { service, personId, observationId } = await setup();
+    const malformed: DerivedSnapshotCandidate = {
+      schemaVersion: 1, personId, factRevision: 1, dataQuality: 'partial',
+      claims: [{
+        id: 'claim-repair', organId: 'cardiovascular', level: 'association',
+        title: '结合报告继续关注', explanation: '这项变化需要结合后续检查理解。',
+        evidenceObservationIds: ['不存在的内部事实-id'], boundaryNote: null
+      }],
+      lifestyleGuidance: []
+    };
+    const repaired: DerivedSnapshotCandidate = {
+      ...malformed,
+      claims: [{
+        ...malformed.claims[0]!,
+        evidenceObservationIds: [observationId],
+        boundaryNote: '仅供参考，不等于诊断。'
+      }]
+    };
+    const review: DerivedSafetyReview = {
+      schemaVersion: 1, personId, factRevision: 1, overallSafe: true,
+      claimReviews: [{ claimId: 'claim-repair', supported: true, safe: true, issue: null }],
+      guidanceReviews: []
+    };
+    const prompts: string[] = [];
+    const webSearchFlags: Array<boolean | undefined> = [];
+    let turn = 0;
+    const result = await new DerivedHealthPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        prompts.push(input.prompt);
+        webSearchFlags.push(input.allowWebSearch);
+        const output = [malformed, repaired, review][turn++]!;
+        return { threadId: 'repair-thread', turnId: `repair-turn-${turn}`, output };
+      }
+    }).process(personId);
+
+    expect(result).toMatchObject({ status: 'published' });
+    expect(prompts[1]).toContain('VALIDATION_ERRORS');
+    expect(prompts[1]).toContain('不得使用网页搜索');
+    expect(webSearchFlags).toEqual([true, false, true]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('独立复核拒绝单条说明时只省略该条，不把整份安全分析交给用户确认', async () => {
+    const { service, personId, observationId } = await setup();
+    const candidate: DerivedSnapshotCandidate = {
+      schemaVersion: 1, personId, factRevision: 1, dataQuality: 'partial',
+      claims: [{
+        id: 'claim-safe', organId: 'cardiovascular', level: 'fact',
+        title: '报告事实', explanation: 'LDL-C 4.2 mmol/L，原报告标记偏高。',
+        evidenceObservationIds: [observationId], boundaryNote: null
+      }],
+      lifestyleGuidance: [{
+        id: 'guidance-unsupported', title: '饮水安排', detail: '按固定时段增加饮水。',
+        evidenceObservationIds: [observationId], consultProfessional: false
+      }]
+    };
+    const review: DerivedSafetyReview = {
+      schemaVersion: 1, personId, factRevision: 1, overallSafe: true,
+      claimReviews: [{ claimId: 'claim-safe', supported: true, safe: true, issue: null }],
+      guidanceReviews: [{ guidanceId: 'guidance-unsupported', supported: false, safe: true, issue: '现有事实不足以支持这条建议' }]
+    };
+    let turn = 0;
+    const result = await new DerivedHealthPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: 'omit-thread', turnId: `omit-turn-${++turn}`, output: turn === 1 ? candidate : review
+      })
+    }).process(personId);
+
+    expect(result).toMatchObject({ status: 'published' });
+    expect(service.store.listCurrentDerivedSnapshots()[0]?.payload).toMatchObject({
+      claims: [expect.objectContaining({ id: 'claim-safe' })],
+      lifestyleGuidance: []
+    });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
 });

@@ -13,7 +13,7 @@ import type {
   SourceManifest
 } from '@contracts';
 
-export const WORKSPACE_SCHEMA_VERSION = 23;
+export const WORKSPACE_SCHEMA_VERSION = 26;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 function calendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
@@ -3853,6 +3853,160 @@ export class WorkspaceStore {
         current = 23;
       }
 
+      if (current === 23) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRecoverTrustedAssignmentReviews = [
+          'documents', 'review_issues', 'audit_events', 'jobs'
+        ].every((table) => tables.has(table));
+        if (canRecoverTrustedAssignmentReviews) {
+          const issues = this.db.prepare(`
+            SELECT ri.id, d.id AS document_id
+            FROM review_issues ri
+            JOIN documents d ON ri.field_ref = 'document:' || d.id
+            WHERE ri.kind = 'field_conflict'
+              AND ri.resolution_status = 'open'
+              AND ri.payload_json IS NULL
+              AND d.status = 'needs_review'
+              AND d.person_assignment_basis IN ('user_selected', 'folder_binding', 'identity_confirmed')
+            ORDER BY ri.created_at, ri.id
+          `).all() as Array<{ id: string; document_id: string }>;
+          for (const issue of issues) {
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1,
+                  payload_json = json_object('reasonCodes', json_array('TRUSTED_ASSIGNMENT_WITHOUT_VERIFIED_CONFLICT'))
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ? AND status = 'needs_review'`).run(issue.document_id);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '报告未识别出可验证的不同姓名，沿用用户已确认的成员归属并继续处理', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+            this.resumeWaitingJobsAfterReview(issue.document_id);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 24;
+          PRAGMA user_version = 24;
+        `);
+        current = 24;
+      }
+
+      if (current === 24) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryRepairableDerivedStructure = [
+          'review_issues', 'audit_events', 'jobs'
+        ].every((table) => tables.has(table));
+        if (canRetryRepairableDerivedStructure) {
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'derived_safety' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let reasonCodes: string[] = [];
+            try {
+              const payload = issue.payload_json ? JSON.parse(issue.payload_json) as { reasonCodes?: unknown } : {};
+              reasonCodes = Array.isArray(payload.reasonCodes)
+                ? payload.reasonCodes.filter((code): code is string => typeof code === 'string')
+                : [];
+            } catch {
+              continue;
+            }
+            const repairable = reasonCodes.length > 0 && reasonCodes.every((code) => (
+              code.startsWith('evidence_mismatch:') || code.startsWith('boundary_note_required:')
+            ));
+            if (!repairable) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`
+              UPDATE jobs
+              SET status = 'queued', stage = 'analyze', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+              WHERE status = 'waiting_user'
+                AND stage IN ('analyze', 'guidance', 'review_derived', 'publish')
+                AND EXISTS (
+                  SELECT 1 FROM json_each(json_extract(jobs.checkpoint_json, '$.documentIds'))
+                  WHERE value = ?
+                )
+            `).run(this.now().toISOString(), documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '派生说明的内部证据引用与边界备注改由自动修复并重新安全核对', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 25;
+          PRAGMA user_version = 25;
+        `);
+        current = 25;
+      }
+
+      if (current === 25) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRetryItemLevelDerivedRejection = [
+          'review_issues', 'audit_events', 'jobs'
+        ].every((table) => tables.has(table));
+        if (canRetryItemLevelDerivedRejection) {
+          const issues = this.db.prepare(`
+            SELECT id, field_ref, payload_json
+            FROM review_issues
+            WHERE kind = 'derived_safety' AND resolution_status = 'open'
+            ORDER BY created_at, id
+          `).all() as Array<{ id: string; field_ref: string; payload_json: string | null }>;
+          for (const issue of issues) {
+            let reasonCodes: string[] = [];
+            try {
+              const payload = issue.payload_json ? JSON.parse(issue.payload_json) as { reasonCodes?: unknown } : {};
+              reasonCodes = Array.isArray(payload.reasonCodes)
+                ? payload.reasonCodes.filter((code): code is string => typeof code === 'string')
+                : [];
+            } catch {
+              continue;
+            }
+            const itemLevelOnly = reasonCodes.length > 0 && reasonCodes.every((code) => (
+              code.startsWith('claim_rejected:') || code.startsWith('guidance_rejected:')
+            ));
+            if (!itemLevelOnly) continue;
+            const documentId = issue.field_ref.startsWith('document:') ? issue.field_ref.slice('document:'.length) : null;
+            if (!documentId) continue;
+            this.db.prepare(`
+              UPDATE review_issues
+              SET resolution_status = 'resolved', resolution_revision = 1
+              WHERE id = ? AND resolution_status = 'open'
+            `).run(issue.id);
+            this.db.prepare(`
+              UPDATE jobs
+              SET status = 'queued', stage = 'analyze', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+              WHERE status = 'waiting_user'
+                AND stage IN ('analyze', 'guidance', 'review_derived', 'publish')
+                AND EXISTS (
+                  SELECT 1 FROM json_each(json_extract(jobs.checkpoint_json, '$.documentIds'))
+                  WHERE value = ?
+                )
+            `).run(this.now().toISOString(), documentId);
+            this.db.prepare(`
+              INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+              VALUES (?, 'review_issue.recovered', ?, '独立复核拒绝的单条派生说明改为省略，其余安全内容重新进入发布流程', ?)
+            `).run(randomUUID(), issue.id, this.now().toISOString());
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 26;
+          PRAGMA user_version = 26;
+        `);
+        current = 26;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -4051,7 +4205,7 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
       CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
-      PRAGMA user_version = 23;
+      PRAGMA user_version = 26;
       `);
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');

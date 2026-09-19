@@ -846,6 +846,28 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
+  it('用户已明确归属时，姓名看不清但没有可验证冲突仍继续处理', async () => {
+    const { service, personId, documentId, output } = await setup();
+    const uncertainIdentity: ExtractionResult = {
+      ...output,
+      subject: { reportedName: null, evidence: [], confidence: 'uncertain' }
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: 'uncertain-identity-thread',
+        turnId: 'uncertain-identity-turn',
+        output: uncertainIdentity
+      })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({
+      status: 'published', candidateCount: 1, revision: 1
+    });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    service.close();
+  });
+
   it('报告姓名与成员昵称不同时要求身份确认，确认后按原姓名再次核对并发布', async () => {
     const { service, personId, documentId, output, subjectSpanId } = await setup();
     const conflicting = {

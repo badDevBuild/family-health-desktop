@@ -601,6 +601,8 @@ export class PersonalWorkspaceService {
         const legacyFieldReview = issue.kind === 'field_conflict'
           && issue.candidateOptions.length > 0
           && issue.candidateDiffs.length === 0;
+        const unverifiedIdentity = issue.reasonCodes.includes('PERSON_IDENTITY_NOT_CONFIRMED')
+          && issue.reportedName === null;
         const differenceCount = issue.candidateDiffs.length;
         return {
           id: issue.id,
@@ -611,6 +613,7 @@ export class PersonalWorkspaceService {
           title: issue.kind === 'person_conflict'
             ? '确认报告姓名与成员身份'
             : legacyFieldReview ? '按新规则重新核对这份报告'
+            : unverifiedIdentity ? '这份资料没有可确认的姓名'
             : issue.kind === 'field_conflict' ? `发现 ${differenceCount} 项核心事实差异`
             : issue.kind === 'derived_safety' ? '健康说明未通过安全复核' : '资料覆盖需要人工确认',
           description: issue.kind === 'person_conflict'
@@ -623,6 +626,8 @@ export class PersonalWorkspaceService {
                 : '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
             : legacyFieldReview
               ? '这项核对由旧版逐字段完全一致规则产生。重新核对后，只在核心事实真正冲突时再请你确认。'
+              : unverifiedIdentity
+                ? '系统无法从原始资料中确认姓名，也没有发现可验证的不同姓名。已手动归属或来自成员文件夹的资料会按当前成员继续处理。'
               : issue.kind === 'field_conflict'
                 ? `两轮核对共有 ${issue.candidateOptions.length} 项候选，其中 ${differenceCount} 项核心字段不一致。只需核对下方差异项。`
                 : '为避免把不确定内容写入健康档案，这份资料已暂停并等待你的核对。',

@@ -76,6 +76,70 @@ describe('ProcessingJobRunner', () => {
     service.close();
   });
 
+  it('一份资料需要核对时仍继续处理同批其余资料', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-runner-partial-review-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '测试工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([
+      { path: '/tmp/虚构待核对报告一.txt', bytes: Buffer.from('报告一 2026-09-17 LDL-C 4.2 mmol/L') },
+      { path: '/tmp/虚构清晰报告二.txt', bytes: Buffer.from('报告二 2026-09-17 LDL-C 4.2 mmol/L') }
+    ], personId);
+    const state: AccountState = {
+      status: 'connected', displayLabel: 'fixture@example.test',
+      quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },
+      runtimeVersion: 'fixture-runtime', lastCheckedAt: '2026-09-18T00:00:00Z'
+    };
+    service.processNow({ accountState: state, consentVersion: 1 });
+    const job = service.store.listStoredJobs()[0]!;
+    const [reviewDocumentId, clearDocumentId] = job.documentIds;
+    const reviewSpanId = service.store.getDocumentExtractionBundle(reviewDocumentId!).manifest.spans[0]!.id;
+    const clearSpanId = service.store.getDocumentExtractionBundle(clearDocumentId!).manifest.spans[0]!.id;
+    const needsReviewOutput: ExtractionResult = {
+      schemaVersion: 1,
+      documentId: reviewDocumentId!,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [],
+      candidates: []
+    };
+    const clearOutput: ExtractionResult = {
+      schemaVersion: 1,
+      documentId: clearDocumentId!,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [clearSpanId],
+      candidates: [{
+        localKey: 'ldl-clear', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
+        evidence: [{ sourceSpanId: clearSpanId, quote: '2026-09-17 LDL-C 4.2 mmol/L' }], issues: []
+      }]
+    };
+    let call = 0;
+    const runtime = {
+      getState: () => state,
+      runStructuredTurn: async () => {
+        call += 1;
+        return call === 1
+          ? { threadId: 'review-thread', turnId: 'review-turn', output: needsReviewOutput }
+          : { threadId: 'clear-thread', turnId: `clear-${call}`, output: clearOutput };
+      }
+    } as unknown as CodexRuntimeManager;
+
+    await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
+
+    expect(call).toBe(3);
+    expect(service.store.listStoredJobs()[0]).toMatchObject({ status: 'waiting_user', completedUnits: 2, totalUnits: 2 });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ documentId: reviewDocumentId, kind: 'coverage_gap', reasonCodes: ['EXTRACTION_COVERAGE_INCOMPLETE'] })
+    ]);
+    expect(service.store.isDocumentCommitted(clearDocumentId!)).toBe(true);
+    expect(service.store.isDocumentCommitted(reviewDocumentId!)).toBe(false);
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    expect(reviewSpanId).toBeTruthy();
+    service.close();
+  });
+
   it('只中断本应用当前 turn，并把任务确认成 cancelled', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-runner-cancel-'));
     roots.push(root);

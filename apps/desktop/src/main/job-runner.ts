@@ -77,7 +77,9 @@ export class ProcessingJobRunner extends EventEmitter {
               if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
               if (result.status === 'needs_review') {
                 needsReview = true;
-                break;
+                // 单份资料需要核对时继续处理同批其余资料；最终派生阶段仍等待
+                // 所有阻断事项解决，避免一张模糊图片让整个批次看起来卡住。
+                continue;
               }
             }
           }

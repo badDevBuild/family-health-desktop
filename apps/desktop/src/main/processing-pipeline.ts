@@ -538,10 +538,12 @@ function subjectIsConsistent(
   result: ExtractionResult,
   bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
 ): boolean {
-  if (result.subject.confidence === 'absent' && result.subject.reportedName === null) {
-    return bundle.personAssignmentBasis === 'user_selected' || bundle.personAssignmentBasis === 'folder_binding';
-  }
-  if (!subjectEvidenceIsValid(result, bundle)) return false;
+  const trustedAssignment = bundle.personAssignmentBasis === 'user_selected'
+    || bundle.personAssignmentBasis === 'folder_binding'
+    || bundle.personAssignmentBasis === 'identity_confirmed';
+  // 用户明确归属或成员文件夹绑定是有效的身份依据。姓名缺失、模糊或证据定位
+  // 不完整时沿用该归属；只有来源中存在可验证的明确姓名时才比较并阻断冲突。
+  if (!subjectEvidenceIsValid(result, bundle)) return trustedAssignment;
   const expectedName = bundle.confirmedReportedName ?? bundle.personDisplayName;
   return normalizedPersonName(result.subject.reportedName!) === normalizedPersonName(expectedName);
 }
@@ -1029,7 +1031,8 @@ export class DocumentExtractionPipeline {
       evidenceRefs,
       ...(candidateOptions ? { candidateOptions } : {}),
       ...(reportedName ? { reportedName } : {}),
-      ...(candidateDiffs ? { candidateDiffs } : {})
+      ...(candidateDiffs ? { candidateDiffs } : {}),
+      reasonCodes: [reason]
     });
     return {
       status: 'needs_review', documentId, issueId, reason,

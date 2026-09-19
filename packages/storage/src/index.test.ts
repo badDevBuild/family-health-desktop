@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -334,7 +334,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -390,7 +390,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -446,7 +446,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -502,7 +502,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -558,7 +558,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -614,7 +614,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -670,7 +670,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -726,7 +726,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -783,7 +783,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -840,7 +840,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -897,7 +897,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -953,7 +953,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
@@ -997,7 +997,136 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(23);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v24 恢复没有明确姓名冲突的用户归属资料与同批任务', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v23-identity-review-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T13:18:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('姓名区域模糊的虚构图片'), mediaType: 'image/png', displayName: '虚构图片.png' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id, assignmentBasis: 'user_selected' });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-19T13:18:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'c'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: []
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 23; PRAGMA user_version = 23;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T13:20:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v25 自动重试只有内部证据引用或边界备注错误的派生说明', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v24-derived-structure-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T14:38:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('虚构报告事实'), mediaType: 'text/plain', displayName: '虚构报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-19T14:38:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'd'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'derived_safety',
+      severity: 'blocking',
+      evidenceRefs: [],
+      preserveDocumentStatus: true,
+      reasonCodes: ['boundary_note_required:c4', 'evidence_mismatch:c9']
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`
+      UPDATE documents SET status = 'completed' WHERE id = '${document.documentId}';
+      UPDATE jobs SET stage = 'analyze' WHERE id = '${job.id}';
+      UPDATE workspaces SET schema_version = 24;
+      PRAGMA user_version = 24;
+    `);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T14:39:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v26 自动重试只有单条说明被独立复核拒绝的派生任务', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v25-derived-item-review-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T14:49:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('虚构报告事实'), mediaType: 'text/plain', displayName: '虚构报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-19T14:49:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'e'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      kind: 'derived_safety',
+      severity: 'blocking',
+      evidenceRefs: [],
+      preserveDocumentStatus: true,
+      reasonCodes: ['guidance_rejected:hydration-routine']
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`
+      UPDATE documents SET status = 'completed' WHERE id = '${document.documentId}';
+      UPDATE jobs SET stage = 'review_derived' WHERE id = '${job.id}';
+      UPDATE workspaces SET schema_version = 25;
+      PRAGMA user_version = 25;
+    `);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T14:50:00Z') });
+    expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
+    expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
     upgraded.close();
     store.close();
   });
