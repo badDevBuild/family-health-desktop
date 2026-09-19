@@ -437,6 +437,38 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
+  it('检查部位的泛化组织词不制造冲突，但左右侧差异仍阻断', async () => {
+    const { service, output } = await setup();
+    const withBodySite = (bodySite: string): ExtractionResult => ({
+      ...output,
+      candidates: output.candidates.map((candidate) => ({ ...candidate, bodySite }))
+    });
+
+    expect(compareIndependentExtractions(
+      withBodySite('甲状腺'),
+      withBodySite('甲状腺实质')
+    )).toEqual({ compatible: true, differences: [] });
+    expect(compareIndependentExtractions(
+      withBodySite('左肾'),
+      withBodySite('右肾')
+    )).toEqual({
+      compatible: false,
+      differences: [expect.objectContaining({ fields: ['bodySite'] })]
+    });
+    service.close();
+  });
+
+  it('HTML 实体与报告原符号视为同一参考范围', async () => {
+    const { service, output } = await setup();
+    const withRange = (referenceRangeRaw: string): ExtractionResult => ({
+      ...output,
+      candidates: output.candidates.map((candidate) => ({ ...candidate, referenceRangeRaw }))
+    });
+    expect(compareIndependentExtractions(withRange('<9.00'), withRange('&lt;9.00')))
+      .toEqual({ compatible: true, differences: [] });
+    service.close();
+  });
+
   it('单轮额外提取的正常小结静默省略，异常小结仍要求核对', async () => {
     const first = await setup();
     const normalSummary = {
@@ -720,7 +752,7 @@ describe('DocumentExtractionPipeline', () => {
     await expect(blockingPipeline.process(second.documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
     expect(second.service.store.getFactRevision(second.personId)).toBe(0);
     expect(second.service.store.listOpenExtractionReviewIssues()[0]!.candidateDiffs)
-      .toEqual([{ localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['issues'] }]);
+      .toEqual([expect.objectContaining({ localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['issues'] })]);
     second.service.close();
   });
 
@@ -801,7 +833,11 @@ describe('DocumentExtractionPipeline', () => {
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
     expect(service.store.getFactRevision(personId)).toBe(0);
     expect(service.store.listOpenExtractionReviewIssues()[0]!.candidateDiffs)
-      .toEqual([{ localKey: 'urine-leukocyte', itemName: '尿白细胞 (LEU)', fields: ['value'] }]);
+      .toEqual([expect.objectContaining({
+        localKey: 'urine-leukocyte', itemName: '尿白细胞 (LEU)', fields: ['value'],
+        firstCandidate: expect.objectContaining({ localKey: 'urine-leukocyte' }),
+        secondCandidate: expect.objectContaining({ localKey: 'urine-leukocyte' })
+      })]);
     service.close();
   });
 
@@ -826,7 +862,11 @@ describe('DocumentExtractionPipeline', () => {
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
     expect(service.store.getFactRevision(personId)).toBe(0);
     const issue = service.store.listOpenExtractionReviewIssues()[0]!;
-    expect(issue.candidateDiffs).toEqual([{ localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['value'] }]);
+    expect(issue.candidateDiffs).toEqual([expect.objectContaining({
+      localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['value'],
+      firstCandidate: expect.objectContaining({ value: expect.objectContaining({ decimal: '4.2' }) }),
+      secondCandidate: expect.objectContaining({ value: expect.objectContaining({ decimal: '4.3' }) })
+    })]);
     expect(issue.candidateOptions[0]!.value).toMatchObject({ decimal: '4.3' });
     service.close();
   });
@@ -843,6 +883,40 @@ describe('DocumentExtractionPipeline', () => {
       status: 'needs_review', reason: 'EXTRACTION_COVERAGE_INCOMPLETE'
     });
     expect(service.store.getFactRevision(personId)).toBe(0);
+    service.close();
+  });
+
+  it('模型漏报覆盖清单时整篇补读一次并继续独立复核', async () => {
+    const { service, personId, documentId, output } = await setup();
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `coverage-recovery-thread-${turn}`,
+        turnId: `coverage-recovery-turn-${++turn}`,
+        output: turn === 1 ? { ...output, coveredSourceSpanIds: [] } : output
+      })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(turn).toBe(3);
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('独立复核漏报覆盖清单时也整篇补读一次再决定是否发布', async () => {
+    const { service, personId, documentId, output } = await setup();
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({
+        threadId: `review-coverage-recovery-thread-${turn}`,
+        turnId: `review-coverage-recovery-turn-${++turn}`,
+        output: turn === 2 ? { ...output, coveredSourceSpanIds: [] } : output
+      })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(turn).toBe(3);
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();
   });
 

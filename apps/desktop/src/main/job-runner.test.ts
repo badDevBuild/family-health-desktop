@@ -120,7 +120,7 @@ describe('ProcessingJobRunner', () => {
       getState: () => state,
       runStructuredTurn: async () => {
         call += 1;
-        return call === 1
+        return call <= 2
           ? { threadId: 'review-thread', turnId: 'review-turn', output: needsReviewOutput }
           : { threadId: 'clear-thread', turnId: `clear-${call}`, output: clearOutput };
       }
@@ -128,7 +128,7 @@ describe('ProcessingJobRunner', () => {
 
     await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
 
-    expect(call).toBe(3);
+    expect(call).toBe(4);
     expect(service.store.listStoredJobs()[0]).toMatchObject({ status: 'waiting_user', completedUnits: 2, totalUnits: 2 });
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([
       expect.objectContaining({ documentId: reviewDocumentId, kind: 'coverage_gap', reasonCodes: ['EXTRACTION_COVERAGE_INCOMPLETE'] })

@@ -560,7 +560,17 @@ function InboxRow({ item, selected, onToggle, onOpen }: { item: InboxItem; selec
 }
 
 function ProcessingPage({ snapshot, onCancel, onRetry, onTogglePause, onDetails }: { snapshot: DashboardSnapshot; onCancel(job: JobSummary): void; onRetry(job: JobSummary): void; onTogglePause(): void; onDetails(job: JobSummary): void }) {
-  return <div className="page-stack"><section className="page-title-row"><div><span className="eyebrow">处理中心</span><h1>每一步都能看懂、能恢复</h1><p>技术等待不会被误写成健康风险，已保存的事实不会因后续失败回滚。</p></div><button className="secondary-button" onClick={onTogglePause}>{snapshot.queuePaused ? <Play size={17} /> : <Pause size={17} />}{snapshot.queuePaused ? '继续队列' : '暂停队列'}</button></section>{snapshot.queuePaused && <div className="info-callout"><Pause size={20} /><div><strong>队列已暂停</strong><p>不会领取新的 AI 任务；正在进行的原子步骤会安全收口，日程设置和已保存资料不受影响。</p></div></div>}<div className="job-grid">{snapshot.jobs.map((job) => <article className="panel job-card" key={job.id}><div className="job-card__top"><span className={`job-icon job-icon--${job.status}`}>{job.status === 'running' ? <LoaderCircle className="spin" size={21} /> : job.status === 'succeeded' ? <Check size={21} /> : <Clock3 size={21} />}</span><div><strong>{job.batchLabel}</strong><small>{job.personLabel ?? '待归属资料'} · {job.statusText}</small></div><StatusBadge tone={job.status === 'running' ? 'info' : job.status === 'succeeded' ? 'success' : 'warning'}>{job.status === 'running' ? '处理中' : job.status === 'succeeded' ? '已完成' : job.status === 'failed' ? '处理失败' : job.status === 'cancelled' ? '已停止' : '等待处理'}</StatusBadge></div><div className="progress-row"><div><i style={{ width: `${Math.round(job.completedUnits / job.totalUnits * 100)}%` }} /></div><span>{job.completedUnits}/{job.totalUnits}</span></div><div className="job-card__footer"><span>最近更新：{formatDateTime(job.updatedAt)}</span><div>{job.canCancel && <button className="text-button" onClick={() => onCancel(job)}>停止</button>}{job.canRetry && <button className="text-button" onClick={() => onRetry(job)}><RefreshCw size={15} /> 重试</button>}<button className="text-button" onClick={() => onDetails(job)}>查看详情 <ChevronRight size={15} /></button></div></div></article>)}</div>{snapshot.jobs.length === 0 && <section className="panel table-empty"><Clock3 size={24} /><strong>还没有处理任务</strong><span>导入资料后，可手动开始或等待已启用的每日检查。</span></section>}<section className="panel process-explainer"><span className="eyebrow">工作方式</span><h2>模型给候选，应用负责正式保存</h2><div className="process-flow"><span>本地预处理</span><ArrowRight /><span>提取</span><ArrowRight /><span>独立核对</span><ArrowRight /><span>规则接纳</span><ArrowRight /><span>增量更新</span></div><p>正常资料会自动完成。只有成员归属、关键数值冲突或安全问题需要你处理。</p></section></div>;
+  return <div className="page-stack">
+    <section className="page-title-row"><div><span className="eyebrow">处理中心</span><h1>每一步都能看懂、能恢复</h1><p>技术等待不会被误写成健康风险，已保存的事实不会因后续失败回滚。</p></div><button className="secondary-button" onClick={onTogglePause}>{snapshot.queuePaused ? <Play size={17} /> : <Pause size={17} />}{snapshot.queuePaused ? '继续队列' : '暂停队列'}</button></section>
+    {snapshot.queuePaused && <div className="info-callout"><Pause size={20} /><div><strong>队列已暂停</strong><p>不会领取新的 AI 任务；正在进行的原子步骤会安全收口，日程设置和已保存资料不受影响。</p></div></div>}
+    <div className="job-grid">{snapshot.jobs.map((job) => <article className="panel job-card" key={job.id}>
+      <div className="job-card__top"><span className={`job-icon job-icon--${job.status}`}>{job.status === 'running' ? <LoaderCircle className="spin" size={21} /> : job.status === 'succeeded' ? <Check size={21} /> : <Clock3 size={21} />}</span><div><strong>{job.batchLabel}</strong><small>{job.personLabel ?? '待归属资料'} · {job.statusText}</small></div><StatusBadge tone={job.status === 'running' ? 'info' : job.status === 'succeeded' ? 'success' : 'warning'}>{job.status === 'running' ? '处理中' : job.status === 'succeeded' ? '已完成' : job.status === 'failed' ? '处理失败' : job.status === 'cancelled' ? '已停止' : job.status === 'waiting_user' ? '等待核对' : '等待处理'}</StatusBadge></div>
+      <div className="progress-row"><div><i style={{ width: `${Math.round(job.completedUnits / job.totalUnits * 100)}%` }} /></div><span>{job.status === 'waiting_user' ? '已检查 ' : ''}{job.completedUnits}/{job.totalUnits}</span></div>
+      <div className="job-card__footer"><span>最近更新：{formatDateTime(job.updatedAt)}</span><div>{job.canCancel && <button className="text-button" onClick={() => onCancel(job)}>停止</button>}{job.canRetry && <button className="text-button" onClick={() => onRetry(job)}><RefreshCw size={15} /> 重试</button>}<button className="text-button" onClick={() => onDetails(job)}>查看详情 <ChevronRight size={15} /></button></div></div>
+    </article>)}</div>
+    {snapshot.jobs.length === 0 && <section className="panel table-empty"><Clock3 size={24} /><strong>还没有处理任务</strong><span>导入资料后，可手动开始或等待已启用的每日检查。</span></section>}
+    <section className="panel process-explainer"><span className="eyebrow">工作方式</span><h2>模型给候选，应用负责正式保存</h2><div className="process-flow"><span>本地预处理</span><ArrowRight /><span>提取</span><ArrowRight /><span>独立核对</span><ArrowRight /><span>规则接纳</span><ArrowRight /><span>增量更新</span></div><p>正常资料会自动完成。只有成员归属、关键数值冲突或安全问题需要你处理。</p></section>
+  </div>;
 }
 
 const jobStageLabel: Record<JobSummary['stage'], string> = {
@@ -846,8 +856,8 @@ function BackupDialog({ onClose, onNotice, onRestored }: { onClose(): void; onNo
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (!busy && event.target === event.currentTarget) onClose(); }}><section className="workspace-dialog backup-dialog" role="dialog" aria-modal="true" aria-labelledby="backup-dialog-title"><header><div><span className="eyebrow">备份与恢复</span><h2 id="backup-dialog-title">保护本机家庭健康档案</h2></div><button className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭备份与恢复"><X size={19} /></button></header><div className="filter-tabs"><button disabled={busy} className={mode === 'create' ? 'is-active' : ''} onClick={() => { setMode('create'); setPassphrase(''); }}>创建备份</button><button disabled={busy} className={mode === 'restore' ? 'is-active' : ''} onClick={() => { setMode('restore'); setPassphrase(''); setConfirmation(''); }}>恢复备份</button></div>{mode === 'create' ? <><p className="dialog-intro">备份包含数据库和原始资料，并使用口令加密。口令不写入应用，也无法找回。</p><label>备份口令（至少 10 个字符）<input disabled={busy} type="password" autoComplete="new-password" value={passphrase} onChange={(event) => setPassphrase(event.target.value)} /></label><label>再次输入口令<input disabled={busy} type="password" autoComplete="new-password" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label>{confirmation && passphrase !== confirmation && <span className="field-error">两次口令不一致。</span>}<div className="dialog-actions"><button className="secondary-button" disabled={busy} onClick={onClose}>取消</button><button className="primary-button" disabled={busy || !createValid} onClick={() => void createBackup()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Archive size={18} />} 选择位置并创建</button></div></> : <><p className="dialog-intro">恢复会在完整解密、数据库检查和对象哈希校验通过后，替换当前本机工作区。校验过程中可以安全停止。</p><button className="secondary-button" disabled={busy} onClick={() => void pickRestore()}><FileText size={17} /> {restoreSelection ? '重新选择备份' : '选择加密备份'}</button>{restoreSelection && <div className="info-callout compact"><Archive size={18} /><div><strong>{restoreSelection.displayName}</strong><p>尚未解密或改动当前工作区。</p></div></div>}<label>备份口令<input disabled={busy} type="password" autoComplete="current-password" value={passphrase} onChange={(event) => setPassphrase(event.target.value)} /></label><label className="check-label"><input disabled={busy} type="checkbox" checked={confirmedReplace} onChange={(event) => setConfirmedReplace(event.target.checked)} /> 我确认用所选备份替换当前本机工作区</label><div className="dialog-actions">{busy ? <button className="secondary-button" onClick={() => void cancelRestore()}><X size={17} /> 停止恢复</button> : <button className="secondary-button" onClick={onClose}>取消</button>}<button className="primary-button" disabled={busy || !restoreSelection || !passphrase || !confirmedReplace} onClick={() => void restoreBackup()}>{busy ? <LoaderCircle size={18} className="spin" /> : <RefreshCw size={18} />} 校验并恢复</button></div></>}</section></div>;
 }
 
-function ReviewBanner({ review, onOpen }: { review: ReviewIssue; onOpen(): void }) {
-  return <button className="review-banner" onClick={onOpen}><span className="review-banner__icon"><CircleHelp size={21} /></span><span><strong>{review.title}</strong><small>{review.description}</small></span><StatusBadge tone="warning">需要你的确认</StatusBadge><ChevronRight size={18} /></button>;
+function ReviewBanner({ review, openCount, onOpen }: { review: ReviewIssue; openCount: number; onOpen(): void }) {
+  return <button className="review-banner" onClick={onOpen}><span className="review-banner__icon"><CircleHelp size={21} /></span><span><strong>{review.title}</strong><small>{review.description}{openCount > 1 ? ` 当前共有 ${openCount} 项待核对。` : ''}</small></span><StatusBadge tone="warning">{openCount > 1 ? `待确认 ${openCount} 项` : '需要你的确认'}</StatusBadge><ChevronRight size={18} /></button>;
 }
 
 const reviewDiffFieldLabels: Record<ReviewIssue['candidateDiffs'][number]['fields'][number], string> = {
@@ -865,6 +875,54 @@ const reviewDiffFieldLabels: Record<ReviewIssue['candidateDiffs'][number]['field
   issues: '数据问题'
 };
 
+type ReviewCandidate = ReviewIssue['candidateOptions'][number];
+type ReviewDiffField = ReviewIssue['candidateDiffs'][number]['fields'][number];
+
+function reviewCandidateFieldValue(candidate: ReviewCandidate | null | undefined, field: ReviewDiffField): string {
+  if (!candidate) return field === 'presence' ? '未读取到这项' : '—';
+  if (field === 'presence') return '读取到这项';
+  if (field === 'value') return candidate.value.rawText ?? '未读出';
+  if (field === 'issues') return candidate.issues.length > 0 ? '存在需要重新核对的数据问题' : '未发现数据问题';
+  const value = candidate[field];
+  return typeof value === 'string' && value.trim() ? value : '未填写';
+}
+
+function ReviewDifferenceEditor({ candidate, fields, included, onIncludedChange, onChange }: {
+  candidate: ReviewCandidate;
+  fields: ReviewDiffField[];
+  included: boolean;
+  onIncludedChange(included: boolean): void;
+  onChange(updater: (candidate: ReviewCandidate) => ReviewCandidate): void;
+}) {
+  const editableFields = fields.filter((field) => field !== 'presence' && field !== 'issues');
+  const editor = (field: ReviewDiffField) => {
+    const label = reviewDiffFieldLabels[field];
+    if (field === 'value') {
+      return <label key={field}>{label}<input value={candidate.value.rawText ?? ''} onChange={(event) => onChange((current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label>;
+    }
+    if (field === 'clinicalDate') {
+      return <label key={field}>{label}<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => onChange((current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label>;
+    }
+    if (field === 'originalName') {
+      return <label key={field}>{label}<input value={candidate.originalName} onChange={(event) => onChange((current) => ({ ...current, originalName: event.target.value }))} /></label>;
+    }
+    if (field === 'standardNameCandidate') {
+      return <label key={field}>{label}<input value={candidate.standardNameCandidate ?? ''} onChange={(event) => onChange((current) => ({ ...current, standardNameCandidate: event.target.value || null }))} /></label>;
+    }
+    if (field === 'unitRaw' || field === 'referenceRangeRaw' || field === 'reportedAbnormalFlag'
+      || field === 'specimen' || field === 'method' || field === 'bodySite') {
+      return <label key={field}>{label}<input value={candidate[field] ?? ''} onChange={(event) => onChange((current) => ({ ...current, [field]: event.target.value || null }))} /></label>;
+    }
+    return null;
+  };
+  return <div className="review-correction-fields">
+    {fields.includes('presence') && <label className="review-presence-choice"><input type="checkbox" checked={included} onChange={(event) => onIncludedChange(event.target.checked)} /> 原报告中确实有这一项，应纳入健康档案</label>}
+    {included && !fields.includes('originalName') && <label>项目名<input value={candidate.originalName} onChange={(event) => onChange((current) => ({ ...current, originalName: event.target.value }))} /></label>}
+    {included && editableFields.map(editor)}
+    {fields.includes('issues') && <div className="info-callout compact"><RefreshCw size={18} /><div><strong>这项不能靠猜测修正</strong><p>请稍后让系统重新核对原始依据；未解决前不会写入健康档案。</p></div></div>}
+  </div>;
+}
+
 function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResolve }: {
   review: ReviewIssue;
   snapshot: DashboardSnapshot;
@@ -875,6 +933,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const [personId, setPersonId] = useState(snapshot.persons[0]?.id ?? '');
   const [busy, setBusy] = useState(false);
   const [candidates, setCandidates] = useState(review.candidateOptions);
+  const [excludedLocalKeys, setExcludedLocalKeys] = useState<Set<string>>(() => new Set());
   const isAssignment = review.kind === 'person_conflict' && review.personId === null;
   const isIdentityConfirmation = review.kind === 'person_conflict' && review.personId !== null && review.reportedName !== null;
   const targetPerson = isIdentityConfirmation
@@ -888,8 +947,10 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
     .map((candidate, index) => ({ candidate, index, difference: differenceByLocalKey.get(candidate.localKey) }))
     .filter((item) => item.difference);
   const hasVisibleConflicts = isFieldConflict && !isLegacyFieldReview && visibleCandidates.length > 0;
+  const resolvedCandidates = candidates.filter((candidate) => !excludedLocalKeys.has(candidate.localKey));
   const canCorrect = hasVisibleConflicts
-    && candidates.every((candidate) => candidate.value.kind !== 'numeric' || /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(candidate.value.decimal));
+    && review.candidateDiffs.every((difference) => !difference.fields.includes('issues'))
+    && resolvedCandidates.every((candidate) => candidate.value.kind !== 'numeric' || /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(candidate.value.decimal));
   const updateCandidate = (index: number, updater: (candidate: (typeof candidates)[number]) => (typeof candidates)[number]) => {
     setCandidates((current) => current.map((candidate, candidateIndex) => candidateIndex === index ? updater(candidate) : candidate));
   };
@@ -908,7 +969,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
           : isLegacyFieldReview
             ? { action: 'retry_review', issueId: review.id, documentId: review.documentId }
           : canCorrect
-            ? { action: 'accept_correction', issueId: review.id, documentId: review.documentId, candidates }
+            ? { action: 'accept_correction', issueId: review.id, documentId: review.documentId, candidates: resolvedCandidates }
             : { action: isDerived ? 'dismiss_derived' : 'archive_only', issueId: review.id, documentId: review.documentId };
       const ok = await onResolve(resolution);
       if (ok) onClose();
@@ -946,7 +1007,25 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
           ) : hasVisibleConflicts ? (
             <>
               <div className="info-callout compact"><CircleHelp size={18} /><div><strong>为什么需要确认</strong><p>两轮独立读取在下列核心字段上给出了不同结果。请只对照原始报告检查这些差异项；其余一致项目无需逐项确认。</p></div></div>
-              <div className="manual-note-list review-difference-list">{visibleCandidates.map(({ candidate, index, difference }) => <article key={candidate.localKey}><div className="review-difference-fields"><strong>两轮不一致：</strong><span>{difference!.fields.map((field) => reviewDiffFieldLabels[field]).join('、')}</span></div><label>项目名<input value={candidate.originalName} onChange={(event) => updateCandidate(index, (current) => ({ ...current, originalName: event.target.value }))} /></label><label>结果<input value={candidate.value.rawText ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label><label>单位<input value={candidate.unitRaw ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, unitRaw: event.target.value || null }))} /></label><label>临床日期<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => updateCandidate(index, (current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label></article>)}</div>
+              <div className="manual-note-list review-difference-list">{visibleCandidates.map(({ candidate, index, difference }) => <article key={candidate.localKey}>
+                <div className="review-difference-fields"><strong>两轮不一致：</strong><span>{difference!.fields.map((field) => reviewDiffFieldLabels[field]).join('、')}</span></div>
+                {difference!.firstCandidate !== undefined && difference!.secondCandidate !== undefined && <div className="review-reading-grid">
+                  <section><span>首次提取</span>{difference!.fields.map((field) => <div key={field}><small>{reviewDiffFieldLabels[field]}</small><strong>{reviewCandidateFieldValue(difference!.firstCandidate, field)}</strong></div>)}</section>
+                  <section><span>独立复核</span>{difference!.fields.map((field) => <div key={field}><small>{reviewDiffFieldLabels[field]}</small><strong>{reviewCandidateFieldValue(difference!.secondCandidate, field)}</strong></div>)}</section>
+                </div>}
+                <div className="review-final-choice"><strong>确认后的正确内容</strong><small>只需修改上方标出的差异字段</small></div>
+                <ReviewDifferenceEditor
+                  candidate={candidate}
+                  fields={difference!.fields}
+                  included={!excludedLocalKeys.has(candidate.localKey)}
+                  onIncludedChange={(included) => setExcludedLocalKeys((current) => {
+                    const next = new Set(current);
+                    if (included) next.delete(candidate.localKey); else next.add(candidate.localKey);
+                    return next;
+                  })}
+                  onChange={(updater) => updateCandidate(index, updater)}
+                />
+              </article>)}</div>
             </>
           ) : (
             <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{isDerived ? '报告事实不会被删除' : '原始资料会继续保留'}</strong><p>{isDerived ? '只是不发布这次未通过安全复核的分析和生活指南。' : '选择仅归档后，这份资料不会进入趋势或后续分析。'}</p></div></div>
@@ -1413,7 +1492,8 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  const openReview = snapshot.reviews.find((review) => review.resolutionStatus === 'open');
+  const openReviews = snapshot.reviews.filter((review) => review.resolutionStatus === 'open');
+  const openReview = openReviews[0];
 
   async function handleOpenEvidence(next: Evidence) {
     setEvidence(next);
@@ -1882,7 +1962,7 @@ export default function App() {
       <div className="app-main">
         <Topbar snapshot={snapshot} onLogin={() => void handleLogin()} onProcessing={() => setPage('processing')} />
         <main className="content-area">
-          {openReview && page !== 'settings' && <ReviewBanner review={openReview} onOpen={() => setReviewDialog(openReview)} />}
+          {openReview && page !== 'settings' && <ReviewBanner review={openReview} openCount={openReviews.length} onOpen={() => setReviewDialog(openReview)} />}
           {content}
         </main>
       </div>

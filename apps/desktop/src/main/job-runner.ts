@@ -63,7 +63,14 @@ export class ProcessingJobRunner extends EventEmitter {
           if (!resumeDerived) {
             for (const documentId of job.documentIds) {
               store.assertJobExecutionActive(executionGuard, documentId);
-              if (store.isDocumentCommitted(documentId)) {
+              if (store.hasOpenBlockingReview(documentId)) {
+                needsReview = true;
+                completedUnits += 1;
+                store.updateJobProgress(job.id, completedUnits);
+                this.emit('changed');
+                continue;
+              }
+              if (store.isDocumentCommitted(documentId) || store.isDocumentExcluded(documentId)) {
                 completedUnits += 1;
                 store.updateJobProgress(job.id, completedUnits);
                 this.emit('changed');

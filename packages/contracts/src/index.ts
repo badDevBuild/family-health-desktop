@@ -365,7 +365,11 @@ export const reviewCandidateDiffSchema = z.object({
     'bodySite',
     'clinicalDate',
     'issues'
-  ])).min(1)
+  ])).min(1),
+  // 保存两次独立读取的完整候选，界面才能真正向用户解释“哪里不同”。
+  // optional 保持旧工作区中既有核对事项可读。
+  firstCandidate: observationCandidateSchema.nullable().optional(),
+  secondCandidate: observationCandidateSchema.nullable().optional()
 }).strict();
 
 export type ReviewCandidateDiff = z.infer<typeof reviewCandidateDiffSchema>;

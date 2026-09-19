@@ -13,7 +13,7 @@
 | 私有环境 stdio | PASS | initialize/initialized/account-read/model-list 在私有环境真实通过；当前 Mac 已完成官方账户连接与成品链路验证 |
 | ESLint | PASS | 全工程 0 error |
 | TypeScript 严格检查 | PASS | Node 与 Renderer 两套 tsconfig 均通过 |
-| 自动测试 | PASS | 常规门禁覆盖 Codex 0.145.0 Web Search 禁用/实时 `thread/start` 兼容性探针、500 文档/5 万指标容量基准、Mach-O/PE 目标识别、发行工件目标架构清理和冒烟工作区路径门禁；另覆盖 40 个纯合成来源包/1,000 个字段/20% 留出/18 个安全故障样例及分项计算；同时覆盖 DOCX 表格/嵌入图、旧 DOC 原件保留、组件缺失、固定哈希/版本、独立 profile、无 UNO listener、超时、PDF 输出和转换视图、SQLite 锁/模拟磁盘满、schema v26 迁移与恢复、恶意备份、恢复取消/故障恢复等；准确测试数量以本次 `pnpm check` 回执为准 |
+| 自动测试 | PASS | 195 项常规测试覆盖 Codex 0.145.0 Web Search 禁用/实时 `thread/start` 兼容性探针、500 文档/5 万指标容量基准、Mach-O/PE 目标识别、发行工件目标架构清理和冒烟工作区路径门禁；另覆盖 40 个纯合成来源包/1,000 个字段/20% 留出/18 个安全故障样例及分项计算；同时覆盖 DOCX 表格/嵌入图、旧 DOC 原件保留、组件缺失、固定哈希/版本、独立 profile、无 UNO listener、超时、PDF 输出和转换视图、SQLite 锁/模拟磁盘满、schema v27 迁移与恢复、整篇覆盖补读、多事项批次恢复、双轮差异展示、恶意备份、恢复取消/故障恢复等 |
 | LibreOffice arm64 合成探针 | PASS（功能）/ 签名 BLOCKED | 官方 26.8.0 DMG SHA-256 与官方校验文件一致；实际 26.8.0.3 将合成 OLE DOC 转成 12,913-byte、1 页 PDF，PDF 层读出 `LDL 3.8 mmol/L`；严格 codesign 校验失败，未打包，详见 `libreoffice-component-gate.md` |
 | Mac arm64 源码构建 | PASS | Electron main/preload/renderer 生产构建与 preload 校验通过 |
 | Mac arm64 未签名应用 | PASS（开发验收） | `release/mac-arm64/家庭健康看板.app` 实际启动；受限冒烟参数将主进程与全部 Chromium 子进程隔离到系统临时目录；品牌图标、私有运行时、个人空间、目录授权、处理授权、任务详情、手动补充、事项、导出、显示/通知、隐私/备份设置可达 |

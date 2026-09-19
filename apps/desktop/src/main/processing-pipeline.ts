@@ -276,9 +276,38 @@ function expandAbbreviatedEvidenceQuotes(
 
 function normalizeCandidates(candidates: ObservationCandidate[], sourceSpans: SourceSpan[]): ObservationCandidate[] {
   return strengthenUnambiguousClinicalDateEvidence(
-    expandAbbreviatedEvidenceQuotes(normalizeBloodPressureCandidates(candidates, sourceSpans), sourceSpans),
+    expandAbbreviatedEvidenceQuotes(normalizeBloodPressureCandidates(candidates.map(normalizeModelEntities), sourceSpans), sourceSpans),
     sourceSpans
   );
+}
+
+function decodeModelEntities(value: string): string {
+  return value
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&#39;', "'")
+    .replaceAll('&amp;', '&');
+}
+
+function normalizeModelEntities(candidate: ObservationCandidate): ObservationCandidate {
+  const value = candidate.value.rawText === null
+    ? candidate.value
+    : { ...candidate.value, rawText: decodeModelEntities(candidate.value.rawText) };
+  const decodeNullable = (text: string | null) => text === null ? null : decodeModelEntities(text);
+  return {
+    ...candidate,
+    originalName: decodeModelEntities(candidate.originalName),
+    standardNameCandidate: decodeNullable(candidate.standardNameCandidate),
+    value,
+    unitRaw: decodeNullable(candidate.unitRaw),
+    referenceRangeRaw: decodeNullable(candidate.referenceRangeRaw),
+    reportedAbnormalFlag: decodeNullable(candidate.reportedAbnormalFlag),
+    specimen: decodeNullable(candidate.specimen),
+    method: decodeNullable(candidate.method),
+    bodySite: decodeNullable(candidate.bodySite)
+  };
 }
 
 export function normalizeBloodPressureCandidates(
@@ -313,7 +342,7 @@ export function normalizeBloodPressureCandidates(
 }
 
 function normalizedComparableText(value: string | null): string | null {
-  return value === null ? null : value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
+  return value === null ? null : decodeModelEntities(value).normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
 }
 
 function normalizedComparableMethod(value: string): string {
@@ -464,13 +493,22 @@ function candidateConflictFields(first: ObservationCandidate, second: Observatio
     && normalizedComparableMethod(first.method) !== normalizedComparableMethod(second.method)) {
     fields.push('method');
   }
-  compareText('bodySite', first.bodySite, second.bodySite, true);
+  if (first.bodySite !== null && second.bodySite !== null
+    && normalizedComparableBodySite(first.bodySite) !== normalizedComparableBodySite(second.bodySite)) {
+    fields.push('bodySite');
+  }
   compareText('clinicalDate', first.clinicalDate, second.clinicalDate, true);
 
   const firstIssueCodes = blockingIssueCodes(first);
   const secondIssueCodes = blockingIssueCodes(second);
   if (stableHash(firstIssueCodes) !== stableHash(secondIssueCodes)) fields.push('issues');
   return fields;
+}
+
+function normalizedComparableBodySite(value: string): string {
+  // “甲状腺”与“甲状腺实质”描述的是同一检查部位；只去掉末尾的泛化组织词，
+  // 不改动左/右等方向信息，避免把真正不同的部位合并。
+  return normalizedComparableText(value)!.replace(/实质$/u, '');
 }
 
 /**
@@ -489,7 +527,13 @@ export function compareIndependentExtractions(
       normalizedComparableText(second.candidates[index]!.originalName) === normalizedComparableText(firstCandidate.originalName)
     ));
     if (sameName.length === 0) {
-      differences.push({ localKey: firstCandidate.localKey, itemName: firstCandidate.originalName, fields: ['presence'] });
+      differences.push({
+        localKey: firstCandidate.localKey,
+        itemName: firstCandidate.originalName,
+        fields: ['presence'],
+        firstCandidate,
+        secondCandidate: null
+      });
       continue;
     }
 
@@ -503,14 +547,22 @@ export function compareIndependentExtractions(
       differences.push({
         localKey: reviewedCandidate.localKey,
         itemName: reviewedCandidate.originalName,
-        fields: match.fields
+        fields: match.fields,
+        firstCandidate,
+        secondCandidate: reviewedCandidate
       });
     }
   }
 
   for (const index of unmatchedSecond) {
     const candidate = second.candidates[index]!;
-    differences.push({ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['presence'] });
+    differences.push({
+      localKey: candidate.localKey,
+      itemName: candidate.originalName,
+      fields: ['presence'],
+      firstCandidate: null,
+      secondCandidate: candidate
+    });
   }
   return { compatible: differences.length === 0, differences };
 }
@@ -705,6 +757,44 @@ export class DocumentExtractionPipeline {
     }
   }
 
+  private async recoverIncompleteCoverage(input: {
+    documentId: string;
+    stage: 'extract' | 'review_facts';
+    sourcePackage: string;
+    imagePaths: string[];
+    expectedSpanIds: string[];
+    previousResult: ExtractionResult;
+    candidateToReview?: ExtractionResult;
+  }): Promise<{ result: ExtractionResult; threadId: string; turnId: string }> {
+    const covered = new Set(input.previousResult.coveredSourceSpanIds);
+    const missingSpanIds = input.expectedSpanIds.filter((id) => !covered.has(id));
+    const turn = await this.runTurn(input.documentId, input.stage, {
+      prompt: [
+        input.stage === 'extract'
+          ? '你是健康报告事实提取器。请重新通读这份完整来源包，只提取来源明确支持的事实。'
+          : '你是独立事实复核器。请重新通读这份完整来源包，独立返回核实后的完整候选集合。',
+        '上一次返回的 coveredSourceSpanIds 不完整。这是覆盖清单补救，不是只检查缺失片段；必须重新结合整篇上下文处理。',
+        '只引用 SOURCE_PACKAGE 中的 sourceSpanId，不诊断、不推测、不提供处方。',
+        'coveredSourceSpanIds 必须逐一包含 REQUIRED_SOURCE_SPAN_IDS 中的每一个 ID，即使某片段没有可提取指标也不能省略。',
+        'imageInputs 的 imageIndex 与随请求附带的图片顺序一一对应。',
+        `REQUIRED_SOURCE_SPAN_IDS=${JSON.stringify(input.expectedSpanIds)}`,
+        `PREVIOUSLY_MISSING_SOURCE_SPAN_IDS=${JSON.stringify(missingSpanIds)}`,
+        `PREVIOUS_RESULT=${JSON.stringify(input.previousResult)}`,
+        ...(input.candidateToReview ? [`CANDIDATE_TO_REVIEW=${JSON.stringify(input.candidateToReview)}`] : []),
+        `SOURCE_PACKAGE=${input.sourcePackage}`
+      ].join('\n'),
+      imagePaths: input.imagePaths,
+      outputSchema,
+      allowWebSearch: false,
+      timeoutMs: 600_000
+    });
+    return {
+      result: extractionResultSchema.parse(turn.output),
+      threadId: turn.threadId,
+      turnId: turn.turnId
+    };
+  }
+
   async process(documentId: string): Promise<ExtractionPipelineResult> {
     let bundle = this.store.getDocumentExtractionBundle(documentId);
     if (bundle.manifest.conversionWarnings.includes('historical_manifest_metadata_unavailable')) {
@@ -839,7 +929,7 @@ export class DocumentExtractionPipeline {
           throw new Error('SOURCE_PACKAGE_LIMIT_EXCEEDED');
         }
         const expectedSpanIds = spans.map((span) => span.id);
-        const extract = await this.runTurn(documentId, 'extract', {
+        let extract = await this.runTurn(documentId, 'extract', {
           prompt: [
             '你是健康报告事实提取器。只提取来源中明确出现的事实，不诊断、不推测、不提供处方。',
             `目标成员显示名为“${bundle.personDisplayName}”。必须单独返回 subject：报告明示姓名时逐字引用证据；未找到时标记 absent；不得根据目标成员反推姓名。`,
@@ -852,8 +942,21 @@ export class DocumentExtractionPipeline {
           outputSchema,
           timeoutMs: 600_000
         });
-        const extracted = extractionResultSchema.parse(extract.output);
+        let extracted = extractionResultSchema.parse(extract.output);
         if (extracted.documentId !== documentId) throw new Error('EXTRACTION_DOCUMENT_MISMATCH');
+        if (!hasCompleteCoverage(extracted, expectedSpanIds) && evidenceIsConfinedToChunk(extracted, expectedSpanIds)) {
+          const recovered = await this.recoverIncompleteCoverage({
+            documentId,
+            stage: 'extract',
+            sourcePackage,
+            imagePaths,
+            expectedSpanIds,
+            previousResult: extracted
+          });
+          extracted = recovered.result;
+          extract = { ...extract, threadId: recovered.threadId, turnId: recovered.turnId, output: recovered.result };
+          if (extracted.documentId !== documentId) throw new Error('EXTRACTION_DOCUMENT_MISMATCH');
+        }
         if (!hasCompleteCoverage(extracted, expectedSpanIds) || !evidenceIsConfinedToChunk(extracted, expectedSpanIds)) {
           return this.needsReview(documentId, 'coverage_gap', expectedSpanIds, 'EXTRACTION_COVERAGE_INCOMPLETE', extract.threadId, extract.turnId);
         }
@@ -875,7 +978,7 @@ export class DocumentExtractionPipeline {
           candidates: normalizeCandidates(extracted.candidates, spans)
         };
 
-        const review = await this.runTurn(documentId, 'review_facts', {
+        let review = await this.runTurn(documentId, 'review_facts', {
           prompt: [
             '你是独立事实复核器。重新阅读本块原始来源，并返回你核实后的完整候选集合。',
             '只保留来源明确支持且引用本块有效 sourceSpanId 的事实；不得因为前一份候选存在就默认接受。',
@@ -888,9 +991,24 @@ export class DocumentExtractionPipeline {
           outputSchema,
           timeoutMs: 600_000
         });
-        const reviewed = extractionResultSchema.parse(review.output);
+        let reviewed = extractionResultSchema.parse(review.output);
         lastReceipt = { threadId: review.threadId, turnId: review.turnId };
         if (reviewed.documentId !== documentId) throw new Error('REVIEW_DOCUMENT_MISMATCH');
+        if (!hasCompleteCoverage(reviewed, expectedSpanIds) && evidenceIsConfinedToChunk(reviewed, expectedSpanIds)) {
+          const recovered = await this.recoverIncompleteCoverage({
+            documentId,
+            stage: 'review_facts',
+            sourcePackage,
+            imagePaths,
+            expectedSpanIds,
+            previousResult: reviewed,
+            candidateToReview: normalizedExtracted
+          });
+          reviewed = recovered.result;
+          review = { ...review, threadId: recovered.threadId, turnId: recovered.turnId, output: recovered.result };
+          lastReceipt = { threadId: recovered.threadId, turnId: recovered.turnId };
+          if (reviewed.documentId !== documentId) throw new Error('REVIEW_DOCUMENT_MISMATCH');
+        }
         if (!hasCompleteCoverage(reviewed, expectedSpanIds) || !evidenceIsConfinedToChunk(reviewed, expectedSpanIds)) {
           return this.needsReview(documentId, 'coverage_gap', expectedSpanIds, 'REVIEW_COVERAGE_INCOMPLETE', review.threadId, review.turnId);
         }

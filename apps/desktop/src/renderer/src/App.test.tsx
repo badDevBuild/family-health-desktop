@@ -277,7 +277,11 @@ describe('App member display editing', () => {
       kind: 'field_conflict', severity: 'blocking', title: '发现 1 项核心事实差异',
       description: '两轮核对共有 3 项候选，其中 1 项核心字段不一致。只需核对下方差异项。',
       evidenceRefs: ['conflict-span'], candidateOptions: candidates,
-      candidateDiffs: [{ localKey: 'candidate-1', itemName: '收缩压', fields: ['value'] }],
+      candidateDiffs: [{
+        localKey: 'candidate-1', itemName: '收缩压', fields: ['value'],
+        firstCandidate: { ...candidates[0]!, value: { kind: 'numeric', rawText: '99', decimal: '99', comparator: 'eq' } },
+        secondCandidate: candidates[0]!
+      }],
       reportedName: null, reasonCodes: [], resolutionStatus: 'open'
     }];
     snapshot.openReviewCount = 1;
@@ -289,6 +293,9 @@ describe('App member display editing', () => {
     expect(screen.queryByDisplayValue('舒张压')).toBeNull();
     expect(screen.queryByDisplayValue('身高')).toBeNull();
     expect(screen.getByText('两轮不一致：')).toBeTruthy();
+    expect(screen.getByText('首次提取')).toBeTruthy();
+    expect(screen.getByText('独立复核')).toBeTruthy();
+    expect(screen.getByText('99')).toBeTruthy();
     expect(screen.getAllByText('结果').length).toBeGreaterThanOrEqual(1);
     expect(container.querySelector('.review-resolution-scroll')).toBeTruthy();
   });

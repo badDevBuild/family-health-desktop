@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -334,7 +334,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -390,7 +390,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -446,7 +446,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -502,7 +502,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -558,7 +558,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -614,7 +614,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -670,7 +670,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -726,7 +726,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -783,7 +783,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -840,7 +840,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -897,7 +897,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -953,7 +953,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -997,7 +997,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -1036,7 +1036,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -1081,7 +1081,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
     upgraded.close();
     store.close();
   });
@@ -1126,7 +1126,64 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(26);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
+    upgraded.close();
+    store.close();
+  });
+
+  it('schema v27 关闭缺少双轮原文与覆盖补救能力的旧事项，并按原批次整体重跑', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v26-review-recovery-'));
+    directories.push(directory);
+    let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T15:00:00Z') });
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const firstSource = store.putSourceObject({ bytes: Buffer.from('虚构甲状腺资料'), mediaType: 'text/plain', displayName: '甲状腺.txt' });
+    const secondSource = store.putSourceObject({ bytes: Buffer.from('虚构多页资料'), mediaType: 'text/plain', displayName: '多页.txt' });
+    const firstDocument = store.registerImportedDocument({ sourceObjectId: firstSource.id, personId: person.id });
+    const secondDocument = store.registerImportedDocument({ sourceObjectId: secondSource.id, personId: person.id });
+    const documentIds = [firstDocument.documentId, secondDocument.documentId];
+    const consentId = store.createManualProcessingConsent({
+      documentIds, personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-19T15:00:00Z',
+      groups: [{ personId: person.id, documentIds, inputSignature: 'f'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const candidate = {
+      localKey: 'thyroid-site', originalName: '甲状腺彩超', standardNameCandidate: null,
+      value: { kind: 'text' as const, rawText: '未见异常' }, unitRaw: null, referenceRangeRaw: null,
+      reportedAbnormalFlag: null, specimen: null, method: '超声', bodySite: '甲状腺实质', clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote: '甲状腺实质' }], issues: []
+    };
+    store.saveExtractionReviewIssue({
+      documentId: firstDocument.documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: ['span-1'],
+      candidateOptions: [candidate],
+      candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['bodySite'] }],
+      reasonCodes: ['INDEPENDENT_REVIEW_MISMATCH']
+    });
+    store.saveExtractionReviewIssue({
+      documentId: secondDocument.documentId, kind: 'coverage_gap', severity: 'blocking', evidenceRefs: ['span-2'],
+      reasonCodes: ['EXTRACTION_COVERAGE_INCOMPLETE']
+    });
+    store.finishJob(job.id, 'waiting_user');
+    store.close();
+
+    const legacy = new Database(join(directory, 'health.db'));
+    legacy.exec(`UPDATE workspaces SET schema_version = 26; PRAGMA user_version = 26;`);
+    legacy.close();
+
+    store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T15:01:00Z') });
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listReadyDocuments()).toEqual(expect.arrayContaining([
+      { id: firstDocument.documentId, personId: person.id },
+      { id: secondDocument.documentId, personId: person.id }
+    ]));
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0, totalUnits: 2 });
+    const upgraded = new Database(store.databasePath, { readonly: true });
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(27);
+    const checkpoint = JSON.parse((upgraded.prepare('SELECT checkpoint_json FROM jobs WHERE id = ?').get(job.id) as { checkpoint_json: string }).checkpoint_json) as { documentIds: string[] };
+    expect(checkpoint.documentIds).toEqual(documentIds);
     upgraded.close();
     store.close();
   });
@@ -1576,6 +1633,44 @@ describe('WorkspaceStore', () => {
       candidateDiffs: [{ localKey: 'current-conflict', itemName: '低密度脂蛋白胆固醇', fields: ['value'] }]
     });
     expect(() => store.retryExtractionReview({ issueId: currentIssueId, documentId: document.documentId })).toThrow('REVIEW_ACTION_INVALID');
+    store.close();
+  });
+
+  it('同一批有多条阻断事项时，最后一条解决后才按原批次恢复', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const firstSource = store.putSourceObject({ bytes: Buffer.from('虚构资料甲'), mediaType: 'text/plain', displayName: '甲.txt' });
+    const secondSource = store.putSourceObject({ bytes: Buffer.from('虚构资料乙'), mediaType: 'text/plain', displayName: '乙.txt' });
+    const firstDocument = store.registerImportedDocument({ sourceObjectId: firstSource.id, personId: person.id });
+    const secondDocument = store.registerImportedDocument({ sourceObjectId: secondSource.id, personId: person.id });
+    const documentIds = [firstDocument.documentId, secondDocument.documentId];
+    const consentId = store.createManualProcessingConsent({
+      documentIds, personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      groups: [{ personId: person.id, documentIds, inputSignature: '9'.repeat(64) }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const candidateFor = (localKey: string) => ({
+      localKey, originalName: '虚构项目', standardNameCandidate: null,
+      value: { kind: 'text' as const, rawText: '虚构结果' }, unitRaw: null, referenceRangeRaw: null,
+      reportedAbnormalFlag: null, specimen: null, method: null, bodySite: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: `${localKey}-span`, quote: '虚构结果' }], issues: []
+    });
+    const firstIssue = store.saveExtractionReviewIssue({
+      documentId: firstDocument.documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: [], candidateOptions: [candidateFor('first')]
+    });
+    const secondIssue = store.saveExtractionReviewIssue({
+      documentId: secondDocument.documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: [], candidateOptions: [candidateFor('second')]
+    });
+    store.finishJob(job.id, 'waiting_user');
+
+    store.retryExtractionReview({ issueId: firstIssue, documentId: firstDocument.documentId });
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'waiting_user', totalUnits: 2 });
+    store.retryExtractionReview({ issueId: secondIssue, documentId: secondDocument.documentId });
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0, totalUnits: 2 });
     store.close();
   });
 
