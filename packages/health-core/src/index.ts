@@ -44,10 +44,66 @@ function evidenceQuoteMatchesSource(source: string, cited: string): boolean {
   return compactCited.length > 0 && compactSource.includes(compactCited);
 }
 
+function normalizedMeasurementNameTokens(candidate: ObservationCandidate): string[] {
+  const values = [candidate.originalName, candidate.standardNameCandidate]
+    .filter((value): value is string => Boolean(value))
+    .map(normalizeEvidenceText);
+  const tokens = new Set<string>();
+  for (const value of values) {
+    const compact = value.replace(/\s+/g, '');
+    if (compact.length >= 2) tokens.add(compact);
+    for (const token of value.match(/[a-z][a-z0-9]{1,}/g) ?? []) tokens.add(token);
+    for (const token of value.match(/[\p{Script=Han}]{2,}/gu) ?? []) tokens.add(token);
+  }
+  return [...tokens].sort((left, right) => right.length - left.length);
+}
+
+function measurementEvidenceWindows(candidate: ObservationCandidate, citedText: string): string[] {
+  const text = citedText.normalize('NFKC').toLowerCase();
+  // PDF 文字层经常会把一个名称拆出空格，因此定位时使用无空白副本。
+  // 窗口从名称结束后开始，避免把 T3、FT4、B12 等名称里的数字误当成结果。
+  const compact = text.replace(/\s+/g, '');
+  const tokens = normalizedMeasurementNameTokens(candidate);
+  const windows: string[] = [];
+  for (const token of tokens) {
+    const normalizedToken = token.replace(/\s+/g, '');
+    let offset = 0;
+    while (offset < compact.length) {
+      const index = compact.indexOf(normalizedToken, offset);
+      if (index < 0) break;
+      const valueStart = index + normalizedToken.length;
+      const delimiterIndex = compact.slice(valueStart).search(/[\n\r;；|]/);
+      const end = delimiterIndex >= 0
+        ? valueStart + delimiterIndex
+        : Math.min(compact.length, valueStart + 80);
+      windows.push(compact.slice(valueStart, end));
+      offset = index + Math.max(normalizedToken.length, 1);
+    }
+  }
+  return [...new Set(windows)];
+}
+
+function normalizedUnit(value: string): string {
+  const normalized = value.normalize('NFKC').toLowerCase()
+    .replace(/[µμ]/g, 'u')
+    .replace(/[×*]/g, 'x')
+    .replace(/\s+/g, '');
+  const aliases: Record<string, string> = {
+    '次/分': 'bpm', '次分': 'bpm', 公斤: 'kg', 千克: 'kg', 厘米: 'cm', 毫米: 'mm'
+  };
+  return aliases[normalized] ?? normalized;
+}
+
+function explicitUnitsInEvidence(text: string): string[] {
+  const matches = text.match(/(?:x10\^?-?\d+\/?l|10\^?-?\d+\/?l|mmhg|kpa|m?mol\/?l|u?mol\/?l|mg\/?d?l|ng\/?ml|pg\/?ml|miu\/?ml|iu\/?l|u\/?l|g\/?l|bpm|次\/?分|厘米|毫米|千克|公斤|kg|cm|fl|pg|mm|%|\/hp)/gi) ?? [];
+  return matches.map(normalizedUnit);
+}
+
 function evidenceContentProblems(candidate: ObservationCandidate, manifest: SourceManifest): string[] {
   const spans = new Map(manifest.spans.map((span) => [span.id, span]));
   const problems: string[] = [];
   const supportedText: string[] = [];
+  const bindingText: string[] = [];
   for (const reference of candidate.evidence) {
     const span = spans.get(reference.sourceSpanId);
     if (!span) continue;
@@ -63,11 +119,16 @@ function evidenceContentProblems(candidate: ObservationCandidate, manifest: Sour
         continue;
       }
       supportedText.push(cited);
+      bindingText.push(reference.quote);
     }
   }
   if (candidate.value.kind === 'numeric' && supportedText.length > 0) {
     const expected = Number(candidate.value.decimal);
-    const numericEvidence = supportedText.flatMap((text) => text.match(/-?(?:\d+(?:\.\d+)?|\.\d+)/g) ?? []).map(Number);
+    const measurementWindows = bindingText.flatMap((text) => measurementEvidenceWindows(candidate, text));
+    if (measurementWindows.length === 0) problems.push('measurement_name_not_in_evidence');
+    const numericEvidence = measurementWindows
+      .flatMap((text) => text.match(/-?(?:\d+(?:\.\d+)?|\.\d+)/g) ?? [])
+      .map(Number);
     if (!numericEvidence.some((value) => Number.isFinite(value) && value === expected)) {
       problems.push('numeric_value_not_in_evidence');
     }
@@ -75,8 +136,14 @@ function evidenceContentProblems(candidate: ObservationCandidate, manifest: Sour
       eq: [], lt: ['<', '小于'], lte: ['<=', '≤', '不高于'], gt: ['>', '大于'], gte: ['>=', '≥', '不低于']
     };
     const requiredComparator = comparatorTokens[candidate.value.comparator];
-    if (requiredComparator.length > 0 && !supportedText.some((text) => requiredComparator.some((token) => text.includes(token)))) {
+    if (requiredComparator.length > 0 && !measurementWindows.some((text) => requiredComparator.some((token) => text.includes(token)))) {
       problems.push('numeric_comparator_not_in_evidence');
+    }
+    if (candidate.unitRaw) {
+      const evidenceUnits = measurementWindows.flatMap(explicitUnitsInEvidence);
+      if (evidenceUnits.length > 0 && !evidenceUnits.includes(normalizedUnit(candidate.unitRaw))) {
+        problems.push('unit_not_bound_to_measurement');
+      }
     }
   }
   if ((candidate.value.kind === 'qualitative' || candidate.value.kind === 'text') && supportedText.length > 0) {

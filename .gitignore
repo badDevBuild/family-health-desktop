@@ -12,6 +12,8 @@ coverage/
 family-health-desktop-spec-v1.zip
 family-health-desktop-review-evidence-*/
 family-health-desktop-review-evidence-*.zip
+fhd-rereview-*/
+family-health-desktop-rereview-*.zip
 *.dmg
 *.exe
 *.blockmap

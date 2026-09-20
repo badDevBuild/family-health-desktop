@@ -52,6 +52,49 @@ describe('自动接纳规则', () => {
       .toEqual({ decision: 'accept', warnings: [] });
   });
 
+  it('数值必须和对应指标出现在同一证据行，不能借用邻项数字', () => {
+    const rowManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{
+        ...manifest.spans[0]!,
+        quote: '低密度脂蛋白 4.2 mmol/L；甘油三酯 1.3 mmol/L'
+      }]
+    };
+    const misplaced: ObservationCandidate = {
+      ...candidate,
+      originalName: '甘油三酯',
+      standardNameCandidate: 'TG',
+      referenceRangeRaw: null,
+      clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote: '低密度脂蛋白 4.2 mmol/L；甘油三酯 1.3 mmol/L' }]
+    };
+    expect(evaluateObservationCandidate(misplaced, rowManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['numeric_value_not_in_evidence'] });
+  });
+
+  it('明确单位和比较符必须属于当前指标证据', () => {
+    const pressureManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote: '收缩压 > 18 kPa' }]
+    };
+    const pressure: ObservationCandidate = {
+      ...candidate,
+      originalName: '收缩压',
+      standardNameCandidate: '收缩压',
+      value: { kind: 'numeric', rawText: '>18', decimal: '18', comparator: 'gt' },
+      unitRaw: 'mmHg',
+      referenceRangeRaw: null,
+      clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote: '收缩压 > 18 kPa' }]
+    };
+    expect(evaluateObservationCandidate(pressure, pressureManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['unit_not_bound_to_measurement'] });
+  });
+
   it('文字结果仅被 PDF 排版空格断开时仍可接纳，真实文字差异仍拒绝', () => {
     const textManifest: SourceManifest = {
       ...manifest,

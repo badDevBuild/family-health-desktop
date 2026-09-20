@@ -249,6 +249,8 @@ export class DerivedHealthPipeline {
     if (!first) throw new Error('DERIVED_FACTS_REQUIRED');
     const issueId = this.store.saveExtractionReviewIssue({
       documentId: first.documentId,
+      ...(this.executionGuard ? { jobId: this.executionGuard.jobId, attemptId: this.executionGuard.attemptId } : {}),
+      stage: 'review_derived',
       kind: 'derived_safety',
       severity: 'blocking',
       evidenceRefs: observations.map((observation) => observation.sourceSpanId),

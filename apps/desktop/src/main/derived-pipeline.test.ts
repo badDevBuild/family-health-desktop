@@ -91,6 +91,24 @@ describe('DerivedHealthPipeline', () => {
     expect(prompts[0]).toContain('userReportedNotes');
     expect(prompts[0]).toContain('搜索词必须去标识化');
     expect(webSearchFlags).toEqual([true, true]);
+    const completedConsentId = service.store.createManualProcessingConsent({
+      documentIds: [service.store.listAcceptedObservations(personId)[0]!.documentId],
+      personIds: [personId],
+      accountFingerprint: 'completed-account',
+      version: 1
+    });
+    service.store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z',
+      initialStatus: 'queued',
+      consentId: completedConsentId,
+      groups: [{
+        personId,
+        documentIds: [service.store.listAcceptedObservations(personId)[0]!.documentId],
+        inputSignature: 'completed-document-job'
+      }]
+    });
+    const completedJob = service.store.claimNextQueuedJob('completed-runner', 'completed-account')!;
+    service.store.finishJob(completedJob.id, 'succeeded');
     service.store.createManualNote({
       personId, kind: 'free_text', immutableText: '新增背景需刷新派生说明', effectiveDate: null,
       structuredFields: {}, expectedContextRevision: 1
@@ -101,7 +119,7 @@ describe('DerivedHealthPipeline', () => {
       runtimeVersion: 'fixture-runtime', lastCheckedAt: '2026-09-18T00:00:00Z'
     };
     service.processNow({ accountState: account, consentVersion: 1 });
-    expect(service.store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
+    expect(service.store.listStoredJobs()).toContainEqual(expect.objectContaining({ stage: 'analyze', status: 'queued' }));
     service.close();
   });
 

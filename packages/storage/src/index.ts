@@ -13,7 +13,7 @@ import type {
   SourceManifest
 } from '@contracts';
 
-export const WORKSPACE_SCHEMA_VERSION = 27;
+export const WORKSPACE_SCHEMA_VERSION = 28;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 function calendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
@@ -232,6 +232,15 @@ export interface OpenExtractionReviewIssue {
   candidateDiffs: ReviewCandidateDiff[];
   reportedName: string | null;
   reasonCodes: string[];
+  jobId: string | null;
+  attemptId: string | null;
+  stage: string | null;
+  documentRun: {
+    coverageComplete: boolean;
+    coveredSourceSpanIds: string[];
+    manifestSpanIds: string[];
+    chunkCount: number;
+  } | null;
 }
 
 export interface StoredJobSummary {
@@ -1471,6 +1480,8 @@ export class WorkspaceStore {
   saveExtractionReviewIssue(input: {
     documentId: string;
     jobId?: string | null;
+    attemptId?: string | null;
+    stage?: string | null;
     kind: 'person_conflict' | 'field_conflict' | 'coverage_gap' | 'overwrite_protected' | 'derived_safety';
     severity: 'blocking' | 'warning';
     evidenceRefs: string[];
@@ -1479,6 +1490,12 @@ export class WorkspaceStore {
     candidateDiffs?: ReviewCandidateDiff[];
     reportedName?: string;
     reasonCodes?: string[];
+    documentRun?: {
+      coverageComplete: boolean;
+      coveredSourceSpanIds: string[];
+      manifestSpanIds: string[];
+      chunkCount: number;
+    };
   }): string {
     const id = randomUUID();
     const transaction = this.db.transaction(() => {
@@ -1491,11 +1508,15 @@ export class WorkspaceStore {
         id, input.jobId ?? null, `document:${input.documentId}`, input.kind,
         input.severity, JSON.stringify(input.evidenceRefs),
         input.candidateOptions || input.candidateDiffs || input.reportedName || input.reasonCodes?.length
+          || input.attemptId || input.stage || input.documentRun
           ? JSON.stringify({
               ...(input.candidateOptions ? { candidateOptions: input.candidateOptions } : {}),
               ...(input.candidateDiffs ? { candidateDiffs: input.candidateDiffs } : {}),
               ...(input.reportedName ? { reportedName: input.reportedName } : {}),
-              ...(input.reasonCodes?.length ? { reasonCodes: input.reasonCodes } : {})
+              ...(input.reasonCodes?.length ? { reasonCodes: input.reasonCodes } : {}),
+              ...(input.attemptId ? { attemptId: input.attemptId } : {}),
+              ...(input.stage ? { stage: input.stage } : {}),
+              ...(input.documentRun ? { documentRun: input.documentRun } : {})
             })
           : null,
         this.now().toISOString()
@@ -1510,7 +1531,7 @@ export class WorkspaceStore {
 
   listOpenExtractionReviewIssues(): OpenExtractionReviewIssue[] {
     const rows = this.db.prepare(`
-      SELECT ri.id, ri.kind, ri.severity, ri.evidence_refs_json, ri.payload_json,
+      SELECT ri.id, ri.job_id, ri.kind, ri.severity, ri.evidence_refs_json, ri.payload_json,
              d.id AS document_id, d.person_id
       FROM review_issues ri
       JOIN documents d ON ri.field_ref = 'document:' || d.id
@@ -1524,6 +1545,9 @@ export class WorkspaceStore {
             candidateDiffs?: ReviewCandidateDiff[];
             reportedName?: string;
             reasonCodes?: string[];
+            attemptId?: string;
+            stage?: string;
+            documentRun?: OpenExtractionReviewIssue['documentRun'];
           }
         : {};
       return {
@@ -1536,7 +1560,11 @@ export class WorkspaceStore {
         candidateOptions: payload.candidateOptions ?? [],
         candidateDiffs: payload.candidateDiffs ?? [],
         reportedName: payload.reportedName ?? null,
-        reasonCodes: payload.reasonCodes ?? []
+        reasonCodes: payload.reasonCodes ?? [],
+        jobId: row.job_id === null ? null : String(row.job_id),
+        attemptId: payload.attemptId ?? null,
+        stage: payload.stage ?? null,
+        documentRun: payload.documentRun ?? null
       };
     });
   }
@@ -1544,10 +1572,11 @@ export class WorkspaceStore {
   retryExtractionReview(input: { issueId: string; documentId: string }): void {
     const transaction = this.db.transaction(() => {
       const issue = this.db.prepare(`
-        SELECT id, kind, resolution_status, payload_json FROM review_issues
+        SELECT id, job_id, kind, resolution_status, payload_json FROM review_issues
         WHERE id = ? AND field_ref = 'document:' || ?
       `).get(input.issueId, input.documentId) as {
         id: string;
+        job_id: string | null;
         kind: string;
         resolution_status: string;
         payload_json: string | null;
@@ -1573,13 +1602,14 @@ export class WorkspaceStore {
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'review_issue.requeued', ?, '旧版核对事项已关闭，资料按当前规则重新核对', ?)
       `).run(randomUUID(), input.issueId, this.now().toISOString());
-      this.resumeWaitingJobsAfterReview(input.documentId);
+      this.resumeWaitingJobsAfterReview(input.documentId, false, issue.job_id);
     });
     transaction();
   }
 
   markReviewIssueCorrected(issueId: string, documentId: string): void {
     const transaction = this.db.transaction(() => {
+      const issue = this.db.prepare(`SELECT job_id FROM review_issues WHERE id = ?`).get(issueId) as { job_id: string | null } | undefined;
       const result = this.db.prepare(`
         UPDATE review_issues SET resolution_status = 'resolved', resolution_revision = 1
         WHERE id = ? AND field_ref = 'document:' || ? AND resolution_status = 'open' AND kind = 'field_conflict'
@@ -1589,7 +1619,7 @@ export class WorkspaceStore {
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'review_issue.corrected', ?, '用户核对原始依据后修正并接纳事实', ?)
       `).run(randomUUID(), issueId, this.now().toISOString());
-      this.resumeWaitingJobsAfterReview(documentId);
+      this.resumeWaitingJobsAfterReview(documentId, false, issue?.job_id ?? null);
     });
     transaction();
   }
@@ -1614,12 +1644,13 @@ export class WorkspaceStore {
   confirmDocumentIdentity(input: { issueId: string; documentId: string; personId: string }): void {
     const transaction = this.db.transaction(() => {
       const issue = this.db.prepare(`
-        SELECT ri.kind, ri.resolution_status, ri.payload_json, d.person_id
+        SELECT ri.job_id, ri.kind, ri.resolution_status, ri.payload_json, d.person_id
         FROM review_issues ri
         JOIN documents d ON ri.field_ref = 'document:' || d.id
         WHERE ri.id = ? AND d.id = ?
       `).get(input.issueId, input.documentId) as {
         kind: string;
+        job_id: string | null;
         resolution_status: string;
         payload_json: string | null;
         person_id: string | null;
@@ -1650,7 +1681,7 @@ export class WorkspaceStore {
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'review_issue.identity_confirmed', ?, '用户确认报告姓名与当前成员为同一人，任务重新进入核对队列', ?)
       `).run(randomUUID(), input.issueId, this.now().toISOString());
-      this.resumeWaitingJobsAfterReview(input.documentId);
+      this.resumeWaitingJobsAfterReview(input.documentId, false, issue.job_id);
     });
     transaction();
   }
@@ -1662,9 +1693,9 @@ export class WorkspaceStore {
   }): void {
     const transaction = this.db.transaction(() => {
       const issue = this.db.prepare(`
-        SELECT id, kind, resolution_status FROM review_issues
+        SELECT id, job_id, kind, resolution_status FROM review_issues
         WHERE id = ? AND field_ref = 'document:' || ?
-      `).get(input.issueId, input.documentId) as { id: string; kind: string; resolution_status: string } | undefined;
+      `).get(input.issueId, input.documentId) as { id: string; job_id: string | null; kind: string; resolution_status: string } | undefined;
       if (!issue || issue.resolution_status !== 'open') throw new Error('REVIEW_ISSUE_NOT_OPEN');
       if (input.action === 'archive_only' && issue.kind === 'derived_safety') throw new Error('REVIEW_ACTION_INVALID');
       if (input.action === 'dismiss_derived' && issue.kind !== 'derived_safety') throw new Error('REVIEW_ACTION_INVALID');
@@ -1694,7 +1725,7 @@ export class WorkspaceStore {
         input.action === 'archive_only' ? '用户选择仅归档，不纳入分析' : '用户选择不发布本次派生说明',
         this.now().toISOString()
       );
-      this.resumeWaitingJobsAfterReview(input.documentId, input.action === 'dismiss_derived');
+      this.resumeWaitingJobsAfterReview(input.documentId, input.action === 'dismiss_derived', issue.job_id);
     });
     transaction();
   }
@@ -1728,14 +1759,28 @@ export class WorkspaceStore {
     return rows.map((row) => ({ personId: row.person_id, documentId: row.document_id }));
   }
 
-  private resumeWaitingJobsAfterReview(documentId: string, finishWithoutResume = false): void {
+  private resumeWaitingJobsAfterReview(documentId: string, finishWithoutResume = false, issueJobId: string | null = null): void {
     const jobs = this.db.prepare(`
       SELECT id, stage, checkpoint_json FROM jobs WHERE status = 'waiting_user'
     `).all() as Array<{ id: string; stage: StoredJobSummary['stage']; checkpoint_json: string | null }>;
     for (const job of jobs) {
-      const checkpoint = job.checkpoint_json ? JSON.parse(job.checkpoint_json) as { documentIds?: string[]; completedUnits?: number } & Record<string, unknown> : {};
-      if (!checkpoint.documentIds?.includes(documentId)) continue;
-      const stillBlocked = checkpoint.documentIds.some((id) => this.hasOpenBlockingReview(id));
+      const checkpoint = job.checkpoint_json ? JSON.parse(job.checkpoint_json) as {
+        documentIds?: string[];
+        completedUnits?: number;
+        consentId?: string | null;
+      } & Record<string, unknown> : {};
+      if (!checkpoint.documentIds?.length) continue;
+      if (issueJobId ? job.id !== issueJobId : !checkpoint.documentIds?.includes(documentId)) continue;
+      if (!checkpoint.consentId || !this.db.prepare(`SELECT 1 FROM consents WHERE id = ? AND revoked_at IS NULL`).get(checkpoint.consentId)) {
+        continue;
+      }
+      const stillBlockedForJob = Boolean(this.db.prepare(`
+        SELECT 1 FROM review_issues
+        WHERE job_id = ? AND resolution_status = 'open' AND severity = 'blocking'
+        LIMIT 1
+      `).get(job.id));
+      const stillBlockedForLegacyDocument = checkpoint.documentIds?.some((id) => this.hasOpenBlockingReview(id)) ?? false;
+      const stillBlocked = stillBlockedForJob || stillBlockedForLegacyDocument;
       if (stillBlocked) continue;
       const resumeExtraction = !finishWithoutResume && (job.stage === 'extract' || job.stage === 'review_facts');
       const status = resumeExtraction ? 'queued' : 'succeeded';
@@ -2194,7 +2239,7 @@ export class WorkspaceStore {
   listProcessingDocumentIds(): Set<string> {
     const rows = this.db.prepare(`
       SELECT checkpoint_json FROM jobs
-      WHERE status != 'cancelled' AND checkpoint_json IS NOT NULL
+      WHERE status NOT IN ('cancelled', 'succeeded') AND checkpoint_json IS NOT NULL
     `).all() as Array<{ checkpoint_json: string }>;
     const documentIds = new Set<string>();
     for (const row of rows) {
@@ -2207,6 +2252,27 @@ export class WorkspaceStore {
         }
       } catch {
         // 无法解析的旧任务不应该影响其他资料的可见性。
+      }
+    }
+    return documentIds;
+  }
+
+  listActiveProcessingDocumentIds(): Set<string> {
+    const rows = this.db.prepare(`
+      SELECT checkpoint_json FROM jobs
+      WHERE status IN ('queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait')
+        AND checkpoint_json IS NOT NULL
+    `).all() as Array<{ checkpoint_json: string }>;
+    const documentIds = new Set<string>();
+    for (const row of rows) {
+      try {
+        const checkpoint = JSON.parse(row.checkpoint_json) as { documentIds?: unknown };
+        if (!Array.isArray(checkpoint.documentIds)) continue;
+        for (const documentId of checkpoint.documentIds) {
+          if (typeof documentId === 'string') documentIds.add(documentId);
+        }
+      } catch {
+        // 无法解析的旧任务不应锁住新一轮派生分析。
       }
     }
     return documentIds;
@@ -2761,10 +2827,56 @@ export class WorkspaceStore {
   }
 
   publishFacts(input: PublishFactsInput): { publicationId: string; revision: number; idempotent: boolean } {
+    const correctionIssue = input.resolvedReviewIssueId
+      ? this.db.prepare(`
+          SELECT id, job_id, kind, resolution_status, payload_json
+          FROM review_issues
+          WHERE id = ? AND field_ref = 'document:' || ?
+        `).get(input.resolvedReviewIssueId, input.documentId) as {
+          id: string;
+          job_id: string | null;
+          kind: string;
+          resolution_status: string;
+          payload_json: string | null;
+        } | undefined
+      : undefined;
+    if (input.resolvedReviewIssueId) {
+      if (!correctionIssue || correctionIssue.kind !== 'field_conflict' || correctionIssue.resolution_status !== 'open') {
+        throw new Error('REVIEW_ISSUE_NOT_OPEN');
+      }
+      const payload = correctionIssue.payload_json
+        ? JSON.parse(correctionIssue.payload_json) as {
+            documentRun?: {
+              coverageComplete?: unknown;
+              coveredSourceSpanIds?: unknown;
+              manifestSpanIds?: unknown;
+            };
+          }
+        : {};
+      const run = payload.documentRun;
+      const covered = Array.isArray(run?.coveredSourceSpanIds)
+        ? run.coveredSourceSpanIds.filter((value): value is string => typeof value === 'string')
+        : [];
+      const manifest = Array.isArray(run?.manifestSpanIds)
+        ? run.manifestSpanIds.filter((value): value is string => typeof value === 'string')
+        : [];
+      const complete = run?.coverageComplete === true
+        && covered.length > 0
+        && new Set(covered).size === covered.length
+        && new Set(manifest).size === manifest.length
+        && covered.length === manifest.length
+        && manifest.every((spanId) => covered.includes(spanId));
+      if (!complete) throw new Error('DOCUMENT_REVIEW_RUN_INCOMPLETE');
+    }
     const existing = this.db.prepare(`
       SELECT publication_id, revision FROM document_commits
       WHERE document_id = ? OR commit_key = ?
     `).get(input.documentId, input.documentCommitKey) as { publication_id: string; revision: number } | undefined;
+    if (existing && input.resolvedReviewIssueId) {
+      // 已提交资料不能通过幂等返回伪装成“修正成功”。修正需要新的显式修订流程，
+      // 当前流程只允许在首次提交前关闭整篇事实冲突。
+      throw new Error('DOCUMENT_ALREADY_COMMITTED_REVIEW_CONFLICT');
+    }
     if (existing) return { publicationId: existing.publication_id, revision: existing.revision, idempotent: true };
 
     const transaction = this.db.transaction(() => {
@@ -2773,6 +2885,9 @@ export class WorkspaceStore {
         SELECT publication_id, revision FROM document_commits
         WHERE document_id = ? OR commit_key = ?
       `).get(input.documentId, input.documentCommitKey) as { publication_id: string; revision: number } | undefined;
+      if (committed && input.resolvedReviewIssueId) {
+        throw new Error('DOCUMENT_ALREADY_COMMITTED_REVIEW_CONFLICT');
+      }
       if (committed) return { publicationId: committed.publication_id, revision: committed.revision, idempotent: true };
       const actual = this.getFactRevision(input.personId);
       if (actual !== input.expectedRevision) throw new RevisionConflictError(input.expectedRevision, actual);
@@ -2839,6 +2954,7 @@ export class WorkspaceStore {
           WHERE id = ? AND field_ref = 'document:' || ? AND resolution_status = 'open' AND kind = 'field_conflict'
         `).run(input.resolvedReviewIssueId, input.documentId);
         if (resolved.changes !== 1) throw new Error('REVIEW_ISSUE_NOT_OPEN');
+        this.resumeWaitingJobsAfterReview(input.documentId, false, correctionIssue?.job_id ?? null);
       }
       return { publicationId, revision: nextRevision, idempotent: false };
     });
@@ -4127,6 +4243,107 @@ export class WorkspaceStore {
         current = 27;
       }
 
+      if (current === 27) {
+        const tables = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>)
+          .map((row) => row.name));
+        const canRecoverIncompleteDocumentReview = [
+          'review_issues', 'documents', 'document_commits', 'jobs', 'audit_events'
+        ].every((table) => tables.has(table));
+        const issues = canRecoverIncompleteDocumentReview
+          ? this.db.prepare(`
+              SELECT id, job_id, field_ref, payload_json
+              FROM review_issues
+              WHERE resolution_status = 'open' AND kind = 'field_conflict'
+              ORDER BY created_at, id
+            `).all() as Array<{ id: string; job_id: string | null; field_ref: string; payload_json: string | null }>
+          : [];
+        for (const issue of issues) {
+          let payload: {
+            documentRun?: {
+              coverageComplete?: unknown;
+              coveredSourceSpanIds?: unknown;
+              manifestSpanIds?: unknown;
+            };
+          } = {};
+          try {
+            payload = issue.payload_json ? JSON.parse(issue.payload_json) as typeof payload : {};
+          } catch {
+            // 无法证明整篇覆盖的旧核对事项按未完成处理。
+          }
+          const run = payload.documentRun;
+          const covered = Array.isArray(run?.coveredSourceSpanIds)
+            ? run.coveredSourceSpanIds.filter((value): value is string => typeof value === 'string')
+            : [];
+          const manifest = Array.isArray(run?.manifestSpanIds)
+            ? run.manifestSpanIds.filter((value): value is string => typeof value === 'string')
+            : [];
+          const hasCompleteRun = run?.coverageComplete === true
+            && covered.length > 0
+            && covered.length === manifest.length
+            && new Set(covered).size === covered.length
+            && new Set(manifest).size === manifest.length
+            && manifest.every((spanId) => covered.includes(spanId));
+          if (hasCompleteRun) continue;
+          const documentId = issue.field_ref.startsWith('document:')
+            ? issue.field_ref.slice('document:'.length)
+            : null;
+          if (!documentId) continue;
+          this.db.prepare(`
+            UPDATE review_issues SET resolution_status = 'resolved', resolution_revision = 1
+            WHERE id = ? AND resolution_status = 'open'
+          `).run(issue.id);
+          this.db.prepare(`
+            UPDATE documents SET status = 'queued'
+            WHERE id = ? AND status = 'needs_review'
+              AND NOT EXISTS (SELECT 1 FROM document_commits dc WHERE dc.document_id = documents.id)
+              AND NOT EXISTS (
+                SELECT 1 FROM review_issues ri
+                WHERE ri.field_ref = 'document:' || documents.id
+                  AND ri.resolution_status = 'open' AND ri.severity = 'blocking'
+              )
+          `).run(documentId);
+          this.db.prepare(`
+            INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+            VALUES (?, 'review_issue.recovered', ?, '旧核对事项无法证明整篇已读完，资料重新进入完整核对队列', ?)
+          `).run(randomUUID(), issue.id, this.now().toISOString());
+
+          const jobs = issue.job_id
+            ? this.db.prepare(`SELECT id, checkpoint_json FROM jobs WHERE id = ? AND status = 'waiting_user'`).all(issue.job_id)
+            : this.db.prepare(`SELECT id, checkpoint_json FROM jobs WHERE status = 'waiting_user'`).all();
+          for (const job of jobs as Array<{ id: string; checkpoint_json: string | null }>) {
+            let checkpoint: ({ documentIds?: string[]; consentId?: string | null } & Record<string, unknown>) = {};
+            try {
+              checkpoint = job.checkpoint_json ? JSON.parse(job.checkpoint_json) as typeof checkpoint : {};
+            } catch {
+              continue;
+            }
+            if (!issue.job_id && !checkpoint.documentIds?.includes(documentId)) continue;
+            if (!checkpoint.consentId || !this.db.prepare(`
+              SELECT 1 FROM consents WHERE id = ? AND revoked_at IS NULL
+            `).get(checkpoint.consentId)) continue;
+            const stillBlocked = issue.job_id
+              ? Boolean(this.db.prepare(`
+                  SELECT 1 FROM review_issues
+                  WHERE job_id = ? AND resolution_status = 'open' AND severity = 'blocking'
+                  LIMIT 1
+                `).get(job.id))
+              : checkpoint.documentIds?.some((id) => this.hasOpenBlockingReview(id));
+            if (stillBlocked) continue;
+            this.db.prepare(`
+              UPDATE jobs
+              SET status = 'queued', stage = 'extract', lease_owner = NULL, lease_expires_at = NULL,
+                  checkpoint_json = ?, updated_at = ?
+              WHERE id = ?
+            `).run(JSON.stringify({ ...checkpoint, completedUnits: 0 }), this.now().toISOString(), job.id);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 28;
+          PRAGMA user_version = 28;
+        `);
+        current = 28;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -4325,7 +4542,7 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
       CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
-      PRAGMA user_version = 27;
+      PRAGMA user_version = 28;
       `);
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');

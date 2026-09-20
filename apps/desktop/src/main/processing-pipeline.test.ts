@@ -222,6 +222,42 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
+  it('扫描图像中明确读到不同姓名时必须阻断，不因缺少文字层放行', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-image-identity-conflict-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '图像身份工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试姓名甲', relation: '本人' });
+    const receipt = await service.importFiles([{ path: '/tmp/扫描件.pdf', bytes: createScannedLikePdf() }], personId);
+    expect(receipt.rejected).toEqual([]);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
+    const output: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: {
+        reportedName: '测试姓名乙',
+        evidence: [{ sourceSpanId: spanId, quote: null }],
+        confidence: 'explicit'
+      },
+      coveredSourceSpanIds: [spanId],
+      candidates: []
+    };
+    let turns = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'image-name-thread', turnId: `image-name-${++turns}`, output })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({
+      status: 'needs_review', reason: 'PERSON_IDENTITY_NOT_CONFIRMED'
+    });
+    expect(turns).toBe(1);
+    expect(service.store.listOpenExtractionReviewIssues()[0]).toMatchObject({
+      kind: 'person_conflict', reportedName: '测试姓名乙'
+    });
+    expect(service.store.getFactRevision(personId)).toBe(0);
+    service.close();
+  });
+
   it('扫描页分块时每次最多携带八个视觉页且不遗漏 source span', () => {
     const spans = Array.from({ length: 17 }, (_, index) => ({
       id: `span-${index + 1}`, documentId: 'doc', spanKind: 'page' as const, page: index + 1,
@@ -321,7 +357,7 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
-  it('两轮只有一侧给出参考范围时保守留空并继续发布', async () => {
+  it('两轮只有一侧给出参考范围时保留原值并转核对', async () => {
     const { service, personId, documentId, output } = await setup();
     const withoutReferenceRange: ExtractionResult = {
       ...output,
@@ -336,11 +372,15 @@ describe('DocumentExtractionPipeline', () => {
       })
     });
 
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
-    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
-    expect(service.store.listAcceptedObservations(personId)).toEqual([
-      expect.objectContaining({ conceptKey: 'LDL-C', decimalValue: '4.2', referenceRange: null })
-    ]);
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([]);
+    expect(service.store.listOpenExtractionReviewIssues()[0]).toMatchObject({
+      candidateDiffs: [expect.objectContaining({
+        fields: ['referenceRangeRaw'],
+        firstCandidate: expect.objectContaining({ referenceRangeRaw: '0-3.4 mmol/L' }),
+        secondCandidate: expect.objectContaining({ referenceRangeRaw: null })
+      })]
+    });
     service.close();
   });
 
@@ -609,6 +649,39 @@ describe('DocumentExtractionPipeline', () => {
       expect.objectContaining({ conceptKey: '舒张压', valueKind: 'numeric', decimalValue: '70', unit: 'mmHg', clinicalDate: '2023-10-08' })
     ]);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('血压名称规范不改写原单位、原文和比较符', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-blood-pressure-source-fidelity-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '血压原值工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '收缩压 > 18 kPa';
+    await service.importFiles([{ path: '/tmp/血压原值报告.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const output: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'pressure-source', originalName: '收缩压', standardNameCandidate: 'SBP',
+        value: { kind: 'numeric', rawText: '>18', decimal: '18', comparator: 'gt' },
+        unitRaw: 'kPa', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: null,
+        evidence: [{ sourceSpanId: span.id, quote: sourceText }], issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'pressure-source-thread', turnId: 'pressure-source-turn', output })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '收缩压', rawText: '>18', decimalValue: '18', qualifier: 'gt', unit: 'kPa' })
+    ]);
     service.close();
   });
 
@@ -986,5 +1059,110 @@ describe('DocumentExtractionPipeline', () => {
     });
     expect(service.store.getFactRevision(personId)).toBe(0);
     service.close();
+  });
+
+  it('同一成员在不同块引用不同姓名证据时仍视为同一人', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-chunk-subject-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '分块身份工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const lines = Array.from({ length: 41 }, (_, index) => `测试成员 虚构指标${index + 1} ${index + 1} mmol/L`);
+    await service.importFiles([{ path: '/tmp/分块身份.txt', bytes: Buffer.from(lines.join('\n')) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const chunks = partitionSourceSpans(service.store.getDocumentExtractionBundle(documentId).manifest.spans);
+    expect(chunks.map((chunk) => chunk.length)).toEqual([40, 1]);
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => {
+        const chunkIndex = Math.floor(turn / 2);
+        turn += 1;
+        const spans = chunks[chunkIndex]!;
+        const itemNumber = chunkIndex === 0 ? 1 : 41;
+        const quote = lines[itemNumber - 1]!;
+        const output: ExtractionResult = {
+          schemaVersion: 1,
+          documentId,
+          subject: {
+            reportedName: '测试成员',
+            evidence: [{ sourceSpanId: spans[0]!.id, quote }],
+            confidence: 'explicit'
+          },
+          coveredSourceSpanIds: spans.map((span) => span.id),
+          candidates: [{
+            localKey: `chunk-${chunkIndex + 1}`, originalName: `虚构指标${itemNumber}`, standardNameCandidate: null,
+            value: { kind: 'numeric', rawText: String(itemNumber), decimal: String(itemNumber), comparator: 'eq' },
+            unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+            specimen: null, method: null, bodySite: null, clinicalDate: null,
+            evidence: [{ sourceSpanId: spans[0]!.id, quote }], issues: []
+          }]
+        };
+        return { threadId: 'chunk-subject-thread', turnId: `chunk-subject-${turn}`, output };
+      }
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 2 });
+    expect(turn).toBe(4);
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(2);
+    service.close();
+  });
+
+  it('长报告中间块冲突时仍读完后续块，人工修正只能提交整篇候选', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-complete-chunk-review-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '整篇核对工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const lines = Array.from({ length: 81 }, (_, index) => `测试成员 虚构指标${index + 1} ${index + 1} mmol/L`);
+    await service.importFiles([{ path: '/tmp/三块长报告.txt', bytes: Buffer.from(lines.join('\n')) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const chunks = partitionSourceSpans(service.store.getDocumentExtractionBundle(documentId).manifest.spans);
+    expect(chunks.map((chunk) => chunk.length)).toEqual([40, 40, 1]);
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => {
+        const chunkIndex = Math.floor(turn / 2);
+        const reviewPass = turn % 2 === 1;
+        turn += 1;
+        const spans = chunks[chunkIndex]!;
+        const itemNumber = [1, 41, 81][chunkIndex]!;
+        const quote = lines[itemNumber - 1]!;
+        const decimal = chunkIndex === 1 && reviewPass ? '999' : String(itemNumber);
+        const output: ExtractionResult = {
+          schemaVersion: 1,
+          documentId,
+          subject: { reportedName: '测试成员', evidence: [{ sourceSpanId: spans[0]!.id, quote }], confidence: 'explicit' },
+          coveredSourceSpanIds: spans.map((span) => span.id),
+          candidates: [{
+            localKey: `chunk-${chunkIndex + 1}`, originalName: `虚构指标${itemNumber}`, standardNameCandidate: null,
+            value: { kind: 'numeric', rawText: decimal, decimal, comparator: 'eq' },
+            unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+            specimen: null, method: null, bodySite: null, clinicalDate: null,
+            evidence: [{ sourceSpanId: spans[0]!.id, quote }], issues: []
+          }]
+        };
+        return { threadId: 'complete-review-thread', turnId: `complete-review-${turn}`, output };
+      }
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'INDEPENDENT_REVIEW_MISMATCH' });
+    expect(turn).toBe(6);
+    const issue = service.store.listOpenExtractionReviewIssues()[0]!;
+    expect(issue.documentRun).toMatchObject({ coverageComplete: true, chunkCount: 3 });
+    expect(issue.documentRun?.coveredSourceSpanIds).toHaveLength(81);
+    expect(issue.candidateOptions.map((candidate) => candidate.localKey)).toEqual(['chunk-1', 'chunk-2', 'chunk-3']);
+
+    // 核对事项必须完整落盘；应用重启后仍要拿到整篇候选，而不是只剩冲突块。
+    service.close();
+    const reopened = new PersonalWorkspaceService(root, '整篇核对工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const persistedIssue = reopened.store.listOpenExtractionReviewIssues()[0]!;
+    expect(persistedIssue.documentRun).toEqual(issue.documentRun);
+    expect(persistedIssue.candidateOptions.map((candidate) => candidate.localKey)).toEqual(['chunk-1', 'chunk-2', 'chunk-3']);
+    const corrected = persistedIssue.candidateOptions.map((candidate) => candidate.localKey === 'chunk-2'
+      ? { ...candidate, value: { kind: 'numeric' as const, rawText: '41', decimal: '41', comparator: 'eq' as const } }
+      : candidate);
+    reopened.acceptCorrectedFacts({ issueId: persistedIssue.id, documentId, candidates: corrected });
+    expect(reopened.store.listAcceptedObservations(personId)).toHaveLength(3);
+    expect(reopened.store.isDocumentCommitted(documentId)).toBe(true);
+    expect(reopened.store.listOpenExtractionReviewIssues()).toEqual([]);
+    reopened.close();
   });
 });

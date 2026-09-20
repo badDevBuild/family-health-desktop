@@ -188,6 +188,31 @@ export class PersonalWorkspaceService {
   }
 
   acceptCorrectedFacts(input: { issueId: string; documentId: string; candidates: ObservationCandidate[] }) {
+    const issue = this.store.listOpenExtractionReviewIssues().find((candidateIssue) => (
+      candidateIssue.id === input.issueId && candidateIssue.documentId === input.documentId
+    ));
+    if (!issue || issue.kind !== 'field_conflict') throw new Error('REVIEW_ISSUE_NOT_OPEN');
+    if (!issue.documentRun?.coverageComplete) throw new Error('DOCUMENT_REVIEW_RUN_INCOMPLETE');
+    const submittedByKey = new Map(input.candidates.map((candidate) => [candidate.localKey, candidate]));
+    if (submittedByKey.size !== input.candidates.length) throw new Error('CORRECTION_DUPLICATE_KEY');
+    const storedByKey = new Map(issue.candidateOptions.map((candidate) => [candidate.localKey, candidate]));
+    if ([...submittedByKey.keys()].some((localKey) => !storedByKey.has(localKey))) {
+      throw new Error('CORRECTION_SCOPE_INVALID');
+    }
+    for (const original of issue.candidateOptions) {
+      const submitted = submittedByKey.get(original.localKey);
+      const difference = issue.candidateDiffs.find((candidateDifference) => candidateDifference.localKey === original.localKey);
+      if (!submitted) {
+        if (!difference?.fields.includes('presence')) throw new Error('CORRECTION_INCOMPLETE');
+        continue;
+      }
+      const normalizedSubmitted = { ...submitted } as Record<string, unknown>;
+      const originalRecord = original as unknown as Record<string, unknown>;
+      for (const field of difference?.fields ?? []) {
+        if (field !== 'presence') normalizedSubmitted[field] = originalRecord[field];
+      }
+      if (stableHash(normalizedSubmitted) !== stableHash(original)) throw new Error('CORRECTION_SCOPE_INVALID');
+    }
     const bundle = this.store.getDocumentExtractionBundle(input.documentId);
     const observations = input.candidates.map((candidate) => {
       const outcome = evaluateObservationCandidate(candidate, bundle.manifest, {
@@ -355,21 +380,22 @@ export class PersonalWorkspaceService {
     documentIds?: string[];
   }): { batchId: string; idempotent: boolean } {
     const selectedIds = options?.documentIds ? new Set(options.documentIds) : null;
-    const processingDocumentIds = options ? this.store.listProcessingDocumentIds() : new Set<string>();
-    if (selectedIds && [...selectedIds].some((documentId) => processingDocumentIds.has(documentId))) {
+    const trackedDocumentIds = options ? this.store.listProcessingDocumentIds() : new Set<string>();
+    const activeDocumentIds = options ? this.store.listActiveProcessingDocumentIds() : new Set<string>();
+    if (selectedIds && [...selectedIds].some((documentId) => trackedDocumentIds.has(documentId))) {
       throw new Error('DOCUMENT_ALREADY_IN_PROCESSING');
     }
     const byPerson = new Map<string, { documentIds: string[]; stage: 'extract' | 'analyze' }>();
     for (const document of this.store.listReadyDocuments()) {
       if (selectedIds && !selectedIds.has(document.id)) continue;
-      if (processingDocumentIds.has(document.id)) continue;
+      if (trackedDocumentIds.has(document.id)) continue;
       const group = byPerson.get(document.personId) ?? { documentIds: [], stage: 'extract' as const };
       group.documentIds.push(document.id);
       byPerson.set(document.personId, group);
     }
     if (!selectedIds) {
       for (const target of this.store.listDerivedRefreshTargets()) {
-        if (processingDocumentIds.has(target.documentId)) continue;
+        if (activeDocumentIds.has(target.documentId)) continue;
         if (!byPerson.has(target.personId)) {
           byPerson.set(target.personId, { documentIds: [target.documentId], stage: 'analyze' });
         }

@@ -114,21 +114,25 @@ function sourceNamesPressureValue(sourceText: string, kind: BloodPressureKind, v
 function canonicalPressureCandidate(
   candidate: ObservationCandidate,
   kind: BloodPressureKind,
-  decimal: string,
-  evidence: ObservationCandidate['evidence']
+  evidence: ObservationCandidate['evidence'],
+  derivedValue?: { decimal: string; comparator: 'eq' }
 ): ObservationCandidate {
   const isSystolic = kind === 'systolic';
+  const value = derivedValue
+    ? { kind: 'numeric' as const, rawText: derivedValue.decimal, decimal: derivedValue.decimal, comparator: derivedValue.comparator }
+    : candidate.value;
   return {
     ...candidate,
     localKey: `bp-${kind}-${stableHash({
       documentId: evidence[0]?.sourceSpanId,
       clinicalDate: candidate.clinicalDate,
-      decimal
+      value
     }).slice(0, 16)}`,
     originalName: isSystolic ? '收缩压' : '舒张压',
     standardNameCandidate: isSystolic ? '收缩压' : '舒张压',
-    value: { kind: 'numeric', rawText: decimal, decimal, comparator: 'eq' },
-    unitRaw: 'mmHg',
+    // 直接候选只规范名称，不改写模型从原文读到的数值、比较符或单位。
+    // 复合“血压 120/80 mmHg”才会创建两个有明确来源的派生数值。
+    value,
     evidence
   };
 }
@@ -323,17 +327,18 @@ export function normalizeBloodPressureCandidates(
     const kind = pressureKind(candidate);
     if (kind && candidate.value.kind === 'numeric' && evidence
       && sourceNamesPressureValue(evidence.sourceText, kind, candidate.value.decimal)) {
-      direct.push(canonicalPressureCandidate(candidate, kind, candidate.value.decimal, evidence.evidence));
+      direct.push(canonicalPressureCandidate(candidate, kind, evidence.evidence));
       continue;
     }
 
     const pair = isBloodPressurePair(candidate) ? pressurePair(candidate.value) : null;
     const hasMmhg = normalizedComparableText(candidate.unitRaw) === 'mmhg' || Boolean(evidence && /\bmm\s*hg\b/i.test(evidence.sourceText));
-    if (pair && evidence && hasMmhg
+    const pairHasExactComparator = candidate.value.kind !== 'numeric' || candidate.value.comparator === 'eq';
+    if (pair && pairHasExactComparator && evidence && hasMmhg
       && sourceNamesPressureValue(evidence.sourceText, 'systolic', pair[0])
       && sourceNamesPressureValue(evidence.sourceText, 'diastolic', pair[1])) {
-      derived.push(canonicalPressureCandidate(candidate, 'systolic', pair[0], evidence.evidence));
-      derived.push(canonicalPressureCandidate(candidate, 'diastolic', pair[1], evidence.evidence));
+      derived.push(canonicalPressureCandidate(candidate, 'systolic', evidence.evidence, { decimal: pair[0], comparator: 'eq' }));
+      derived.push(canonicalPressureCandidate(candidate, 'diastolic', evidence.evidence, { decimal: pair[1], comparator: 'eq' }));
       continue;
     }
     direct.push(candidate);
@@ -393,43 +398,6 @@ function omitOmittableOneSidedCandidates(
       candidates: second.candidates.filter((candidate) => (
         !isOmittableOneSidedCandidate(candidate) || firstNames.has(normalizedComparableText(candidate.originalName))
       ))
-    }
-  };
-}
-
-function clearOneSidedReferenceRanges(
-  first: ExtractionResult,
-  second: ExtractionResult
-): { first: ExtractionResult; second: ExtractionResult } {
-  const firstByName = new Map<string | null, ObservationCandidate[]>();
-  const secondByName = new Map<string | null, ObservationCandidate[]>();
-  for (const candidate of first.candidates) {
-    const name = normalizedComparableText(candidate.originalName);
-    firstByName.set(name, [...(firstByName.get(name) ?? []), candidate]);
-  }
-  for (const candidate of second.candidates) {
-    const name = normalizedComparableText(candidate.originalName);
-    secondByName.set(name, [...(secondByName.get(name) ?? []), candidate]);
-  }
-  const shouldClear = (candidate: ObservationCandidate, own: Map<string | null, ObservationCandidate[]>, other: Map<string | null, ObservationCandidate[]>) => {
-    const name = normalizedComparableText(candidate.originalName);
-    const ownMatches = own.get(name) ?? [];
-    const otherMatches = other.get(name) ?? [];
-    return ownMatches.length === 1 && otherMatches.length === 1
-      && (candidate.referenceRangeRaw === null || otherMatches[0]!.referenceRangeRaw === null);
-  };
-  return {
-    first: {
-      ...first,
-      candidates: first.candidates.map((candidate) => shouldClear(candidate, firstByName, secondByName)
-        ? { ...candidate, referenceRangeRaw: null }
-        : candidate)
-    },
-    second: {
-      ...second,
-      candidates: second.candidates.map((candidate) => shouldClear(candidate, secondByName, firstByName)
-        ? { ...candidate, referenceRangeRaw: null }
-        : candidate)
     }
   };
 }
@@ -586,6 +554,15 @@ function subjectEvidenceIsValid(
   });
 }
 
+function subjectEvidenceReferencesKnownSource(
+  result: ExtractionResult,
+  bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
+): boolean {
+  if (result.subject.confidence !== 'explicit' || !result.subject.reportedName || result.subject.evidence.length === 0) return false;
+  const knownSpanIds = new Set(bundle.manifest.spans.map((span) => span.id));
+  return result.subject.evidence.every((reference) => knownSpanIds.has(reference.sourceSpanId));
+}
+
 function subjectIsConsistent(
   result: ExtractionResult,
   bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
@@ -593,9 +570,10 @@ function subjectIsConsistent(
   const trustedAssignment = bundle.personAssignmentBasis === 'user_selected'
     || bundle.personAssignmentBasis === 'folder_binding'
     || bundle.personAssignmentBasis === 'identity_confirmed';
-  // 用户明确归属或成员文件夹绑定是有效的身份依据。姓名缺失、模糊或证据定位
-  // 不完整时沿用该归属；只有来源中存在可验证的明确姓名时才比较并阻断冲突。
-  if (!subjectEvidenceIsValid(result, bundle)) return trustedAssignment;
+  // 没有姓名或只是模糊读取时，可以沿用用户明确归属。
+  // 但模型已在图像来源上给出明确姓名时，即使没有本地文字层，
+  // 也必须比较并把异名交给用户核对，不能把“无法文字验证”当成“没有冲突”。
+  if (!subjectEvidenceIsValid(result, bundle) && !subjectEvidenceReferencesKnownSource(result, bundle)) return trustedAssignment;
   const expectedName = bundle.confirmedReportedName ?? bundle.personDisplayName;
   return normalizedPersonName(result.subject.reportedName!) === normalizedPersonName(expectedName);
 }
@@ -604,11 +582,34 @@ function conflictingReportedName(
   result: ExtractionResult,
   bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
 ): string | null {
-  if (!subjectEvidenceIsValid(result, bundle) || !result.subject.reportedName) return null;
+  if ((!subjectEvidenceIsValid(result, bundle) && !subjectEvidenceReferencesKnownSource(result, bundle)) || !result.subject.reportedName) return null;
   const expectedName = bundle.confirmedReportedName ?? bundle.personDisplayName;
   return normalizedPersonName(result.subject.reportedName) === normalizedPersonName(expectedName)
     ? null
     : result.subject.reportedName;
+}
+
+function aggregateReviewedSubject(subjects: ExtractionResult['subject'][]): ExtractionResult['subject'] {
+  const explicit = subjects.find((subject) => subject.confidence === 'explicit' && subject.reportedName);
+  if (explicit) {
+    const evidence = new Map(explicit.evidence.map((reference) => [reference.sourceSpanId, reference]));
+    for (const subject of subjects) {
+      if (subject.confidence !== 'explicit' || !subject.reportedName
+        || normalizedPersonName(subject.reportedName) !== normalizedPersonName(explicit.reportedName!)) continue;
+      for (const reference of subject.evidence) evidence.set(reference.sourceSpanId, reference);
+    }
+    return { ...explicit, evidence: [...evidence.values()] };
+  }
+  return subjects.find((subject) => subject.confidence === 'uncertain')
+    ?? subjects[0]
+    ?? { reportedName: null, evidence: [], confidence: 'absent' };
+}
+
+function reviewedSubjectsAreConsistent(subjects: ExtractionResult['subject'][]): boolean {
+  const names = new Set(subjects
+    .filter((subject) => subject.confidence === 'explicit' && subject.reportedName)
+    .map((subject) => normalizedPersonName(subject.reportedName!)));
+  return names.size <= 1;
 }
 
 function hasCompleteCoverage(result: ExtractionResult, expectedSpanIds: string[]): boolean {
@@ -845,6 +846,7 @@ export class DocumentExtractionPipeline {
     const coveredSourceSpanIds: string[] = [];
     const reviewReceipts: Array<{ extractTurnId: string; reviewTurnId: string }> = [];
     const reviewedSubjects: ExtractionResult['subject'][] = [];
+    const pendingCandidateDiffs: ReviewCandidateDiff[] = [];
     let lastReceipt: { threadId: string; turnId: string } | null = null;
     let temporaryRoot: string | null = null;
     try {
@@ -1029,11 +1031,7 @@ export class DocumentExtractionPipeline {
           ...reviewed,
           candidates: normalizeCandidates(reviewed.candidates, spans)
         };
-        const withoutOmittableOneSided = omitOmittableOneSidedCandidates(normalizedExtracted, normalizedReviewed);
-        const aligned = clearOneSidedReferenceRanges(
-          withoutOmittableOneSided.first,
-          withoutOmittableOneSided.second
-        );
+        const aligned = omitOmittableOneSidedCandidates(normalizedExtracted, normalizedReviewed);
         const comparison = compareIndependentExtractions(aligned.first, aligned.second);
         if (!comparison.compatible) {
           const reviewedKeys = new Set(aligned.second.candidates.map((candidate) => candidate.localKey));
@@ -1042,17 +1040,15 @@ export class DocumentExtractionPipeline {
             && comparison.differences.some((difference) => difference.localKey === candidate.localKey && difference.fields.includes('presence'))
           ));
           const reviewCandidates = [...aligned.second.candidates, ...missingCandidates];
-          return this.needsReview(
-            documentId,
-            'field_conflict',
-            expectedSpanIds,
-            'INDEPENDENT_REVIEW_MISMATCH',
-            review.threadId,
-            review.turnId,
-            reviewCandidates.length > 0 ? reviewCandidates : aligned.first.candidates,
-            undefined,
-            comparison.differences
-          );
+          // 先完整读完后续块，再一次性交给用户核对。这样人工修正的是
+          // 整份报告的完整候选集，不会把中间一块误当成整篇并提前提交。
+          reviewedCandidates.push(...(reviewCandidates.length > 0 ? reviewCandidates : aligned.first.candidates));
+          pendingCandidateDiffs.push(...comparison.differences);
+          reviewedSubjects.push(aligned.second.subject);
+          coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
+          reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: review.turnId });
+          if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
+          continue;
         }
         reviewedCandidates.push(...aligned.second.candidates);
         reviewedSubjects.push(aligned.second.subject);
@@ -1067,11 +1063,44 @@ export class DocumentExtractionPipeline {
     if (reviewedCandidates.length === 0) {
       return this.needsReview(documentId, 'coverage_gap', coveredSourceSpanIds, 'NO_EXTRACTABLE_FACTS_CONFIRMED', lastReceipt.threadId, lastReceipt.turnId);
     }
+    const manifestSpanIds = bundle.manifest.spans.map((span) => span.id);
+    const uniqueCoveredSpanIds = [...new Set(coveredSourceSpanIds)];
+    const coverageComplete = uniqueCoveredSpanIds.length === manifestSpanIds.length
+      && manifestSpanIds.every((spanId) => uniqueCoveredSpanIds.includes(spanId));
+    if (!coverageComplete) {
+      return this.needsReview(
+        documentId,
+        'coverage_gap',
+        manifestSpanIds,
+        'DOCUMENT_COVERAGE_INCOMPLETE',
+        lastReceipt.threadId,
+        lastReceipt.turnId
+      );
+    }
+    if (pendingCandidateDiffs.length > 0) {
+      return this.needsReview(
+        documentId,
+        'field_conflict',
+        manifestSpanIds,
+        'INDEPENDENT_REVIEW_MISMATCH',
+        lastReceipt.threadId,
+        lastReceipt.turnId,
+        reviewedCandidates,
+        undefined,
+        pendingCandidateDiffs,
+        {
+          coverageComplete: true,
+          coveredSourceSpanIds: uniqueCoveredSpanIds,
+          manifestSpanIds,
+          chunkCount: chunks.length
+        }
+      );
+    }
     const reviewed: ExtractionResult = {
       schemaVersion: 1,
       documentId,
-      subject: reviewedSubjects[0]!,
-      coveredSourceSpanIds,
+      subject: aggregateReviewedSubject(reviewedSubjects),
+      coveredSourceSpanIds: uniqueCoveredSpanIds,
       candidates: reviewedCandidates
     };
     const reviewRef = `chunk-review:${stableHash(reviewReceipts)}`;
@@ -1079,7 +1108,7 @@ export class DocumentExtractionPipeline {
     const accepted: Array<ReturnType<typeof candidateToObservation>> = [];
     for (const candidate of reviewed.candidates) {
       const outcome = evaluateObservationCandidate(candidate, bundle.manifest, {
-        personConsistent: reviewedSubjects.every((subject) => stableHash(subject) === stableHash(reviewedSubjects[0])),
+        personConsistent: reviewedSubjectsAreConsistent(reviewedSubjects),
         overwritesUserLockedValue: false
       });
       const inputSignature = stableHash({ documentId, manifestSha256: bundle.manifest.sha256, candidate });
@@ -1140,16 +1169,25 @@ export class DocumentExtractionPipeline {
     turnId?: string,
     candidateOptions?: ObservationCandidate[],
     reportedName?: string,
-    candidateDiffs?: ReviewCandidateDiff[]
+    candidateDiffs?: ReviewCandidateDiff[],
+    documentRun?: {
+      coverageComplete: boolean;
+      coveredSourceSpanIds: string[];
+      manifestSpanIds: string[];
+      chunkCount: number;
+    }
   ): ExtractionPipelineResult {
     const issueId = this.store.saveExtractionReviewIssue({
       documentId,
+      ...(this.executionGuard ? { jobId: this.executionGuard.jobId, attemptId: this.executionGuard.attemptId } : {}),
+      stage: candidateDiffs ? 'review_facts' : 'extract',
       kind,
       severity: 'blocking',
       evidenceRefs,
       ...(candidateOptions ? { candidateOptions } : {}),
       ...(reportedName ? { reportedName } : {}),
       ...(candidateDiffs ? { candidateDiffs } : {}),
+      ...(documentRun ? { documentRun } : {}),
       reasonCodes: [reason]
     });
     return {

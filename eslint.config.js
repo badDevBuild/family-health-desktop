@@ -10,7 +10,8 @@ export default tseslint.config(
       'release/**',
       'coverage/**',
       'schemas/codex/**',
-      'family-health-desktop-review-evidence-*/**'
+      'family-health-desktop-review-evidence-*/**',
+      'fhd-rereview-*/**'
     ]
   },
   js.configs.recommended,
