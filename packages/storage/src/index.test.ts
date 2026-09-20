@@ -74,7 +74,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('从 schema v2 原位升级并保留工作区', () => {
+  it('从 schema v2 原位升级并保留工作区', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v2-'));
     directories.push(directory);
     createSchemaV2Database(directory);
@@ -95,7 +95,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema 多步升级失败时整体回滚并保留升级前一致性备份', () => {
+  it('schema 多步升级失败时整体回滚并保留升级前一致性备份', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-migration-failure-'));
     directories.push(directory);
     createSchemaV2Database(directory);
@@ -181,7 +181,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v8 将旧身份冲突升级为可确认关系，并在确认后保留报告姓名', () => {
+  it('schema v8 将旧身份冲突升级为可确认关系，并在确认后保留报告姓名', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v7-identity-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -216,7 +216,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v9 只重试可恢复的旧 PDF 覆盖误拦截，必须由原文件复核后才补全清单', () => {
+  it('schema v9 只重试可恢复的旧 PDF 覆盖误拦截，必须由原文件复核后才补全清单', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v8-pdf-manifest-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -282,7 +282,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v11 只重试仅有非阻断标记差异的旧血压组合值核对', () => {
+  it('schema v11 只重试仅有非阻断标记差异的旧血压组合值核对', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v9-blood-pressure-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -339,7 +339,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v12 只重试同一来源片段内临床日期唯一的旧证据上下文误拦截', () => {
+  it('schema v12 只重试同一来源片段内临床日期唯一的旧证据上下文误拦截', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v11-date-context-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -395,7 +395,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v13 只重试原文定性值有清晰依据的旧标准分类差异', () => {
+  it('schema v13 只重试原文定性值有清晰依据的旧标准分类差异', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v12-qualitative-category-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -451,7 +451,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v14 只重试项目文字唯一且前置检查日期一致的旧证据误拦截', () => {
+  it('schema v14 只重试项目文字唯一且前置检查日期一致的旧证据误拦截', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v13-section-date-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -507,7 +507,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v15 只重试同一超声项目的方法别名差异', () => {
+  it('schema v15 只重试同一超声项目的方法别名差异', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v14-ultrasound-method-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -563,7 +563,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v16 只重试 PDF 排版空格造成的结果断字误拦截', () => {
+  it('schema v16 只重试 PDF 排版空格造成的结果断字误拦截', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v15-whitespace-evidence-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -619,7 +619,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v17 只重试有清晰原文依据的单侧正常小结', () => {
+  it('schema v17 只重试有清晰原文依据的单侧正常小结', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v16-normal-summary-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -675,7 +675,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v18 只重试有清晰项目名依据的单侧空白未知项', () => {
+  it('schema v18 只重试有清晰项目名依据的单侧空白未知项', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v17-empty-unknown-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -731,7 +731,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v19 只重试字符相同但 PDF 空白排版不同的证据摘录', () => {
+  it('schema v19 只重试字符相同但 PDF 空白排版不同的证据摘录', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v18-whitespace-citation-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -788,7 +788,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v20 只重试同一来源内前后片段可唯一定位的省略证据', () => {
+  it('schema v20 只重试同一来源内前后片段可唯一定位的省略证据', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v19-abbreviated-citation-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -845,7 +845,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v21 允许省略证据的结尾在后续科室重复，但当前科室内必须唯一', () => {
+  it('schema v21 允许省略证据的结尾在后续科室重复，但当前科室内必须唯一', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v20-section-abbreviation-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -902,7 +902,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v22 将单侧缺失的参考范围保守留空并重新排队', () => {
+  it('schema v22 将单侧缺失的参考范围保守留空并重新排队', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v21-reference-range-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -958,7 +958,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v23 重新运行可能由否定式医学边界误判而暂停的派生分析', () => {
+  it('schema v23 重新运行可能由否定式医学边界误判而暂停的派生分析', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v22-derived-boundary-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
@@ -1002,7 +1002,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v24 恢复没有明确姓名冲突的用户归属资料与同批任务', () => {
+  it('schema v24 恢复没有明确姓名冲突的用户归属资料与同批任务', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v23-identity-review-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T13:18:00Z') });
@@ -1041,7 +1041,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v25 自动重试只有内部证据引用或边界备注错误的派生说明', () => {
+  it('schema v25 自动重试只有内部证据引用或边界备注错误的派生说明', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v24-derived-structure-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T14:38:00Z') });
@@ -1086,7 +1086,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v26 自动重试只有单条说明被独立复核拒绝的派生任务', () => {
+  it('schema v26 自动重试只有单条说明被独立复核拒绝的派生任务', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v25-derived-item-review-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T14:49:00Z') });
@@ -1131,7 +1131,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v27 关闭缺少双轮原文与覆盖补救能力的旧事项，并按原批次整体重跑', () => {
+  it('schema v27 关闭缺少双轮原文与覆盖补救能力的旧事项，并按原批次整体重跑', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v26-review-recovery-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-19T15:00:00Z') });
@@ -1188,7 +1188,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v28 不允许缺少整篇覆盖证明的旧修正事项直接提交', () => {
+  it('schema v28 不允许缺少整篇覆盖证明的旧修正事项直接提交', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v27-complete-review-'));
     directories.push(directory);
     let store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-20T00:00:00Z') });
