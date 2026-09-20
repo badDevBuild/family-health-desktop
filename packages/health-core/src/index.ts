@@ -58,11 +58,34 @@ function normalizedMeasurementNameTokens(candidate: ObservationCandidate): strin
   return [...tokens].sort((left, right) => right.length - left.length);
 }
 
+function compoundMeasurementNameParts(candidate: ObservationCandidate): Array<{ prefix: string; suffix: string }> {
+  const suffixes = ['前后径', '左右径', '上下径', '长径', '短径', '横径', '纵径', '厚径', '直径'];
+  const parts = new Map<string, { prefix: string; suffix: string }>();
+  for (const value of [candidate.originalName, candidate.standardNameCandidate]) {
+    if (!value) continue;
+    const compact = normalizeEvidenceText(value).replace(/\s+/g, '');
+    const suffix = suffixes.find((candidateSuffix) => compact.endsWith(candidateSuffix));
+    if (!suffix) continue;
+    const prefix = compact.slice(0, -suffix.length);
+    if (prefix.length < 2) continue;
+    parts.set(`${prefix}\u0000${suffix}`, { prefix, suffix });
+  }
+  return [...parts.values()];
+}
+
 function measurementEvidenceWindows(candidate: ObservationCandidate, citedText: string): string[] {
   const text = citedText.normalize('NFKC').toLowerCase();
-  // PDF 文字层经常会把一个名称拆出空格，因此定位时使用无空白副本。
-  // 窗口从名称结束后开始，避免把 T3、FT4、B12 等名称里的数字误当成结果。
-  const compact = text.replace(/\s+/g, '');
+  // PDF 文字层经常会把一个名称拆出空格，因此定位名称时使用无空白副本；
+  // 但截取数值窗口时必须回到原文字串，否则“91 94”会被误拼成“9194”。
+  const compactCharacters: string[] = [];
+  const originalOffsets: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (/\s/.test(character)) continue;
+    compactCharacters.push(character);
+    originalOffsets.push(index);
+  }
+  const compact = compactCharacters.join('');
   const tokens = normalizedMeasurementNameTokens(candidate);
   const windows: string[] = [];
   for (const token of tokens) {
@@ -72,12 +95,35 @@ function measurementEvidenceWindows(candidate: ObservationCandidate, citedText: 
       const index = compact.indexOf(normalizedToken, offset);
       if (index < 0) break;
       const valueStart = index + normalizedToken.length;
-      const delimiterIndex = compact.slice(valueStart).search(/[\n\r;；|]/);
-      const end = delimiterIndex >= 0
-        ? valueStart + delimiterIndex
-        : Math.min(compact.length, valueStart + 80);
-      windows.push(compact.slice(valueStart, end));
+      const originalStart = valueStart > 0 ? (originalOffsets[valueStart - 1] ?? text.length - 1) + 1 : 0;
+      const remainder = text.slice(originalStart);
+      const delimiterIndex = remainder.search(/[\n\r;；|]/);
+      const end = delimiterIndex >= 0 ? originalStart + delimiterIndex : Math.min(text.length, originalStart + 160);
+      windows.push(text.slice(originalStart, end));
       offset = index + Math.max(normalizedToken.length, 1);
+    }
+  }
+
+  // 超声等报告常把同一部位的共同前缀只写一次，例如：
+  // “甲状腺左侧叶前后径 15.7mm，左右径 14.8mm”。模型把第二项规范为
+  // “甲状腺左侧叶左右径”是合理的，但原文不会连续出现这个完整名称。
+  // 只在共同部位前缀之后很短的范围内寻找目标尺寸后缀，以免把左/右侧数值串错。
+  for (const { prefix, suffix } of compoundMeasurementNameParts(candidate)) {
+    let prefixOffset = 0;
+    while (prefixOffset < compact.length) {
+      const prefixIndex = compact.indexOf(prefix, prefixOffset);
+      if (prefixIndex < 0) break;
+      const prefixEnd = prefixIndex + prefix.length;
+      const suffixIndex = compact.indexOf(suffix, prefixEnd);
+      if (suffixIndex >= 0 && suffixIndex - prefixEnd <= 80) {
+        const valueStart = suffixIndex + suffix.length;
+        const originalStart = valueStart > 0 ? (originalOffsets[valueStart - 1] ?? text.length - 1) + 1 : 0;
+        const remainder = text.slice(originalStart);
+        const delimiterIndex = remainder.search(/[\n\r;；|]/);
+        const end = delimiterIndex >= 0 ? originalStart + delimiterIndex : Math.min(text.length, originalStart + 160);
+        windows.push(text.slice(originalStart, end));
+      }
+      prefixOffset = prefixIndex + Math.max(prefix.length, 1);
     }
   }
   return [...new Set(windows)];
@@ -95,7 +141,7 @@ function normalizedUnit(value: string): string {
 }
 
 function explicitUnitsInEvidence(text: string): string[] {
-  const matches = text.match(/(?:x10\^?-?\d+\/?l|10\^?-?\d+\/?l|mmhg|kpa|m?mol\/?l|u?mol\/?l|mg\/?d?l|ng\/?ml|pg\/?ml|miu\/?ml|iu\/?l|u\/?l|g\/?l|bpm|次\/?分|厘米|毫米|千克|公斤|kg|cm|fl|pg|mm|%|\/hp)/gi) ?? [];
+  const matches = text.match(/(?:x10\^?-?\d+\/?l|10\^?-?\d+\/?l|mmhg|kpa|(?:m|u|n|p)?mol\/?l|mg\/?d?l|ng\/?ml|pg\/?ml|miu\/?ml|iu\/?l|u\/?l|g\/?l|bpm|次\/?分|厘米|毫米|千克|公斤|kg|cm|fl|pg|mm|%|\/hp)/gi) ?? [];
   return matches.map(normalizedUnit);
 }
 

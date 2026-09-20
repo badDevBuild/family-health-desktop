@@ -252,7 +252,7 @@ describe('App member display editing', () => {
     await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
       action: 'retry_review', issueId: 'legacy-review-1', documentId: 'legacy-document-1'
     }));
-    expect(await screen.findByText('已关闭旧版核对事项，报告正在按新规则重新核对。')).toBeTruthy();
+    expect(await screen.findByText('报告正在按新规则重新核对；只有仍无法判断时才会再次询问你。')).toBeTruthy();
   });
 
   it('真正的核心冲突只展示差异项并保留滚动内容区', async () => {
@@ -298,6 +298,98 @@ describe('App member display editing', () => {
     expect(screen.getByText('99')).toBeTruthy();
     expect(screen.getAllByText('结果').length).toBeGreaterThanOrEqual(1);
     expect(container.querySelector('.review-resolution-scroll')).toBeTruthy();
+  });
+
+  it('模型仍无法裁决异常标记时用普通语言解释如何确认', async () => {
+    const snapshot = createPersonalSnapshot();
+    const candidate = {
+      localKey: 'weight-current', originalName: '体重', standardNameCandidate: '体重',
+      value: { kind: 'numeric' as const, rawText: '94', decimal: '94', comparator: 'eq' as const },
+      unitRaw: 'kg', referenceRangeRaw: '---', reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2024-10-22',
+      evidence: [{ sourceSpanId: 'trend-span', quote: '体重 91 94 ▲ --- kg' }], issues: []
+    };
+    snapshot.reviews = [{
+      id: 'trend-review-1', personId: 'personal-person-1', documentId: 'trend-document-1',
+      kind: 'field_conflict', severity: 'blocking', title: '模型仍无法判断 1 个符号的含义',
+      description: '系统已再次查看原始页面，但仍需要确认。', evidenceRefs: ['trend-span'],
+      candidateOptions: [candidate], candidateDiffs: [{
+        localKey: candidate.localKey, itemName: candidate.originalName, fields: ['reportedAbnormalFlag'],
+        firstCandidate: { ...candidate, reportedAbnormalFlag: '▲' }, secondCandidate: candidate
+      }],
+      reportedName: null, reasonCodes: ['ABNORMAL_FLAG_ADJUDICATION_UNCLEAR'], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /模型仍无法判断 1 个符号的含义/ }));
+    expect(await screen.findByText('模型仍无法判断符号含义')).toBeTruthy();
+    expect(screen.getByText(/如果符号位于“趋势”列，下面保持空白/)).toBeTruthy();
+    expect(screen.getByLabelText('报告明确写出的异常说明（没有则留空）')).toBeTruthy();
+  });
+
+  it('旧流程留下的异常标记冲突统一按新规则重新核对', async () => {
+    const snapshot = createPersonalSnapshot();
+    const candidate = {
+      localKey: 'heart-rate-current', originalName: '心率', standardNameCandidate: '心率',
+      value: { kind: 'numeric' as const, rawText: '62', decimal: '62', comparator: 'eq' as const },
+      unitRaw: 'bpm', referenceRangeRaw: '60-100', reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2024-10-22',
+      evidence: [{ sourceSpanId: 'trend-span', quote: '心率 64 62 ▼ 60-100 bpm' }], issues: []
+    };
+    snapshot.reviews = [{
+      id: 'legacy-trend-review', personId: 'personal-person-1', documentId: 'legacy-trend-document',
+      kind: 'field_conflict', severity: 'blocking', title: '发现 1 项核心事实差异',
+      description: '旧流程产生的异常标记差异。', evidenceRefs: ['trend-span'], candidateOptions: [candidate],
+      candidateDiffs: [{
+        localKey: candidate.localKey, itemName: candidate.originalName, fields: ['reportedAbnormalFlag'],
+        firstCandidate: { ...candidate, reportedAbnormalFlag: '▼' }, secondCandidate: candidate
+      }],
+      reportedName: null, reasonCodes: ['INDEPENDENT_REVIEW_MISMATCH'], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'retry_review' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /发现 1 项核心事实差异/ }));
+    expect(await screen.findByText('不需要逐项检查这 1 项内容')).toBeTruthy();
+    expect(screen.queryByLabelText('报告明确写出的异常说明（没有则留空）')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '按新规则重新核对' }));
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'retry_review', issueId: 'legacy-trend-review', documentId: 'legacy-trend-document'
+    }));
+  });
+
+  it('日期表头与数据行未绑定时不要求用户编辑整份报告', async () => {
+    const snapshot = createPersonalSnapshot();
+    const candidate = {
+      localKey: 'height-2023', originalName: '身高', standardNameCandidate: '身高',
+      value: { kind: 'numeric' as const, rawText: '187', decimal: '187', comparator: 'eq' as const },
+      unitRaw: 'cm', referenceRangeRaw: '---', reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+      evidence: [{ sourceSpanId: 'comparison-span', quote: '身高 187 187 ━ --- cm' }], issues: []
+    };
+    snapshot.reviews = [{
+      id: 'date-evidence-review', personId: 'personal-person-1', documentId: 'comparison-document',
+      kind: 'field_conflict', severity: 'blocking', title: '发现 1 项证据关联问题',
+      description: '日期表头与数据行需要重新关联。', evidenceRefs: ['comparison-span'], candidateOptions: [candidate],
+      candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['issues'] }],
+      reportedName: null, reasonCodes: ['clinical_date_not_in_evidence'], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'retry_review' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /发现 1 项证据关联问题/ }));
+    expect(await screen.findByText('不需要你逐项确认')).toBeTruthy();
+    expect(screen.getByText(/日期表头与数据行没有正确连在一起/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '让模型重新核对' }));
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'retry_review', issueId: 'date-evidence-review', documentId: 'comparison-document'
+    }));
   });
 
   it('requires explicit confirmation before logout and keeps the local workspace visible', async () => {

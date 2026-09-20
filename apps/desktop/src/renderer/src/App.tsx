@@ -867,7 +867,7 @@ const reviewDiffFieldLabels: Record<ReviewIssue['candidateDiffs'][number]['field
   value: '结果',
   unitRaw: '单位',
   referenceRangeRaw: '参考范围',
-  reportedAbnormalFlag: '报告异常标记',
+  reportedAbnormalFlag: '报告明确写出的异常说明（没有则留空）',
   specimen: '标本',
   method: '检验方法',
   bodySite: '检查部位',
@@ -941,12 +941,21 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
     : null;
   const isDerived = review.kind === 'derived_safety';
   const isFieldConflict = review.kind === 'field_conflict';
-  const isLegacyFieldReview = isFieldConflict && candidates.length > 0 && review.candidateDiffs.length === 0;
+  const isLegacyFieldReview = isFieldConflict
+    && candidates.length > 0
+    && (review.candidateDiffs.length === 0 || review.reasonCodes.includes('INDEPENDENT_REVIEW_MISMATCH'));
   const differenceByLocalKey = new Map(review.candidateDiffs.map((difference) => [difference.localKey, difference]));
   const visibleCandidates = candidates
     .map((candidate, index) => ({ candidate, index, difference: differenceByLocalKey.get(candidate.localKey) }))
     .filter((item) => item.difference);
   const hasVisibleConflicts = isFieldConflict && !isLegacyFieldReview && visibleCandidates.length > 0;
+  const isAbnormalFlagOnlyReview = hasVisibleConflicts
+    && review.candidateDiffs.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'reportedAbnormalFlag');
+  const canRetryAbnormalFlagReview = isAbnormalFlagOnlyReview
+    && !review.reasonCodes.includes('ABNORMAL_FLAG_ADJUDICATION_UNCLEAR');
+  const canRetryEvidenceBindingReview = hasVisibleConflicts
+    && review.candidateDiffs.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'issues');
+  const canRetryModelReview = canRetryAbnormalFlagReview || canRetryEvidenceBindingReview;
   const resolvedCandidates = candidates.filter((candidate) => !excludedLocalKeys.has(candidate.localKey));
   const canCorrect = hasVisibleConflicts
     && review.candidateDiffs.every((difference) => !difference.fields.includes('issues'))
@@ -957,7 +966,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const canSubmit = !busy
     && (!isAssignment || Boolean(personId))
     && (!isIdentityConfirmation || Boolean(targetPerson))
-    && (!isFieldConflict || isLegacyFieldReview || canCorrect);
+    && (!isFieldConflict || isLegacyFieldReview || canRetryModelReview || canCorrect);
 
   async function submitResolution() {
     setBusy(true);
@@ -966,7 +975,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
         ? { action: 'assign_person', documentId: review.documentId, personId }
         : isIdentityConfirmation && targetPerson
           ? { action: 'confirm_identity', issueId: review.id, documentId: review.documentId, personId: targetPerson.id }
-          : isLegacyFieldReview
+          : isLegacyFieldReview || canRetryModelReview
             ? { action: 'retry_review', issueId: review.id, documentId: review.documentId }
           : canCorrect
             ? { action: 'accept_correction', issueId: review.id, documentId: review.documentId, candidates: resolvedCandidates }
@@ -1006,7 +1015,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
             <div className="info-callout compact"><RefreshCw size={18} /><div><strong>不需要逐项检查这 {candidates.length} 项内容</strong><p>旧版把标本、日期或证据摘录的写法差异也当成冲突。点击重新核对后，系统会用新规则再处理；只有数值、项目、单位等核心事实真正不一致时才会再次询问你。</p></div></div>
           ) : hasVisibleConflicts ? (
             <>
-              <div className="info-callout compact"><CircleHelp size={18} /><div><strong>为什么需要确认</strong><p>两轮独立读取在下列核心字段上给出了不同结果。请只对照原始报告检查这些差异项；其余一致项目无需逐项确认。</p></div></div>
+              <div className="info-callout compact"><CircleHelp size={18} /><div><strong>{canRetryEvidenceBindingReview ? '不需要你逐项确认' : canRetryAbnormalFlagReview ? '可以交给模型重新判断' : isAbnormalFlagOnlyReview ? '模型仍无法判断符号含义' : '为什么需要确认'}</strong><p>{canRetryEvidenceBindingReview ? '这是日期表头与数据行没有正确连在一起造成的内部证据问题。点击下方按钮后，系统会按年度对比表重新核对；只有核心数值仍有冲突时才会再询问你。' : canRetryAbnormalFlagReview ? '这条核对事项由旧流程产生。点击下方按钮后，模型会结合原始页面和表头判断符号表示趋势还是异常；只有仍无法确定时才会再次询问你。' : isAbnormalFlagOnlyReview ? '系统已经结合原始页面再次核对，但仍无法确定符号表示趋势还是异常。如果符号位于“趋势”列，下面保持空白；只有报告明确写出偏高、偏低、阳性或阴性时才填写。' : '两轮独立读取在下列核心字段上给出了不同结果。请只对照原始报告检查这些差异项；其余一致项目无需逐项确认。'}</p></div></div>
               <div className="manual-note-list review-difference-list">{visibleCandidates.map(({ candidate, index, difference }) => <article key={candidate.localKey}>
                 <div className="review-difference-fields"><strong>两轮不一致：</strong><span>{difference!.fields.map((field) => reviewDiffFieldLabels[field]).join('、')}</span></div>
                 {difference!.firstCandidate !== undefined && difference!.secondCandidate !== undefined && <div className="review-reading-grid">
@@ -1035,7 +1044,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
           <button className="secondary-button" onClick={onClose}>稍后处理</button>
           <button className="primary-button" disabled={!canSubmit} onClick={() => void submitResolution()}>
             {busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}
-            {isAssignment ? '确认归属' : isIdentityConfirmation ? '确认是同一人' : isLegacyFieldReview ? '按新规则重新核对' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}
+            {isAssignment ? '确认归属' : isIdentityConfirmation ? '确认是同一人' : isLegacyFieldReview ? '按新规则重新核对' : canRetryEvidenceBindingReview ? '让模型重新核对' : canRetryAbnormalFlagReview ? '让模型重新判断' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}
           </button>
         </div>
       </section>
@@ -1532,7 +1541,7 @@ export default function App() {
     setToast(input.action === 'assign_person'
       ? '成员归属已确认，资料已进入待处理队列。'
       : input.action === 'confirm_identity' ? '身份关系已确认，任务将从事实提取重新核对并继续。'
-      : input.action === 'retry_review' ? '已关闭旧版核对事项，报告正在按新规则重新核对。'
+      : input.action === 'retry_review' ? '报告正在按新规则重新核对；只有仍无法判断时才会再次询问你。'
       : input.action === 'archive_only' ? '资料已仅归档，不会进入分析。'
       : input.action === 'accept_correction' ? '修正后的事实已保存，并保留原始证据链。'
       : '报告事实已保留，本次未通过复核的说明不会发布。');

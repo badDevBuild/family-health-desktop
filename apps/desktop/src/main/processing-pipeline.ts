@@ -14,6 +14,15 @@ import {
 import { evaluateObservationCandidate, stableHash } from '@core';
 import { buildPdfManifest, INGESTION_LIMITS, renderDocxImagesToFiles, renderHeicImagesToPngs, renderPdfPagesToPngs } from '@ingestion';
 import type { JobExecutionGuard, WorkspaceStore } from '@storage';
+import {
+  ACCEPTANCE_RULES_VERSION,
+  buildAdjudicateAbnormalFlagsPrompt,
+  buildAdjudicateFactDifferencesPrompt,
+  buildExtractPrompt,
+  buildRepairFactValidationPrompt,
+  buildRecoverCoveragePrompt,
+  buildReviewFactsPrompt
+} from './prompts/index.js';
 
 interface StructuredRuntime {
   runStructuredTurn(input: {
@@ -30,6 +39,29 @@ export type ExtractionPipelineResult =
   | { status: 'needs_review'; documentId: string; issueId: string; reason: string; threadId?: string; turnId?: string };
 
 const outputSchema = z.toJSONSchema(extractionResultSchema, { target: 'draft-7' }) as Record<string, unknown>;
+const factDifferenceAdjudicationSchema = z.object({
+  schemaVersion: z.literal(1),
+  decisions: z.array(z.object({
+    differenceIndex: z.number().int().nonnegative(),
+    choice: z.enum(['first', 'second', 'omit', 'unresolved']),
+    reasonCode: z.string().min(1).max(120)
+  }).strict())
+}).strict();
+const factDifferenceAdjudicationOutputSchema = z.toJSONSchema(
+  factDifferenceAdjudicationSchema,
+  { target: 'draft-7' }
+) as Record<string, unknown>;
+
+type FactDifferenceAdjudication = z.infer<typeof factDifferenceAdjudicationSchema>;
+type AdjudicationApplication = {
+  result: ExtractionResult;
+  unresolvedDifferences: ReviewCandidateDiff[];
+};
+type CandidateValidationFailure = {
+  localKey: string;
+  itemName: string;
+  reasons: string[];
+};
 interface ImageMapping {
   imageIndex: number;
   page: number | null;
@@ -61,6 +93,109 @@ function blockingIssueCodes(candidate: ObservationCandidate): string[] {
   return [...new Set(candidate.issues
     .map((issue) => issue.code)
     .filter((code) => code.startsWith('blocking_')))].sort();
+}
+
+function onlyReportedAbnormalFlagDifferences(differences: ReviewCandidateDiff[]): boolean {
+  return differences.length > 0
+    && differences.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'reportedAbnormalFlag');
+}
+
+function reviewDifferenceEvidenceRefs(differences: ReviewCandidateDiff[]): string[] {
+  const refs: string[] = [];
+  for (const difference of differences) {
+    for (const candidate of [difference.firstCandidate, difference.secondCandidate]) {
+      for (const evidence of candidate?.evidence ?? []) {
+        if (!refs.includes(evidence.sourceSpanId)) refs.push(evidence.sourceSpanId);
+      }
+    }
+  }
+  return refs;
+}
+
+function isSupportedAdjudicatedAbnormalFlag(value: string | null): boolean {
+  if (value === null) return true;
+  return /^(?:偏高|偏低|阳性|阴性|正常|未见异常|high|low|positive|negative|normal|h|l)$/i.test(value.trim());
+}
+
+function applyReportedAbnormalFlagAdjudication(
+  reviewed: ExtractionResult,
+  adjudicated: ExtractionResult,
+  differences: ReviewCandidateDiff[]
+): AdjudicationApplication {
+  const adjudicatedByKey = new Map(adjudicated.candidates.map((candidate) => [candidate.localKey, candidate]));
+  const targetKeys = new Set(differences.map((difference) => difference.localKey));
+  const flags = new Map<string, string | null>();
+  const unresolvedDifferences: ReviewCandidateDiff[] = [];
+  for (const difference of differences) {
+    const candidate = adjudicatedByKey.get(difference.localKey);
+    if (!candidate
+      || candidate.issues.some((issue) => issue.code.startsWith('blocking_'))
+      || !isSupportedAdjudicatedAbnormalFlag(candidate.reportedAbnormalFlag)) {
+      unresolvedDifferences.push(difference);
+      continue;
+    }
+    flags.set(difference.localKey, candidate.reportedAbnormalFlag);
+  }
+  return {
+    result: {
+      ...reviewed,
+      candidates: reviewed.candidates.map((candidate) => targetKeys.has(candidate.localKey) && flags.has(candidate.localKey)
+        ? { ...candidate, reportedAbnormalFlag: flags.get(candidate.localKey) ?? null }
+        : candidate)
+    },
+    unresolvedDifferences
+  };
+}
+
+function applyFactDifferenceAdjudication(
+  reviewed: ExtractionResult,
+  differences: ReviewCandidateDiff[],
+  adjudication: FactDifferenceAdjudication
+): AdjudicationApplication | null {
+  if (adjudication.decisions.length !== differences.length) return null;
+  const decisions = new Map<number, FactDifferenceAdjudication['decisions'][number]>();
+  for (const decision of adjudication.decisions) {
+    if (decision.differenceIndex >= differences.length || decisions.has(decision.differenceIndex)) return null;
+    decisions.set(decision.differenceIndex, decision);
+  }
+  if (decisions.size !== differences.length) return null;
+
+  const replacements = new Map<string, ObservationCandidate | null>();
+  const additions: ObservationCandidate[] = [];
+  const unresolvedDifferences: ReviewCandidateDiff[] = [];
+  for (const [differenceIndex, difference] of differences.entries()) {
+    const decision = decisions.get(differenceIndex)!;
+    if (decision.choice === 'unresolved') {
+      unresolvedDifferences.push(difference);
+      continue;
+    }
+    const selected = decision.choice === 'first'
+      ? difference.firstCandidate ?? null
+      : decision.choice === 'second'
+        ? difference.secondCandidate ?? null
+        : null;
+    if (decision.choice === 'omit' && difference.firstCandidate && difference.secondCandidate) return null;
+    if (decision.choice !== 'omit' && !selected) return null;
+
+    if (difference.secondCandidate) {
+      replacements.set(difference.secondCandidate.localKey, selected);
+    } else if (selected) {
+      additions.push(selected);
+    }
+  }
+
+  const candidates = reviewed.candidates.flatMap((candidate) => {
+    if (!replacements.has(candidate.localKey)) return [candidate];
+    const replacement = replacements.get(candidate.localKey) ?? null;
+    return replacement ? [replacement] : [];
+  });
+  candidates.push(...additions);
+  const uniqueKeys = new Set(candidates.map((candidate) => candidate.localKey));
+  if (uniqueKeys.size !== candidates.length) return null;
+  return {
+    result: { ...reviewed, candidates },
+    unresolvedDifferences
+  };
 }
 
 function pressureKind(candidate: ObservationCandidate): BloodPressureKind | null {
@@ -219,12 +354,81 @@ function contextualDateEvidenceQuote(
     return spanQuote.slice(start, end);
   }
 
+  // 年度对比表通常只在表头写一次两个（或多个）日期，数据行本身不再重复日期：
+  // 2023-10-08 2024-10-22 趋势 ... 体重 91 94 ▲ ...
+  // 这类版面必须把“日期表头 + 当前数据行”作为一个连续证据片段，不能要求
+  // 每个数据行自行重复日期；同时只在明确出现“趋势”列且距离很近时启用，
+  // 避免把普通的多日期叙述误判成列式对比表。
+  const trendIndex = spanQuote.lastIndexOf('趋势', quoteIndex);
+  if (trendIndex >= 0 && quoteIndex - trendIndex <= 1_000) {
+    const headerDates = allDates.filter((match) => (
+      match.index + match.length <= trendIndex
+      && trendIndex - (match.index + match.length) <= 500
+    ));
+    if (headerDates.length >= 2 && headerDates.some((match) => match.date === clinicalDate)) {
+      const start = headerDates[0]!.index;
+      return spanQuote.slice(start, quoteIndex + citedQuote.length);
+    }
+  }
+
   const nearestPrecedingDate = labelledCalendarDateMatches(spanQuote)
     .filter((match) => match.index + match.length <= quoteIndex)
     .sort((left, right) => right.index - left.index)[0];
   if (!nearestPrecedingDate || nearestPrecedingDate.date !== clinicalDate) return null;
   if (quoteIndex - (nearestPrecedingDate.index + nearestPrecedingDate.length) > 2_000) return null;
   return spanQuote.slice(nearestPrecedingDate.index, quoteIndex + citedQuote.length);
+}
+
+function previousPageSummaryDateEvidence(
+  candidate: ObservationCandidate,
+  currentSpan: SourceSpan,
+  citedQuote: string,
+  clinicalDate: string,
+  sourceSpans: SourceSpan[]
+): ObservationCandidate['evidence'][number] | null {
+  if (currentSpan.spanKind !== 'page' || currentSpan.page === null || !currentSpan.quote) return null;
+  const currentQuoteIndex = currentSpan.quote.indexOf(citedQuote);
+  if (currentQuoteIndex < 0 || currentQuoteIndex > 300) return null;
+
+  // PDF 分页可能把一个科室小结切到下一页开头：上一页保留“甲状腺彩超 + 检查日期 +
+  // 检查正文”，下一页只剩“小结 ...”。仅对明确以“小结”结尾的中文项目名、且小结
+  // 位于下一页开头时，才允许从紧邻上一页补充日期证据，避免跨科室误绑定。
+  const sectionName = candidate.originalName.normalize('NFKC').replace(/\s+/g, '').replace(/小结$/, '');
+  if (sectionName === candidate.originalName.normalize('NFKC').replace(/\s+/g, '') || sectionName.length < 2) return null;
+
+  const previousSpans = sourceSpans.filter((span) => (
+    span.documentId === currentSpan.documentId
+    && span.spanKind === 'page'
+    && span.page === currentSpan.page! - 1
+    && span.readability === 'clear'
+    && Boolean(span.quote)
+  ));
+  if (previousSpans.length !== 1) return null;
+  const previousSpan = previousSpans[0]!;
+  const previousQuote = previousSpan.quote!;
+  const compactCharacters: string[] = [];
+  const originalOffsets: number[] = [];
+  for (let index = 0; index < previousQuote.length; index += 1) {
+    const character = previousQuote[index]!;
+    if (/\s/.test(character)) continue;
+    compactCharacters.push(character);
+    originalOffsets.push(index);
+  }
+  const compactQuote = compactCharacters.join('').normalize('NFKC');
+  const sectionIndex = compactQuote.lastIndexOf(sectionName);
+  if (sectionIndex < 0 || compactQuote.indexOf(sectionName) !== sectionIndex) return null;
+  const sectionOriginalIndex = originalOffsets[sectionIndex];
+  if (sectionOriginalIndex === undefined) return null;
+  const matchingDates = labelledCalendarDateMatches(previousQuote).filter((match) => (
+    match.date === clinicalDate
+    && match.index >= sectionOriginalIndex
+    && match.index - sectionOriginalIndex <= 500
+  ));
+  if (matchingDates.length !== 1) return null;
+  return {
+    sourceSpanId: previousSpan.id,
+    quote: previousQuote.slice(sectionOriginalIndex)
+  };
 }
 
 function strengthenUnambiguousClinicalDateEvidence(
@@ -235,16 +439,27 @@ function strengthenUnambiguousClinicalDateEvidence(
   return candidates.map((candidate) => {
     const clinicalDate = candidate.clinicalDate;
     if (!clinicalDate) return candidate;
-    const evidence = candidate.evidence.map((reference) => {
+    const evidence = candidate.evidence.flatMap((reference) => {
       if (reference.quote && calendarDateMatches(reference.quote).some((match) => match.date === clinicalDate)) {
-        return reference;
+        return [reference];
       }
       const span = spansById.get(reference.sourceSpanId);
-      if (!span?.quote || span.readability !== 'clear' || !reference.quote) return reference;
+      if (!span?.quote || span.readability !== 'clear' || !reference.quote) return [reference];
       const strengthenedQuote = contextualDateEvidenceQuote(span.quote, reference.quote, clinicalDate);
-      return strengthenedQuote ? { ...reference, quote: strengthenedQuote } : reference;
+      if (strengthenedQuote) return [{ ...reference, quote: strengthenedQuote }];
+      const previousPageEvidence = previousPageSummaryDateEvidence(
+        candidate,
+        span,
+        reference.quote,
+        clinicalDate,
+        sourceSpans
+      );
+      return previousPageEvidence ? [reference, previousPageEvidence] : [reference];
     });
-    return { ...candidate, evidence };
+    const uniqueEvidence = [...new Map(evidence.map((reference) => (
+      [`${reference.sourceSpanId}\u0000${reference.quote ?? ''}`, reference] as const
+    ))).values()];
+    return { ...candidate, evidence: uniqueEvidence };
   });
 }
 
@@ -351,9 +566,22 @@ function normalizedComparableText(value: string | null): string | null {
 }
 
 function normalizedComparableMethod(value: string): string {
-  const normalized = normalizedComparableText(value)!;
+  const normalized = normalizedComparableText(value)!.replace(/检查$/u, '');
   if (/(?:彩超|超声|b\s*超|ultrasound|sonograph|doppler)/i.test(normalized)) return 'ultrasound';
+  if (/^(?:幽门螺杆?菌)?尿素酶抗体$/u.test(normalized)) return 'urease-antibody';
   return normalized;
+}
+
+function isNormalLikeText(value: string | null): boolean {
+  return /^(?:正常|未见异常|无异常|阴性|negative|normal|no abnormality(?: detected)?)$/i
+    .test(normalizedComparableText(value) ?? '');
+}
+
+function normalizedComparableAbnormalFlag(candidate: ObservationCandidate): string | null {
+  const flag = normalizedComparableText(candidate.reportedAbnormalFlag);
+  if (flag && isNormalLikeText(flag)) return 'normal-like';
+  if (flag === null && candidate.value.kind !== 'numeric' && isNormalLikeText(candidate.value.rawText)) return 'normal-like';
+  return flag;
 }
 
 function isOptionalNormalSummary(candidate: ObservationCandidate): boolean {
@@ -423,8 +651,7 @@ function comparableValue(candidate: ObservationCandidate): unknown {
   }
   return {
     kind: candidate.value.kind,
-    rawText: normalizedComparableText(candidate.value.rawText),
-    reason: normalizedComparableText(candidate.value.reason)
+    rawText: normalizedComparableText(candidate.value.rawText)
   };
 }
 
@@ -451,11 +678,14 @@ function candidateConflictFields(first: ObservationCandidate, second: Observatio
   };
 
   compareText('originalName', first.originalName, second.originalName);
-  compareText('standardNameCandidate', first.standardNameCandidate, second.standardNameCandidate);
+  // standardNameCandidate 是模型给出的展示别名，不是报告原始事实；只要原项目名一致，
+  // 两轮使用不同标准名不应阻断整份报告。
   if (candidateValuesConflict(first, second)) fields.push('value');
   compareText('unitRaw', first.unitRaw, second.unitRaw);
   compareText('referenceRangeRaw', first.referenceRangeRaw, second.referenceRangeRaw);
-  compareText('reportedAbnormalFlag', first.reportedAbnormalFlag, second.reportedAbnormalFlag);
+  if (normalizedComparableAbnormalFlag(first) !== normalizedComparableAbnormalFlag(second)) {
+    fields.push('reportedAbnormalFlag');
+  }
   compareText('specimen', first.specimen, second.specimen, true);
   if (first.method !== null && second.method !== null
     && normalizedComparableMethod(first.method) !== normalizedComparableMethod(second.method)) {
@@ -476,7 +706,7 @@ function candidateConflictFields(first: ObservationCandidate, second: Observatio
 function normalizedComparableBodySite(value: string): string {
   // “甲状腺”与“甲状腺实质”描述的是同一检查部位；只去掉末尾的泛化组织词，
   // 不改动左/右等方向信息，避免把真正不同的部位合并。
-  return normalizedComparableText(value)!.replace(/实质$/u, '');
+  return normalizedComparableText(value)!.replace(/(?:实质|结)$/u, '');
 }
 
 /**
@@ -533,6 +763,42 @@ export function compareIndependentExtractions(
     });
   }
   return { compatible: differences.length === 0, differences };
+}
+
+function candidateValidationFailures(
+  result: ExtractionResult,
+  bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
+): CandidateValidationFailure[] {
+  return result.candidates.flatMap((candidate) => {
+    const outcome = evaluateObservationCandidate(candidate, bundle.manifest, {
+      personConsistent: subjectIsConsistent(result, bundle),
+      overwritesUserLockedValue: false
+    });
+    return outcome.decision === 'accept' || outcome.decision === 'accept_with_warnings'
+      ? []
+      : [{ localKey: candidate.localKey, itemName: candidate.originalName, reasons: outcome.reasons }];
+  });
+}
+
+function repairPreservesUntargetedCandidates(
+  before: ExtractionResult,
+  after: ExtractionResult,
+  failures: CandidateValidationFailure[]
+): boolean {
+  const targetKeys = new Set(failures.map((failure) => failure.localKey));
+  const beforeByKey = new Map(before.candidates.map((candidate) => [candidate.localKey, candidate]));
+  const afterByKey = new Map(after.candidates.map((candidate) => [candidate.localKey, candidate]));
+  if (beforeByKey.size !== before.candidates.length
+    || afterByKey.size !== after.candidates.length
+    || beforeByKey.size !== afterByKey.size) return false;
+  for (const [localKey, candidate] of beforeByKey) {
+    const repaired = afterByKey.get(localKey);
+    if (!repaired) return false;
+    if (!targetKeys.has(localKey) && stableHash(candidate) !== stableHash(repaired)) return false;
+    if (targetKeys.has(localKey)
+      && normalizedComparableText(candidate.originalName) !== normalizedComparableText(repaired.originalName)) return false;
+  }
+  return true;
 }
 
 function normalizedPersonName(value: string): string {
@@ -770,20 +1036,14 @@ export class DocumentExtractionPipeline {
     const covered = new Set(input.previousResult.coveredSourceSpanIds);
     const missingSpanIds = input.expectedSpanIds.filter((id) => !covered.has(id));
     const turn = await this.runTurn(input.documentId, input.stage, {
-      prompt: [
-        input.stage === 'extract'
-          ? '你是健康报告事实提取器。请重新通读这份完整来源包，只提取来源明确支持的事实。'
-          : '你是独立事实复核器。请重新通读这份完整来源包，独立返回核实后的完整候选集合。',
-        '上一次返回的 coveredSourceSpanIds 不完整。这是覆盖清单补救，不是只检查缺失片段；必须重新结合整篇上下文处理。',
-        '只引用 SOURCE_PACKAGE 中的 sourceSpanId，不诊断、不推测、不提供处方。',
-        'coveredSourceSpanIds 必须逐一包含 REQUIRED_SOURCE_SPAN_IDS 中的每一个 ID，即使某片段没有可提取指标也不能省略。',
-        'imageInputs 的 imageIndex 与随请求附带的图片顺序一一对应。',
-        `REQUIRED_SOURCE_SPAN_IDS=${JSON.stringify(input.expectedSpanIds)}`,
-        `PREVIOUSLY_MISSING_SOURCE_SPAN_IDS=${JSON.stringify(missingSpanIds)}`,
-        `PREVIOUS_RESULT=${JSON.stringify(input.previousResult)}`,
-        ...(input.candidateToReview ? [`CANDIDATE_TO_REVIEW=${JSON.stringify(input.candidateToReview)}`] : []),
-        `SOURCE_PACKAGE=${input.sourcePackage}`
-      ].join('\n'),
+      prompt: buildRecoverCoveragePrompt({
+        stage: input.stage,
+        sourcePackage: input.sourcePackage,
+        expectedSpanIds: input.expectedSpanIds,
+        missingSpanIds,
+        previousResult: input.previousResult,
+        ...(input.candidateToReview ? { candidateToReview: input.candidateToReview } : {})
+      }),
       imagePaths: input.imagePaths,
       outputSchema,
       allowWebSearch: false,
@@ -794,6 +1054,123 @@ export class DocumentExtractionPipeline {
       threadId: turn.threadId,
       turnId: turn.turnId
     };
+  }
+
+  private async adjudicateReportedAbnormalFlags(input: {
+    documentId: string;
+    sourcePackage: string;
+    imagePaths: string[];
+    expectedSpanIds: string[];
+    first: ExtractionResult;
+    second: ExtractionResult;
+    differences: ReviewCandidateDiff[];
+    bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>;
+  }): Promise<{ result: ExtractionResult | null; unresolvedDifferences: ReviewCandidateDiff[]; threadId: string; turnId: string }> {
+    const turn = await this.runTurn(input.documentId, 'review_facts', {
+      prompt: buildAdjudicateAbnormalFlagsPrompt({
+        sourcePackage: input.sourcePackage,
+        expectedSpanIds: input.expectedSpanIds,
+        differences: input.differences,
+        first: input.first,
+        second: input.second
+      }),
+      imagePaths: input.imagePaths,
+      outputSchema,
+      allowWebSearch: false,
+      timeoutMs: 600_000
+    });
+    const parsed = extractionResultSchema.safeParse(turn.output);
+    if (!parsed.success
+      || parsed.data.documentId !== input.documentId
+      || !hasCompleteCoverage(parsed.data, input.expectedSpanIds)
+      || !evidenceIsConfinedToChunk(parsed.data, input.expectedSpanIds)
+      || !subjectIsConsistent(parsed.data, input.bundle)) {
+      return {
+        result: null,
+        unresolvedDifferences: input.differences,
+        threadId: turn.threadId,
+        turnId: turn.turnId
+      };
+    }
+    const normalized = {
+      ...parsed.data,
+      candidates: normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans)
+    };
+    const application = applyReportedAbnormalFlagAdjudication(input.second, normalized, input.differences);
+    return {
+      result: application.result,
+      unresolvedDifferences: application.unresolvedDifferences,
+      threadId: turn.threadId,
+      turnId: turn.turnId
+    };
+  }
+
+  private async adjudicateFactDifferences(input: {
+    documentId: string;
+    sourcePackage: string;
+    imagePaths: string[];
+    second: ExtractionResult;
+    differences: ReviewCandidateDiff[];
+  }): Promise<{ result: ExtractionResult | null; unresolvedDifferences: ReviewCandidateDiff[]; threadId: string; turnId: string }> {
+    const turn = await this.runTurn(input.documentId, 'review_facts', {
+      prompt: buildAdjudicateFactDifferencesPrompt({
+        sourcePackage: input.sourcePackage,
+        differences: input.differences
+      }),
+      imagePaths: input.imagePaths,
+      outputSchema: factDifferenceAdjudicationOutputSchema,
+      allowWebSearch: false,
+      timeoutMs: 600_000
+    });
+    const parsed = factDifferenceAdjudicationSchema.safeParse(turn.output);
+    const application = parsed.success
+      ? applyFactDifferenceAdjudication(input.second, input.differences, parsed.data)
+      : null;
+    return {
+      result: application?.result ?? null,
+      unresolvedDifferences: application?.unresolvedDifferences ?? input.differences,
+      threadId: turn.threadId,
+      turnId: turn.turnId
+    };
+  }
+
+  private async repairFactValidationIssues(input: {
+    documentId: string;
+    sourcePackage: string;
+    imagePaths: string[];
+    expectedSpanIds: string[];
+    result: ExtractionResult;
+    failures: CandidateValidationFailure[];
+    bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>;
+  }): Promise<{ result: ExtractionResult | null; threadId: string; turnId: string }> {
+    const turn = await this.runTurn(input.documentId, 'review_facts', {
+      prompt: buildRepairFactValidationPrompt({
+        sourcePackage: input.sourcePackage,
+        validationErrors: input.failures,
+        candidate: input.result
+      }),
+      imagePaths: input.imagePaths,
+      outputSchema,
+      allowWebSearch: false,
+      timeoutMs: 600_000
+    });
+    const parsed = extractionResultSchema.safeParse(turn.output);
+    if (!parsed.success
+      || parsed.data.documentId !== input.documentId
+      || !hasCompleteCoverage(parsed.data, input.expectedSpanIds)
+      || !evidenceIsConfinedToChunk(parsed.data, input.expectedSpanIds)
+      || !subjectIsConsistent(parsed.data, input.bundle)) {
+      return { result: null, threadId: turn.threadId, turnId: turn.turnId };
+    }
+    const normalized: ExtractionResult = {
+      ...parsed.data,
+      candidates: normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans)
+    };
+    if (!repairPreservesUntargetedCandidates(input.result, normalized, input.failures)
+      || candidateValidationFailures(normalized, input.bundle).length > 0) {
+      return { result: null, threadId: turn.threadId, turnId: turn.turnId };
+    }
+    return { result: normalized, threadId: turn.threadId, turnId: turn.turnId };
   }
 
   async process(documentId: string): Promise<ExtractionPipelineResult> {
@@ -847,6 +1224,9 @@ export class DocumentExtractionPipeline {
     const reviewReceipts: Array<{ extractTurnId: string; reviewTurnId: string }> = [];
     const reviewedSubjects: ExtractionResult['subject'][] = [];
     const pendingCandidateDiffs: ReviewCandidateDiff[] = [];
+    let abnormalFlagAdjudicationUnclear = false;
+    let factAdjudicationUnclear = false;
+    let validationRepairUnclear = false;
     let lastReceipt: { threadId: string; turnId: string } | null = null;
     let temporaryRoot: string | null = null;
     try {
@@ -932,14 +1312,10 @@ export class DocumentExtractionPipeline {
         }
         const expectedSpanIds = spans.map((span) => span.id);
         let extract = await this.runTurn(documentId, 'extract', {
-          prompt: [
-            '你是健康报告事实提取器。只提取来源中明确出现的事实，不诊断、不推测、不提供处方。',
-            `目标成员显示名为“${bundle.personDisplayName}”。必须单独返回 subject：报告明示姓名时逐字引用证据；未找到时标记 absent；不得根据目标成员反推姓名。`,
-            '每个候选必须只引用本块 sourceSpanId；看不清时使用 unknown，不得编造值、单位、日期或成员身份。',
-            'imageInputs 的 imageIndex 与随请求附带的图片顺序一一对应；图片来自原报告、PDF 对应页渲染或 DOCX 嵌入图，不是额外来源。',
-            'coveredSourceSpanIds 必须逐一列出你实际检查过的本块全部来源片段，即使某片段没有可提取指标也不能省略。',
-            `SOURCE_PACKAGE=${sourcePackage}`
-          ].join('\n'),
+          prompt: buildExtractPrompt({
+            personDisplayName: bundle.personDisplayName,
+            sourcePackage
+          }),
           imagePaths,
           outputSchema,
           timeoutMs: 600_000
@@ -981,14 +1357,10 @@ export class DocumentExtractionPipeline {
         };
 
         let review = await this.runTurn(documentId, 'review_facts', {
-          prompt: [
-            '你是独立事实复核器。重新阅读本块原始来源，并返回你核实后的完整候选集合。',
-            '只保留来源明确支持且引用本块有效 sourceSpanId 的事实；不得因为前一份候选存在就默认接受。',
-            'imageInputs 的 imageIndex 与随请求附带的图片顺序一一对应。',
-            'coveredSourceSpanIds 必须逐一列出你实际检查过的本块全部来源片段。',
-            `SOURCE_PACKAGE=${sourcePackage}`,
-            `CANDIDATE_TO_REVIEW=${JSON.stringify(normalizedExtracted)}`
-          ].join('\n'),
+          prompt: buildReviewFactsPrompt({
+            sourcePackage,
+            candidateToReview: JSON.stringify(normalizedExtracted)
+          }),
           imagePaths,
           outputSchema,
           timeoutMs: 600_000
@@ -1033,27 +1405,115 @@ export class DocumentExtractionPipeline {
         };
         const aligned = omitOmittableOneSidedCandidates(normalizedExtracted, normalizedReviewed);
         const comparison = compareIndependentExtractions(aligned.first, aligned.second);
+        let resolvedChunk: ExtractionResult | null = aligned.second;
+        let unresolvedChunkDifferences: ReviewCandidateDiff[] = [];
+        let resolutionTurnId = review.turnId;
         if (!comparison.compatible) {
+          if (onlyReportedAbnormalFlagDifferences(comparison.differences)) {
+            const adjudicated = await this.adjudicateReportedAbnormalFlags({
+              documentId,
+              sourcePackage,
+              imagePaths,
+              expectedSpanIds,
+              first: aligned.first,
+              second: aligned.second,
+              differences: comparison.differences,
+              bundle
+            });
+            lastReceipt = { threadId: adjudicated.threadId, turnId: adjudicated.turnId };
+            resolvedChunk = adjudicated.result;
+            unresolvedChunkDifferences = adjudicated.unresolvedDifferences;
+            resolutionTurnId = adjudicated.turnId;
+            if (!resolvedChunk || unresolvedChunkDifferences.length > 0) factAdjudicationUnclear = true;
+            if (!resolvedChunk || unresolvedChunkDifferences.length > 0) abnormalFlagAdjudicationUnclear = true;
+          } else {
+            const adjudicated = await this.adjudicateFactDifferences({
+              documentId,
+              sourcePackage,
+              imagePaths,
+              second: aligned.second,
+              differences: comparison.differences
+            });
+            lastReceipt = { threadId: adjudicated.threadId, turnId: adjudicated.turnId };
+            resolvedChunk = adjudicated.result;
+            unresolvedChunkDifferences = adjudicated.unresolvedDifferences;
+            resolutionTurnId = adjudicated.turnId;
+            if (!resolvedChunk || unresolvedChunkDifferences.length > 0) factAdjudicationUnclear = true;
+          }
+        }
+
+        if (!resolvedChunk) {
           const reviewedKeys = new Set(aligned.second.candidates.map((candidate) => candidate.localKey));
           const missingCandidates = aligned.first.candidates.filter((candidate) => (
             !reviewedKeys.has(candidate.localKey)
             && comparison.differences.some((difference) => difference.localKey === candidate.localKey && difference.fields.includes('presence'))
           ));
           const reviewCandidates = [...aligned.second.candidates, ...missingCandidates];
-          // 先完整读完后续块，再一次性交给用户核对。这样人工修正的是
-          // 整份报告的完整候选集，不会把中间一块误当成整篇并提前提交。
+          // 自动裁决仍无法确认时，也先读完整份报告，最后只生成一个汇总核对事项。
           reviewedCandidates.push(...(reviewCandidates.length > 0 ? reviewCandidates : aligned.first.candidates));
           pendingCandidateDiffs.push(...comparison.differences);
           reviewedSubjects.push(aligned.second.subject);
           coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
-          reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: review.turnId });
+          reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: resolutionTurnId });
           if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
           continue;
         }
-        reviewedCandidates.push(...aligned.second.candidates);
+
+        if (unresolvedChunkDifferences.length > 0) {
+          const resolvedKeys = new Set(resolvedChunk.candidates.map((candidate) => candidate.localKey));
+          const unresolvedFirstOnlyCandidates = unresolvedChunkDifferences.flatMap((difference) => (
+            !difference.secondCandidate && difference.firstCandidate && !resolvedKeys.has(difference.firstCandidate.localKey)
+              ? [difference.firstCandidate]
+              : []
+          ));
+          resolvedChunk = {
+            ...resolvedChunk,
+            candidates: [...resolvedChunk.candidates, ...unresolvedFirstOnlyCandidates]
+          };
+          pendingCandidateDiffs.push(...unresolvedChunkDifferences);
+        }
+
+        const unresolvedCandidateKeys = new Set(unresolvedChunkDifferences.flatMap((difference) => [
+          difference.localKey,
+          difference.firstCandidate?.localKey,
+          difference.secondCandidate?.localKey
+        ].filter((value): value is string => Boolean(value))));
+        const validationFailures = candidateValidationFailures(resolvedChunk, bundle)
+          .filter((failure) => !unresolvedCandidateKeys.has(failure.localKey));
+        if (validationFailures.length > 0) {
+          const repaired = await this.repairFactValidationIssues({
+            documentId,
+            sourcePackage,
+            imagePaths,
+            expectedSpanIds,
+            result: resolvedChunk,
+            failures: validationFailures,
+            bundle
+          });
+          lastReceipt = { threadId: repaired.threadId, turnId: repaired.turnId };
+          resolutionTurnId = repaired.turnId;
+          if (repaired.result) {
+            resolvedChunk = repaired.result;
+          } else {
+            validationRepairUnclear = true;
+            const candidatesByKey = new Map(resolvedChunk.candidates.map((candidate) => [candidate.localKey, candidate]));
+            pendingCandidateDiffs.push(...validationFailures.map((failure) => {
+              const candidate = candidatesByKey.get(failure.localKey) ?? null;
+              return {
+                localKey: failure.localKey,
+                itemName: failure.itemName,
+                fields: ['issues'] as ReviewDiffField[],
+                firstCandidate: candidate,
+                secondCandidate: candidate
+              };
+            }));
+          }
+        }
+
+        reviewedCandidates.push(...resolvedChunk.candidates);
         reviewedSubjects.push(aligned.second.subject);
         coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
-        reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: review.turnId });
+        reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: resolutionTurnId });
         if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
       }
     } finally {
@@ -1078,11 +1538,18 @@ export class DocumentExtractionPipeline {
       );
     }
     if (pendingCandidateDiffs.length > 0) {
+      const conflictEvidenceRefs = reviewDifferenceEvidenceRefs(pendingCandidateDiffs);
       return this.needsReview(
         documentId,
         'field_conflict',
-        manifestSpanIds,
-        'INDEPENDENT_REVIEW_MISMATCH',
+        conflictEvidenceRefs.length > 0 ? conflictEvidenceRefs : manifestSpanIds,
+        abnormalFlagAdjudicationUnclear && onlyReportedAbnormalFlagDifferences(pendingCandidateDiffs)
+          ? 'ABNORMAL_FLAG_ADJUDICATION_UNCLEAR'
+          : validationRepairUnclear && pendingCandidateDiffs.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'issues')
+            ? 'FACT_VALIDATION_REPAIR_UNRESOLVED'
+            : factAdjudicationUnclear
+              ? 'FACT_ADJUDICATION_UNRESOLVED'
+          : 'INDEPENDENT_REVIEW_MISMATCH',
         lastReceipt.threadId,
         lastReceipt.turnId,
         reviewedCandidates,
@@ -1106,6 +1573,11 @@ export class DocumentExtractionPipeline {
     const reviewRef = `chunk-review:${stableHash(reviewReceipts)}`;
 
     const accepted: Array<ReturnType<typeof candidateToObservation>> = [];
+    const finalValidationFailures: Array<{
+      candidate: ObservationCandidate;
+      reasons: string[];
+      decision: 'reject' | 'needs_review';
+    }> = [];
     for (const candidate of reviewed.candidates) {
       const outcome = evaluateObservationCandidate(candidate, bundle.manifest, {
         personConsistent: reviewedSubjectsAreConsistent(reviewedSubjects),
@@ -1116,28 +1588,35 @@ export class DocumentExtractionPipeline {
       const acceptanceId = this.store.saveAcceptanceDecision({
         method: 'auto',
         actor: 'policy',
-        rulesVersion: 'health-acceptance-v2',
+        rulesVersion: ACCEPTANCE_RULES_VERSION,
         inputSignature,
         outputHash,
         reviewRef,
         decision: outcome.decision
       });
       if (outcome.decision === 'reject' || outcome.decision === 'needs_review') {
-        return this.needsReview(
-          documentId,
-          outcome.decision === 'reject' ? 'field_conflict' : 'coverage_gap',
-          candidate.evidence.map((ref) => ref.sourceSpanId),
-          outcome.decision === 'reject' ? outcome.reasons.join(',') : outcome.reasons.join(','),
-          lastReceipt.threadId,
-          lastReceipt.turnId,
-          reviewed.candidates,
-          undefined,
-          outcome.decision === 'reject'
-            ? [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['issues'] }]
-            : undefined
-        );
+        finalValidationFailures.push({ candidate, reasons: outcome.reasons, decision: outcome.decision });
+        continue;
       }
       accepted.push(candidateToObservation(candidate, acceptanceId, documentId));
+    }
+    if (finalValidationFailures.length > 0) {
+      const reasons = [...new Set(finalValidationFailures.flatMap((failure) => failure.reasons))];
+      return this.needsReview(
+        documentId,
+        finalValidationFailures.some((failure) => failure.decision === 'reject') ? 'field_conflict' : 'coverage_gap',
+        [...new Set(finalValidationFailures.flatMap((failure) => failure.candidate.evidence.map((ref) => ref.sourceSpanId)))],
+        `FACT_VALIDATION_UNRESOLVED:${reasons.join(',')}`,
+        lastReceipt.threadId,
+        lastReceipt.turnId,
+        reviewed.candidates,
+        undefined,
+        finalValidationFailures.map((failure) => ({
+          localKey: failure.candidate.localKey,
+          itemName: failure.candidate.originalName,
+          fields: ['issues']
+        }))
+      );
     }
 
     const expectedRevision = this.store.getFactRevision(bundle.personId);
@@ -1149,10 +1628,10 @@ export class DocumentExtractionPipeline {
         sourceSha256: bundle.manifest.sha256,
         normalizerVersion: bundle.manifest.normalizerVersion,
         extractionSchemaVersion: reviewed.schemaVersion,
-        rulesVersion: 'health-acceptance-v2'
+        rulesVersion: ACCEPTANCE_RULES_VERSION
       }),
       expectedRevision,
-      changeSetHash: stableHash({ documentId, reviewed, rulesVersion: 'health-acceptance-v2' }),
+      changeSetHash: stableHash({ documentId, reviewed, rulesVersion: ACCEPTANCE_RULES_VERSION }),
       summary: `从 1 份资料接纳 ${accepted.length} 条有来源事实`,
       observations: accepted,
       ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})

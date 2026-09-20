@@ -16,14 +16,19 @@ export interface HealthThreadStartParams {
   selectedCapabilityRoots: [];
 }
 
-const offlineInstructions = 'Return only data matching the supplied output schema. Do not call tools, access files, or provide diagnosis or prescriptions.';
+const offlineInstructions = [
+  'Return only JSON matching the supplied output schema.',
+  'Do not call tools, access local files, or browse the web.',
+  'Do not diagnose disease or give prescriptions, drug changes, or dosages.',
+  'Use only facts explicitly supported by the provided source package.'
+].join(' ');
 
 const webSearchInstructions = [
-  'Return only data matching the supplied output schema.',
+  'Return only JSON matching the supplied output schema.',
   'You may use only the built-in web search for de-identified, generic medical background.',
   'Never put names, exact dates, verbatim report text, local paths, internal IDs, or unique combinations of personal facts into a search query.',
-  'Web results must not replace or alter report facts.',
-  'Do not access local files through tools or provide diagnosis or prescriptions.'
+  'Web results must not replace or alter report facts, and must not be cited as URLs.',
+  'Do not access local files through tools or provide diagnosis, prescriptions, drug changes, or dosages.'
 ].join(' ');
 
 export function createHealthThreadStartParams(input: {

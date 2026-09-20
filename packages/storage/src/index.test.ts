@@ -1842,6 +1842,91 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('旧流程留下的纯异常标记冲突可以重新交给模型裁决', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('心率 64 62 ▼ 60-100 bpm'), mediaType: 'text/plain', displayName: '趋势核对.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-20T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'trend-marker-retry' }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const candidate = {
+      localKey: 'heart-rate', originalName: '心率', standardNameCandidate: '心率',
+      value: { kind: 'numeric' as const, rawText: '62', decimal: '62', comparator: 'eq' as const },
+      unitRaw: 'bpm', referenceRangeRaw: '60-100', reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: 'trend-span', quote: '心率 64 62 ▼ 60-100 bpm' }], issues: []
+    };
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      jobId: job.id,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['trend-span'],
+      candidateOptions: [candidate],
+      candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['reportedAbnormalFlag'] }]
+    });
+    store.finishJob(job.id, 'waiting_user');
+
+    store.retryExtractionReview({ issueId, documentId: document.documentId });
+
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0 });
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    store.close();
+  });
+
+  it('纯证据绑定问题可以重新排队，但核心事实冲突仍不可直接重试', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('2023-10-08 2024-10-22 趋势 身高 187 187'), mediaType: 'text/plain', displayName: '年度对比.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-20T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'comparison-date-retry' }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const candidate = {
+      localKey: 'height-2023', originalName: '身高', standardNameCandidate: '身高',
+      value: { kind: 'numeric' as const, rawText: '187', decimal: '187', comparator: 'eq' as const },
+      unitRaw: 'cm', referenceRangeRaw: '---', reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
+      evidence: [{ sourceSpanId: 'comparison-span', quote: '身高 187 187' }], issues: []
+    };
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId,
+      jobId: job.id,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: ['comparison-span'],
+      candidateOptions: [candidate],
+      candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['issues'] }],
+      reasonCodes: ['clinical_date_not_in_evidence']
+    });
+    store.finishJob(job.id, 'waiting_user');
+
+    store.retryExtractionReview({ issueId, documentId: document.documentId });
+
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0 });
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    store.close();
+  });
+
   it('同一批有多条阻断事项时，最后一条解决后才按原批次恢复', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '测试成员' });

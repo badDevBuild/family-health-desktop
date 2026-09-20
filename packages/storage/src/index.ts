@@ -1585,9 +1585,20 @@ export class WorkspaceStore {
         throw new Error('REVIEW_ISSUE_NOT_OPEN');
       }
       const payload = issue.payload_json
-        ? JSON.parse(issue.payload_json) as { candidateOptions?: ObservationCandidate[]; candidateDiffs?: ReviewCandidateDiff[] }
+        ? JSON.parse(issue.payload_json) as {
+          candidateOptions?: ObservationCandidate[];
+          candidateDiffs?: ReviewCandidateDiff[];
+          reasonCodes?: string[];
+        }
         : {};
-      if (!payload.candidateOptions?.length || (payload.candidateDiffs?.length ?? 0) > 0) {
+      const candidateDiffs = payload.candidateDiffs ?? [];
+      const abnormalFlagOnly = candidateDiffs.length > 0
+        && candidateDiffs.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'reportedAbnormalFlag');
+      const evidenceIssueOnly = candidateDiffs.length > 0
+        && candidateDiffs.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'issues');
+      const legacyComparisonIssue = payload.reasonCodes?.includes('INDEPENDENT_REVIEW_MISMATCH') === true;
+      if (!payload.candidateOptions?.length
+        || (candidateDiffs.length > 0 && !abnormalFlagOnly && !evidenceIssueOnly && !legacyComparisonIssue)) {
         throw new Error('REVIEW_ACTION_INVALID');
       }
       const document = this.db.prepare(`SELECT status FROM documents WHERE id = ?`).get(input.documentId) as { status: string } | undefined;
@@ -1600,7 +1611,7 @@ export class WorkspaceStore {
       this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ?`).run(input.documentId);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
-        VALUES (?, 'review_issue.requeued', ?, '旧版核对事项已关闭，资料按当前规则重新核对', ?)
+        VALUES (?, 'review_issue.requeued', ?, '核对事项已关闭，资料按当前规则重新核对', ?)
       `).run(randomUUID(), input.issueId, this.now().toISOString());
       this.resumeWaitingJobsAfterReview(input.documentId, false, issue.job_id);
     });

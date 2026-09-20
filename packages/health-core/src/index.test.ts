@@ -74,6 +74,64 @@ describe('自动接纳规则', () => {
       .toEqual({ decision: 'reject', reasons: ['numeric_value_not_in_evidence'] });
   });
 
+  it('年度对比行中的相邻数值保持分隔，不会把 91 和 94 误拼为 9194', () => {
+    const comparisonManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote: '体 重 91 94 ▲ --- kg' }]
+    };
+    const currentWeight: ObservationCandidate = {
+      ...candidate,
+      localKey: 'weight-current',
+      originalName: '体重',
+      standardNameCandidate: '体重',
+      value: { kind: 'numeric', rawText: '94', decimal: '94', comparator: 'eq' },
+      unitRaw: 'kg',
+      referenceRangeRaw: '---',
+      reportedAbnormalFlag: null,
+      clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote: '体 重 91 94 ▲ --- kg' }]
+    };
+    expect(evaluateObservationCandidate(currentWeight, comparisonManifest, {
+      personConsistent: true, overwritesUserLockedValue: false
+    })).toEqual({ decision: 'accept', warnings: [] });
+  });
+
+  it('同一超声部位连续尺寸可共享前缀，但不会串用另一尺寸的数值', () => {
+    const quote = '检查日期：2024-10-25 甲状腺左侧叶前后径：15.7mm，左右径：14.8mm；甲状腺右侧叶前后径：19.4mm，左右径：16.9mm';
+    const ultrasoundManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const leftTransverse: ObservationCandidate = {
+      ...candidate,
+      localKey: 'thyroid-left-transverse',
+      originalName: '甲状腺左侧叶左右径',
+      standardNameCandidate: '甲状腺左叶左右径',
+      value: { kind: 'numeric', rawText: '14.8mm', decimal: '14.8', comparator: 'eq' },
+      unitRaw: 'mm',
+      referenceRangeRaw: null,
+      reportedAbnormalFlag: null,
+      specimen: null,
+      method: '甲状腺彩超',
+      bodySite: '甲状腺左侧叶',
+      clinicalDate: '2024-10-25',
+      evidence: [{ sourceSpanId: 'span-1', quote }],
+      issues: []
+    };
+    expect(evaluateObservationCandidate(leftTransverse, ultrasoundManifest, {
+      personConsistent: true, overwritesUserLockedValue: false
+    })).toEqual({ decision: 'accept_with_warnings', warnings: ['reference_range_not_provided'] });
+    expect(evaluateObservationCandidate({
+      ...leftTransverse,
+      value: { kind: 'numeric', rawText: '16.9mm', decimal: '16.9', comparator: 'eq' }
+    }, ultrasoundManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['numeric_value_not_in_evidence'] });
+  });
+
   it('明确单位和比较符必须属于当前指标证据', () => {
     const pressureManifest: SourceManifest = {
       ...manifest,
@@ -93,6 +151,32 @@ describe('自动接纳规则', () => {
     };
     expect(evaluateObservationCandidate(pressure, pressureManifest, { personConsistent: true, overwritesUserLockedValue: false }))
       .toEqual({ decision: 'reject', reasons: ['unit_not_bound_to_measurement'] });
+  });
+
+  it('甲状腺激素的 pmol/L 单位不会被后续 mIU/mL 项目误判为单位冲突', () => {
+    const quote = '血清游离三碘甲状原氨酸 (FT3) 4.80 pmol/l 2.76-6.45 血清促甲状腺激素 (TSH) 6.45 mIU/ml 0.35-5.1';
+    const thyroidManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const ft3: ObservationCandidate = {
+      ...candidate,
+      localKey: 'ft3',
+      originalName: '血清游离三碘甲状原氨酸 (FT3)',
+      standardNameCandidate: '游离三碘甲状腺原氨酸',
+      value: { kind: 'numeric', rawText: '4.80', decimal: '4.80', comparator: 'eq' },
+      unitRaw: 'pmol/l',
+      referenceRangeRaw: '2.76-6.45',
+      reportedAbnormalFlag: null,
+      specimen: '血清',
+      clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(ft3, thyroidManifest, {
+      personConsistent: true, overwritesUserLockedValue: false
+    })).toEqual({ decision: 'accept', warnings: [] });
   });
 
   it('文字结果仅被 PDF 排版空格断开时仍可接纳，真实文字差异仍拒绝', () => {

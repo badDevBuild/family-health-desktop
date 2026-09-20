@@ -7,6 +7,7 @@ import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManif
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
+import { ACCEPTANCE_RULES_VERSION, promptMetaForStage } from './prompts/index.js';
 
 const organNames = [
   ['cardiovascular', '心血管'],
@@ -223,7 +224,7 @@ export class PersonalWorkspaceService {
         throw new Error(`CORRECTION_INVALID:${outcome.reasons.join(',')}`);
       }
       const acceptanceId = this.store.saveAcceptanceDecision({
-        method: 'user_resolution', actor: 'user', rulesVersion: 'health-acceptance-v2',
+        method: 'user_resolution', actor: 'user', rulesVersion: ACCEPTANCE_RULES_VERSION,
         inputSignature: stableHash({ documentId: input.documentId, candidate }),
         outputHash: stableHash({ candidate, outcome }), reviewRef: input.issueId, decision: outcome.decision
       });
@@ -253,10 +254,10 @@ export class PersonalWorkspaceService {
       documentCommitKey: stableHash({
         documentId: input.documentId, sourceSha256: bundle.manifest.sha256,
         normalizerVersion: bundle.manifest.normalizerVersion,
-        extractionSchemaVersion: 1, rulesVersion: 'health-acceptance-v2'
+        extractionSchemaVersion: 1, rulesVersion: ACCEPTANCE_RULES_VERSION
       }),
       expectedRevision: this.store.getFactRevision(bundle.personId),
-      changeSetHash: stableHash({ documentId: input.documentId, candidates: input.candidates, rulesVersion: 'health-acceptance-v2', actor: 'user' }),
+      changeSetHash: stableHash({ documentId: input.documentId, candidates: input.candidates, rulesVersion: ACCEPTANCE_RULES_VERSION, actor: 'user' }),
       summary: `用户核对原始依据后修正并接纳 ${observations.length} 条事实`,
       observations,
       resolvedReviewIssueId: input.issueId
@@ -359,8 +360,7 @@ export class PersonalWorkspaceService {
           sourceRevisionIds: group.documentIds,
           factRevision: this.store.getFactRevision(group.personId),
           contextRevision: 0,
-          promptVersion: 'extract-v1',
-          rulesVersion: 'acceptance-v1'
+          ...promptMetaForStage('extract')
         })
       }))
     });
@@ -415,8 +415,7 @@ export class PersonalWorkspaceService {
         documentIds: [...group.documentIds].sort(),
         factRevision: this.store.getFactRevision(personId),
         contextRevision: this.store.getClinicalContextRevision(personId),
-        promptVersion: 'extract-v1',
-        rulesVersion: 'acceptance-v1'
+        ...promptMetaForStage(group.stage)
       })
     }));
     const consentId = options
@@ -626,7 +625,7 @@ export class PersonalWorkspaceService {
       ...extractionIssues.map((issue) => {
         const legacyFieldReview = issue.kind === 'field_conflict'
           && issue.candidateOptions.length > 0
-          && issue.candidateDiffs.length === 0;
+          && (issue.candidateDiffs.length === 0 || issue.reasonCodes.includes('INDEPENDENT_REVIEW_MISMATCH'));
         const unverifiedIdentity = issue.reasonCodes.includes('PERSON_IDENTITY_NOT_CONFIRMED')
           && issue.reportedName === null;
         const differenceCount = issue.candidateDiffs.length;

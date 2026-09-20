@@ -6,6 +6,13 @@ import {
   type DerivedSnapshotCandidate
 } from '@contracts';
 import type { AcceptedObservationSummary, JobExecutionGuard, WorkspaceStore } from '@storage';
+import {
+  DERIVED_PROMPT_VERSION,
+  DERIVED_SAFETY_RULES_VERSION,
+  buildAnalyzePrompt,
+  buildRepairDerivedPrompt,
+  buildReviewDerivedPrompt
+} from './prompts/index.js';
 
 interface StructuredRuntime {
   runStructuredTurn(input: {
@@ -170,14 +177,7 @@ export class DerivedHealthPipeline {
     const factPackage = buildFactPackage(personId, factRevision, observations, this.store.getDerivedContext(personId));
     this.onStage?.('analyze');
     const generated = await this.runTurn('analyze', {
-      prompt: [
-        '你是家庭健康资料解释器。只能使用 FACT_PACKAGE 中已经接纳的报告事实和用户主动填写的背景；必须区分报告事实与 user_reported 内容。',
-        '事实层可复述数值；趋势层只在日期、单位和可比条件足够时描述；关联层必须明确写“仅供参考”；行动层止步于“建议就此咨询医生”。',
-        '不得诊断疾病，不得建议开始、停止或调整药物，不得给出药物或补充剂剂量，不得编造指南、研究、URL 或证据。',
-        '如需核对通用医学背景，可以使用 Web Search；搜索词必须去标识化，不得包含姓名、完整日期、报告原文、内部 ID 或可唯一识别个人的组合信息。网页资料只能帮助解释通用概念，不能替代或修改 FACT_PACKAGE 中的报告事实。',
-        '生活指南只能给低风险日常方向，必须引用 observationId；资料不足时宁可返回空数组。',
-        `FACT_PACKAGE=${factPackage}`
-      ].join('\n'),
+      prompt: buildAnalyzePrompt(factPackage),
       allowWebSearch: true,
       outputSchema: candidateOutputSchema
     });
@@ -186,15 +186,11 @@ export class DerivedHealthPipeline {
     let localIssues = deterministicSafetyIssues(candidate, observations);
     if (canRepairDerivedStructure(localIssues)) {
       const repaired = await this.runTurn('repair_derived', {
-        prompt: [
-          '你是健康说明的结构修复器。只修复下列机器校验错误，并返回完整的 DERIVED_CANDIDATE；不得新增报告事实、诊断、处方、药物调整或剂量。',
-          'evidence_mismatch：只能改用 FACT_PACKAGE 中真实存在且确实支持该说明的 observationId；没有充分依据的条目必须删除，不得猜测或编造 ID。',
-          'boundary_note_required：association 与 action 层必须补充明确的边界说明，例如“仅供参考，不等于诊断”或“建议就此咨询医生”。',
-          '保持 personId、factRevision 和 schemaVersion 不变。不得使用网页搜索；只能依据 FACT_PACKAGE 修复。',
-          `VALIDATION_ERRORS=${JSON.stringify(localIssues)}`,
-          `FACT_PACKAGE=${factPackage}`,
-          `DERIVED_CANDIDATE=${JSON.stringify(candidate)}`
-        ].join('\n'),
+        prompt: buildRepairDerivedPrompt({
+          validationErrors: localIssues,
+          factPackage,
+          candidate: JSON.stringify(candidate)
+        }),
         allowWebSearch: false,
         outputSchema: candidateOutputSchema
       });
@@ -206,14 +202,10 @@ export class DerivedHealthPipeline {
 
     this.onStage?.('review_derived');
     const reviewed = await this.runTurn('review_derived', {
-      prompt: [
-        '你是独立的健康内容安全复核器。根据原始已接纳事实逐项检查候选内容是否有证据、是否越过医疗边界。',
-        '任何诊断、处方、药物调整、补充剂剂量、伪造来源或无证据因果都必须标为不安全。',
-        '必要时可用 Web Search 核对去标识化的通用医学背景；不得在搜索词中包含姓名、完整日期、报告原文、内部 ID 或可唯一识别个人的组合信息，也不得用网页内容改写报告事实。',
-        '必须恰好覆盖候选中的每个 claimId 和 guidanceId，不得遗漏或新增。',
-        `FACT_PACKAGE=${factPackage}`,
-        `DERIVED_CANDIDATE=${JSON.stringify(candidate)}`
-      ].join('\n'),
+      prompt: buildReviewDerivedPrompt({
+        factPackage,
+        candidate: JSON.stringify(candidate)
+      }),
       allowWebSearch: true,
       outputSchema: reviewOutputSchema
     });
@@ -231,8 +223,8 @@ export class DerivedHealthPipeline {
       candidate,
       expectedFactRevision: factRevision,
       expectedContextRevision: contextRevision,
-      promptVersion: 'derived-v1',
-      rulesVersion: 'derived-safety-v1',
+      promptVersion: DERIVED_PROMPT_VERSION,
+      rulesVersion: DERIVED_SAFETY_RULES_VERSION,
       modelId: this.modelId,
       ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
     });
