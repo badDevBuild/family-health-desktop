@@ -3,6 +3,8 @@ export {
   DERIVED_PROMPT_VERSION,
   DERIVED_SAFETY_RULES_VERSION,
   EXTRACTION_PROMPT_VERSION,
+  SYSTEM_ANALYSIS_PROMPT_VERSION,
+  SYSTEM_ANALYSIS_RULES_VERSION,
   promptMetaForStage,
   renderPrompt
 } from './shared.js';
@@ -17,5 +19,7 @@ export {
 export {
   buildAnalyzePrompt,
   buildRepairDerivedPrompt,
-  buildReviewDerivedPrompt
+  buildReviewDerivedPrompt,
+  buildReviewSystemAnalysisPrompt,
+  buildSystemAnalysisPrompt
 } from './derived.js';

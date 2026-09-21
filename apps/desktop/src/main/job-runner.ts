@@ -6,6 +6,7 @@ import { DEFAULT_AI_PREFERENCES, type AiPreferences } from '@contracts';
 import { CodexRuntimeManager } from './codex-runtime.js';
 import { DerivedHealthPipeline } from './derived-pipeline.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
+import { SystemAnalysisPipeline } from './system-analysis-pipeline.js';
 
 export class ProcessingJobRunner extends EventEmitter {
   private running = false;
@@ -56,7 +57,8 @@ export class ProcessingJobRunner extends EventEmitter {
         };
         try {
           const pipeline = new DocumentExtractionPipeline(store, jobRuntime, executionGuard);
-          const resumeDerived = ['analyze', 'guidance', 'review_derived', 'publish'].includes(job.stage);
+          const resumeSystem = ['system_analysis', 'system_review'].includes(job.stage);
+          const resumeDerived = resumeSystem || ['analyze', 'guidance', 'review_derived', 'publish'].includes(job.stage);
           let completedUnits = resumeDerived ? job.documentIds.length : 0;
           let needsReview = false;
           let lastReceipt: { threadId: string; turnId: string } | null = null;
@@ -90,7 +92,7 @@ export class ProcessingJobRunner extends EventEmitter {
               }
             }
           }
-          if (!needsReview) {
+          if (!needsReview && !resumeSystem) {
             if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
             const derived = await new DerivedHealthPipeline(store, jobRuntime, (stage) => {
               store.updateJobStage(job.id, stage);
@@ -99,8 +101,28 @@ export class ProcessingJobRunner extends EventEmitter {
             if (derived.threadId && derived.turnId) lastReceipt = { threadId: derived.threadId, turnId: derived.turnId };
             if (derived.status === 'needs_review') needsReview = true;
           }
+          if (!needsReview) {
+            const systemPipeline = new SystemAnalysisPipeline(
+              store,
+              jobRuntime,
+              (stage) => {
+                store.updateJobStage(job.id, stage);
+                this.emit('changed');
+              },
+              executionGuard,
+              job.documentIds[0]!,
+              aiPreferences.modelId
+            );
+            for (const systemId of ['cardiovascular', 'endocrine_metabolic'] as const) {
+              const systemResult = await systemPipeline.process(job.personId, systemId);
+              if (systemResult.status === 'published') {
+                lastReceipt = { threadId: systemResult.threadId, turnId: systemResult.turnId };
+              }
+            }
+          }
           if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
           const finalStatus = needsReview ? 'waiting_user' : 'succeeded';
+          if (!needsReview) store.updateJobStage(job.id, 'publish');
           store.finishJob(job.id, finalStatus);
           store.finishJobAttempt({ attemptId, status: finalStatus, ...lastReceipt });
           this.emit('terminal', { jobId: job.id, status: finalStatus });

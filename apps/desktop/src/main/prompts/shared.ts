@@ -14,13 +14,17 @@
 export const EXTRACTION_PROMPT_VERSION = 'extract-v3';
 
 /** 派生分析/安全复核提示词版本，写入 derived_snapshots.prompt_version。 */
-export const DERIVED_PROMPT_VERSION = 'derived-v2';
+export const DERIVED_PROMPT_VERSION = 'derived-v3';
 
 /** 本地事实接纳规则版本，与 health-core 的 evaluateObservationCandidate 对齐。 */
-export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v2';
+export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v3';
 
 /** 派生安全规则版本，与 derived-pipeline 本地拦截对齐。 */
-export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v1';
+export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
+
+/** 成员档案 v2 的系统级综合与独立复核版本。 */
+export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v1';
+export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v1';
 
 export interface PromptSection {
   title: string;
@@ -112,7 +116,7 @@ export const FAMILY_TONE_RULES: string[] = [
 export const WEB_SEARCH_RULES: string[] = [
   '只用于核对通用医学背景（例如某指标的含义、常见参考范围的口径），不用于查找任何个人。',
   '搜索词必须去标识化：不得包含姓名、完整日期、报告原文、内部 ID，或可唯一识别个人的组合信息（例如“某年某月某医院某项检查某数值”）。',
-  '网页内容只能帮助解释概念，不能替代或修改 FACT_PACKAGE 中的报告事实，也不能作为新的事实写入输出；不得编造或引用 URL。'
+  '网页内容只能支持通用医学知识，不能替代或修改 FACT_PACKAGE 中的个人报告事实。只有确实打开并核对过的 HTTPS 来源才可写入 generalKnowledgeEvidence；不得编造 URL、标题、机构或适用范围。'
 ];
 
 /**

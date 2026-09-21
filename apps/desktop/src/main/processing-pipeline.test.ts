@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
 import { PersonalWorkspaceService } from './workspace-service.js';
-import { compareIndependentExtractions, DocumentExtractionPipeline, partitionPdfSpans, partitionSourceSpans } from './processing-pipeline.js';
+import { compareIndependentExtractions, DocumentExtractionPipeline, mergeIndependentlyConfirmedEvidence, partitionPdfSpans, partitionSourceSpans, scopeCandidateKeys } from './processing-pipeline.js';
 
 const roots: string[] = [];
 const require = createRequire(import.meta.url);
@@ -152,6 +152,77 @@ function createTextPdf(text: string): Uint8Array {
 }
 
 describe('DocumentExtractionPipeline', () => {
+  it('由应用为每个分块生成稳定候选引用，跨块重复 localKey 不会冲突', () => {
+    const base = {
+      localKey: 'glucose', originalName: '葡萄糖', standardNameCandidate: null,
+      value: { kind: 'numeric' as const, rawText: '5.2', decimal: '5.2', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2024-01-01',
+      evidence: [{ sourceSpanId: 'span-1', quote: '葡萄糖 5.2 mmol/L' }], issues: []
+    };
+    const first = scopeCandidateKeys([base], 0)[0]!;
+    const repeated = scopeCandidateKeys([{ ...base, clinicalDate: '2025-01-01' }], 1)[0]!;
+    expect(first.localKey).not.toBe(repeated.localKey);
+    expect(scopeCandidateKeys([first], 0)[0]!.localKey).toBe(first.localKey);
+  });
+
+  it('只保留两次独立读取都确认的重复来源角色', () => {
+    const baseCandidate = (localKey: string, evidence: ExtractionResult['candidates'][number]['evidence']) => ({
+      localKey, originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
+      value: { kind: 'numeric' as const, rawText: '4.20', decimal: '4.20', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4', reportedAbnormalFlag: '偏高',
+      specimen: '血清', method: null, bodySite: null, clinicalDate: '2026-09-18', evidence, issues: []
+    });
+    const result = (candidate: ExtractionResult['candidates'][number]): ExtractionResult => ({
+      schemaVersion: 1, documentId: 'document-duplicate-source',
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: ['summary-span', 'detail-span'], candidates: [candidate]
+    });
+    const first = result(baseCandidate('first', [
+      { sourceSpanId: 'detail-span', quote: 'LDL-C 4.20', sourceRole: 'primary', duplicateBasis: null },
+      { sourceSpanId: 'summary-span', quote: '摘要 LDL-C 4.20', sourceRole: 'duplicate_source', duplicateBasis: 'exam_item_id' }
+    ]));
+    const second = result(baseCandidate('second', [
+      { sourceSpanId: 'detail-span', quote: 'LDL-C 4.20', sourceRole: 'primary', duplicateBasis: null },
+      { sourceSpanId: 'summary-span', quote: '摘要 LDL-C 4.20', sourceRole: 'duplicate_source', duplicateBasis: 'exam_item_id' }
+    ]));
+
+    const merged = mergeIndependentlyConfirmedEvidence(first, second);
+    expect(merged.candidates).toHaveLength(1);
+    expect(merged.candidates[0]!.evidence).toEqual([
+      expect.objectContaining({ sourceSpanId: 'detail-span', sourceRole: 'primary' }),
+      expect.objectContaining({ sourceSpanId: 'summary-span', sourceRole: 'duplicate_source', duplicateBasis: 'exam_item_id' })
+    ]);
+
+    const oneSidedClaim = mergeIndependentlyConfirmedEvidence(first, result(baseCandidate('second', [
+      { sourceSpanId: 'detail-span', quote: 'LDL-C 4.20' },
+      { sourceSpanId: 'summary-span', quote: '摘要 LDL-C 4.20' }
+    ])));
+    expect(oneSidedClaim.candidates[0]!.evidence.every((reference) => reference.sourceRole === 'primary')).toBe(true);
+  });
+
+  it('同日同值的两次独立采样不会因证据合并而少计', () => {
+    const candidate = (localKey: string, sourceSpanId: string) => ({
+      localKey, originalName: 'TSH', standardNameCandidate: 'TSH',
+      value: { kind: 'numeric' as const, rawText: '2.10', decimal: '2.10', comparator: 'eq' as const },
+      unitRaw: 'mIU/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: '血清', method: null, bodySite: null, clinicalDate: '2026-09-18',
+      evidence: [{ sourceSpanId, quote: `TSH 2.10 ${sourceSpanId}` }], issues: []
+    });
+    const result = (prefix: string): ExtractionResult => ({
+      schemaVersion: 1, documentId: 'document-two-samples',
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: ['sample-a', 'sample-b'],
+      candidates: [candidate(`${prefix}-a`, 'sample-a'), candidate(`${prefix}-b`, 'sample-b')]
+    });
+    const merged = mergeIndependentlyConfirmedEvidence(result('first'), result('second'));
+    expect(merged.candidates).toHaveLength(2);
+    expect(merged.candidates.map((item) => item.evidence)).toEqual([
+      [{ sourceSpanId: 'sample-a', quote: 'TSH 2.10 sample-a' }],
+      [{ sourceSpanId: 'sample-b', quote: 'TSH 2.10 sample-b' }]
+    ]);
+  });
+
   it('旧版 PDF 缺少清单元数据时重读原文件核对，不再误拦截为覆盖缺口', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-legacy-pdf-pipeline-'));
     roots.push(root);
@@ -489,7 +560,7 @@ describe('DocumentExtractionPipeline', () => {
     expect(issue.evidenceRefs).toEqual([output.candidates[0]!.evidence[0]!.sourceSpanId]);
     expect(issue.evidenceRefs).not.toContain(subjectSpanId);
     expect(issue.candidateDiffs).toEqual([
-      expect.objectContaining({ localKey: 'ldl-1', fields: ['reportedAbnormalFlag'] })
+      expect.objectContaining({ itemName: '低密度脂蛋白胆固醇', fields: ['reportedAbnormalFlag'] })
     ]);
     service.close();
   });
@@ -624,9 +695,9 @@ describe('DocumentExtractionPipeline', () => {
     expect(service.store.getFactRevision(personId)).toBe(0);
     const issue = service.store.listOpenExtractionReviewIssues()[0]!;
     expect(issue.candidateDiffs).toHaveLength(1);
-    expect(issue.candidateDiffs[0]).toMatchObject({ localKey: 'hdl-1', fields: ['referenceRangeRaw'] });
+    expect(issue.candidateDiffs[0]).toMatchObject({ itemName: '高密度脂蛋白胆固醇', fields: ['referenceRangeRaw'] });
     expect(issue.candidateOptions).toHaveLength(2);
-    expect(issue.candidateOptions.find((candidate) => candidate.localKey === 'ldl-1'))
+    expect(issue.candidateOptions.find((candidate) => candidate.originalName === '低密度脂蛋白胆固醇'))
       .toMatchObject({ referenceRangeRaw: '0-3.4 mmol/L' });
     service.close();
   });
@@ -656,8 +727,8 @@ describe('DocumentExtractionPipeline', () => {
     expect(service.store.getFactRevision(personId)).toBe(0);
     const issue = service.store.listOpenExtractionReviewIssues()[0]!;
     expect(issue.candidateDiffs).toHaveLength(1);
-    expect(issue.candidateDiffs[0]).toMatchObject({ localKey: 'hdl-1', fields: ['reportedAbnormalFlag'] });
-    expect(issue.candidateOptions.find((candidate) => candidate.localKey === 'ldl-1'))
+    expect(issue.candidateDiffs[0]).toMatchObject({ itemName: '高密度脂蛋白胆固醇', fields: ['reportedAbnormalFlag'] });
+    expect(issue.candidateOptions.find((candidate) => candidate.originalName === '低密度脂蛋白胆固醇'))
       .toMatchObject({ reportedAbnormalFlag: '偏高' });
     service.close();
   });
@@ -1080,7 +1151,7 @@ describe('DocumentExtractionPipeline', () => {
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '年度对比日期工作区', () => new Date('2026-09-20T00:00:00Z'));
     const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
-    const sourceText = '历次体检结果对比 一般检查 2023-10-08 2024-10-22 趋势 正常参考 单位 体重 91 94 ▲ --- kg';
+    const sourceText = '合成医院 体检中心 报告日期 2024-10-23 历次体检结果对比 一般检查 2023-10-08 2024-10-22 趋势 正常参考 单位 体重 91 94 ▲ --- kg';
     await service.importFiles([{ path: '/tmp/年度对比报告.txt', bytes: Buffer.from(sourceText) }], personId);
     const documentId = service.getSnapshot(null).inbox[0]!.id;
     const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
@@ -1103,6 +1174,20 @@ describe('DocumentExtractionPipeline', () => {
       schemaVersion: 1,
       documentId,
       subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      reportMetadata: {
+        reportKind: { value: '体检报告', evidence: [{ sourceSpanId: span.id, quote: '体检中心' }] },
+        title: { value: '历次体检结果对比', evidence: [{ sourceSpanId: span.id, quote: '历次体检结果对比' }] },
+        organization: { value: '合成医院', evidence: [{ sourceSpanId: span.id, quote: '合成医院' }] },
+        campus: null,
+        department: { value: '体检中心', evidence: [{ sourceSpanId: span.id, quote: '体检中心' }] },
+        reportNumber: null,
+        examItems: [{ value: '一般检查', evidence: [{ sourceSpanId: span.id, quote: '一般检查' }] }],
+        times: [
+          { value: '2024-10-22', precision: 'day', role: 'examined', evidence: [{ sourceSpanId: span.id, quote: '2024-10-22' }] },
+          { value: '2024-10-23', precision: 'day', role: 'report_issued', evidence: [{ sourceSpanId: span.id, quote: '报告日期 2024-10-23' }] },
+          { value: '2023-10-08', precision: 'day', role: 'history_quoted', evidence: [{ sourceSpanId: span.id, quote: '2023-10-08' }] }
+        ]
+      },
       coveredSourceSpanIds: [span.id],
       candidates: [
         candidate('weight-2023', '91', '2023-10-08'),
@@ -1119,6 +1204,16 @@ describe('DocumentExtractionPipeline', () => {
       expect.objectContaining({ conceptKey: '体重', decimalValue: '91', clinicalDate: '2023-10-08' }),
       expect.objectContaining({ conceptKey: '体重', decimalValue: '94', clinicalDate: '2024-10-22' })
     ]);
+    expect(service.store.listReportMetadata(personId)[0]).toMatchObject({
+      title: '历次体检结果对比', organization: '合成医院', reportDate: '2024-10-23',
+      extracted: { department: { value: '体检中心' } }
+    });
+    expect(service.listHealthEvents(personId)[0]).toMatchObject({
+      title: '历次体检结果对比', organization: '合成医院', department: '体检中心',
+      time: { value: '2024-10-22', source: 'explicit' },
+      reportIssuedTime: { value: '2024-10-23' },
+      factCount: 2
+    });
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();
   });
@@ -1298,7 +1393,7 @@ describe('DocumentExtractionPipeline', () => {
     await expect(blockingPipeline.process(second.documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'FACT_ADJUDICATION_UNRESOLVED' });
     expect(second.service.store.getFactRevision(second.personId)).toBe(0);
     expect(second.service.store.listOpenExtractionReviewIssues()[0]!.candidateDiffs)
-      .toEqual([expect.objectContaining({ localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['issues'] })]);
+      .toEqual([expect.objectContaining({ itemName: '低密度脂蛋白胆固醇', fields: ['issues'] })]);
     second.service.close();
   });
 
@@ -1380,9 +1475,9 @@ describe('DocumentExtractionPipeline', () => {
     expect(service.store.getFactRevision(personId)).toBe(0);
     expect(service.store.listOpenExtractionReviewIssues()[0]!.candidateDiffs)
       .toEqual([expect.objectContaining({
-        localKey: 'urine-leukocyte', itemName: '尿白细胞 (LEU)', fields: ['value'],
-        firstCandidate: expect.objectContaining({ localKey: 'urine-leukocyte' }),
-        secondCandidate: expect.objectContaining({ localKey: 'urine-leukocyte' })
+        itemName: '尿白细胞 (LEU)', fields: ['value'],
+        firstCandidate: expect.objectContaining({ originalName: '尿白细胞 (LEU)' }),
+        secondCandidate: expect.objectContaining({ originalName: '尿白细胞 (LEU)' })
       })]);
     service.close();
   });
@@ -1409,7 +1504,7 @@ describe('DocumentExtractionPipeline', () => {
     expect(service.store.getFactRevision(personId)).toBe(0);
     const issue = service.store.listOpenExtractionReviewIssues()[0]!;
     expect(issue.candidateDiffs).toEqual([expect.objectContaining({
-      localKey: 'ldl-1', itemName: '低密度脂蛋白胆固醇', fields: ['value'],
+      itemName: '低密度脂蛋白胆固醇', fields: ['value'],
       firstCandidate: expect.objectContaining({ value: expect.objectContaining({ decimal: '4.2' }) }),
       secondCandidate: expect.objectContaining({ value: expect.objectContaining({ decimal: '4.3' }) })
     })]);
@@ -1634,15 +1729,19 @@ describe('DocumentExtractionPipeline', () => {
     const issue = service.store.listOpenExtractionReviewIssues()[0]!;
     expect(issue.documentRun).toMatchObject({ coverageComplete: true, chunkCount: 3 });
     expect(issue.documentRun?.coveredSourceSpanIds).toHaveLength(81);
-    expect(issue.candidateOptions.map((candidate) => candidate.localKey)).toEqual(['chunk-1', 'chunk-2', 'chunk-3']);
+    expect(issue.candidateOptions.map((candidate) => candidate.localKey)).toEqual([
+      expect.stringMatching(/^chunk-1-[a-f0-9]{24}$/),
+      expect.stringMatching(/^chunk-2-[a-f0-9]{24}$/),
+      expect.stringMatching(/^chunk-3-[a-f0-9]{24}$/)
+    ]);
 
     // 核对事项必须完整落盘；应用重启后仍要拿到整篇候选，而不是只剩冲突块。
     service.close();
     const reopened = new PersonalWorkspaceService(root, '整篇核对工作区', () => new Date('2026-09-18T00:00:00Z'));
     const persistedIssue = reopened.store.listOpenExtractionReviewIssues()[0]!;
     expect(persistedIssue.documentRun).toEqual(issue.documentRun);
-    expect(persistedIssue.candidateOptions.map((candidate) => candidate.localKey)).toEqual(['chunk-1', 'chunk-2', 'chunk-3']);
-    const corrected = persistedIssue.candidateOptions.map((candidate) => candidate.localKey === 'chunk-2'
+    expect(persistedIssue.candidateOptions.map((candidate) => candidate.localKey)).toEqual(issue.candidateOptions.map((candidate) => candidate.localKey));
+    const corrected = persistedIssue.candidateOptions.map((candidate) => candidate.originalName === '虚构指标41'
       ? { ...candidate, value: { kind: 'numeric' as const, rawText: '41', decimal: '41', comparator: 'eq' as const } }
       : candidate);
     reopened.acceptCorrectedFacts({ issueId: persistedIssue.id, documentId, candidates: corrected });

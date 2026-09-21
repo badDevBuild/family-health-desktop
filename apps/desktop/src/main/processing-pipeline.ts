@@ -7,6 +7,7 @@ import {
   extractionResultSchema,
   type ExtractionResult,
   type ObservationCandidate,
+  type ReportMetadataCandidate,
   type ReviewCandidateDiff,
   type SourceManifest,
   type SourceSpan
@@ -500,6 +501,19 @@ function normalizeCandidates(candidates: ObservationCandidate[], sourceSpans: So
   );
 }
 
+export function scopeCandidateKeys(candidates: ObservationCandidate[], chunkIndex: number): ObservationCandidate[] {
+  const prefix = `chunk-${chunkIndex + 1}-`;
+  return candidates.map((candidate) => {
+    // localKey 是模型在当前块内的临时别名。进入应用后立即换成
+    // “文档块 + 原别名”生成的稳定引用，避免跨块同名项目相互覆盖。
+    if (candidate.localKey.startsWith(prefix) && /^chunk-\d+-[a-f0-9]{24}$/.test(candidate.localKey)) return candidate;
+    return {
+      ...candidate,
+      localKey: `${prefix}${stableHash({ chunkIndex, modelLocalKey: candidate.localKey }).slice(0, 24)}`
+    };
+  });
+}
+
 function decodeModelEntities(value: string): string {
   return value
     .replaceAll('&lt;', '<')
@@ -765,6 +779,69 @@ export function compareIndependentExtractions(
   return { compatible: differences.length === 0, differences };
 }
 
+/**
+ * 证据来源不是医学事实差异，但不能因此只保留第二轮的一处引用。
+ * 仅当两轮都唯一地对齐到同一个候选时合并证据；“重复来源”角色则要求
+ * 两轮对同一 sourceSpanId 和同一依据类型都做出明确判定。
+ * 同日、同名、同数值的两次独立采样会有多个可对齐对象，因而不会进入合并。
+ */
+export function mergeIndependentlyConfirmedEvidence(
+  first: ExtractionResult,
+  second: ExtractionResult
+): ExtractionResult {
+  const compatibleFirstIndexes = second.candidates.map((secondCandidate) => first.candidates
+    .map((firstCandidate, index) => ({ firstCandidate, index }))
+    .filter(({ firstCandidate }) => (
+      normalizedComparableText(firstCandidate.originalName) === normalizedComparableText(secondCandidate.originalName)
+      && candidateConflictFields(firstCandidate, secondCandidate).length === 0
+    ))
+    .map(({ index }) => index));
+  const compatibleSecondCounts = first.candidates.map((firstCandidate) => second.candidates.filter((secondCandidate) => (
+    normalizedComparableText(firstCandidate.originalName) === normalizedComparableText(secondCandidate.originalName)
+    && candidateConflictFields(firstCandidate, secondCandidate).length === 0
+  )).length);
+
+  return {
+    ...second,
+    candidates: second.candidates.map((secondCandidate, secondIndex) => {
+      const firstIndexes = compatibleFirstIndexes[secondIndex]!;
+      if (firstIndexes.length !== 1 || compatibleSecondCounts[firstIndexes[0]!] !== 1) return secondCandidate;
+      const firstCandidate = first.candidates[firstIndexes[0]!]!;
+      const firstDuplicateClaims = new Set(firstCandidate.evidence.flatMap((reference) => (
+        reference.sourceRole === 'duplicate_source' && reference.duplicateBasis
+          ? [`${reference.sourceSpanId}\u0000${reference.duplicateBasis}`]
+          : []
+      )));
+      const secondDuplicateClaims = new Set(secondCandidate.evidence.flatMap((reference) => (
+        reference.sourceRole === 'duplicate_source' && reference.duplicateBasis
+          ? [`${reference.sourceSpanId}\u0000${reference.duplicateBasis}`]
+          : []
+      )));
+      const jointlyConfirmedDuplicates = new Set(
+        [...firstDuplicateClaims].filter((claim) => secondDuplicateClaims.has(claim))
+      );
+      const merged = [...new Map(
+        [...secondCandidate.evidence, ...firstCandidate.evidence].map((reference) => {
+          const claim = reference.duplicateBasis
+            ? `${reference.sourceSpanId}\u0000${reference.duplicateBasis}`
+            : null;
+          const duplicateConfirmed = claim !== null && jointlyConfirmedDuplicates.has(claim);
+          return [
+            `${reference.sourceSpanId}\u0000${reference.quote ?? ''}`,
+            {
+              sourceSpanId: reference.sourceSpanId,
+              quote: reference.quote,
+              sourceRole: duplicateConfirmed ? 'duplicate_source' as const : 'primary' as const,
+              duplicateBasis: duplicateConfirmed ? reference.duplicateBasis ?? null : null
+            }
+          ] as const;
+        })
+      ).values()];
+      return { ...secondCandidate, evidence: merged };
+    })
+  };
+}
+
 function candidateValidationFailures(
   result: ExtractionResult,
   bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
@@ -878,6 +955,43 @@ function reviewedSubjectsAreConsistent(subjects: ExtractionResult['subject'][]):
   return names.size <= 1;
 }
 
+function reportMetadataEvidence(metadata: ReportMetadataCandidate | null | undefined) {
+  if (!metadata) return [];
+  return [
+    metadata.reportKind,
+    metadata.title,
+    metadata.organization,
+    metadata.campus,
+    metadata.department,
+    metadata.reportNumber,
+    metadata.encounterIdentifier,
+    ...(metadata.sampleIdentifiers ?? []),
+    ...metadata.examItems,
+    ...metadata.times
+  ].flatMap((field) => field?.evidence ?? []);
+}
+
+function aggregateReportMetadata(items: Array<ReportMetadataCandidate | null | undefined>): ReportMetadataCandidate | null {
+  const present = items.filter((item): item is ReportMetadataCandidate => Boolean(item));
+  if (present.length === 0) return null;
+  const firstField = (key: 'reportKind' | 'title' | 'organization' | 'campus' | 'department' | 'reportNumber' | 'encounterIdentifier') => (
+    present.find((item) => item[key] !== null)?.[key] ?? null
+  );
+  const unique = <T>(values: T[]) => [...new Map(values.map((value) => [stableHash(value), value])).values()];
+  return {
+    reportKind: firstField('reportKind'),
+    title: firstField('title'),
+    organization: firstField('organization'),
+    campus: firstField('campus'),
+    department: firstField('department'),
+    reportNumber: firstField('reportNumber'),
+    encounterIdentifier: firstField('encounterIdentifier'),
+    sampleIdentifiers: unique(present.flatMap((item) => item.sampleIdentifiers ?? [])),
+    examItems: unique(present.flatMap((item) => item.examItems)),
+    times: unique(present.flatMap((item) => item.times))
+  };
+}
+
 function hasCompleteCoverage(result: ExtractionResult, expectedSpanIds: string[]): boolean {
   const covered = new Set(result.coveredSourceSpanIds);
   return covered.size === result.coveredSourceSpanIds.length
@@ -888,7 +1002,8 @@ function hasCompleteCoverage(result: ExtractionResult, expectedSpanIds: string[]
 function evidenceIsConfinedToChunk(result: ExtractionResult, expectedSpanIds: string[]): boolean {
   const expected = new Set(expectedSpanIds);
   return result.subject.evidence.every((ref) => expected.has(ref.sourceSpanId))
-    && result.candidates.every((candidate) => candidate.evidence.every((ref) => expected.has(ref.sourceSpanId)));
+    && result.candidates.every((candidate) => candidate.evidence.every((ref) => expected.has(ref.sourceSpanId)))
+    && reportMetadataEvidence(result.reportMetadata).every((ref) => expected.has(ref.sourceSpanId));
 }
 
 function needsVisualEvidence(span: SourceSpan): boolean {
@@ -972,7 +1087,8 @@ function normalizeReportedAbnormalFlag(value: string | null): 'high' | 'low' | '
 }
 
 function candidateToObservation(candidate: ObservationCandidate, acceptanceId: string, documentId: string) {
-  const firstEvidence = candidate.evidence[0];
+  const firstEvidence = candidate.evidence.find((reference) => reference.sourceRole !== 'duplicate_source')
+    ?? candidate.evidence[0];
   if (!firstEvidence) throw new Error('CANDIDATE_EVIDENCE_REQUIRED');
   const decimalValue = candidate.value.kind === 'numeric' ? candidate.value.decimal : null;
   const qualifier = candidate.value.kind === 'numeric'
@@ -1065,6 +1181,7 @@ export class DocumentExtractionPipeline {
     second: ExtractionResult;
     differences: ReviewCandidateDiff[];
     bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>;
+    chunkIndex: number;
   }): Promise<{ result: ExtractionResult | null; unresolvedDifferences: ReviewCandidateDiff[]; threadId: string; turnId: string }> {
     const turn = await this.runTurn(input.documentId, 'review_facts', {
       prompt: buildAdjudicateAbnormalFlagsPrompt({
@@ -1094,7 +1211,10 @@ export class DocumentExtractionPipeline {
     }
     const normalized = {
       ...parsed.data,
-      candidates: normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans)
+      candidates: scopeCandidateKeys(
+        normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans),
+        input.chunkIndex
+      )
     };
     const application = applyReportedAbnormalFlagAdjudication(input.second, normalized, input.differences);
     return {
@@ -1142,6 +1262,7 @@ export class DocumentExtractionPipeline {
     result: ExtractionResult;
     failures: CandidateValidationFailure[];
     bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>;
+    chunkIndex: number;
   }): Promise<{ result: ExtractionResult | null; threadId: string; turnId: string }> {
     const turn = await this.runTurn(input.documentId, 'review_facts', {
       prompt: buildRepairFactValidationPrompt({
@@ -1164,7 +1285,10 @@ export class DocumentExtractionPipeline {
     }
     const normalized: ExtractionResult = {
       ...parsed.data,
-      candidates: normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans)
+      candidates: scopeCandidateKeys(
+        normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans),
+        input.chunkIndex
+      )
     };
     if (!repairPreservesUntargetedCandidates(input.result, normalized, input.failures)
       || candidateValidationFailures(normalized, input.bundle).length > 0) {
@@ -1223,6 +1347,7 @@ export class DocumentExtractionPipeline {
     const coveredSourceSpanIds: string[] = [];
     const reviewReceipts: Array<{ extractTurnId: string; reviewTurnId: string }> = [];
     const reviewedSubjects: ExtractionResult['subject'][] = [];
+    const reviewedMetadata: Array<ReportMetadataCandidate | null | undefined> = [];
     const pendingCandidateDiffs: ReviewCandidateDiff[] = [];
     let abnormalFlagAdjudicationUnclear = false;
     let factAdjudicationUnclear = false;
@@ -1353,7 +1478,7 @@ export class DocumentExtractionPipeline {
         }
         const normalizedExtracted: ExtractionResult = {
           ...extracted,
-          candidates: normalizeCandidates(extracted.candidates, spans)
+          candidates: scopeCandidateKeys(normalizeCandidates(extracted.candidates, spans), chunkIndex)
         };
 
         let review = await this.runTurn(documentId, 'review_facts', {
@@ -1401,11 +1526,12 @@ export class DocumentExtractionPipeline {
         }
         const normalizedReviewed: ExtractionResult = {
           ...reviewed,
-          candidates: normalizeCandidates(reviewed.candidates, spans)
+          candidates: scopeCandidateKeys(normalizeCandidates(reviewed.candidates, spans), chunkIndex)
         };
         const aligned = omitOmittableOneSidedCandidates(normalizedExtracted, normalizedReviewed);
-        const comparison = compareIndependentExtractions(aligned.first, aligned.second);
-        let resolvedChunk: ExtractionResult | null = aligned.second;
+        const reviewedWithMergedEvidence = mergeIndependentlyConfirmedEvidence(aligned.first, aligned.second);
+        const comparison = compareIndependentExtractions(aligned.first, reviewedWithMergedEvidence);
+        let resolvedChunk: ExtractionResult | null = reviewedWithMergedEvidence;
         let unresolvedChunkDifferences: ReviewCandidateDiff[] = [];
         let resolutionTurnId = review.turnId;
         if (!comparison.compatible) {
@@ -1416,9 +1542,10 @@ export class DocumentExtractionPipeline {
               imagePaths,
               expectedSpanIds,
               first: aligned.first,
-              second: aligned.second,
+              second: reviewedWithMergedEvidence,
               differences: comparison.differences,
-              bundle
+              bundle,
+              chunkIndex
             });
             lastReceipt = { threadId: adjudicated.threadId, turnId: adjudicated.turnId };
             resolvedChunk = adjudicated.result;
@@ -1431,7 +1558,7 @@ export class DocumentExtractionPipeline {
               documentId,
               sourcePackage,
               imagePaths,
-              second: aligned.second,
+              second: reviewedWithMergedEvidence,
               differences: comparison.differences
             });
             lastReceipt = { threadId: adjudicated.threadId, turnId: adjudicated.turnId };
@@ -1443,16 +1570,17 @@ export class DocumentExtractionPipeline {
         }
 
         if (!resolvedChunk) {
-          const reviewedKeys = new Set(aligned.second.candidates.map((candidate) => candidate.localKey));
+          const reviewedKeys = new Set(reviewedWithMergedEvidence.candidates.map((candidate) => candidate.localKey));
           const missingCandidates = aligned.first.candidates.filter((candidate) => (
             !reviewedKeys.has(candidate.localKey)
             && comparison.differences.some((difference) => difference.localKey === candidate.localKey && difference.fields.includes('presence'))
           ));
-          const reviewCandidates = [...aligned.second.candidates, ...missingCandidates];
+          const reviewCandidates = [...reviewedWithMergedEvidence.candidates, ...missingCandidates];
           // 自动裁决仍无法确认时，也先读完整份报告，最后只生成一个汇总核对事项。
           reviewedCandidates.push(...(reviewCandidates.length > 0 ? reviewCandidates : aligned.first.candidates));
           pendingCandidateDiffs.push(...comparison.differences);
           reviewedSubjects.push(aligned.second.subject);
+          reviewedMetadata.push(aligned.second.reportMetadata);
           coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
           reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: resolutionTurnId });
           if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
@@ -1488,7 +1616,8 @@ export class DocumentExtractionPipeline {
             expectedSpanIds,
             result: resolvedChunk,
             failures: validationFailures,
-            bundle
+            bundle,
+            chunkIndex
           });
           lastReceipt = { threadId: repaired.threadId, turnId: repaired.turnId };
           resolutionTurnId = repaired.turnId;
@@ -1512,6 +1641,7 @@ export class DocumentExtractionPipeline {
 
         reviewedCandidates.push(...resolvedChunk.candidates);
         reviewedSubjects.push(aligned.second.subject);
+        reviewedMetadata.push(resolvedChunk.reportMetadata ?? aligned.second.reportMetadata);
         coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
         reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: resolutionTurnId });
         if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
@@ -1567,6 +1697,7 @@ export class DocumentExtractionPipeline {
       schemaVersion: 1,
       documentId,
       subject: aggregateReviewedSubject(reviewedSubjects),
+      reportMetadata: aggregateReportMetadata(reviewedMetadata),
       coveredSourceSpanIds: uniqueCoveredSpanIds,
       candidates: reviewedCandidates
     };
@@ -1633,6 +1764,7 @@ export class DocumentExtractionPipeline {
       expectedRevision,
       changeSetHash: stableHash({ documentId, reviewed, rulesVersion: ACCEPTANCE_RULES_VERSION }),
       summary: `从 1 份资料接纳 ${accepted.length} 条有来源事实`,
+      reportMetadata: reviewed.reportMetadata ?? null,
       observations: accepted,
       ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
     });

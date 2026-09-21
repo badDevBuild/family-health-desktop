@@ -1,8 +1,9 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { AccountState, DerivedSafetyReview, DerivedSnapshotCandidate, ExtractionResult } from '@contracts';
+import type { AccountState, DerivedSafetyReview, DerivedSnapshotCandidate, ExtractionResult, LifestyleGuidanceCandidate } from '@contracts';
 import { DerivedHealthPipeline } from './derived-pipeline.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
@@ -38,7 +39,34 @@ async function setup() {
     runStructuredTurn: async () => ({ threadId: 'extract-thread', turnId: 'extract-turn', output: extraction })
   }).process(documentId);
   const observationId = service.store.listAcceptedObservations(personId)[0]!.id;
-  return { service, personId, documentId, observationId };
+  return { service, root, personId, documentId, observationId };
+}
+
+function guidanceFixture(input: Pick<LifestyleGuidanceCandidate, 'id' | 'title' | 'detail' | 'evidenceObservationIds'> & Partial<LifestyleGuidanceCandidate>): LifestyleGuidanceCandidate {
+  return {
+    dedupeKey: 'daily-activity',
+    category: 'exercise',
+    goal: '建立可持续的日常活动习惯',
+    rationale: '用低负担方式开始，并根据身体感受调整。',
+    steps: ['选择感觉舒适的日常步行'],
+    startingOptions: ['先从一次短距离步行开始'],
+    scheduleSuggestion: null,
+    trackingSuggestion: '只记录是否完成和身体感受。',
+    constraints: ['出现不适时停止并咨询专业人员'],
+    uncertainties: [],
+    generalKnowledgeEvidence: [{
+      id: 'knowledge-test-1',
+      sourceTitle: '合成测试用一般活动说明',
+      sourceOrganization: '测试机构',
+      sourceUrl: 'https://example.invalid/guidance',
+      reviewedAt: '2026-09-18',
+      supportedScope: '仅支持从可承受的低强度活动开始这一通用方向'
+    }],
+    sourceKind: 'ai_proposed',
+    relatedSystemIds: ['cardiovascular'],
+    consultProfessional: true,
+    ...input
+  };
 }
 
 describe('DerivedHealthPipeline', () => {
@@ -60,11 +88,17 @@ describe('DerivedHealthPipeline', () => {
         evidenceObservationIds: [observationId],
         boundaryNote: '这不是诊断，需结合医生判断。'
       }],
-      lifestyleGuidance: [{
+      lifestyleGuidance: [guidanceFixture({
         id: 'guide-1', title: '保持规律活动',
         detail: '可以从身体感觉舒适的步行开始，如有不适应先咨询医生。',
         evidenceObservationIds: [observationId], consultProfessional: true
-      }]
+      }), guidanceFixture({
+        id: 'guide-duplicate', title: '增加日常活动',
+        detail: '从本人可以承受的活动开始。',
+        steps: ['在方便的时间安排一次短距离活动'],
+        relatedSystemIds: ['cardiovascular', 'endocrine_metabolic'],
+        evidenceObservationIds: [observationId], consultProfessional: true
+      })]
     };
     const review: DerivedSafetyReview = {
       schemaVersion: 1, personId, factRevision: 1, overallSafe: true,
@@ -83,6 +117,101 @@ describe('DerivedHealthPipeline', () => {
     }).process(personId);
     expect(result).toMatchObject({ status: 'published' });
     expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);
+    const proposal = service.store.listLifestyleProposals(personId)[0]!;
+    expect(proposal).toMatchObject({
+      personId,
+      title: '保持规律活动',
+      status: 'proposed',
+      evidenceObservationIds: [observationId],
+      dedupeKey: 'daily-activity',
+      steps: ['选择感觉舒适的日常步行', '在方便的时间安排一次短距离活动'],
+      relatedSystemIds: ['cardiovascular', 'endocrine_metabolic']
+    });
+    const materialized = new Database(service.store.databasePath, { readonly: true });
+    try {
+      expect(materialized.prepare(`SELECT COUNT(*) AS count FROM knowledge_entries`).get()).toEqual({ count: 1 });
+      const proposalRow = materialized.prepare(`SELECT structure_json FROM lifestyle_proposals_v2 WHERE id = ?`).get(proposal.id) as { structure_json: string };
+      expect(JSON.parse(proposalRow.structure_json)).toMatchObject({
+        goal: '建立可持续的日常活动习惯',
+        relatedSystemIds: ['cardiovascular', 'endocrine_metabolic'],
+        generalKnowledgeEvidence: [expect.objectContaining({ sourceOrganization: '测试机构' })]
+      });
+    } finally {
+      materialized.close();
+    }
+    const adoptionInput = {
+      personId,
+      proposalId: proposal.id,
+      userGoal: '建立能持续的日常活动习惯',
+      selectedStartingOption: '餐后轻量步行',
+      plannedTime: '工作日晚饭后',
+      owner: '本人',
+      progressNote: '先观察一周的身体感受',
+      dueDate: '2026-10-01'
+    };
+    const dismissed = service.setLifestyleProposalDecision({ personId, proposalId: proposal.id, decision: 'dismiss' });
+    expect(dismissed).toMatchObject({ proposalId: proposal.id, status: 'dismissed' });
+    expect(() => service.adoptLifestyleProposal(adoptionInput)).toThrow('LIFESTYLE_PROPOSAL_NOT_AVAILABLE');
+    const currentCandidate = service.store.listCurrentDerivedSnapshots()[0]!.payload;
+    service.store.publishDerivedSnapshot({
+      candidate: {
+        ...currentCandidate,
+        lifestyleGuidance: currentCandidate.lifestyleGuidance.map((item) => ({ ...item, title: '保持规律活动（更新）' }))
+      },
+      expectedFactRevision: service.store.getFactRevision(personId),
+      expectedContextRevision: service.store.getClinicalContextRevision(personId),
+      promptVersion: 'derived-v3',
+      rulesVersion: 'derived-safety-v2',
+      modelId: 'test-refresh-model'
+    });
+    const refreshedProposal = service.store.listLifestyleProposals(personId).find((item) => item.id !== proposal.id)!;
+    expect(refreshedProposal).toMatchObject({ dedupeKey: proposal.dedupeKey, status: 'dismissed' });
+    expect(service.store.listLifestyleProposals(personId)).toHaveLength(1);
+    const refreshedAdoptionInput = { ...adoptionInput, proposalId: refreshedProposal.id };
+    expect(service.setLifestyleProposalDecision({ personId, proposalId: refreshedProposal.id, decision: 'restore' })).toMatchObject({ status: 'proposed' });
+    const adopted = service.adoptLifestyleProposal(refreshedAdoptionInput);
+    expect(adopted).toMatchObject({
+      proposalId: refreshedProposal.id,
+      title: refreshedProposal.title,
+      userGoal: adoptionInput.userGoal,
+      selectedStartingOption: adoptionInput.selectedStartingOption,
+      plannedTime: adoptionInput.plannedTime,
+      owner: adoptionInput.owner,
+      progressNote: adoptionInput.progressNote,
+      dueDate: adoptionInput.dueDate,
+      status: 'planned'
+    });
+    expect(service.adoptLifestyleProposal(refreshedAdoptionInput)).toEqual(adopted);
+    expect(service.getLifestylePlan(personId)).toMatchObject({
+      proposals: [expect.objectContaining({ id: refreshedProposal.id, status: 'adopted' })],
+      adoptedActions: [expect.objectContaining({ id: adopted.id, proposalId: refreshedProposal.id, status: 'planned' })]
+    });
+    const postAdoptionCandidate = service.store.listCurrentDerivedSnapshots()[0]!.payload;
+    service.store.publishDerivedSnapshot({
+      candidate: {
+        ...postAdoptionCandidate,
+        lifestyleGuidance: postAdoptionCandidate.lifestyleGuidance.map((item) => ({
+          ...item,
+          title: '保持规律活动（新报告更新）',
+          detail: '新报告已纳入分析，但同一行动方向无需再次确认。'
+        }))
+      },
+      expectedFactRevision: service.store.getFactRevision(personId),
+      expectedContextRevision: service.store.getClinicalContextRevision(personId),
+      promptVersion: 'derived-v4',
+      rulesVersion: 'derived-safety-v2',
+      modelId: 'test-post-adoption-refresh-model'
+    });
+    expect(service.store.listCurrentDerivedSnapshots()[0]!.payload.lifestyleGuidance[0]).toMatchObject({
+      dedupeKey: refreshedProposal.dedupeKey,
+      title: '保持规律活动（新报告更新）'
+    });
+    expect(service.store.listLifestyleProposals(personId)).toEqual([
+      expect.objectContaining({ id: refreshedProposal.id, status: 'adopted' })
+    ]);
+    expect(service.store.listActionAdoptions(personId)).toEqual([
+      expect.objectContaining({ id: adopted.id, proposalId: refreshedProposal.id, status: 'planned' })
+    ]);
     expect(service.getSnapshot(null)).toMatchObject({
       persons: [expect.objectContaining({ derivedStatus: 'current', assessmentSummary: candidate.claims[0]!.explanation })],
       guidance: [expect.objectContaining({ id: 'guide-1', personId })]
@@ -229,10 +358,10 @@ describe('DerivedHealthPipeline', () => {
         title: '报告事实', explanation: 'LDL-C 4.2 mmol/L，原报告标记偏高。',
         evidenceObservationIds: [observationId], boundaryNote: null
       }],
-      lifestyleGuidance: [{
+      lifestyleGuidance: [guidanceFixture({
         id: 'guidance-unsupported', title: '饮水安排', detail: '按固定时段增加饮水。',
-        evidenceObservationIds: [observationId], consultProfessional: false
-      }]
+        dedupeKey: 'hydration', category: 'other', evidenceObservationIds: [observationId], consultProfessional: false
+      })]
     };
     const review: DerivedSafetyReview = {
       schemaVersion: 1, personId, factRevision: 1, overallSafe: true,

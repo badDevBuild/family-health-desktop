@@ -12,17 +12,23 @@ const EXTRACTION_HARD_RULES: string[] = [
 const EXTRACTION_FIELD_GUIDE: string[] = [
   'schemaVersion 固定为 1；documentId 必须与 SOURCE_PACKAGE.documentId 完全一致。',
   'subject：报告明示姓名时 confidence=explicit，reportedName 逐字摘录并给出 evidence；找不到姓名时 reportedName=null、confidence=absent、evidence=[]；看见疑似姓名但无法确认时 confidence=uncertain。不得根据目标成员显示名反推。',
-  'localKey：本块内稳定可读的短键，例如 ldl-c、收缩压；不要用随机 UUID。同一指标在本块只出现一次。',
+  'localKey：本块内稳定可读的短键，例如 ldl-c-2023、ldl-c-2024；不要用随机 UUID。同一指标若有多个明确日期结果列，必须每列各建一个候选并使用不同 localKey。',
+  'evidence.sourceRole：一条观测的主要依据标 primary。只有检查编号/样本编号或报告结构明确证明摘要页与明细页是同一次真实检测时，才合成一个候选，把其他来源标 duplicate_source，并在 duplicateBasis 填 report_structure、exam_item_id 或 sample_id。同日、同名、同数值或同一姓名都不足以判定重复；可疑重复必须保留为两个独立候选。',
   'originalName 用报告原文；standardNameCandidate 填通用中文或常见缩写（如 LDL-C），不确定则 null。',
   'value.kind：数字用 numeric（decimal 不含千分位和单位，comparator 默认 eq，原文有 < > 时用 lt/gt）；阴阳性/等级用 qualitative；叙述结论用 text；看不清用 unknown 并填写 reason。',
   'unitRaw、referenceRangeRaw、specimen、method、bodySite：原文没有则 null，不要补全。',
-  'clinicalDate 只填 YYYY-MM-DD 真实日历日。年度对比表若只在表头写日期，把当前结果列对应的日期填到该行；跨页“××小结”可把上一页同科室标题附近的日期作为额外 evidence。对不上则 null。',
+  'clinicalDate 只填 YYYY-MM-DD 真实日历日。年度对比表的每个明确日期结果列都要分别提取，并把该列日期表头与项目/结果单元格一起加入 evidence；不能只保留最后一列，也不能把历史值写成新报告日期。跨页“××小结”仅在证据明确绑定时继承日期，对不上则 null。',
+  'reportMetadata：只填写报告明确写出的报告类型/标题、执行机构、院区、科室、报告号、检查项目和时间；每个字段必须有自己的 evidence。没有就填 null 或空数组，不能从文件名、目录、目标成员、所在地或网页推测。',
+  'reportMetadata.encounterIdentifier / sampleIdentifiers：只有原报告明示就诊号、体检批次号、检查单号或样本号时才填写。字段必须携带包含标识原文的 evidence；同日、同机构、同姓名或同数值不得生成标识。',
+  'reportMetadata.times：采样 sampled、检查 examined、就诊 encounter、签发 report_issued、报告引用的历史日期 history_quoted 必须分开；只明确到年或月时保留 year/month 精度，不得补成 1 月 1 日或当月 1 日。当前报告机构不能自动套给 history_quoted 历史结果。',
   '血压写成 120/80 时可作为一个候选 originalName=血压；不要输出互相矛盾的收缩压/舒张压。',
   'issues 只在无法确定时添加。符号含义不清时 code=blocking_abnormal_marker_unclear。'
 ];
 
 const EXTRACTION_EXAMPLES: string[] = [
-  '趋势列：表头为“2023-10-08 2024-10-22 趋势”，数据行“体重 91 94 ▲”。体重候选 clinicalDate 用 2024-10-22，reportedAbnormalFlag=null，因为 ▲ 位于趋势列。',
+  '历史列：表头为“2023-10-08 2024-10-22 趋势”，数据行“体重 91 94 ▲”。必须输出体重-2023 与体重-2024 两个候选，clinicalDate 分别绑定各自表头；两者 reportedAbnormalFlag 都为 null，因为 ▲ 位于趋势列。',
+  '重复来源：报告摘要和检验明细用同一检查编号展示同一次 LDL-C 4.20。输出一个候选，主明细依据标 primary，摘要依据标 duplicate_source，duplicateBasis=exam_item_id。如果只是同日同值而没有结构或编号证据，仍输出两个候选。',
+  '日期精度：报告只写“2024 年”时，reportMetadata.times.value=2024、precision=year；不得填写 2024-01-01。签发日和采样日同时出现时保留两条不同 role。',
   '提示列：LDL-C 4.20 mmol/L，参考 0-3.37，提示列写 H 或偏高。reportedAbnormalFlag=偏高。',
   'subject：页眉写“姓名：张三”，subject.reportedName=张三，confidence=explicit，evidence.quote 含“姓名：张三”。'
 ];

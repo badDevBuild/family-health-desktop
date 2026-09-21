@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -92,6 +92,418 @@ describe('WorkspaceStore', () => {
     expect(backup.pragma('user_version', { simple: true })).toBe(2);
     expect(backup.prepare('SELECT id, settings_revision FROM workspaces').get()).toEqual({ id: 'workspace-v2', settings_revision: 4 });
     backup.close();
+    store.close();
+  });
+
+  it('schema v33 建立成员档案注册表、版本化派生表与可撤销纠错表', () => {
+    const store = makeStore();
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.pragma('user_version', { simple: true })).toBe(33);
+    const tables = new Set((database.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>).map((row) => row.name));
+    for (const table of [
+      'body_system_registry',
+      'concept_definitions',
+      'observation_concept_mappings',
+      'system_fact_links',
+      'health_events_v2',
+      'report_records',
+      'system_analysis_snapshots_v2',
+      'lifestyle_proposals_v2',
+      'action_adoptions_v2',
+      'derivation_dependencies',
+      'concept_mapping_corrections',
+      'event_relation_changes'
+    ]) expect(tables.has(table)).toBe(true);
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM body_system_registry`).get()).toEqual({ count: 12 });
+    expect((database.prepare(`SELECT COUNT(*) AS count FROM concept_definitions`).get() as { count: number }).count).toBeGreaterThanOrEqual(10);
+    expect(database.prepare(`SELECT canonical_name FROM concept_definitions WHERE id = 'thyroid-ft4'`).get()).toEqual({ canonical_name: '游离甲状腺素' });
+    expect(database.prepare(`SELECT canonical_name FROM concept_definitions WHERE id = 'thyroid-total-t4'`).get()).toEqual({ canonical_name: '总甲状腺素' });
+    expect((database.pragma('table_info(lifestyle_proposals_v2)') as Array<{ name: string }>).some((column) => column.name === 'structure_json')).toBe(true);
+    expect((database.pragma('table_info(action_adoptions_v2)') as Array<{ name: string }>).some((column) => column.name === 'details_json')).toBe(true);
+    database.close();
+    store.close();
+  });
+
+  it('概念修正保留原始事实、使旧新系统快照同时过期，并可撤销', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('LDL-C 3.8 mmol/L'), mediaType: 'text/plain', displayName: 'concept-fixture.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const spanId = 'span-concept-correction';
+    store.saveSourceManifest({
+      id: 'manifest-concept-correction', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: 'concept-fixture.txt', totalUnits: 1,
+      coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z',
+      spans: [{ id: spanId, documentId: document.documentId, spanKind: 'line', page: null, blockId: null, lineStart: 1, lineEnd: 1, quote: 'LDL-C 3.8 mmol/L', readability: 'clear' }]
+    });
+    const acceptanceId = store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'concept-input',
+      outputHash: 'concept-output', reviewRef: null, decision: 'accept'
+    });
+    store.publishFacts({
+      personId: person.id, documentId: document.documentId,
+      documentCommitKey: 'a'.repeat(64), expectedRevision: 0, changeSetHash: 'b'.repeat(64), summary: '合成概念修正夹具',
+      observations: [{
+        conceptKey: 'LDL-C', rawText: '3.8', valueKind: 'numeric', decimalValue: '3.8', qualifier: 'eq',
+        unit: 'mmol/L', referenceRange: '0-3.4', clinicalDate: '2026-09-18', abnormalFlag: 'high',
+        documentId: document.documentId, sourceSpanId: spanId, acceptanceId, specimen: '血清', method: null, bodySite: null,
+        evidence: [{ sourceSpanId: spanId, quote: 'LDL-C 3.8 mmol/L' }]
+      }]
+    });
+    const observation = store.listAcceptedObservations(person.id)[0]!;
+    expect(observation).toMatchObject({ conceptKey: 'LDL-C', mapping: { conceptId: 'loinc-like-ldl-c', status: 'verified' } });
+
+    const database = new Database(store.databasePath);
+    const insertSnapshot = database.prepare(`
+      INSERT INTO system_analysis_snapshots_v2 (
+        id, person_id, system_id, fact_revision, context_revision, prompt_version, rules_version,
+        model_id, evidence_bundle_hash, coverage_json, payload_json, status, created_at
+      ) VALUES (?, ?, ?, 1, 0, 'test', 'test', 'test', ?, '{}', '{}', 'current', '2026-09-18T00:00:00.000Z')
+    `);
+    for (const systemId of ['cardiovascular', 'endocrine_metabolic', 'renal_urinary', 'respiratory']) {
+      insertSnapshot.run(`snapshot-${systemId}`, person.id, systemId, `${systemId}-hash`);
+    }
+    database.close();
+
+    const corrected = store.setObservationConceptMapping({
+      personId: person.id,
+      observationId: observation.id,
+      conceptId: 'renal-creatinine',
+      reason: '合成测试：用户确认概念归类'
+    });
+    expect(corrected).toMatchObject({
+      observationId: observation.id,
+      mapping: { conceptId: 'renal-creatinine', canonicalName: '血清肌酐', status: 'verified' },
+      canUndo: true,
+      factRevision: 2
+    });
+    expect(new Set(corrected.invalidatedSystemIds)).toEqual(new Set(['cardiovascular', 'endocrine_metabolic', 'renal_urinary']));
+    expect(store.listAcceptedObservations(person.id)[0]).toMatchObject({
+      conceptKey: 'LDL-C',
+      rawText: '3.8',
+      mapping: { conceptId: 'renal-creatinine', canonicalName: '血清肌酐' },
+      mappingCanUndo: true
+    });
+    const afterCorrection = new Database(store.databasePath, { readonly: true });
+    expect(afterCorrection.prepare(`SELECT system_id, status FROM system_analysis_snapshots_v2 ORDER BY system_id`).all()).toEqual([
+      { system_id: 'cardiovascular', status: 'stale' },
+      { system_id: 'endocrine_metabolic', status: 'stale' },
+      { system_id: 'renal_urinary', status: 'stale' },
+      { system_id: 'respiratory', status: 'current' }
+    ]);
+    afterCorrection.close();
+
+    const undone = store.undoObservationConceptMapping({ personId: person.id, observationId: observation.id });
+    expect(undone).toMatchObject({ mapping: { conceptId: 'loinc-like-ldl-c' }, canUndo: false, factRevision: 3 });
+    expect(store.listAcceptedObservations(person.id)[0]).toMatchObject({
+      conceptKey: 'LDL-C', mapping: { conceptId: 'loinc-like-ldl-c' }, mappingCanUndo: false
+    });
+    const afterUndo = new Database(store.databasePath, { readonly: true });
+    expect(afterUndo.prepare(`SELECT COUNT(*) AS count FROM concept_mapping_corrections WHERE observation_id = ?`).get(observation.id)).toEqual({ count: 2 });
+    expect(afterUndo.prepare(`SELECT COUNT(*) AS count FROM audit_events WHERE entity_id = ? AND event_type LIKE 'concept_mapping_%'`).get(observation.id)).toEqual({ count: 2 });
+    afterUndo.close();
+    expect(store.integrityCheck()).toBe('ok');
+    store.close();
+  });
+
+  it('同次检查的摘要和明细作为一个观测的多处来源持久保存', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('摘要 LDL-C 4.20\n明细 LDL-C 4.20 mmol/L'),
+      mediaType: 'text/plain', displayName: 'duplicate-source-fixture.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'manifest-duplicate-source', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: 'duplicate-source-fixture.txt', totalUnits: 2,
+      coveredUnitIndexes: [0, 1], normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z',
+      spans: [
+        { id: 'summary-span', documentId: document.documentId, spanKind: 'line', page: 1, blockId: 'summary', lineStart: 1, lineEnd: 1, quote: '摘要 LDL-C 4.20', readability: 'clear' },
+        { id: 'detail-span', documentId: document.documentId, spanKind: 'line', page: 2, blockId: 'detail', lineStart: 2, lineEnd: 2, quote: '明细 LDL-C 4.20 mmol/L', readability: 'clear' }
+      ]
+    });
+    const acceptanceId = store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'duplicate-source-input',
+      outputHash: 'duplicate-source-output', reviewRef: null, decision: 'accept'
+    });
+    store.publishFacts({
+      personId: person.id, documentId: document.documentId,
+      documentCommitKey: '8'.repeat(64), expectedRevision: 0, changeSetHash: '9'.repeat(64), summary: '重复来源夹具',
+      observations: [{
+        conceptKey: 'LDL-C', rawText: '4.20', valueKind: 'numeric', decimalValue: '4.20', qualifier: 'eq',
+        unit: 'mmol/L', referenceRange: null, clinicalDate: '2026-09-18', abnormalFlag: 'unknown',
+        documentId: document.documentId, sourceSpanId: 'detail-span', acceptanceId, specimen: '血清', method: null, bodySite: null,
+        evidence: [
+          { sourceSpanId: 'detail-span', quote: '明细 LDL-C 4.20 mmol/L', sourceRole: 'primary', duplicateBasis: null },
+          { sourceSpanId: 'summary-span', quote: '摘要 LDL-C 4.20', sourceRole: 'duplicate_source', duplicateBasis: 'report_structure' }
+        ]
+      }]
+    });
+
+    const observations = store.listAcceptedObservations(person.id);
+    expect(observations).toHaveLength(1);
+    expect(observations[0]!.evidence).toEqual([
+      expect.objectContaining({ sourceSpanId: 'detail-span', sourceRole: 'primary' }),
+      expect.objectContaining({ sourceSpanId: 'summary-span', sourceRole: 'duplicate_source', duplicateBasis: 'report_structure' })
+    ]);
+    store.close();
+  });
+
+  it('家庭总览按成员读取有界事实窗口，同时用聚合统计保留精确总数', () => {
+    const store = makeStore();
+    const people = ['甲', '乙'].map((suffix) => store.createPerson({ displayName: `合成成员${suffix}`, relation: '测试成员' }));
+    for (const [personIndex, person] of people.entries()) {
+      const source = store.putSourceObject({
+        bytes: Buffer.from(`合成容量窗口 ${personIndex}`),
+        mediaType: 'text/plain',
+        displayName: `window-${personIndex}.txt`
+      });
+      const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+      const spanId = `window-span-${personIndex}`;
+      store.saveSourceManifest({
+        id: `window-manifest-${personIndex}`, sourceObjectId: source.id, sha256: source.sha256,
+        mediaType: 'text/plain', originalDisplayName: `window-${personIndex}.txt`, totalUnits: 1,
+        coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z',
+        spans: [{ id: spanId, documentId: document.documentId, spanKind: 'line', page: null, blockId: null, lineStart: 1, lineEnd: 1, quote: '合成窗口证据', readability: 'clear' }]
+      });
+      const acceptanceId = store.saveAcceptanceDecision({
+        method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: `window-input-${personIndex}`,
+        outputHash: `window-output-${personIndex}`, reviewRef: null, decision: 'accept'
+      });
+      store.publishFacts({
+        personId: person.id, documentId: document.documentId,
+        documentCommitKey: String(personIndex + 3).repeat(64), expectedRevision: 0,
+        changeSetHash: String(personIndex + 5).repeat(64), summary: '合成窗口事实',
+        observations: [0, 1, 2].map((index) => ({
+          conceptKey: `合成指标${index}`, rawText: String(index), valueKind: 'numeric' as const,
+          decimalValue: String(index), qualifier: 'eq', unit: 'unit', referenceRange: '0-1',
+          clinicalDate: `2026-09-${String(10 + index).padStart(2, '0')}`,
+          abnormalFlag: index === 2 ? 'high' as const : 'normal' as const,
+          documentId: document.documentId, sourceSpanId: spanId, acceptanceId,
+          specimen: null, method: null, bodySite: null,
+          evidence: [{ sourceSpanId: spanId, quote: `合成指标${index}` }]
+        }))
+      });
+    }
+
+    const window = store.listAcceptedObservations(undefined, { limitPerPerson: 2 });
+    expect(window).toHaveLength(4);
+    for (const person of people) {
+      expect(window.filter((observation) => observation.personId === person.id).map((observation) => observation.clinicalDate))
+        .toEqual(['2026-09-11', '2026-09-12']);
+      expect(store.listPersonObservationStats().get(person.id)).toEqual({
+        acceptedFactCount: 3,
+        attentionCount: 1,
+        latestClinicalDate: '2026-09-12'
+      });
+    }
+    expect(() => store.listAcceptedObservations(undefined, { limitPerPerson: 0 })).toThrow('OBSERVATION_WINDOW_LIMIT_INVALID');
+    store.close();
+  });
+
+  it('报告元数据按字段保存证据，并将历史列作为独立观测而不继承当前机构', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const sourceText = '合成医院 体检中心 报告号 R-001\n检查日期 2026-09-10 报告日期 2026-09-12\nLDL-C 2024-09-01 3.1 2026-09-10 3.8';
+    const source = store.putSourceObject({ bytes: Buffer.from(sourceText), mediaType: 'text/plain', displayName: 'metadata-fixture.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const spanId = 'span-report-metadata';
+    store.saveSourceManifest({
+      id: 'manifest-report-metadata', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: 'metadata-fixture.txt', totalUnits: 1,
+      coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z',
+      spans: [{ id: spanId, documentId: document.documentId, spanKind: 'line', page: null, blockId: null, lineStart: 1, lineEnd: 3, quote: sourceText, readability: 'clear' }]
+    });
+    const acceptanceId = store.saveAcceptanceDecision({ method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'metadata-input', outputHash: 'metadata-output', reviewRef: null, decision: 'accept' });
+    const observation = (clinicalDate: string, rawText: string) => ({
+      conceptKey: 'LDL-C', rawText, valueKind: 'numeric' as const, decimalValue: rawText, qualifier: 'eq',
+      unit: 'mmol/L', referenceRange: '0-3.4', clinicalDate, abnormalFlag: 'unknown' as const,
+      documentId: document.documentId, sourceSpanId: spanId, acceptanceId, specimen: '血清', method: null, bodySite: null,
+      evidence: [{ sourceSpanId: spanId, quote: `LDL-C ${clinicalDate} ${rawText}` }]
+    });
+    store.publishFacts({
+      personId: person.id, documentId: document.documentId,
+      documentCommitKey: 'c'.repeat(64), expectedRevision: 0, changeSetHash: 'd'.repeat(64), summary: '历史列与报告元数据夹具',
+      reportMetadata: {
+        reportKind: { value: '年度体检报告', evidence: [{ sourceSpanId: spanId, quote: '体检中心' }] },
+        title: { value: '合成年度体检', evidence: [{ sourceSpanId: spanId, quote: '合成医院 体检中心' }] },
+        organization: { value: '合成医院', evidence: [{ sourceSpanId: spanId, quote: '合成医院' }] },
+        campus: null,
+        department: { value: '体检中心', evidence: [{ sourceSpanId: spanId, quote: '体检中心' }] },
+        reportNumber: { value: 'R-001', evidence: [{ sourceSpanId: spanId, quote: '报告号 R-001' }] },
+        encounterIdentifier: { value: 'E-001', evidence: [{ sourceSpanId: spanId, quote: '报告号 R-001' }] },
+        sampleIdentifiers: [],
+        examItems: [{ value: '血脂', evidence: [{ sourceSpanId: spanId, quote: 'LDL-C' }] }],
+        times: [
+          { value: '2026-09-10', precision: 'day', role: 'examined', evidence: [{ sourceSpanId: spanId, quote: '检查日期 2026-09-10' }] },
+          { value: '2026-09-12', precision: 'day', role: 'report_issued', evidence: [{ sourceSpanId: spanId, quote: '报告日期 2026-09-12' }] },
+          { value: '2024-09-01', precision: 'day', role: 'history_quoted', evidence: [{ sourceSpanId: spanId, quote: '2024-09-01 3.1' }] },
+          { value: '2023', precision: 'year', role: 'history_quoted', evidence: [{ sourceSpanId: spanId, quote: 'LDL-C' }] }
+        ]
+      },
+      observations: [observation('2024-09-01', '3.1'), observation('2026-09-10', '3.8')]
+    });
+
+    expect(store.listAcceptedObservations(person.id).map((item) => item.clinicalDate)).toEqual(['2024-09-01', '2026-09-10']);
+    const metadata = store.listReportMetadata(person.id)[0]!;
+    expect(metadata).toMatchObject({
+      title: '合成年度体检', reportKind: '年度体检报告', organization: '合成医院', reportDate: '2026-09-12',
+      extracted: { department: { value: '体检中心' }, reportNumber: { value: 'R-001' } }
+    });
+    expect(metadata.extracted?.times).toContainEqual(expect.objectContaining({ value: '2023', precision: 'year', role: 'history_quoted' }));
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.prepare(`SELECT clinical_date, end_date FROM health_events_v2`).get()).toEqual({ clinical_date: '2026-09-10', end_date: null });
+    const payload = JSON.parse(String((database.prepare(`SELECT payload_json FROM report_metadata_revisions`).get() as { payload_json: string }).payload_json)) as { extracted: { times: Array<{ value: string; role: string }> } };
+    expect(payload.extracted.times).toContainEqual(expect.objectContaining({ value: '2024-09-01', role: 'history_quoted' }));
+    database.close();
+
+    const snapshots = new Database(store.databasePath);
+    const insertSnapshot = snapshots.prepare(`
+      INSERT INTO system_analysis_snapshots_v2 (
+        id, person_id, system_id, fact_revision, context_revision, prompt_version, rules_version,
+        model_id, evidence_bundle_hash, coverage_json, payload_json, status, created_at
+      ) VALUES (?, ?, ?, 1, 0, 'test', 'test', 'test', ?, '{}', '{}', 'current', '2026-09-18T00:00:00.000Z')
+    `);
+    for (const systemId of ['cardiovascular', 'endocrine_metabolic', 'respiratory']) {
+      insertSnapshot.run(`metadata-snapshot-${systemId}`, person.id, systemId, `metadata-${systemId}`);
+    }
+    snapshots.close();
+
+    const corrected = store.updateReportMetadata({
+      personId: person.id,
+      reportId: metadata.reportId,
+      expectedRevision: 1,
+      title: '本人确认的年度体检',
+      organization: '合成医院新院区',
+      department: '健康管理科',
+      clinicalTime: { value: '2026-09', precision: 'month' },
+      reason: '合成测试：核对原报告'
+    });
+    expect(corrected).toMatchObject({ metadataRevision: 2, factRevision: 2, canUndo: true });
+    expect(store.listReportMetadata(person.id)[0]).toMatchObject({
+      title: '本人确认的年度体检', organization: '合成医院新院区', department: '健康管理科',
+      clinicalTime: { value: '2026-09', precision: 'month' }, metadataStatus: 'corrected', metadataRevision: 2, canUndo: true
+    });
+    const correctedSnapshots = new Database(store.databasePath, { readonly: true });
+    expect(correctedSnapshots.prepare(`SELECT system_id, status FROM system_analysis_snapshots_v2 ORDER BY system_id`).all()).toEqual([
+      { system_id: 'cardiovascular', status: 'stale' },
+      { system_id: 'endocrine_metabolic', status: 'stale' },
+      { system_id: 'respiratory', status: 'current' }
+    ]);
+    correctedSnapshots.close();
+    expect(() => store.updateReportMetadata({
+      personId: person.id, reportId: metadata.reportId, expectedRevision: 1,
+      title: '迟到修正', organization: null, department: null,
+      clinicalTime: { value: null, precision: 'unknown' }, reason: '迟到写入'
+    })).toThrow(RevisionConflictError);
+
+    const undone = store.undoReportMetadata({ personId: person.id, reportId: metadata.reportId, expectedRevision: 2 });
+    expect(undone).toMatchObject({ metadataRevision: 3, factRevision: 3, canUndo: false });
+    expect(store.listReportMetadata(person.id)[0]).toMatchObject({
+      title: '合成年度体检', organization: '合成医院', department: '体检中心',
+      clinicalTime: { value: '2026-09-10', precision: 'day' }, metadataStatus: 'inferred', metadataRevision: 3, canUndo: false
+    });
+    const audit = new Database(store.databasePath, { readonly: true });
+    expect(audit.prepare(`SELECT COUNT(*) AS count FROM audit_events WHERE entity_id = ? AND event_type LIKE 'report_metadata_%'`).get(metadata.reportId)).toEqual({ count: 2 });
+    expect(audit.prepare(`SELECT COUNT(*) AS count FROM report_metadata_revisions WHERE report_id = ?`).get(metadata.reportId)).toEqual({ count: 3 });
+    audit.close();
+
+    const publishRelatedReport = (identifier: string, suffix: string, expectedRevision: number) => {
+      const relatedText = `合成医院 检查日期 2026-09-10 检查单号 ${identifier} HDL-C 1.2`;
+      const relatedSource = store.putSourceObject({ bytes: Buffer.from(relatedText), mediaType: 'text/plain', displayName: `related-${suffix}.txt` });
+      const relatedDocument = store.registerImportedDocument({ sourceObjectId: relatedSource.id, personId: person.id });
+      const relatedSpan = `span-related-${suffix}`;
+      store.saveSourceManifest({
+        id: `manifest-related-${suffix}`, sourceObjectId: relatedSource.id, sha256: relatedSource.sha256,
+        mediaType: 'text/plain', originalDisplayName: `related-${suffix}.txt`, totalUnits: 1,
+        coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00.000Z',
+        spans: [{ id: relatedSpan, documentId: relatedDocument.documentId, spanKind: 'line', page: null, blockId: null, lineStart: 1, lineEnd: 1, quote: relatedText, readability: 'clear' }]
+      });
+      const relatedAcceptance = store.saveAcceptanceDecision({ method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: `related-${suffix}`, outputHash: `related-output-${suffix}`, reviewRef: null, decision: 'accept' });
+      store.publishFacts({
+        personId: person.id, documentId: relatedDocument.documentId,
+        documentCommitKey: suffix.repeat(64).slice(0, 64), expectedRevision, changeSetHash: `${suffix}a`.repeat(64).slice(0, 64), summary: '关联报告',
+        reportMetadata: {
+          reportKind: null, title: { value: '合成检验明细', evidence: [{ sourceSpanId: relatedSpan, quote: relatedText }] },
+          organization: { value: '合成医院', evidence: [{ sourceSpanId: relatedSpan, quote: '合成医院' }] },
+          campus: null, department: null, reportNumber: null,
+          encounterIdentifier: { value: identifier, evidence: [{ sourceSpanId: relatedSpan, quote: `检查单号 ${identifier}` }] }, sampleIdentifiers: [], examItems: [],
+          times: [{ value: '2026-09-10', precision: 'day', role: 'examined', evidence: [{ sourceSpanId: relatedSpan, quote: '检查日期 2026-09-10' }] }]
+        },
+        observations: [{
+          conceptKey: 'HDL-C', rawText: '1.2', valueKind: 'numeric', decimalValue: '1.2', qualifier: 'eq', unit: 'mmol/L',
+          referenceRange: null, clinicalDate: '2026-09-10', abnormalFlag: 'unknown', documentId: relatedDocument.documentId,
+          sourceSpanId: relatedSpan, acceptanceId: relatedAcceptance, specimen: '血清', method: null, bodySite: null,
+          evidence: [{ sourceSpanId: relatedSpan, quote: 'HDL-C 1.2' }]
+        }]
+      });
+    };
+    publishRelatedReport('E-001', 'e', 3);
+    publishRelatedReport('E-OTHER', 'f', 4);
+    const groupedReports = store.listReportMetadata(person.id);
+    const sameBatchEvents = new Set(groupedReports
+      .filter((item) => item.extracted?.encounterIdentifier?.value === 'E-001')
+      .map((item) => item.eventId));
+    const otherBatchEvent = groupedReports.find((item) => item.extracted?.encounterIdentifier?.value === 'E-OTHER')!.eventId;
+    expect(sameBatchEvents.size).toBe(1);
+    expect(sameBatchEvents.has(otherBatchEvent)).toBe(false);
+    const sameBatchEvent = [...sameBatchEvents][0]!;
+    const groupedDatabase = new Database(store.databasePath, { readonly: true });
+    expect(groupedDatabase.prepare(`SELECT COUNT(*) AS count FROM health_events_v2`).get()).toEqual({ count: 2 });
+    groupedDatabase.close();
+
+    const merged = store.mergeHealthEvents({
+      personId: person.id,
+      targetEventId: sameBatchEvent,
+      sourceEventId: otherBatchEvent,
+      reason: '合成测试：本人确认属于同一次检查'
+    });
+    expect(merged).toMatchObject({ factRevision: 6, canUndo: true, eventIds: [sameBatchEvent, otherBatchEvent] });
+    expect(new Set(store.listReportMetadata(person.id).map((item) => item.eventId))).toEqual(new Set([sameBatchEvent]));
+    expect(store.getLatestActiveEventRelationChange(person.id, sameBatchEvent)).toMatchObject({ id: merged.changeId, action: 'merge' });
+
+    const mergeUndo = store.undoHealthEventRelation({ personId: person.id, changeId: merged.changeId });
+    expect(mergeUndo).toMatchObject({ factRevision: 7, canUndo: false });
+    expect(new Set(store.listReportMetadata(person.id).map((item) => item.eventId))).toEqual(new Set([sameBatchEvent, otherBatchEvent]));
+    expect(store.getLatestActiveEventRelationChange(person.id, sameBatchEvent)).toBeNull();
+
+    const reportToSplit = groupedReports.find((item) => item.extracted?.encounterIdentifier?.value === 'E-001' && item.reportId !== metadata.reportId)!;
+    const split = store.splitHealthEvent({
+      personId: person.id,
+      eventId: sameBatchEvent,
+      reportId: reportToSplit.reportId,
+      reason: '合成测试：本人确认不是同一次检查'
+    });
+    expect(split).toMatchObject({ factRevision: 8, canUndo: true, reportIds: [reportToSplit.reportId] });
+    expect(new Set(store.listReportMetadata(person.id)
+      .filter((item) => item.extracted?.encounterIdentifier?.value === 'E-001')
+      .map((item) => item.eventId)).size).toBe(2);
+    expect(store.getLatestActiveEventRelationChange(person.id, sameBatchEvent)).toMatchObject({ id: split.changeId, action: 'split' });
+
+    const splitUndo = store.undoHealthEventRelation({ personId: person.id, changeId: split.changeId });
+    expect(splitUndo).toMatchObject({ factRevision: 9, canUndo: false });
+    expect(new Set(store.listReportMetadata(person.id)
+      .filter((item) => item.extracted?.encounterIdentifier?.value === 'E-001')
+      .map((item) => item.eventId))).toEqual(new Set([sameBatchEvent]));
+    expect(store.getLatestActiveEventRelationChange(person.id, sameBatchEvent)).toBeNull();
+
+    const relationAudit = new Database(store.databasePath, { readonly: true });
+    expect(relationAudit.prepare(`SELECT COUNT(*) AS count FROM event_relation_changes`).get()).toEqual({ count: 4 });
+    expect(relationAudit.prepare(`SELECT COUNT(*) AS count FROM audit_events WHERE event_type LIKE 'health_event%'`).get()).toEqual({ count: 4 });
+    relationAudit.close();
+
+    const splitBeforeDelete = store.splitHealthEvent({
+      personId: person.id,
+      eventId: sameBatchEvent,
+      reportId: reportToSplit.reportId,
+      reason: '合成测试：拆分后删除来源报告'
+    });
+    expect(splitBeforeDelete.canUndo).toBe(true);
+    expect(() => store.deleteDocument({ documentId: reportToSplit.documentId, retainedByRecoveryPoint: true })).not.toThrow();
+    expect(store.getLatestActiveEventRelationChange(person.id, sameBatchEvent)).toBeNull();
+    expect(store.listReportMetadata(person.id).some((item) => item.reportId === reportToSplit.reportId)).toBe(false);
+    expect(store.integrityCheck()).toBe('ok');
     store.close();
   });
 
@@ -334,7 +746,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -390,7 +802,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -446,7 +858,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -502,7 +914,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -558,7 +970,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -614,7 +1026,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -670,7 +1082,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -726,7 +1138,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -783,7 +1195,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -840,7 +1252,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -897,7 +1309,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -953,7 +1365,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -997,7 +1409,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -1036,7 +1448,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -1081,7 +1493,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -1126,7 +1538,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -1181,7 +1593,7 @@ describe('WorkspaceStore', () => {
     ]));
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0, totalUnits: 2 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     const checkpoint = JSON.parse((upgraded.prepare('SELECT checkpoint_json FROM jobs WHERE id = ?').get(job.id) as { checkpoint_json: string }).checkpoint_json) as { documentIds: string[] };
     expect(checkpoint.documentIds).toEqual(documentIds);
     upgraded.close();
@@ -1239,7 +1651,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toContainEqual({ id: document.documentId, personId: person.id });
     expect(store.listStoredJobs()[0]).toMatchObject({ id: job.id, status: 'queued', stage: 'extract', completedUnits: 0 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(28);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(33);
     upgraded.close();
     store.close();
   });
@@ -1365,6 +1777,31 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('已提交事实的资料重新纳入时保持已完成，不会留下无法消失的待处理状态', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('纯虚构已提交报告'), mediaType: 'text/plain', displayName: '已提交.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.publishFacts({
+      personId: person.id,
+      documentId: document.documentId,
+      documentCommitKey: 'a'.repeat(64),
+      expectedRevision: 0,
+      changeSetHash: 'b'.repeat(64),
+      summary: '虚构零观察提交',
+      observations: []
+    });
+
+    store.setDocumentIncluded({ documentId: document.documentId, included: false });
+    expect(store.setDocumentIncluded({ documentId: document.documentId, included: true }))
+      .toEqual({ included: true, personId: person.id });
+    expect(store.listImportedDocuments()).toEqual([
+      expect.objectContaining({ id: document.documentId, status: 'completed' })
+    ]);
+    expect(store.listReadyDocuments()).toEqual([]);
+    store.close();
+  });
+
   it('删除报告会清除当前事实链、删除未共享原件并留下可解除的导入抑制记录', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '测试成员', relation: '本人' });
@@ -1389,6 +1826,10 @@ describe('WorkspaceStore', () => {
       observations: [{ conceptKey: 'LDL-C', rawText: '3.8', valueKind: 'numeric', decimalValue: '3.8', qualifier: 'eq', unit: 'mmol/L', referenceRange: '0-3.4', clinicalDate: '2026-09-18', abnormalFlag: 'high', documentId: document.documentId, sourceSpanId: spanId, acceptanceId, specimen: null, method: null, bodySite: null, evidence: [{ sourceSpanId: spanId, quote: 'LDL 3.8 mmol/L' }] }]
     });
     expect(store.listAcceptedObservations()).toHaveLength(1);
+    const semanticIndexBefore = new Database(store.databasePath, { readonly: true });
+    expect(semanticIndexBefore.prepare(`SELECT COUNT(*) AS count FROM report_records`).get()).toEqual({ count: 1 });
+    expect(semanticIndexBefore.prepare(`SELECT COUNT(*) AS count FROM health_events_v2`).get()).toEqual({ count: 1 });
+    semanticIndexBefore.close();
     const sourcePath = join(store.vaultDirectory, source.vaultRelativePath);
     expect(existsSync(sourcePath)).toBe(true);
 
@@ -1397,6 +1838,10 @@ describe('WorkspaceStore', () => {
     });
     expect(store.listImportedDocuments()).toEqual([]);
     expect(store.listAcceptedObservations()).toEqual([]);
+    const semanticIndexAfter = new Database(store.databasePath, { readonly: true });
+    expect(semanticIndexAfter.prepare(`SELECT COUNT(*) AS count FROM report_records`).get()).toEqual({ count: 0 });
+    expect(semanticIndexAfter.prepare(`SELECT COUNT(*) AS count FROM health_events_v2`).get()).toEqual({ count: 0 });
+    semanticIndexAfter.close();
     expect(existsSync(sourcePath)).toBe(false);
     expect(store.isSourceImportSuppressed(source.sha256)).toBe(true);
     expect(store.listDeletedDocuments()).toEqual([expect.objectContaining({ displayName: '待删除.txt', personId: person.id, rawObjectRetained: false })]);

@@ -13,7 +13,9 @@ import {
   buildRepairFactValidationPrompt,
   buildRepairDerivedPrompt,
   buildReviewDerivedPrompt,
+  buildReviewSystemAnalysisPrompt,
   buildReviewFactsPrompt,
+  buildSystemAnalysisPrompt,
   promptMetaForStage
 } from './index.js';
 
@@ -40,13 +42,13 @@ function instructionPart(prompt: string): string {
 describe('pipeline prompts', () => {
   it('版本号与阶段签名保持一致', () => {
     expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v3');
-    expect(DERIVED_PROMPT_VERSION).toBe('derived-v2');
+    expect(DERIVED_PROMPT_VERSION).toBe('derived-v3');
     expect(promptMetaForStage('extract')).toEqual({
       promptVersion: 'extract-v3',
       rulesVersion: ACCEPTANCE_RULES_VERSION
     });
     expect(promptMetaForStage('analyze')).toEqual({
-      promptVersion: 'derived-v2',
+      promptVersion: 'derived-v3',
       rulesVersion: DERIVED_SAFETY_RULES_VERSION
     });
   });
@@ -57,6 +59,10 @@ describe('pipeline prompts', () => {
     expect(instructions).toContain('你是健康报告事实提取器');
     expect(instructions).toContain('位于“趋势”列');
     expect(instructions).toContain('不得根据目标成员显示名反推');
+    expect(instructions).toContain('每个明确日期结果列都要分别提取');
+    expect(instructions).toContain('不能只保留最后一列');
+    expect(instructions).toContain('只明确到年或月时保留 year/month 精度');
+    expect(instructions).toContain('不能从文件名、目录、目标成员、所在地或网页推测');
     expect(instructions).not.toContain('SOURCE_PACKAGE=');
     expect(prompt).toContain('## 输入\nSOURCE_PACKAGE=');
     expect(prompt).toContain('span-visual-1');
@@ -146,6 +152,10 @@ describe('pipeline prompts', () => {
     expect(instructions).toContain('association 关联层');
     expect(instructions).toContain('搜索词必须去标识化');
     expect(instructions).toContain('不得建议开始、停止、调整任何药物');
+    expect(instructions).toContain('dedupeKey');
+    expect(instructions).toContain('generalKnowledgeEvidence');
+    expect(instructions).toContain('只有确实打开并核对过的 HTTPS 来源才可写入 generalKnowledgeEvidence');
+    expect(instructions).toContain('goal、rationale、steps、startingOptions');
     expect(prompt).toContain('userReportedNotes');
     expect(prompt).toContain('本人补充：近期作息不规律');
   });
@@ -168,6 +178,26 @@ describe('pipeline prompts', () => {
     });
     expect(instructionPart(prompt)).toContain('必须恰好覆盖候选中的每个 claimId 和 guidanceId');
     expect(instructionPart(prompt)).toContain('搜索词必须去标识化');
+    expect(instructionPart(prompt)).toContain('generalKnowledgeEvidence 的网页来源真实存在、机构/标题/适用范围与建议一致');
+    expect(instructionPart(prompt)).toContain('必须用去标识化搜索独立核对');
     expect(prompt).toContain('DERIVED_CANDIDATE=');
+  });
+
+  it('系统分析只使用完整证据包和程序趋势', () => {
+    const prompt = buildSystemAnalysisPrompt('{"identity":{"systemId":"cardiovascular"}}');
+    const instructions = instructionPart(prompt);
+    expect(instructions).toContain('contextFacts 只能当背景');
+    expect(instructions).toContain('只能复述 trends.trendFacts');
+    expect(instructions).toContain('本任务不使用网页搜索');
+    expect(prompt).toContain('SYSTEM_EVIDENCE_BUNDLE=');
+  });
+
+  it('系统复核必须覆盖主张、矛盾和讨论点', () => {
+    const prompt = buildReviewSystemAnalysisPrompt({ evidenceBundle: '{}', candidate: '{}' });
+    const instructions = instructionPart(prompt);
+    expect(instructions).toContain('conflict:索引');
+    expect(instructions).toContain('discussion:索引');
+    expect(instructions).toContain('trendConsistent');
+    expect(prompt).toContain('SYSTEM_ANALYSIS_CANDIDATE=');
   });
 });

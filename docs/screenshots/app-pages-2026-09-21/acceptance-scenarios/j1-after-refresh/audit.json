@@ -1,0 +1,114 @@
+{
+  "outputDirectory": "docs/screenshots/app-pages-2026-09-21/acceptance-scenarios/j1-after-refresh",
+  "syntheticOnly": true,
+  "detailCoverage": {
+    "metricOpened": true,
+    "eventOpened": true,
+    "sourceOpened": true
+  },
+  "desktopScreenshots": 8,
+  "compactScreenshots": 5,
+  "compactAudits": [
+    {
+      "name": "01-overview-200-percent",
+      "viewport": {
+        "width": 720,
+        "height": 450,
+        "devicePixelRatio": 2
+      },
+      "documentScrollWidth": 720,
+      "documentClientWidth": 720,
+      "horizontalOverflow": false,
+      "visibleHeading": "合成成员甲"
+    },
+    {
+      "name": "02-body-200-percent",
+      "viewport": {
+        "width": 720,
+        "height": 450,
+        "devicePixelRatio": 2
+      },
+      "documentScrollWidth": 720,
+      "documentClientWidth": 720,
+      "horizontalOverflow": false,
+      "visibleHeading": "合成成员甲"
+    },
+    {
+      "name": "04-timeline-200-percent",
+      "viewport": {
+        "width": 720,
+        "height": 450,
+        "devicePixelRatio": 2
+      },
+      "documentScrollWidth": 720,
+      "documentClientWidth": 720,
+      "horizontalOverflow": false,
+      "visibleHeading": "合成成员甲"
+    },
+    {
+      "name": "06-guidance-200-percent",
+      "viewport": {
+        "width": 720,
+        "height": 450,
+        "devicePixelRatio": 2
+      },
+      "documentScrollWidth": 720,
+      "documentClientWidth": 720,
+      "horizontalOverflow": false,
+      "visibleHeading": "合成成员甲"
+    },
+    {
+      "name": "07-sources-200-percent",
+      "viewport": {
+        "width": 720,
+        "height": 450,
+        "devicePixelRatio": 2
+      },
+      "documentScrollWidth": 720,
+      "documentClientWidth": 720,
+      "horizontalOverflow": false,
+      "visibleHeading": "合成成员甲"
+    }
+  ],
+  "allCompactPagesWithoutHorizontalOverflow": true,
+  "keyboardJourney": {
+    "focusedBodyTab": true,
+    "focusedSystem": true,
+    "focusedMetric": true,
+    "focusedEvidenceTrigger": true,
+    "evidenceCloseFocused": true,
+    "evidenceTriggerFocusRestored": true,
+    "passed": true
+  },
+  "adoptionJourney": {
+    "startedFrom": "adopted",
+    "formVisible": false,
+    "adopted": true
+  },
+  "accessibilityAudit": {
+    "tabs": [
+      {
+        "label": "健康总览",
+        "selected": "false"
+      },
+      {
+        "label": "身体与指标",
+        "selected": "false"
+      },
+      {
+        "label": "检查时间线",
+        "selected": "false"
+      },
+      {
+        "label": "生活与行动",
+        "selected": "true"
+      },
+      {
+        "label": "原始资料",
+        "selected": "false"
+      }
+    ],
+    "dialogs": 0,
+    "unlabeledButtons": 0
+  }
+}

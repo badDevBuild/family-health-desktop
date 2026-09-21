@@ -4,16 +4,29 @@ import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import type {
   ActionItem,
+  ConceptMapping,
+  ConceptMappingReceipt,
   CreateManualNoteInput,
   DerivedSnapshotCandidate,
   ManualNote,
+  HealthEventRelationReceipt,
+  MergeHealthEventsInput,
   ObservationCandidate,
   Person,
+  ReportMetadataCandidate,
+  ReportMetadataCorrectionReceipt,
   ReviewCandidateDiff,
-  SourceManifest
+  SourceManifest,
+  SplitHealthEventInput,
+  SystemAnalysisSnapshot,
+  SystemEvidenceBundle,
+  UndoReportMetadataInput,
+  UndoHealthEventRelationInput,
+  UpdateReportMetadataInput
 } from '@contracts';
+import { BODY_SYSTEM_REGISTRY_VERSION, CONCEPT_DICTIONARY_VERSION, MEMBER_MODEL_VERSION, bodySystemRegistry, conceptDictionary, linkConceptToSystems, mapConcept, selectContextSystems } from '@core';
 
-export const WORKSPACE_SCHEMA_VERSION = 28;
+export const WORKSPACE_SCHEMA_VERSION = 33;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 function calendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
@@ -248,7 +261,7 @@ export interface StoredJobSummary {
   documentIds: string[];
   batchLabel: string;
   personLabel: string | null;
-  stage: 'extract' | 'review_facts' | 'analyze' | 'guidance' | 'review_derived' | 'publish';
+  stage: 'extract' | 'review_facts' | 'analyze' | 'guidance' | 'review_derived' | 'system_analysis' | 'system_review' | 'publish';
   status: 'queued' | 'running' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'retry_wait' | 'succeeded' | 'failed' | 'cancelled';
   completedUnits: number;
   totalUnits: number;
@@ -289,6 +302,7 @@ export interface PublishFactsInput {
   expectedRevision: number;
   changeSetHash: string;
   summary: string;
+  reportMetadata?: ReportMetadataCandidate | null;
   observations: Array<{
     conceptKey: string;
     rawText: string;
@@ -305,7 +319,12 @@ export interface PublishFactsInput {
     specimen: string | null;
     method: string | null;
     bodySite: string | null;
-    evidence: Array<{ sourceSpanId: string; quote: string | null }>;
+    evidence: Array<{
+      sourceSpanId: string;
+      quote: string | null;
+      sourceRole?: 'primary' | 'duplicate_source' | undefined;
+      duplicateBasis?: 'report_structure' | 'exam_item_id' | 'sample_id' | null | undefined;
+    }>;
   }>;
   executionGuard?: JobExecutionGuard;
   resolvedReviewIssueId?: string;
@@ -330,7 +349,41 @@ export interface AcceptedObservationSummary {
   specimen: string | null;
   method: string | null;
   bodySite: string | null;
-  evidence: Array<{ sourceSpanId: string; quote: string | null }>;
+  evidence: Array<{
+    sourceSpanId: string;
+    quote: string | null;
+    sourceRole?: 'primary' | 'duplicate_source' | undefined;
+    duplicateBasis?: 'report_structure' | 'exam_item_id' | 'sample_id' | null | undefined;
+  }>;
+  mapping: ConceptMapping;
+  mappingVersion: string;
+  mappingCorrectedAt: string | null;
+  mappingCanUndo: boolean;
+  createdAt: string;
+}
+
+export interface StoredReportMetadataSummary {
+  documentId: string;
+  reportId: string;
+  eventId: string;
+  title: string;
+  reportKind: string;
+  organization: string | null;
+  reportDate: string | null;
+  metadataStatus: 'confirmed' | 'inferred' | 'unknown' | 'corrected';
+  metadataRevision: number;
+  extracted: ReportMetadataCandidate | null;
+  department: string | null;
+  clinicalTime: { value: string | null; precision: 'year' | 'month' | 'day' | 'unknown' };
+  canUndo: boolean;
+}
+
+export interface ActiveEventRelationChange {
+  id: string;
+  action: 'merge' | 'split';
+  fromEventId: string;
+  toEventId: string;
+  reportIds: string[];
   createdAt: string;
 }
 
@@ -342,6 +395,57 @@ export interface PublishedDerivedSnapshot {
   status: 'current' | 'stale' | 'building' | 'unavailable';
   payload: DerivedSnapshotCandidate;
   createdAt: string;
+}
+
+export type PublishedSystemAnalysisSnapshot = SystemAnalysisSnapshot;
+
+export interface StoredLifestyleProposal {
+  id: string;
+  personId: string;
+  category: 'exercise' | 'diet' | 'sleep' | 'monitoring' | 'review' | 'other';
+  title: string;
+  dedupeKey: string;
+  goal: string;
+  rationale: string;
+  detail: string;
+  steps: string[];
+  startingOptions: string[];
+  scheduleSuggestion: string | null;
+  trackingSuggestion: string;
+  constraints: string[];
+  uncertainties: string[];
+  consultProfessional: boolean;
+  evidenceObservationIds: string[];
+  generalKnowledgeEvidence: Array<{
+    id: string;
+    sourceTitle: string;
+    sourceOrganization: string;
+    sourceUrl: string;
+    reviewedAt: string;
+    supportedScope: string;
+  }>;
+  sourceKind: 'ai_proposed' | 'clinician_reported' | 'care_preparation';
+  relatedSystemIds: string[];
+  status: 'proposed' | 'adopted' | 'dismissed' | 'superseded';
+  sourceSnapshotId: string | null;
+  version: number;
+  updatedAt: string;
+}
+
+export interface StoredActionAdoption {
+  id: string;
+  personId: string;
+  proposalId: string | null;
+  title: string;
+  userGoal: string;
+  selectedStartingOption: string;
+  plannedTime: string | null;
+  owner: string;
+  progressNote: string | null;
+  status: 'planned' | 'in_progress' | 'completed' | 'paused' | 'dismissed';
+  dueDate: string | null;
+  userRevision: number;
+  updatedAt: string;
 }
 
 export interface EvidenceAccess {
@@ -486,6 +590,7 @@ export class WorkspaceStore {
           VALUES (?, ?, ?, 'user_reported', ?)
         `).run(input.personId, nextContextRevision, JSON.stringify({ operation: 'birth_year_changed', birthYear: input.birthYear }), changedAt);
         this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+        this.db.prepare(`UPDATE system_analysis_snapshots_v2 SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
       }
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
@@ -580,7 +685,7 @@ export class WorkspaceStore {
     `).all(personId ?? null, personId ?? null) as Array<Record<string, unknown>>;
     return rows.map((row) => {
       const stored = JSON.parse(String(row.structured_fields_json)) as Record<string, unknown>;
-      const kind = ['history', 'allergy', 'medication', 'self_measurement', 'free_text'].includes(String(stored.kind))
+      const kind = ['history', 'allergy', 'medication', 'self_measurement', 'goal', 'constraint', 'free_text'].includes(String(stored.kind))
         ? String(stored.kind) as ManualNote['kind'] : 'free_text';
       const structuredFields = Object.fromEntries(Object.entries(stored)
         .filter(([key, value]) => key !== 'kind' && typeof value === 'string')) as Record<string, string>;
@@ -601,6 +706,11 @@ export class WorkspaceStore {
   createManualNote(input: CreateManualNoteInput): ManualNote {
     const id = randomUUID();
     const recordedAt = this.now().toISOString();
+    const affectedSystemIds = selectContextSystems({
+      kind: input.kind,
+      text: input.immutableText,
+      structuredFields: input.structuredFields
+    }).systemIds;
     const transaction = this.db.transaction(() => {
       const actual = this.getPersonRevision(input.personId, 'clinical_context_revision');
       if (actual !== input.expectedContextRevision) throw new RevisionConflictError(input.expectedContextRevision, actual);
@@ -628,6 +738,13 @@ export class WorkspaceStore {
       `).run(next, input.personId, actual);
       if (update.changes !== 1) throw new RevisionConflictError(actual, this.getPersonRevision(input.personId, 'clinical_context_revision'));
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      if (affectedSystemIds.length > 0) {
+        this.db.prepare(`
+          UPDATE system_analysis_snapshots_v2 SET status = 'stale'
+          WHERE person_id = ? AND status = 'current'
+            AND system_id IN (${affectedSystemIds.map(() => '?').join(',')})
+        `).run(input.personId, ...affectedSystemIds);
+      }
     });
     transaction();
     return this.listManualNotes(input.personId).find((note) => note.id === id)!;
@@ -684,6 +801,187 @@ export class WorkspaceStore {
     return this.listActionItems(input.personId).find((item) => item.id === id)!;
   }
 
+  listLifestyleProposals(personId: string): StoredLifestyleProposal[] {
+    const rows = this.db.prepare(`
+      SELECT id, person_id, category, title, detail, consult_professional,
+             evidence_refs_json, structure_json, status, source_snapshot_id, version, updated_at
+      FROM lifestyle_proposals_v2
+      WHERE person_id = ? AND status != 'superseded'
+      ORDER BY CASE status WHEN 'adopted' THEN 1 WHEN 'dismissed' THEN 2 ELSE 0 END,
+               updated_at DESC, id
+    `).all(personId) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const structure = JSON.parse(String(row.structure_json ?? '{}')) as Partial<Pick<StoredLifestyleProposal,
+        'dedupeKey' | 'goal' | 'rationale' | 'steps' | 'startingOptions' | 'scheduleSuggestion' |
+        'trackingSuggestion' | 'constraints' | 'uncertainties' | 'generalKnowledgeEvidence' |
+        'sourceKind' | 'relatedSystemIds'>>;
+      const title = String(row.title);
+      const detail = String(row.detail);
+      return {
+        id: String(row.id),
+        personId: String(row.person_id),
+        category: String(row.category) as StoredLifestyleProposal['category'],
+        title,
+        dedupeKey: structure.dedupeKey ?? `legacy:${String(row.id)}`,
+        goal: structure.goal ?? title,
+        rationale: structure.rationale ?? detail,
+        detail,
+        steps: structure.steps?.length ? structure.steps : [detail],
+        startingOptions: structure.startingOptions?.length ? structure.startingOptions : ['从本人愿意且可承受的一小步开始'],
+        scheduleSuggestion: structure.scheduleSuggestion ?? null,
+        trackingSuggestion: structure.trackingSuggestion ?? '记录是否完成以及身体感受即可。',
+        constraints: structure.constraints ?? [],
+        uncertainties: structure.uncertainties ?? [],
+        consultProfessional: Number(row.consult_professional) === 1,
+        evidenceObservationIds: JSON.parse(String(row.evidence_refs_json)) as string[],
+        generalKnowledgeEvidence: structure.generalKnowledgeEvidence ?? [],
+        sourceKind: structure.sourceKind ?? 'care_preparation',
+        relatedSystemIds: structure.relatedSystemIds ?? [],
+        status: String(row.status) as StoredLifestyleProposal['status'],
+        sourceSnapshotId: row.source_snapshot_id === null ? null : String(row.source_snapshot_id),
+        version: Number(row.version),
+        updatedAt: String(row.updated_at)
+      };
+    });
+  }
+
+  setLifestyleProposalDecision(input: {
+    personId: string;
+    proposalId: string;
+    decision: 'dismiss' | 'restore';
+  }): { proposalId: string; status: 'proposed' | 'dismissed'; updatedAt: string } {
+    const updatedAt = this.now().toISOString();
+    const transaction = this.db.transaction(() => {
+      const proposal = this.db.prepare(`
+        SELECT status FROM lifestyle_proposals_v2 WHERE id = ? AND person_id = ?
+      `).get(input.proposalId, input.personId) as { status: string } | undefined;
+      if (!proposal || proposal.status === 'superseded' || proposal.status === 'adopted') {
+        throw new Error('LIFESTYLE_PROPOSAL_NOT_AVAILABLE');
+      }
+      const nextStatus = input.decision === 'dismiss' ? 'dismissed' : 'proposed';
+      if ((input.decision === 'dismiss' && proposal.status !== 'proposed') || (input.decision === 'restore' && proposal.status !== 'dismissed')) {
+        throw new Error('LIFESTYLE_PROPOSAL_DECISION_INVALID');
+      }
+      this.db.prepare(`UPDATE lifestyle_proposals_v2 SET status = ?, updated_at = ? WHERE id = ?`)
+        .run(nextStatus, updatedAt, input.proposalId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        randomUUID(),
+        input.decision === 'dismiss' ? 'lifestyle_proposal.dismissed' : 'lifestyle_proposal.restored',
+        input.proposalId,
+        input.decision === 'dismiss' ? '用户选择暂不采纳这条生活建议。' : '用户恢复了一条先前忽略的生活建议。',
+        updatedAt
+      );
+      return nextStatus;
+    });
+    const status = transaction();
+    return { proposalId: input.proposalId, status, updatedAt };
+  }
+
+  listActionAdoptions(personId: string): StoredActionAdoption[] {
+    const rows = this.db.prepare(`
+      SELECT id, person_id, proposal_id, title, details_json, status, due_date, user_revision, updated_at
+      FROM action_adoptions_v2 WHERE person_id = ?
+      ORDER BY CASE status WHEN 'completed' THEN 1 WHEN 'dismissed' THEN 2 ELSE 0 END,
+               updated_at DESC, id
+    `).all(personId) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const details = JSON.parse(String(row.details_json ?? '{}')) as Partial<Pick<StoredActionAdoption,
+        'userGoal' | 'selectedStartingOption' | 'plannedTime' | 'owner' | 'progressNote'>>;
+      const title = String(row.title);
+      return {
+        id: String(row.id),
+        personId: String(row.person_id),
+        proposalId: row.proposal_id === null ? null : String(row.proposal_id),
+        title,
+        userGoal: details.userGoal ?? title,
+        selectedStartingOption: details.selectedStartingOption ?? title,
+        plannedTime: details.plannedTime ?? null,
+        owner: details.owner ?? '本人',
+        progressNote: details.progressNote ?? null,
+        status: String(row.status) as StoredActionAdoption['status'],
+        dueDate: row.due_date === null ? null : String(row.due_date),
+        userRevision: Number(row.user_revision),
+        updatedAt: String(row.updated_at)
+      };
+    });
+  }
+
+  adoptLifestyleProposal(input: {
+    personId: string;
+    proposalId: string;
+    userGoal: string;
+    selectedStartingOption: string;
+    plannedTime: string | null;
+    owner: string;
+    progressNote: string | null;
+    dueDate: string | null;
+  }): StoredActionAdoption {
+    const timestamp = this.now().toISOString();
+    const transaction = this.db.transaction(() => {
+      const proposal = this.db.prepare(`
+        SELECT id, person_id, title, detail, status FROM lifestyle_proposals_v2
+        WHERE id = ? AND person_id = ?
+      `).get(input.proposalId, input.personId) as {
+        id: string;
+        person_id: string;
+        title: string;
+        detail: string;
+        status: string;
+      } | undefined;
+      if (!proposal || proposal.status === 'superseded' || proposal.status === 'dismissed') {
+        throw new Error('LIFESTYLE_PROPOSAL_NOT_AVAILABLE');
+      }
+      const existing = this.db.prepare(`
+        SELECT id FROM action_adoptions_v2
+        WHERE person_id = ? AND proposal_id = ? AND status != 'dismissed'
+        LIMIT 1
+      `).get(input.personId, input.proposalId) as { id: string } | undefined;
+      if (existing) return existing.id;
+      const id = randomUUID();
+      const actionDetail = [
+        input.userGoal.trim(),
+        `起始方式：${input.selectedStartingOption.trim()}`,
+        input.plannedTime?.trim() ? `计划时间：${input.plannedTime.trim()}` : null,
+        `负责人：${input.owner.trim()}`,
+        input.progressNote?.trim() ? `起始备注：${input.progressNote.trim()}` : null
+      ].filter((item): item is string => Boolean(item)).join('\n');
+      this.db.prepare(`
+        INSERT INTO action_items (
+          id, person_id, origin, source_ref, status, title, detail,
+          due_date, due_text, user_revision, updated_at
+        ) VALUES (?, ?, 'ai_proposed', ?, 'planned', ?, ?, ?, '由我决定开始时间', 1, ?)
+      `).run(id, input.personId, `proposal:${input.proposalId}`, proposal.title, actionDetail, input.dueDate, timestamp);
+      this.db.prepare(`
+        INSERT INTO action_events (id, action_id, actor, previous_status, next_status, note, created_at)
+        VALUES (?, ?, 'user', NULL, 'planned', '用户采纳生活建议为独立行动', ?)
+      `).run(randomUUID(), id, timestamp);
+      this.db.prepare(`
+        INSERT INTO action_adoptions_v2 (
+          id, person_id, proposal_id, title, details_json, status, due_date,
+          user_revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'planned', ?, 1, ?, ?)
+      `).run(
+        id, input.personId, input.proposalId, proposal.title,
+        JSON.stringify({
+          userGoal: input.userGoal.trim(),
+          selectedStartingOption: input.selectedStartingOption.trim(),
+          plannedTime: input.plannedTime?.trim() || null,
+          owner: input.owner.trim(),
+          progressNote: input.progressNote?.trim() || null
+        }),
+        input.dueDate, timestamp, timestamp
+      );
+      this.db.prepare(`UPDATE lifestyle_proposals_v2 SET status = 'adopted', updated_at = ? WHERE id = ?`)
+        .run(timestamp, input.proposalId);
+      return id;
+    });
+    const id = transaction();
+    return this.listActionAdoptions(input.personId).find((item) => item.id === id)!;
+  }
+
   updateActionStatus(input: {
     actionId: string;
     status: ActionItem['status'];
@@ -709,6 +1007,11 @@ export class WorkspaceStore {
         INSERT INTO action_events (id, action_id, actor, previous_status, next_status, note, created_at)
         VALUES (?, ?, 'user', ?, ?, NULL, ?)
       `).run(randomUUID(), input.actionId, current.status, input.status, updatedAt);
+      this.db.prepare(`
+        UPDATE action_adoptions_v2
+        SET status = ?, user_revision = user_revision + 1, updated_at = ?
+        WHERE id = ?
+      `).run(input.status, updatedAt, input.actionId);
       return current.person_id;
     });
     const personId = transaction();
@@ -723,6 +1026,32 @@ export class WorkspaceStore {
       GROUP BY person_id
     `).all() as Array<{ person_id: string; count: number }>;
     return new Map(rows.map((row) => [row.person_id, row.count]));
+  }
+
+  listPersonObservationStats(): Map<string, { acceptedFactCount: number; attentionCount: number; latestClinicalDate: string | null }> {
+    const rows = this.db.prepare(`
+      SELECT o.person_id,
+             COUNT(*) AS accepted_fact_count,
+             SUM(CASE WHEN r.abnormal_flag IN ('high', 'low', 'positive') THEN 1 ELSE 0 END) AS attention_count,
+             MAX(e.clinical_date) AS latest_clinical_date
+      FROM observations o
+      JOIN observation_revisions r
+        ON r.observation_id = o.id AND r.revision = o.current_revision
+      JOIN source_spans ss ON ss.id = r.source_span_id
+      JOIN documents d ON d.id = ss.document_id AND d.excluded_from_analysis = 0
+      LEFT JOIN encounters e ON e.id = o.encounter_id
+      GROUP BY o.person_id
+    `).all() as Array<{
+      person_id: string;
+      accepted_fact_count: number;
+      attention_count: number;
+      latest_clinical_date: string | null;
+    }>;
+    return new Map(rows.map((row) => [row.person_id, {
+      acceptedFactCount: Number(row.accepted_fact_count),
+      attentionCount: Number(row.attention_count),
+      latestClinicalDate: row.latest_clinical_date
+    }]));
   }
 
   updateDisplayName(personId: string, displayName: string, expectedRevision: number): number {
@@ -748,6 +1077,7 @@ export class WorkspaceStore {
         UPDATE persons SET clinical_context_revision = ? WHERE id = ? AND clinical_context_revision = ?
       `).run(next, personId, actual);
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(personId);
+      this.db.prepare(`UPDATE system_analysis_snapshots_v2 SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(personId);
       return next;
     });
     return transaction();
@@ -1099,13 +1429,15 @@ export class WorkspaceStore {
     const changedAt = this.now().toISOString();
     const transaction = this.db.transaction(() => {
       const document = this.db.prepare(`
-        SELECT d.person_id, d.excluded_from_analysis, so.sha256
+        SELECT d.person_id, d.excluded_from_analysis, so.sha256,
+               EXISTS(SELECT 1 FROM document_commits dc WHERE dc.document_id = d.id) AS committed
         FROM documents d JOIN source_objects so ON so.id = d.source_object_id
         WHERE d.id = ?
-      `).get(input.documentId) as { person_id: string | null; excluded_from_analysis: number; sha256: string } | undefined;
+      `).get(input.documentId) as { person_id: string | null; excluded_from_analysis: number; sha256: string; committed: number } | undefined;
       if (!document) throw new Error('DOCUMENT_NOT_FOUND');
       const currentlyIncluded = document.excluded_from_analysis === 0;
       if (currentlyIncluded === input.included) return { included: input.included, personId: document.person_id };
+      const affectedSystemIds = this.systemIdsForDocuments([input.documentId]);
 
       const activeJobs = this.db.prepare(`
         SELECT id, checkpoint_json FROM jobs
@@ -1119,7 +1451,10 @@ export class WorkspaceStore {
       if (documentHasActiveJob) throw new Error('DOCUMENT_HAS_ACTIVE_JOB');
 
       if (input.included) {
-        this.db.prepare(`UPDATE documents SET status = 'queued', excluded_from_analysis = 0 WHERE id = ?`).run(input.documentId);
+        // 已有事实提交的资料重新纳入时，只需使派生说明失效并重算。
+        // 若改成 queued，任务运行器会因已提交而跳过提取，界面却永久显示待处理。
+        this.db.prepare(`UPDATE documents SET status = ?, excluded_from_analysis = 0 WHERE id = ?`)
+          .run(document.committed ? 'completed' : 'queued', input.documentId);
         this.db.prepare(`DELETE FROM exclusions WHERE document_id = ? AND reason = 'user_removed_from_analysis'`).run(input.documentId);
       } else {
         this.db.prepare(`UPDATE documents SET status = 'ignored', excluded_from_analysis = 1 WHERE id = ?`).run(input.documentId);
@@ -1139,6 +1474,7 @@ export class WorkspaceStore {
           ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
         `).run(document.person_id);
         this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(document.person_id);
+        this.invalidateSystemSnapshots(document.person_id, affectedSystemIds);
       }
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
@@ -1229,13 +1565,32 @@ export class WorkspaceStore {
           SELECT DISTINCT acceptance_id FROM observation_revisions
           WHERE observation_id IN (${observationIds.map(() => '?').join(',')})
         `).all(...observationIds) as Array<{ acceptance_id: string }>;
+        const reportRows = this.db.prepare(`
+          SELECT DISTINCT report_id FROM report_source_links WHERE document_id = ?
+        `).all(input.documentId) as Array<{ report_id: string }>;
+        const reportIds = reportRows.map((row) => row.report_id);
+        const eventRows = reportIds.length === 0 ? [] : this.db.prepare(`
+          SELECT DISTINCT event_id FROM event_report_links
+          WHERE report_id IN (${reportIds.map(() => '?').join(',')})
+        `).all(...reportIds) as Array<{ event_id: string }>;
 
         if (document.person_id) {
           const snapshotRows = this.db.prepare(`SELECT id FROM derived_snapshots WHERE person_id = ?`).all(document.person_id) as Array<{ id: string }>;
           for (const snapshot of snapshotRows) this.db.prepare(`DELETE FROM snapshot_evidence WHERE snapshot_id = ?`).run(snapshot.id);
           this.db.prepare(`DELETE FROM derived_snapshots WHERE person_id = ?`).run(document.person_id);
+          const memberSnapshotRows = this.db.prepare(`
+            SELECT id FROM system_analysis_snapshots_v2 WHERE person_id = ?
+          `).all(document.person_id) as Array<{ id: string }>;
+          for (const snapshot of memberSnapshotRows) {
+            this.db.prepare(`DELETE FROM derivation_dependencies WHERE derived_id = ?`).run(snapshot.id);
+          }
+          this.db.prepare(`DELETE FROM system_analysis_snapshots_v2 WHERE person_id = ?`).run(document.person_id);
           this.db.prepare(`DELETE FROM document_commits WHERE document_id = ?`).run(input.documentId);
           this.db.prepare(`DELETE FROM publication_events WHERE person_id = ? AND id NOT IN (SELECT publication_id FROM document_commits)`).run(document.person_id);
+        }
+        this.db.prepare(`DELETE FROM derivation_dependencies WHERE dependency_id = ?`).run(input.documentId);
+        for (const observationId of observationIds) {
+          this.db.prepare(`DELETE FROM derivation_dependencies WHERE dependency_id = ?`).run(observationId);
         }
         if (observationIds.length > 0) {
           for (const observationId of observationIds) {
@@ -1267,6 +1622,36 @@ export class WorkspaceStore {
         this.db.prepare(`DELETE FROM ai_transmissions WHERE document_id = ?`).run(input.documentId);
         this.db.prepare(`DELETE FROM exclusions WHERE document_id = ?`).run(input.documentId);
         this.db.prepare(`DELETE FROM document_conversions WHERE document_id = ?`).run(input.documentId);
+        for (const reportId of reportIds) {
+          this.db.prepare(`
+            UPDATE event_relation_changes
+            SET active = 0
+            WHERE active = 1
+              AND EXISTS (
+                SELECT 1 FROM json_each(event_relation_changes.report_ids_json)
+                WHERE json_each.value = ?
+              )
+          `).run(reportId);
+          this.db.prepare(`DELETE FROM report_metadata_revisions WHERE report_id = ?`).run(reportId);
+          this.db.prepare(`DELETE FROM event_report_links WHERE report_id = ?`).run(reportId);
+          this.db.prepare(`DELETE FROM report_source_links WHERE report_id = ?`).run(reportId);
+          this.db.prepare(`DELETE FROM report_records WHERE id = ?`).run(reportId);
+        }
+        for (const event of eventRows) {
+          const stillUsed = this.db.prepare(`SELECT 1 FROM event_report_links WHERE event_id = ? LIMIT 1`).get(event.event_id);
+          if (!stillUsed) {
+            const relationIds = (this.db.prepare(`
+              SELECT id FROM event_relation_changes WHERE from_event_id = ? OR to_event_id = ?
+            `).all(event.event_id, event.event_id) as Array<{ id: string }>).map((row) => row.id);
+            for (const relationId of relationIds) {
+              this.db.prepare(`DELETE FROM event_relation_changes WHERE parent_change_id = ?`).run(relationId);
+            }
+            for (const relationId of relationIds) {
+              this.db.prepare(`DELETE FROM event_relation_changes WHERE id = ?`).run(relationId);
+            }
+            this.db.prepare(`DELETE FROM health_events_v2 WHERE id = ?`).run(event.event_id);
+          }
+        }
         this.db.prepare(`DELETE FROM documents WHERE id = ?`).run(input.documentId);
 
         for (const acceptance of acceptanceRows) {
@@ -1713,6 +2098,7 @@ export class WorkspaceStore {
 
       if (input.action === 'archive_only') {
         const document = this.db.prepare(`SELECT person_id FROM documents WHERE id = ?`).get(input.documentId) as { person_id: string | null } | undefined;
+        const affectedSystemIds = this.systemIdsForDocuments([input.documentId]);
         this.db.prepare(`
           UPDATE documents SET status = 'completed', excluded_from_analysis = 1 WHERE id = ?
         `).run(input.documentId);
@@ -1722,6 +2108,7 @@ export class WorkspaceStore {
             ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
           `).run(document.person_id);
           this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(document.person_id);
+          this.invalidateSystemSnapshots(document.person_id, affectedSystemIds);
         }
       }
       this.db.prepare(`
@@ -1833,6 +2220,7 @@ export class WorkspaceStore {
       personId: input.personId,
       localImport: true,
       scheduledAiProcessing: input.allowScheduledAiProcessing,
+      includeRelevantHistory: input.allowScheduledAiProcessing,
       pathFingerprint
     };
     const transaction = this.db.transaction(() => {
@@ -2191,6 +2579,7 @@ export class WorkspaceStore {
   createManualProcessingConsent(input: {
     documentIds: string[];
     personIds: string[];
+    historicalObservationIds?: string[];
     accountFingerprint: string;
     version: number;
   }): string {
@@ -2205,7 +2594,9 @@ export class WorkspaceStore {
         type: 'manual_batch',
         documentIds: [...input.documentIds].sort(),
         personIds: [...input.personIds].sort(),
-        stages: ['extract', 'review_facts', 'analyze', 'guidance', 'review_derived', 'publish']
+        historicalObservationIds: [...(input.historicalObservationIds ?? [])].sort(),
+        includeRelevantHistory: true,
+        stages: ['extract', 'review_facts', 'analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish']
       }),
       input.accountFingerprint,
       input.version,
@@ -2314,8 +2705,9 @@ export class WorkspaceStore {
         stages?: string[];
         personId?: string | null;
         scheduledAiProcessing?: boolean;
+        includeRelevantHistory?: boolean;
       } : null;
-      const requiredStages = ['extract', 'review_facts', 'analyze', 'guidance', 'review_derived', 'publish'];
+      const requiredStages = ['extract', 'review_facts', 'analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish'];
       const scheduledDocumentsMatch = checkpoint.authorizationType === 'scheduled' && scope?.type === 'inbox_binding'
         ? checkpoint.documentIds.every((documentId) => {
           const occurrence = this.db.prepare(`
@@ -2332,6 +2724,7 @@ export class WorkspaceStore {
       const scopeMatches = checkpoint.authorizationType === 'scheduled'
         ? scope?.type === 'inbox_binding'
           && scope.scheduledAiProcessing === true
+          && scope.includeRelevantHistory === true
           && scope.personId === row.person_id
           && scheduledDocumentsMatch
         : scope?.type === 'manual_batch'
@@ -2435,6 +2828,41 @@ export class WorkspaceStore {
     if (checkpoint.consentId !== guard.consentId || row.revoked_at !== null) throw new Error('CONSENT_REVOKED');
     if (row.account_fingerprint !== guard.accountFingerprint) throw new Error('ACCOUNT_FINGERPRINT_MISMATCH');
     if (documentId && !checkpoint.documentIds?.includes(documentId)) throw new Error('DOCUMENT_OUTSIDE_CONSENT_SCOPE');
+  }
+
+  assertObservationScopeActive(
+    guard: JobExecutionGuard,
+    personId: string,
+    observations: Array<{ id: string; documentId: string }>
+  ): void {
+    this.assertJobExecutionActive(guard);
+    const row = this.db.prepare(`
+      SELECT c.scope_json
+      FROM jobs j
+      JOIN job_attempts a ON a.job_id = j.id AND a.id = ?
+      JOIN consents c ON c.id = ? AND c.revoked_at IS NULL
+      WHERE j.id = ? AND j.person_id = ?
+    `).get(guard.attemptId, guard.consentId, guard.jobId, personId) as { scope_json: string } | undefined;
+    if (!row) throw new Error('CONSENT_REVOKED');
+    const scope = JSON.parse(row.scope_json) as {
+      type?: string;
+      personId?: string | null;
+      personIds?: string[];
+      documentIds?: string[];
+      historicalObservationIds?: string[];
+      includeRelevantHistory?: boolean;
+      scheduledAiProcessing?: boolean;
+    };
+    const allowed = scope.type === 'inbox_binding'
+      ? scope.scheduledAiProcessing === true && scope.includeRelevantHistory === true && scope.personId === personId
+      : scope.type === 'manual_batch'
+        && scope.includeRelevantHistory === true
+        && scope.personIds?.includes(personId)
+        && observations.every((observation) => (
+          scope.documentIds?.includes(observation.documentId)
+          || scope.historicalObservationIds?.includes(observation.id)
+        ));
+    if (!allowed) throw new Error('HISTORICAL_FACTS_OUTSIDE_CONSENT_SCOPE');
   }
 
   beginAiTransmission(input: { guard: JobExecutionGuard; documentId: string; stage: string }): string {
@@ -2664,13 +3092,200 @@ export class WorkspaceStore {
     return row?.fact_revision ?? 0;
   }
 
-  listAcceptedObservations(personId?: string): AcceptedObservationSummary[] {
-    const rows = this.db.prepare(`
+  setObservationConceptMapping(input: {
+    personId: string;
+    observationId: string;
+    conceptId: string | null;
+    reason: string;
+  }): ConceptMappingReceipt {
+    const observation = this.listAcceptedObservations(input.personId).find((item) => item.id === input.observationId);
+    if (!observation) throw new Error('OBSERVATION_NOT_FOUND');
+    const definition = input.conceptId ? conceptDictionary.find((item) => item.id === input.conceptId) : null;
+    if (input.conceptId && !definition) throw new Error('CONCEPT_NOT_FOUND');
+    const nextMapping: ConceptMapping = definition ? {
+      rawName: observation.conceptKey,
+      normalizedName: definition.canonicalName,
+      conceptId: definition.id,
+      canonicalName: definition.canonicalName,
+      status: 'verified',
+      confidence: 1,
+      reasons: [`用户确认归入“${definition.canonicalName}”；原始名称保持不变。`]
+    } : {
+      rawName: observation.conceptKey,
+      normalizedName: observation.conceptKey,
+      conceptId: null,
+      canonicalName: null,
+      status: 'unmapped',
+      confidence: 0,
+      reasons: ['用户确认当前不能安全归入现有概念；原始名称保持不变。']
+    };
+    if (nextMapping.conceptId === observation.mapping.conceptId && nextMapping.status === observation.mapping.status) {
+      throw new Error('CONCEPT_MAPPING_UNCHANGED');
+    }
+
+    const correctionId = randomUUID();
+    const timestamp = this.now().toISOString();
+    const oldSystems = linkConceptToSystems(observation.mapping).map((item) => item.systemId);
+    const newSystems = linkConceptToSystems(nextMapping).map((item) => item.systemId);
+    const invalidatedSystemIds = [...new Set([...oldSystems, ...newSystems])];
+    const transaction = this.db.transaction(() => {
+      const currentRevision = this.db.prepare(`SELECT current_revision FROM observations WHERE id = ? AND person_id = ?`)
+        .get(input.observationId, input.personId) as { current_revision: number } | undefined;
+      if (!currentRevision) throw new Error('OBSERVATION_NOT_FOUND');
+      this.db.prepare(`UPDATE concept_mapping_corrections SET active = 0 WHERE observation_id = ? AND active = 1`)
+        .run(input.observationId);
+      this.db.prepare(`
+        INSERT INTO concept_mapping_corrections (
+          id, observation_id, observation_revision, concept_id, normalized_name,
+          status, confidence, reasons_json, previous_concept_id, previous_normalized_name,
+          previous_status, previous_confidence, previous_reasons_json,
+          action, reason, active, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'set', ?, 1, ?)
+      `).run(
+        correctionId, input.observationId, currentRevision.current_revision,
+        nextMapping.conceptId, nextMapping.normalizedName, nextMapping.status,
+        nextMapping.confidence, JSON.stringify(nextMapping.reasons),
+        observation.mapping.conceptId, observation.mapping.normalizedName,
+        observation.mapping.status, observation.mapping.confidence,
+        JSON.stringify(observation.mapping.reasons), input.reason.trim(), timestamp
+      );
+      this.db.prepare(`
+        INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)
+        ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
+      `).run(input.personId);
+      if (invalidatedSystemIds.length > 0) {
+        this.db.prepare(`
+          UPDATE system_analysis_snapshots_v2 SET status = 'stale'
+          WHERE person_id = ? AND status = 'current'
+            AND system_id IN (${invalidatedSystemIds.map(() => '?').join(',')})
+        `).run(input.personId, ...invalidatedSystemIds);
+      }
+      this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'concept_mapping_corrected', ?, '用户修正了指标概念映射；原始事实保持不变。', ?)
+      `).run(randomUUID(), input.observationId, timestamp);
+    });
+    transaction();
+    return {
+      observationId: input.observationId,
+      mapping: nextMapping,
+      mappingVersion: `user:${correctionId}`,
+      correctedAt: timestamp,
+      canUndo: true,
+      invalidatedSystemIds,
+      factRevision: this.getFactRevision(input.personId)
+    };
+  }
+
+  undoObservationConceptMapping(input: { personId: string; observationId: string }): ConceptMappingReceipt {
+    const observation = this.listAcceptedObservations(input.personId).find((item) => item.id === input.observationId);
+    if (!observation) throw new Error('OBSERVATION_NOT_FOUND');
+    const correction = this.db.prepare(`
+      SELECT id, observation_revision, previous_concept_id, previous_normalized_name,
+             previous_status, previous_confidence, previous_reasons_json
+      FROM concept_mapping_corrections
+      WHERE observation_id = ? AND active = 1 AND action = 'set'
+    `).get(input.observationId) as Record<string, unknown> | undefined;
+    if (!correction) throw new Error('CONCEPT_MAPPING_NOT_UNDOABLE');
+    const previousConceptId = correction.previous_concept_id === null ? null : String(correction.previous_concept_id);
+    const definition = previousConceptId ? conceptDictionary.find((item) => item.id === previousConceptId) : null;
+    const restoredMapping: ConceptMapping = {
+      rawName: observation.conceptKey,
+      normalizedName: String(correction.previous_normalized_name),
+      conceptId: previousConceptId,
+      canonicalName: definition?.canonicalName ?? null,
+      status: String(correction.previous_status) as ConceptMapping['status'],
+      confidence: Number(correction.previous_confidence),
+      reasons: JSON.parse(String(correction.previous_reasons_json)) as string[]
+    };
+    const undoId = randomUUID();
+    const timestamp = this.now().toISOString();
+    const oldSystems = linkConceptToSystems(observation.mapping).map((item) => item.systemId);
+    const restoredSystems = linkConceptToSystems(restoredMapping).map((item) => item.systemId);
+    const invalidatedSystemIds = [...new Set([...oldSystems, ...restoredSystems])];
+    const transaction = this.db.transaction(() => {
+      this.db.prepare(`UPDATE concept_mapping_corrections SET active = 0 WHERE id = ? AND active = 1`).run(String(correction.id));
+      this.db.prepare(`
+        INSERT INTO concept_mapping_corrections (
+          id, observation_id, observation_revision, concept_id, normalized_name,
+          status, confidence, reasons_json, previous_concept_id, previous_normalized_name,
+          previous_status, previous_confidence, previous_reasons_json,
+          action, reason, active, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'undo', '撤销上一次概念修正', 1, ?)
+      `).run(
+        undoId, input.observationId, Number(correction.observation_revision),
+        restoredMapping.conceptId, restoredMapping.normalizedName, restoredMapping.status,
+        restoredMapping.confidence, JSON.stringify(restoredMapping.reasons),
+        observation.mapping.conceptId, observation.mapping.normalizedName,
+        observation.mapping.status, observation.mapping.confidence,
+        JSON.stringify(observation.mapping.reasons), timestamp
+      );
+      this.db.prepare(`
+        INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)
+        ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
+      `).run(input.personId);
+      if (invalidatedSystemIds.length > 0) {
+        this.db.prepare(`
+          UPDATE system_analysis_snapshots_v2 SET status = 'stale'
+          WHERE person_id = ? AND status = 'current'
+            AND system_id IN (${invalidatedSystemIds.map(() => '?').join(',')})
+        `).run(input.personId, ...invalidatedSystemIds);
+      }
+      this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'concept_mapping_undone', ?, '用户撤销了上一次指标概念修正；原始事实保持不变。', ?)
+      `).run(randomUUID(), input.observationId, timestamp);
+    });
+    transaction();
+    return {
+      observationId: input.observationId,
+      mapping: restoredMapping,
+      mappingVersion: `user:${undoId}`,
+      correctedAt: timestamp,
+      canUndo: false,
+      invalidatedSystemIds,
+      factRevision: this.getFactRevision(input.personId)
+    };
+  }
+
+  listAcceptedObservations(personId?: string, options?: { limitPerPerson?: number }): AcceptedObservationSummary[] {
+    const limitPerPerson = options?.limitPerPerson;
+    if (limitPerPerson !== undefined && (!Number.isInteger(limitPerPerson) || limitPerPerson < 1 || limitPerPerson > 5_000)) {
+      throw new Error('OBSERVATION_WINDOW_LIMIT_INVALID');
+    }
+    const scopeCte = limitPerPerson === undefined ? '' : `
+      WITH ranked_observation_ids AS (
+        SELECT o2.id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY o2.person_id
+                 ORDER BY COALESCE(e2.clinical_date, o2.created_at) DESC, o2.id DESC
+               ) AS person_rank
+        FROM observations o2
+        JOIN observation_revisions r2
+          ON r2.observation_id = o2.id AND r2.revision = o2.current_revision
+        JOIN source_spans ss2 ON ss2.id = r2.source_span_id
+        JOIN documents d2 ON d2.id = ss2.document_id AND d2.excluded_from_analysis = 0
+        LEFT JOIN encounters e2 ON e2.id = o2.encounter_id
+        WHERE (? IS NULL OR o2.person_id = ?)
+      )`;
+    const scopeJoin = limitPerPerson === undefined ? '' : `
+      JOIN ranked_observation_ids scoped
+        ON scoped.id = o.id AND scoped.person_rank <= ?`;
+    const rows = this.db.prepare(`${scopeCte}
       SELECT o.id, o.person_id, o.concept_key, o.created_at,
              r.value_kind, r.raw_text, r.decimal_value, r.qualifier, r.unit,
              r.reference_range, r.abnormal_flag, r.source_span_id,
              r.specimen, r.method, r.body_site, r.evidence_json,
              e.clinical_date, ss.quote AS source_quote, d.id AS document_id,
+             COALESCE(c.concept_id, m.concept_id) AS mapping_concept_id,
+             COALESCE(c.normalized_name, m.normalized_name) AS mapping_normalized_name,
+             COALESCE(c.status, m.status) AS mapping_status,
+             COALESCE(c.confidence, m.confidence) AS mapping_confidence,
+             COALESCE(c.reasons_json, m.reasons_json) AS mapping_reasons_json,
+             c.id AS correction_id, c.action AS correction_action, c.created_at AS correction_created_at,
+             m.mapper_version AS automatic_mapper_version,
              (
                SELECT occ.display_name
                FROM source_occurrences occ
@@ -2682,11 +3297,43 @@ export class WorkspaceStore {
         ON r.observation_id = o.id AND r.revision = o.current_revision
       JOIN source_spans ss ON ss.id = r.source_span_id
       JOIN documents d ON d.id = ss.document_id AND d.excluded_from_analysis = 0
+      ${scopeJoin}
       LEFT JOIN encounters e ON e.id = o.encounter_id
+      LEFT JOIN observation_concept_mappings m
+        ON m.observation_id = o.id AND m.observation_revision = o.current_revision
+       AND m.rowid = (
+         SELECT MAX(m2.rowid) FROM observation_concept_mappings m2
+         WHERE m2.observation_id = o.id AND m2.observation_revision = o.current_revision
+       )
+      LEFT JOIN concept_mapping_corrections c
+        ON c.observation_id = o.id AND c.observation_revision = o.current_revision AND c.active = 1
       WHERE (? IS NULL OR o.person_id = ?)
       ORDER BY COALESCE(e.clinical_date, o.created_at), o.concept_key, o.id
-    `).all(personId ?? null, personId ?? null) as Array<Record<string, unknown>>;
-    return rows.map((row) => ({
+    `).all(...(limitPerPerson === undefined
+      ? [personId ?? null, personId ?? null]
+      : [personId ?? null, personId ?? null, limitPerPerson, personId ?? null, personId ?? null]
+    )) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const automatic = mapConcept({
+        rawName: String(row.concept_key),
+        standardName: String(row.concept_key),
+        specimen: row.specimen === null ? null : String(row.specimen),
+        method: row.method === null ? null : String(row.method),
+        bodySite: row.body_site === null ? null : String(row.body_site),
+        unit: row.unit === null ? null : String(row.unit)
+      });
+      const conceptId = row.mapping_concept_id === null ? automatic.conceptId : String(row.mapping_concept_id);
+      const definition = conceptId ? conceptDictionary.find((item) => item.id === conceptId) : null;
+      const mapping: ConceptMapping = row.mapping_status === null ? automatic : {
+        rawName: String(row.concept_key),
+        normalizedName: String(row.mapping_normalized_name),
+        conceptId,
+        canonicalName: definition?.canonicalName ?? null,
+        status: String(row.mapping_status) as ConceptMapping['status'],
+        confidence: Number(row.mapping_confidence),
+        reasons: JSON.parse(String(row.mapping_reasons_json)) as string[]
+      };
+      return ({
       id: String(row.id),
       personId: String(row.person_id),
       conceptKey: String(row.concept_key),
@@ -2705,9 +3352,381 @@ export class WorkspaceStore {
       specimen: row.specimen === null ? null : String(row.specimen),
       method: row.method === null ? null : String(row.method),
       bodySite: row.body_site === null ? null : String(row.body_site),
-      evidence: JSON.parse(String(row.evidence_json ?? '[]')) as Array<{ sourceSpanId: string; quote: string | null }>,
+      evidence: JSON.parse(String(row.evidence_json ?? '[]')) as AcceptedObservationSummary['evidence'],
+      mapping,
+      mappingVersion: row.correction_id === null
+        ? String(row.automatic_mapper_version ?? CONCEPT_DICTIONARY_VERSION)
+        : `user:${String(row.correction_id)}`,
+      mappingCorrectedAt: row.correction_created_at === null ? null : String(row.correction_created_at),
+      mappingCanUndo: row.correction_id !== null && row.correction_action === 'set',
       createdAt: String(row.created_at)
-    }));
+      });
+    });
+  }
+
+  listReportMetadata(personId: string): StoredReportMetadataSummary[] {
+    const rows = this.db.prepare(`
+      SELECT r.id, r.event_id, r.title, r.report_kind, r.organization, r.report_date,
+             r.metadata_status, r.metadata_revision, l.document_id, mr.payload_json,
+             e.clinical_date, e.date_precision
+      FROM report_records r
+      JOIN report_source_links l ON l.report_id = r.id
+      LEFT JOIN health_events_v2 e ON e.id = r.event_id
+      LEFT JOIN report_metadata_revisions mr
+        ON mr.report_id = r.id AND mr.revision = r.metadata_revision
+      WHERE r.person_id = ?
+      ORDER BY r.created_at, r.id
+    `).all(personId) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const payload = row.payload_json ? JSON.parse(String(row.payload_json)) as {
+        extracted?: ReportMetadataCandidate | null;
+        correction?: { department?: string | null } | null;
+        action?: 'set' | 'undo';
+      } : {};
+      return {
+        documentId: String(row.document_id),
+        reportId: String(row.id),
+        eventId: String(row.event_id),
+        title: String(row.title),
+        reportKind: String(row.report_kind),
+        organization: row.organization === null ? null : String(row.organization),
+        reportDate: row.report_date === null ? null : String(row.report_date),
+        metadataStatus: String(row.metadata_status) as StoredReportMetadataSummary['metadataStatus'],
+        metadataRevision: Number(row.metadata_revision),
+        extracted: payload.extracted ?? null,
+        department: payload.correction?.department ?? payload.extracted?.department?.value ?? null,
+        clinicalTime: {
+          value: row.clinical_date === null ? null : String(row.clinical_date),
+          precision: (row.date_precision === null ? 'unknown' : String(row.date_precision)) as StoredReportMetadataSummary['clinicalTime']['precision']
+        },
+        canUndo: payload.action === 'set'
+      };
+    });
+  }
+
+  getLatestActiveEventRelationChange(personId: string, eventId: string): ActiveEventRelationChange | null {
+    const row = this.db.prepare(`
+      SELECT id, action, from_event_id, to_event_id, report_ids_json, created_at
+      FROM event_relation_changes
+      WHERE person_id = ? AND active = 1 AND action IN ('merge','split')
+        AND (from_event_id = ? OR to_event_id = ?)
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `).get(personId, eventId, eventId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      action: String(row.action) as ActiveEventRelationChange['action'],
+      fromEventId: String(row.from_event_id),
+      toEventId: String(row.to_event_id),
+      reportIds: JSON.parse(String(row.report_ids_json)) as string[],
+      createdAt: String(row.created_at)
+    };
+  }
+
+  updateReportMetadata(input: UpdateReportMetadataInput): ReportMetadataCorrectionReceipt {
+    const transaction = this.db.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT r.id, r.person_id, r.event_id, r.title, r.organization, r.metadata_status,
+               r.metadata_revision, e.clinical_date, e.date_precision, e.date_role, e.date_source,
+               mr.payload_json
+        FROM report_records r
+        LEFT JOIN health_events_v2 e ON e.id = r.event_id
+        LEFT JOIN report_metadata_revisions mr
+          ON mr.report_id = r.id AND mr.revision = r.metadata_revision
+        WHERE r.id = ? AND r.person_id = ?
+      `).get(input.reportId, input.personId) as Record<string, unknown> | undefined;
+      if (!row) throw new Error('REPORT_NOT_FOUND');
+      const revision = Number(row.metadata_revision);
+      if (revision !== input.expectedRevision) throw new RevisionConflictError(input.expectedRevision, revision);
+      const payload = row.payload_json ? JSON.parse(String(row.payload_json)) as {
+        extracted?: ReportMetadataCandidate | null;
+        correction?: { department?: string | null } | null;
+      } : {};
+      const nextRevision = revision + 1;
+      const timestamp = this.now().toISOString();
+      const affectedSystemIds = this.systemIdsForReports([input.reportId]);
+      const organization = input.organization?.trim() || null;
+      const department = input.department?.trim() || null;
+      const correction = {
+        title: input.title.trim(), organization, department,
+        clinicalTime: input.clinicalTime,
+        reason: input.reason.trim()
+      };
+      const previous = {
+        title: String(row.title),
+        organization: row.organization === null ? null : String(row.organization),
+        metadataStatus: String(row.metadata_status),
+        clinicalDate: row.clinical_date === null ? null : String(row.clinical_date),
+        datePrecision: row.date_precision === null ? 'unknown' : String(row.date_precision),
+        dateRole: row.date_role === null ? 'unknown' : String(row.date_role),
+        dateSource: row.date_source === null ? 'unknown' : String(row.date_source),
+        correction: payload.correction ?? null
+      };
+      this.db.prepare(`
+        UPDATE report_records
+        SET title = ?, organization = ?, metadata_status = 'corrected', metadata_revision = ?
+        WHERE id = ?
+      `).run(correction.title, organization, nextRevision, input.reportId);
+      if (row.event_id !== null) this.db.prepare(`
+        UPDATE health_events_v2
+        SET title = ?, clinical_date = ?, end_date = NULL, date_precision = ?, date_role = 'exam',
+            date_source = 'corrected', metadata_status = 'corrected', metadata_revision = ?, updated_at = ?
+        WHERE id = ?
+      `).run(correction.title, correction.clinicalTime.value, correction.clinicalTime.precision, nextRevision, timestamp, String(row.event_id));
+      this.db.prepare(`
+        INSERT INTO report_metadata_revisions (
+          report_id, revision, payload_json, actor, evidence_refs_json, created_at
+        ) VALUES (?, ?, ?, 'user', '[]', ?)
+      `).run(input.reportId, nextRevision, JSON.stringify({
+        extracted: payload.extracted ?? null, correction, action: 'set', previous
+      }), timestamp);
+      this.db.prepare(`
+        INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)
+        ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
+      `).run(input.personId);
+      this.invalidateSystemSnapshots(input.personId, affectedSystemIds);
+      this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'report_metadata_corrected', ?, '用户修正了报告标题、机构、科室或临床日期；原始提取记录保持不变。', ?)
+      `).run(randomUUID(), input.reportId, timestamp);
+      return nextRevision;
+    });
+    const metadataRevision = transaction();
+    return { reportId: input.reportId, metadataRevision, factRevision: this.getFactRevision(input.personId), canUndo: true };
+  }
+
+  undoReportMetadata(input: UndoReportMetadataInput): ReportMetadataCorrectionReceipt {
+    const transaction = this.db.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT r.id, r.person_id, r.event_id, r.metadata_revision, mr.payload_json
+        FROM report_records r
+        JOIN report_metadata_revisions mr ON mr.report_id = r.id AND mr.revision = r.metadata_revision
+        WHERE r.id = ? AND r.person_id = ?
+      `).get(input.reportId, input.personId) as Record<string, unknown> | undefined;
+      if (!row) throw new Error('REPORT_NOT_FOUND');
+      const revision = Number(row.metadata_revision);
+      if (revision !== input.expectedRevision) throw new RevisionConflictError(input.expectedRevision, revision);
+      const payload = JSON.parse(String(row.payload_json)) as {
+        extracted?: ReportMetadataCandidate | null;
+        action?: 'set' | 'undo';
+        previous?: {
+          title: string; organization: string | null; metadataStatus: string;
+          clinicalDate: string | null; datePrecision: string; dateRole: string; dateSource: string;
+          correction: { department?: string | null } | null;
+        };
+      };
+      if (payload.action !== 'set' || !payload.previous) throw new Error('REPORT_METADATA_NOT_UNDOABLE');
+      const nextRevision = revision + 1;
+      const timestamp = this.now().toISOString();
+      const affectedSystemIds = this.systemIdsForReports([input.reportId]);
+      const previous = payload.previous;
+      this.db.prepare(`
+        UPDATE report_records
+        SET title = ?, organization = ?, metadata_status = ?, metadata_revision = ?
+        WHERE id = ?
+      `).run(previous.title, previous.organization, previous.metadataStatus, nextRevision, input.reportId);
+      if (row.event_id !== null) this.db.prepare(`
+        UPDATE health_events_v2
+        SET title = ?, clinical_date = ?, end_date = NULL, date_precision = ?, date_role = ?,
+            date_source = ?, metadata_status = ?, metadata_revision = ?, updated_at = ?
+        WHERE id = ?
+      `).run(
+        previous.title, previous.clinicalDate, previous.datePrecision, previous.dateRole,
+        previous.dateSource, previous.metadataStatus, nextRevision, timestamp, String(row.event_id)
+      );
+      this.db.prepare(`
+        INSERT INTO report_metadata_revisions (
+          report_id, revision, payload_json, actor, evidence_refs_json, created_at
+        ) VALUES (?, ?, ?, 'user', '[]', ?)
+      `).run(input.reportId, nextRevision, JSON.stringify({
+        extracted: payload.extracted ?? null, correction: previous.correction, action: 'undo'
+      }), timestamp);
+      this.db.prepare(`
+        INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)
+        ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
+      `).run(input.personId);
+      this.invalidateSystemSnapshots(input.personId, affectedSystemIds);
+      this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'report_metadata_correction_undone', ?, '用户撤销了上一次报告元数据修正；原始提取记录保持不变。', ?)
+      `).run(randomUUID(), input.reportId, timestamp);
+      return nextRevision;
+    });
+    const metadataRevision = transaction();
+    return { reportId: input.reportId, metadataRevision, factRevision: this.getFactRevision(input.personId), canUndo: false };
+  }
+
+  private moveReportsBetweenEvents(reportIds: string[], fromEventId: string, toEventId: string): void {
+    const deleteLink = this.db.prepare(`DELETE FROM event_report_links WHERE event_id = ? AND report_id = ?`);
+    const insertLink = this.db.prepare(`INSERT OR IGNORE INTO event_report_links (event_id, report_id) VALUES (?, ?)`);
+    const updateReport = this.db.prepare(`UPDATE report_records SET event_id = ? WHERE id = ? AND event_id = ?`);
+    for (const reportId of reportIds) {
+      const changed = updateReport.run(toEventId, reportId, fromEventId).changes;
+      if (changed !== 1) throw new Error('EVENT_RELATION_CHANGED');
+      deleteLink.run(fromEventId, reportId);
+      insertLink.run(toEventId, reportId);
+    }
+  }
+
+  private systemIdsForDocuments(documentIds: string[]): string[] {
+    if (documentIds.length === 0) return [];
+    const placeholders = documentIds.map(() => '?').join(',');
+    const linkedRows = this.db.prepare(`
+      SELECT DISTINCT sfl.system_id
+      FROM observations o
+      JOIN observation_revisions r
+        ON r.observation_id = o.id AND r.revision = o.current_revision
+      JOIN source_spans ss ON ss.id = r.source_span_id
+      JOIN system_fact_links sfl
+        ON sfl.observation_id = o.id AND sfl.observation_revision = o.current_revision
+      WHERE ss.document_id IN (${placeholders})
+    `).all(...documentIds) as Array<{ system_id: string }>;
+    const correctedRows = this.db.prepare(`
+      SELECT DISTINCT c.concept_id
+      FROM observations o
+      JOIN observation_revisions r
+        ON r.observation_id = o.id AND r.revision = o.current_revision
+      JOIN source_spans ss ON ss.id = r.source_span_id
+      JOIN concept_mapping_corrections c
+        ON c.observation_id = o.id AND c.observation_revision = o.current_revision AND c.active = 1
+      WHERE ss.document_id IN (${placeholders}) AND c.concept_id IS NOT NULL
+    `).all(...documentIds) as Array<{ concept_id: string }>;
+    const systemIds = new Set(linkedRows.map((row) => row.system_id));
+    for (const row of correctedRows) {
+      const definition = conceptDictionary.find((item) => item.id === row.concept_id);
+      for (const link of definition?.systemLinks ?? []) systemIds.add(link.systemId);
+    }
+    return [...systemIds].sort();
+  }
+
+  private systemIdsForReports(reportIds: string[]): string[] {
+    if (reportIds.length === 0) return [];
+    const placeholders = reportIds.map(() => '?').join(',');
+    const documentIds = (this.db.prepare(`
+      SELECT DISTINCT document_id FROM report_source_links
+      WHERE report_id IN (${placeholders})
+    `).all(...reportIds) as Array<{ document_id: string }>).map((row) => row.document_id);
+    return this.systemIdsForDocuments(documentIds);
+  }
+
+  private invalidateSystemSnapshots(personId: string, systemIds: string[]): void {
+    if (systemIds.length === 0) return;
+    this.db.prepare(`
+      UPDATE system_analysis_snapshots_v2 SET status = 'stale'
+      WHERE person_id = ? AND status = 'current'
+        AND system_id IN (${systemIds.map(() => '?').join(',')})
+    `).run(personId, ...systemIds);
+  }
+
+  private invalidateAfterEventRelationChange(personId: string, reportIds: string[]): number {
+    this.db.prepare(`
+      INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)
+      ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
+    `).run(personId);
+    this.invalidateSystemSnapshots(personId, this.systemIdsForReports(reportIds));
+    this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(personId);
+    return this.getFactRevision(personId);
+  }
+
+  mergeHealthEvents(input: MergeHealthEventsInput): HealthEventRelationReceipt {
+    if (input.targetEventId === input.sourceEventId) throw new Error('EVENTS_MUST_BE_DIFFERENT');
+    const transaction = this.db.transaction(() => {
+      const events = this.db.prepare(`
+        SELECT id FROM health_events_v2 WHERE person_id = ? AND id IN (?, ?)
+      `).all(input.personId, input.targetEventId, input.sourceEventId) as Array<{ id: string }>;
+      if (events.length !== 2) throw new Error('HEALTH_EVENT_NOT_FOUND');
+      const targetHasReport = this.db.prepare(`SELECT 1 FROM event_report_links WHERE event_id = ? LIMIT 1`).get(input.targetEventId);
+      if (!targetHasReport) throw new Error('TARGET_EVENT_EMPTY');
+      const reportIds = (this.db.prepare(`SELECT report_id FROM event_report_links WHERE event_id = ? ORDER BY report_id`).all(input.sourceEventId) as Array<{ report_id: string }>).map((row) => row.report_id);
+      if (reportIds.length === 0) throw new Error('SOURCE_EVENT_EMPTY');
+      this.moveReportsBetweenEvents(reportIds, input.sourceEventId, input.targetEventId);
+      const changeId = randomUUID();
+      const timestamp = this.now().toISOString();
+      this.db.prepare(`
+        INSERT INTO event_relation_changes (
+          id, person_id, action, from_event_id, to_event_id, report_ids_json,
+          reason, active, parent_change_id, created_at
+        ) VALUES (?, ?, 'merge', ?, ?, ?, ?, 1, NULL, ?)
+      `).run(changeId, input.personId, input.sourceEventId, input.targetEventId, JSON.stringify(reportIds), input.reason.trim(), timestamp);
+      const factRevision = this.invalidateAfterEventRelationChange(input.personId, reportIds);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'health_events_merged', ?, '用户将两个健康事件合并；原始报告与事实保持不变，可撤销。', ?)
+      `).run(randomUUID(), changeId, timestamp);
+      return { changeId, reportIds, factRevision };
+    });
+    const result = transaction();
+    return { ...result, eventIds: [input.targetEventId, input.sourceEventId], canUndo: true };
+  }
+
+  splitHealthEvent(input: SplitHealthEventInput): HealthEventRelationReceipt {
+    const transaction = this.db.transaction(() => {
+      const event = this.db.prepare(`SELECT * FROM health_events_v2 WHERE id = ? AND person_id = ?`).get(input.eventId, input.personId) as Record<string, unknown> | undefined;
+      if (!event) throw new Error('HEALTH_EVENT_NOT_FOUND');
+      const reportIds = (this.db.prepare(`SELECT report_id FROM event_report_links WHERE event_id = ? ORDER BY report_id`).all(input.eventId) as Array<{ report_id: string }>).map((row) => row.report_id);
+      if (!reportIds.includes(input.reportId)) throw new Error('REPORT_NOT_IN_EVENT');
+      if (reportIds.length < 2) throw new Error('EVENT_HAS_SINGLE_REPORT');
+      const newEventId = randomUUID();
+      const timestamp = this.now().toISOString();
+      this.db.prepare(`
+        INSERT INTO health_events_v2 (
+          id, person_id, type, title, clinical_date, end_date, date_precision, date_role,
+          date_source, metadata_status, metadata_revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        newEventId, input.personId, event.type, event.title, event.clinical_date, event.end_date,
+        event.date_precision, event.date_role, 'corrected', 'corrected', event.metadata_revision, timestamp, timestamp
+      );
+      this.moveReportsBetweenEvents([input.reportId], input.eventId, newEventId);
+      const changeId = randomUUID();
+      this.db.prepare(`
+        INSERT INTO event_relation_changes (
+          id, person_id, action, from_event_id, to_event_id, report_ids_json,
+          reason, active, parent_change_id, created_at
+        ) VALUES (?, ?, 'split', ?, ?, ?, ?, 1, NULL, ?)
+      `).run(changeId, input.personId, input.eventId, newEventId, JSON.stringify([input.reportId]), input.reason.trim(), timestamp);
+      const factRevision = this.invalidateAfterEventRelationChange(input.personId, [input.reportId]);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'health_event_split', ?, '用户从健康事件中拆出一份报告；原始报告与事实保持不变，可撤销。', ?)
+      `).run(randomUUID(), changeId, timestamp);
+      return { changeId, newEventId, factRevision };
+    });
+    const result = transaction();
+    return { changeId: result.changeId, eventIds: [input.eventId, result.newEventId], reportIds: [input.reportId], factRevision: result.factRevision, canUndo: true };
+  }
+
+  undoHealthEventRelation(input: UndoHealthEventRelationInput): HealthEventRelationReceipt {
+    const transaction = this.db.transaction(() => {
+      const change = this.db.prepare(`
+        SELECT * FROM event_relation_changes WHERE id = ? AND person_id = ? AND active = 1 AND action IN ('merge','split')
+      `).get(input.changeId, input.personId) as Record<string, unknown> | undefined;
+      if (!change) throw new Error('EVENT_RELATION_NOT_UNDOABLE');
+      const reportIds = JSON.parse(String(change.report_ids_json)) as string[];
+      const fromEventId = String(change.from_event_id);
+      const toEventId = String(change.to_event_id);
+      this.moveReportsBetweenEvents(reportIds, toEventId, fromEventId);
+      this.db.prepare(`UPDATE event_relation_changes SET active = 0 WHERE id = ?`).run(input.changeId);
+      const undoId = randomUUID();
+      const timestamp = this.now().toISOString();
+      this.db.prepare(`
+        INSERT INTO event_relation_changes (
+          id, person_id, action, from_event_id, to_event_id, report_ids_json,
+          reason, active, parent_change_id, created_at
+        ) VALUES (?, ?, 'undo', ?, ?, ?, '撤销上一次事件关系修改', 0, ?, ?)
+      `).run(undoId, input.personId, toEventId, fromEventId, JSON.stringify(reportIds), input.changeId, timestamp);
+      const factRevision = this.invalidateAfterEventRelationChange(input.personId, reportIds);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'health_event_relation_undone', ?, '用户撤销了上一次健康事件合并或拆分。', ?)
+      `).run(randomUUID(), input.changeId, timestamp);
+      return { undoId, reportIds, fromEventId, toEventId, factRevision };
+    });
+    const result = transaction();
+    return { changeId: result.undoId, eventIds: [result.fromEventId, result.toEventId], reportIds: result.reportIds, factRevision: result.factRevision, canUndo: false };
   }
 
   getDerivedContext(personId: string): { person: Person; notes: ManualNote[] } {
@@ -2782,6 +3801,90 @@ export class WorkspaceStore {
         input.promptVersion, input.rulesVersion, input.modelId,
         JSON.stringify({ observationIds }), payloadJson, this.now().toISOString()
       );
+      const proposalTimestamp = this.now().toISOString();
+      const dismissedDedupeKeys = new Set((this.db.prepare(`
+        SELECT DISTINCT json_extract(structure_json, '$.dedupeKey') AS dedupe_key
+        FROM lifestyle_proposals_v2
+        WHERE person_id = ? AND status = 'dismissed'
+          AND json_extract(structure_json, '$.dedupeKey') IS NOT NULL
+      `).all(candidate.personId) as Array<{ dedupe_key: string }>).map((row) => row.dedupe_key));
+      const adoptedDedupeKeys = new Set((this.db.prepare(`
+        SELECT DISTINCT json_extract(structure_json, '$.dedupeKey') AS dedupe_key
+        FROM lifestyle_proposals_v2
+        WHERE person_id = ? AND status = 'adopted'
+          AND json_extract(structure_json, '$.dedupeKey') IS NOT NULL
+      `).all(candidate.personId) as Array<{ dedupe_key: string }>).map((row) => row.dedupe_key));
+      this.db.prepare(`
+        UPDATE lifestyle_proposals_v2
+        SET status = 'superseded', updated_at = ?
+        WHERE person_id = ? AND status IN ('proposed', 'dismissed')
+      `).run(proposalTimestamp, candidate.personId);
+      const proposalInsert = this.db.prepare(`
+        INSERT INTO lifestyle_proposals_v2 (
+          id, person_id, category, title, detail, consult_professional,
+          evidence_refs_json, structure_json, status, source_snapshot_id, version, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      `);
+      const knowledgeInsert = this.db.prepare(`
+        INSERT OR IGNORE INTO knowledge_entries (
+          id, topic_key, locale, source_title, source_url, reviewed_at,
+          payload_json, version, created_at
+        ) VALUES (?, ?, 'zh-CN', ?, ?, ?, ?, 'knowledge-v1', ?)
+      `);
+      for (const guidance of candidate.lifestyleGuidance) {
+        const generalKnowledgeEvidence = guidance.generalKnowledgeEvidence.map((knowledge) => {
+          const id = `knowledge-${createHash('sha256').update(JSON.stringify({
+            sourceTitle: knowledge.sourceTitle,
+            sourceOrganization: knowledge.sourceOrganization,
+            sourceUrl: knowledge.sourceUrl,
+            reviewedAt: knowledge.reviewedAt,
+            supportedScope: knowledge.supportedScope
+          })).digest('hex').slice(0, 24)}`;
+          knowledgeInsert.run(
+            id,
+            guidance.dedupeKey,
+            knowledge.sourceTitle,
+            knowledge.sourceUrl,
+            knowledge.reviewedAt,
+            JSON.stringify({
+              sourceOrganization: knowledge.sourceOrganization,
+              supportedScope: knowledge.supportedScope
+            }),
+            proposalTimestamp
+          );
+          return { ...knowledge, id };
+        });
+        // 同一方向一旦被用户采纳，新一轮模型输出只更新快照，不再重复要求用户确认。
+        // 原提案及其行动保持不变，继续作为用户决定的来源记录。
+        if (adoptedDedupeKeys.has(guidance.dedupeKey)) continue;
+        proposalInsert.run(
+          randomUUID(),
+          candidate.personId,
+          guidance.category,
+          guidance.title,
+          guidance.detail,
+          guidance.consultProfessional ? 1 : 0,
+          JSON.stringify(guidance.evidenceObservationIds),
+          JSON.stringify({
+            dedupeKey: guidance.dedupeKey,
+            goal: guidance.goal,
+            rationale: guidance.rationale,
+            steps: guidance.steps,
+            startingOptions: guidance.startingOptions,
+            scheduleSuggestion: guidance.scheduleSuggestion,
+            trackingSuggestion: guidance.trackingSuggestion,
+            constraints: guidance.constraints,
+            uncertainties: guidance.uncertainties,
+            generalKnowledgeEvidence,
+            sourceKind: guidance.sourceKind,
+            relatedSystemIds: guidance.relatedSystemIds
+          }),
+          dismissedDedupeKeys.has(guidance.dedupeKey) ? 'dismissed' : 'proposed',
+          snapshotId,
+          proposalTimestamp,
+          proposalTimestamp
+        );
+      }
       const evidenceInsert = this.db.prepare(`
         INSERT INTO snapshot_evidence (
           snapshot_id, claim_id, observation_revision_id, source_span_id
@@ -2818,7 +3921,7 @@ export class WorkspaceStore {
     const rows = this.db.prepare(`
       SELECT id, person_id, fact_revision, context_revision, status, payload_json, created_at
       FROM derived_snapshots
-      ORDER BY person_id, created_at DESC, id DESC
+      ORDER BY person_id, created_at DESC, rowid DESC
     `).all() as Array<Record<string, unknown>>;
     const seen = new Set<string>();
     return rows.flatMap((row) => {
@@ -2835,6 +3938,150 @@ export class WorkspaceStore {
         createdAt: String(row.created_at)
       }];
     });
+  }
+
+  listSystemAnalysisSnapshots(personId?: string, currentOnly = false): PublishedSystemAnalysisSnapshot[] {
+    const rows = this.db.prepare(`
+      SELECT id, person_id, system_id, fact_revision, prompt_version, evidence_bundle_hash,
+             payload_json, status, created_at
+      FROM system_analysis_snapshots_v2
+      WHERE (? IS NULL OR person_id = ?) AND (? = 0 OR status = 'current')
+      ORDER BY person_id, system_id, created_at DESC, id DESC
+    `).all(personId ?? null, personId ?? null, currentOnly ? 1 : 0) as Array<Record<string, unknown>>;
+    return rows.map((row) => {
+      const payload = JSON.parse(String(row.payload_json)) as Omit<SystemAnalysisSnapshot, 'id' | 'status' | 'generatedAt'>;
+      return {
+        ...payload,
+        id: String(row.id),
+        status: String(row.status) as SystemAnalysisSnapshot['status'],
+        generatedAt: String(row.created_at)
+      };
+    });
+  }
+
+  publishSystemAnalysisSnapshot(input: {
+    snapshot: Omit<SystemAnalysisSnapshot, 'id' | 'status' | 'generatedAt'>;
+    evidenceBundle: SystemEvidenceBundle;
+    expectedContextRevision: number;
+    rulesVersion: string;
+    modelId: string;
+    executionGuard?: JobExecutionGuard;
+  }): { snapshotId: string; idempotent: boolean } {
+    const { snapshot, evidenceBundle } = input;
+    if (snapshot.personId !== evidenceBundle.identity.personId
+      || snapshot.systemId !== evidenceBundle.identity.systemId
+      || snapshot.inputSignature !== evidenceBundle.scope.inputSignature
+      || snapshot.factRevision !== evidenceBundle.scope.factRevision) {
+      throw new Error('SYSTEM_ANALYSIS_SCOPE_MISMATCH');
+    }
+    const existing = this.db.prepare(`
+      SELECT id FROM system_analysis_snapshots_v2
+      WHERE person_id = ? AND system_id = ? AND evidence_bundle_hash = ?
+        AND prompt_version = ? AND rules_version = ? AND model_id = ? AND status = 'current'
+      LIMIT 1
+    `).get(
+      snapshot.personId, snapshot.systemId, snapshot.inputSignature,
+      snapshot.promptVersion, input.rulesVersion, input.modelId
+    ) as { id: string } | undefined;
+    if (existing) return { snapshotId: existing.id, idempotent: true };
+
+    const transaction = this.db.transaction(() => {
+      if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard);
+      const actualFactRevision = this.getFactRevision(snapshot.personId);
+      const actualContextRevision = this.getClinicalContextRevision(snapshot.personId);
+      if (actualFactRevision !== snapshot.factRevision) {
+        throw new RevisionConflictError(snapshot.factRevision, actualFactRevision);
+      }
+      if (actualContextRevision !== input.expectedContextRevision
+        || actualContextRevision !== evidenceBundle.scope.contextRevision) {
+        throw new Error('CLINICAL_CONTEXT_REVISION_CONFLICT');
+      }
+      const observationIds = [...new Set([
+        ...evidenceBundle.directFacts,
+        ...evidenceBundle.contextFacts
+      ].map((fact) => fact.observationId))];
+      if (observationIds.length > 0) {
+        const count = this.db.prepare(`
+          SELECT COUNT(*) AS count FROM observations
+          WHERE person_id = ? AND id IN (${observationIds.map(() => '?').join(',')})
+        `).get(snapshot.personId, ...observationIds) as { count: number };
+        if (Number(count.count) !== observationIds.length) throw new Error('SYSTEM_ANALYSIS_EVIDENCE_MISMATCH');
+      }
+
+      const snapshotId = randomUUID();
+      const timestamp = this.now().toISOString();
+      this.db.prepare(`
+        UPDATE system_analysis_snapshots_v2 SET status = 'stale'
+        WHERE person_id = ? AND system_id = ? AND status = 'current'
+      `).run(snapshot.personId, snapshot.systemId);
+      this.db.prepare(`
+        INSERT INTO system_analysis_snapshots_v2 (
+          id, person_id, system_id, fact_revision, context_revision, prompt_version,
+          rules_version, model_id, evidence_bundle_hash, coverage_json,
+          payload_json, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)
+      `).run(
+        snapshotId, snapshot.personId, snapshot.systemId, snapshot.factRevision,
+        input.expectedContextRevision, snapshot.promptVersion, input.rulesVersion,
+        input.modelId, snapshot.inputSignature, JSON.stringify(snapshot.coverage),
+        JSON.stringify(snapshot), timestamp
+      );
+      const dependencyInsert = this.db.prepare(`
+        INSERT OR REPLACE INTO derivation_dependencies (
+          derived_kind, derived_id, dependency_kind, dependency_id, dependency_revision, created_at
+        ) VALUES ('system_analysis', ?, ?, ?, ?, ?)
+      `);
+      for (const observationId of observationIds) {
+        dependencyInsert.run(snapshotId, 'observation', observationId, String(snapshot.factRevision), timestamp);
+      }
+      for (const context of evidenceBundle.personalContext) {
+        dependencyInsert.run(snapshotId, 'personal_context', context.id, String(input.expectedContextRevision), timestamp);
+      }
+      dependencyInsert.run(snapshotId, 'selector', snapshot.systemId, `${BODY_SYSTEM_REGISTRY_VERSION}:${CONCEPT_DICTIONARY_VERSION}`, timestamp);
+      return { snapshotId, idempotent: false };
+    });
+    return transaction();
+  }
+
+  private findStrongMetadataEventMatch(personId: string, metadata: ReportMetadataCandidate | null | undefined): string | null {
+    if (!metadata?.organization?.value) return null;
+    const normalized = (value: string) => value.normalize('NFKC').trim().toLocaleLowerCase('zh-CN');
+    const organization = normalized(metadata.organization.value);
+    const clinicalTime = metadata.times
+      .filter((time) => ['sampled', 'examined', 'encounter'].includes(time.role))
+      .sort((left, right) => ({ day: 3, month: 2, year: 1 }[right.precision] - { day: 3, month: 2, year: 1 }[left.precision]))[0];
+    if (!clinicalTime) return null;
+    const encounterIdentifier = metadata.encounterIdentifier?.value
+      ? normalized(metadata.encounterIdentifier.value)
+      : null;
+    const sampleIdentifiers = new Set((metadata.sampleIdentifiers ?? []).map((item) => normalized(item.value)));
+    if (!encounterIdentifier && sampleIdentifiers.size === 0) return null;
+    const rows = this.db.prepare(`
+      SELECT r.event_id, mr.payload_json
+      FROM report_records r
+      JOIN report_metadata_revisions mr
+        ON mr.report_id = r.id AND mr.revision = r.metadata_revision
+      WHERE r.person_id = ?
+    `).all(personId) as Array<{ event_id: string; payload_json: string }>;
+    const matches = new Set<string>();
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload_json) as { extracted?: ReportMetadataCandidate | null };
+      const existing = payload.extracted;
+      if (!existing?.organization?.value || normalized(existing.organization.value) !== organization) continue;
+      const existingTime = existing.times
+        .filter((time) => ['sampled', 'examined', 'encounter'].includes(time.role))
+        .sort((left, right) => ({ day: 3, month: 2, year: 1 }[right.precision] - { day: 3, month: 2, year: 1 }[left.precision]))[0];
+      if (!existingTime || existingTime.value !== clinicalTime.value || existingTime.precision !== clinicalTime.precision) continue;
+      const existingEncounter = existing.encounterIdentifier?.value
+        ? normalized(existing.encounterIdentifier.value)
+        : null;
+      const existingSamples = new Set((existing.sampleIdentifiers ?? []).map((item) => normalized(item.value)));
+      const sameEncounter = encounterIdentifier !== null && existingEncounter === encounterIdentifier;
+      const sharedSample = [...sampleIdentifiers].some((identifier) => existingSamples.has(identifier));
+      if (sameEncounter || sharedSample) matches.add(row.event_id);
+    }
+    // 若历史数据中同一标识已经对应多个事件，保持并列等待用户处理，绝不任选一个。
+    return matches.size === 1 ? [...matches][0]! : null;
   }
 
   publishFacts(input: PublishFactsInput): { publicationId: string; revision: number; idempotent: boolean } {
@@ -2905,6 +4152,7 @@ export class WorkspaceStore {
       const nextRevision = actual + 1;
       const publicationId = randomUUID();
       const encounters = new Map<string, string>();
+      const affectedSystemIds = new Set<string>();
 
       for (const observation of input.observations) {
         const encounterKey = `${observation.documentId}:${observation.clinicalDate ?? 'unknown'}`;
@@ -2941,6 +4189,117 @@ export class WorkspaceStore {
           observation.sourceSpanId, observation.acceptanceId, observation.specimen, observation.method,
           observation.bodySite, JSON.stringify(observation.evidence), this.now().toISOString()
         );
+        const mapping = mapConcept({
+          rawName: observation.conceptKey,
+          standardName: observation.conceptKey,
+          specimen: observation.specimen,
+          method: observation.method,
+          bodySite: observation.bodySite,
+          unit: observation.unit
+        });
+        this.db.prepare(`
+          INSERT INTO observation_concept_mappings (
+            observation_id, observation_revision, concept_id, normalized_name,
+            status, confidence, reasons_json, mapper_version, created_at
+          ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          observationId,
+          mapping.conceptId,
+          mapping.normalizedName,
+          mapping.status,
+          mapping.confidence,
+          JSON.stringify(mapping.reasons),
+          CONCEPT_DICTIONARY_VERSION,
+          this.now().toISOString()
+        );
+        for (const link of linkConceptToSystems(mapping)) {
+          affectedSystemIds.add(link.systemId);
+          this.db.prepare(`
+            INSERT INTO system_fact_links (
+              observation_id, observation_revision, system_id, relation, linker_version, created_at
+            ) VALUES (?, 1, ?, ?, ?, ?)
+          `).run(observationId, link.systemId, link.relation, BODY_SYSTEM_REGISTRY_VERSION, this.now().toISOString());
+        }
+      }
+
+      const document = this.db.prepare(`
+        SELECT d.source_object_id,
+               COALESCE((
+                 SELECT occ.display_name FROM source_occurrences occ
+                 WHERE occ.source_object_id = d.source_object_id
+                 ORDER BY occ.last_seen DESC LIMIT 1
+               ), '已导入健康资料') AS display_name,
+               so.sha256
+        FROM documents d JOIN source_objects so ON so.id = d.source_object_id
+        WHERE d.id = ?
+      `).get(input.documentId) as { source_object_id: string; display_name: string; sha256: string } | undefined;
+      if (document) {
+        const metadata = input.reportMetadata ?? null;
+        const metadataTimes = metadata?.times ?? [];
+        const currentClinicalTime = metadataTimes
+          .filter((time) => ['sampled', 'examined', 'encounter'].includes(time.role))
+          .sort((left, right) => ({ day: 3, month: 2, year: 1 }[right.precision] - { day: 3, month: 2, year: 1 }[left.precision]))[0];
+        const reportIssuedTime = metadataTimes.find((time) => time.role === 'report_issued');
+        const dates = [...new Set(input.observations.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)))].sort();
+        const earliest = dates[0] ?? null;
+        const latest = dates.at(-1) ?? null;
+        const spanDays = earliest && latest
+          ? Math.round((Date.parse(`${latest}T00:00:00Z`) - Date.parse(`${earliest}T00:00:00Z`)) / 86_400_000)
+          : null;
+        const eventDate = currentClinicalTime?.value
+          ?? (dates.length === 1 || (spanDays !== null && spanDays <= 14) ? earliest : null);
+        const eventEndDate = currentClinicalTime ? null : eventDate && latest !== eventDate ? latest : null;
+        const matchedEventId = this.findStrongMetadataEventMatch(input.personId, metadata);
+        const eventId = matchedEventId ?? randomUUID();
+        const reportId = randomUUID();
+        const eventTitle = metadata?.title?.value ?? metadata?.reportKind?.value ?? document.display_name;
+        const reportTitle = metadata?.title?.value ?? document.display_name;
+        const reportKind = metadata?.reportKind?.value ?? 'health_report';
+        const reportDate = reportIssuedTime?.value ?? eventDate;
+        const metadataStatus = metadata ? 'inferred' : eventDate ? 'inferred' : 'unknown';
+        if (!matchedEventId) this.db.prepare(`
+            INSERT INTO health_events_v2 (
+              id, person_id, type, title, clinical_date, end_date, date_precision,
+              date_role, date_source, metadata_status, metadata_revision, created_at, updated_at
+            ) VALUES (?, ?, 'checkup', ?, ?, ?, ?, 'exam', ?, ?, 1, ?, ?)
+          `).run(
+            eventId, input.personId, eventTitle, eventDate, eventEndDate,
+            currentClinicalTime?.precision ?? (eventDate ? 'day' : 'unknown'),
+            currentClinicalTime ? 'explicit' : eventDate ? 'inherited' : 'unknown',
+            metadataStatus, this.now().toISOString(), this.now().toISOString()
+          );
+        this.db.prepare(`
+          INSERT INTO report_records (
+            id, person_id, event_id, report_kind, title, organization, report_date,
+            metadata_status, metadata_revision, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        `).run(
+          reportId, input.personId, eventId, reportKind, reportTitle,
+          metadata?.organization?.value ?? null, reportDate, metadataStatus, this.now().toISOString()
+        );
+        this.db.prepare(`
+          INSERT INTO report_source_links (report_id, document_id, relation, source_hash, created_at)
+          VALUES (?, ?, 'primary', ?, ?)
+        `).run(reportId, input.documentId, document.sha256, this.now().toISOString());
+        this.db.prepare(`INSERT INTO event_report_links (event_id, report_id) VALUES (?, ?)`).run(eventId, reportId);
+        this.db.prepare(`
+          INSERT INTO report_metadata_revisions (
+            report_id, revision, payload_json, actor, evidence_refs_json, created_at
+          ) VALUES (?, 1, ?, ?, ?, ?)
+        `).run(reportId, JSON.stringify({
+          memberModelVersion: MEMBER_MODEL_VERSION,
+          clinicalDate: eventDate,
+          endDate: eventEndDate,
+          dateCandidates: dates,
+          historicalColumnsDetected: dates.length > 1 && eventDate === null,
+          extracted: metadata
+        }), metadata ? 'independent_review_projection' : 'deterministic_projection', JSON.stringify(
+          metadata ? [
+            metadata.reportKind, metadata.title, metadata.organization, metadata.campus,
+            metadata.department, metadata.reportNumber, metadata.encounterIdentifier,
+            ...(metadata.sampleIdentifiers ?? []), ...metadata.examItems, ...metadata.times
+          ].flatMap((field) => field?.evidence ?? []) : []
+        ), this.now().toISOString());
       }
 
       this.db.prepare(`
@@ -2949,6 +4308,11 @@ export class WorkspaceStore {
         ON CONFLICT(person_id) DO UPDATE SET fact_revision = excluded.fact_revision
       `).run(input.personId, nextRevision);
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      const staleSystemSnapshot = this.db.prepare(`
+        UPDATE system_analysis_snapshots_v2 SET status = 'stale'
+        WHERE person_id = ? AND system_id = ? AND status = 'current'
+      `);
+      for (const systemId of affectedSystemIds) staleSystemSnapshot.run(input.personId, systemId);
       this.db.prepare(`
         INSERT INTO publication_events (
           id, person_id, expected_revision, new_revision, change_set_hash, summary, committed_at
@@ -3986,7 +5350,7 @@ export class WorkspaceStore {
               UPDATE jobs
               SET status = 'queued', updated_at = ?
               WHERE status = 'waiting_user'
-                AND stage IN ('analyze', 'guidance', 'review_derived', 'publish')
+                AND stage IN ('analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish')
                 AND EXISTS (
                   SELECT 1 FROM json_each(json_extract(jobs.checkpoint_json, '$.documentIds'))
                   WHERE value = ?
@@ -4083,7 +5447,7 @@ export class WorkspaceStore {
               UPDATE jobs
               SET status = 'queued', stage = 'analyze', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
               WHERE status = 'waiting_user'
-                AND stage IN ('analyze', 'guidance', 'review_derived', 'publish')
+                AND stage IN ('analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish')
                 AND EXISTS (
                   SELECT 1 FROM json_each(json_extract(jobs.checkpoint_json, '$.documentIds'))
                   WHERE value = ?
@@ -4140,7 +5504,7 @@ export class WorkspaceStore {
               UPDATE jobs
               SET status = 'queued', stage = 'analyze', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
               WHERE status = 'waiting_user'
-                AND stage IN ('analyze', 'guidance', 'review_derived', 'publish')
+                AND stage IN ('analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish')
                 AND EXISTS (
                   SELECT 1 FROM json_each(json_extract(jobs.checkpoint_json, '$.documentIds'))
                   WHERE value = ?
@@ -4355,6 +5719,188 @@ export class WorkspaceStore {
         current = 28;
       }
 
+      if (current === 28) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS body_system_registry (
+            id TEXT PRIMARY KEY, registry_version TEXT NOT NULL, name TEXT NOT NULL,
+            short_name TEXT NOT NULL, description TEXT NOT NULL, display_order INTEGER NOT NULL,
+            topics_json TEXT NOT NULL, updated_at TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS concept_definitions (
+            id TEXT PRIMARY KEY, dictionary_version TEXT NOT NULL, canonical_name TEXT NOT NULL,
+            specimen TEXT, method TEXT, body_site TEXT, compatible_units_json TEXT NOT NULL,
+            system_links_json TEXT NOT NULL, topic_id TEXT, updated_at TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS concept_aliases (
+            concept_id TEXT NOT NULL REFERENCES concept_definitions(id) ON DELETE CASCADE,
+            alias TEXT NOT NULL, normalized_alias TEXT NOT NULL, dictionary_version TEXT NOT NULL,
+            PRIMARY KEY(concept_id, normalized_alias)
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS idx_concept_alias_lookup ON concept_aliases(normalized_alias, dictionary_version);
+          CREATE TABLE IF NOT EXISTS observation_concept_mappings (
+            observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+            observation_revision INTEGER NOT NULL, concept_id TEXT REFERENCES concept_definitions(id),
+            normalized_name TEXT NOT NULL, status TEXT NOT NULL, confidence REAL NOT NULL,
+            reasons_json TEXT NOT NULL, mapper_version TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(observation_id, observation_revision, mapper_version)
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS system_fact_links (
+            observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+            observation_revision INTEGER NOT NULL, system_id TEXT NOT NULL REFERENCES body_system_registry(id),
+            relation TEXT NOT NULL CHECK(relation IN ('direct','context')),
+            linker_version TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(observation_id, observation_revision, system_id, relation, linker_version)
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS idx_system_fact_links_system ON system_fact_links(system_id, observation_id);
+          CREATE TABLE IF NOT EXISTS health_events_v2 (
+            id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id), type TEXT NOT NULL,
+            title TEXT NOT NULL, clinical_date TEXT, end_date TEXT, date_precision TEXT NOT NULL,
+            date_role TEXT NOT NULL, date_source TEXT NOT NULL, metadata_status TEXT NOT NULL,
+            metadata_revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS idx_health_events_v2_person_date ON health_events_v2(person_id, clinical_date);
+          CREATE TABLE IF NOT EXISTS report_records (
+            id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id), event_id TEXT REFERENCES health_events_v2(id),
+            report_kind TEXT NOT NULL, title TEXT NOT NULL, organization TEXT, report_date TEXT,
+            metadata_status TEXT NOT NULL, metadata_revision INTEGER NOT NULL, created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS report_source_links (
+            report_id TEXT NOT NULL REFERENCES report_records(id) ON DELETE CASCADE,
+            document_id TEXT NOT NULL REFERENCES documents(id), relation TEXT NOT NULL,
+            source_hash TEXT, created_at TEXT NOT NULL, PRIMARY KEY(report_id, document_id)
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS report_metadata_revisions (
+            report_id TEXT NOT NULL REFERENCES report_records(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL, payload_json TEXT NOT NULL, actor TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(report_id, revision)
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS event_report_links (
+            event_id TEXT NOT NULL REFERENCES health_events_v2(id) ON DELETE CASCADE,
+            report_id TEXT NOT NULL REFERENCES report_records(id) ON DELETE CASCADE,
+            PRIMARY KEY(event_id, report_id)
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS system_analysis_snapshots_v2 (
+            id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
+            system_id TEXT NOT NULL REFERENCES body_system_registry(id), fact_revision INTEGER NOT NULL,
+            context_revision INTEGER NOT NULL, prompt_version TEXT NOT NULL, rules_version TEXT NOT NULL,
+            model_id TEXT NOT NULL, evidence_bundle_hash TEXT NOT NULL, coverage_json TEXT NOT NULL,
+            payload_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS idx_system_analysis_current ON system_analysis_snapshots_v2(person_id, system_id, status, created_at);
+          CREATE TABLE IF NOT EXISTS knowledge_entries (
+            id TEXT PRIMARY KEY, topic_key TEXT NOT NULL, locale TEXT NOT NULL,
+            source_title TEXT NOT NULL, source_url TEXT, reviewed_at TEXT,
+            payload_json TEXT NOT NULL, version TEXT NOT NULL, created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS lifestyle_proposals_v2 (
+            id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id), category TEXT NOT NULL,
+            title TEXT NOT NULL, detail TEXT NOT NULL, consult_professional INTEGER NOT NULL,
+            evidence_refs_json TEXT NOT NULL, status TEXT NOT NULL, source_snapshot_id TEXT,
+            version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS idx_lifestyle_proposals_person ON lifestyle_proposals_v2(person_id, status, updated_at);
+          CREATE TABLE IF NOT EXISTS action_adoptions_v2 (
+            id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
+            proposal_id TEXT REFERENCES lifestyle_proposals_v2(id), title TEXT NOT NULL,
+            status TEXT NOT NULL, due_date TEXT, user_revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          ) STRICT;
+          CREATE TABLE IF NOT EXISTS derivation_dependencies (
+            derived_kind TEXT NOT NULL, derived_id TEXT NOT NULL, dependency_kind TEXT NOT NULL,
+            dependency_id TEXT NOT NULL, dependency_revision TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(derived_kind, derived_id, dependency_kind, dependency_id)
+          ) STRICT;
+          UPDATE workspaces SET schema_version = 29;
+          PRAGMA user_version = 29;
+        `);
+        current = 29;
+      }
+
+      if (current === 29) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS concept_mapping_corrections (
+            id TEXT PRIMARY KEY,
+            observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+            observation_revision INTEGER NOT NULL,
+            concept_id TEXT REFERENCES concept_definitions(id),
+            normalized_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('verified','proposed','unmapped')),
+            confidence REAL NOT NULL,
+            reasons_json TEXT NOT NULL,
+            previous_concept_id TEXT REFERENCES concept_definitions(id),
+            previous_normalized_name TEXT NOT NULL,
+            previous_status TEXT NOT NULL CHECK(previous_status IN ('verified','proposed','unmapped')),
+            previous_confidence REAL NOT NULL,
+            previous_reasons_json TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('set','undo')),
+            reason TEXT NOT NULL,
+            active INTEGER NOT NULL CHECK(active IN (0,1)),
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_mapping_corrections_active
+            ON concept_mapping_corrections(observation_id) WHERE active = 1;
+          CREATE INDEX IF NOT EXISTS idx_concept_mapping_corrections_history
+            ON concept_mapping_corrections(observation_id, created_at, id);
+          UPDATE workspaces SET schema_version = 30;
+          PRAGMA user_version = 30;
+        `);
+        current = 30;
+      }
+
+      if (current === 30) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS event_relation_changes (
+            id TEXT PRIMARY KEY,
+            person_id TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+            action TEXT NOT NULL CHECK(action IN ('merge','split','undo')),
+            from_event_id TEXT NOT NULL REFERENCES health_events_v2(id),
+            to_event_id TEXT NOT NULL REFERENCES health_events_v2(id),
+            report_ids_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            active INTEGER NOT NULL CHECK(active IN (0,1)),
+            parent_change_id TEXT REFERENCES event_relation_changes(id),
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS idx_event_relation_changes_person
+            ON event_relation_changes(person_id, created_at, id);
+          UPDATE workspaces SET schema_version = 31;
+          PRAGMA user_version = 31;
+        `);
+        current = 31;
+      }
+
+      if (current === 31) {
+        const proposalColumns = this.db.pragma('table_info(lifestyle_proposals_v2)') as Array<{ name: string }>;
+        if (!proposalColumns.some((column) => column.name === 'structure_json')) {
+          this.db.exec(`
+            ALTER TABLE lifestyle_proposals_v2
+              ADD COLUMN structure_json TEXT NOT NULL DEFAULT '{}';
+          `);
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 32;
+          PRAGMA user_version = 32;
+        `);
+        current = 32;
+      }
+
+      if (current === 32) {
+        const adoptionColumns = this.db.pragma('table_info(action_adoptions_v2)') as Array<{ name: string }>;
+        if (!adoptionColumns.some((column) => column.name === 'details_json')) {
+          this.db.exec(`
+            ALTER TABLE action_adoptions_v2
+              ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}';
+          `);
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 33;
+          PRAGMA user_version = 33;
+        `);
+        current = 33;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -4553,14 +6099,208 @@ export class WorkspaceStore {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_actions_person_status ON action_items(person_id, status);
       CREATE INDEX IF NOT EXISTS idx_ai_transmissions_document ON ai_transmissions(document_id, started_at);
-      PRAGMA user_version = 28;
+      CREATE TABLE IF NOT EXISTS body_system_registry (
+        id TEXT PRIMARY KEY, registry_version TEXT NOT NULL, name TEXT NOT NULL,
+        short_name TEXT NOT NULL, description TEXT NOT NULL, display_order INTEGER NOT NULL,
+        topics_json TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS concept_definitions (
+        id TEXT PRIMARY KEY, dictionary_version TEXT NOT NULL, canonical_name TEXT NOT NULL,
+        specimen TEXT, method TEXT, body_site TEXT, compatible_units_json TEXT NOT NULL,
+        system_links_json TEXT NOT NULL, topic_id TEXT, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS concept_aliases (
+        concept_id TEXT NOT NULL REFERENCES concept_definitions(id) ON DELETE CASCADE,
+        alias TEXT NOT NULL, normalized_alias TEXT NOT NULL, dictionary_version TEXT NOT NULL,
+        PRIMARY KEY(concept_id, normalized_alias)
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_concept_alias_lookup ON concept_aliases(normalized_alias, dictionary_version);
+      CREATE TABLE IF NOT EXISTS observation_concept_mappings (
+        observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+        observation_revision INTEGER NOT NULL, concept_id TEXT REFERENCES concept_definitions(id),
+        normalized_name TEXT NOT NULL, status TEXT NOT NULL, confidence REAL NOT NULL,
+        reasons_json TEXT NOT NULL, mapper_version TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(observation_id, observation_revision, mapper_version)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS system_fact_links (
+        observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+        observation_revision INTEGER NOT NULL, system_id TEXT NOT NULL REFERENCES body_system_registry(id),
+        relation TEXT NOT NULL CHECK(relation IN ('direct','context')),
+        linker_version TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(observation_id, observation_revision, system_id, relation, linker_version)
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_system_fact_links_system ON system_fact_links(system_id, observation_id);
+      CREATE TABLE IF NOT EXISTS health_events_v2 (
+        id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id), type TEXT NOT NULL,
+        title TEXT NOT NULL, clinical_date TEXT, end_date TEXT, date_precision TEXT NOT NULL,
+        date_role TEXT NOT NULL, date_source TEXT NOT NULL, metadata_status TEXT NOT NULL,
+        metadata_revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_health_events_v2_person_date ON health_events_v2(person_id, clinical_date);
+      CREATE TABLE IF NOT EXISTS report_records (
+        id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id), event_id TEXT REFERENCES health_events_v2(id),
+        report_kind TEXT NOT NULL, title TEXT NOT NULL, organization TEXT, report_date TEXT,
+        metadata_status TEXT NOT NULL, metadata_revision INTEGER NOT NULL, created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS report_source_links (
+        report_id TEXT NOT NULL REFERENCES report_records(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id), relation TEXT NOT NULL,
+        source_hash TEXT, created_at TEXT NOT NULL, PRIMARY KEY(report_id, document_id)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS report_metadata_revisions (
+        report_id TEXT NOT NULL REFERENCES report_records(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL, payload_json TEXT NOT NULL, actor TEXT NOT NULL,
+        evidence_refs_json TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(report_id, revision)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS event_report_links (
+        event_id TEXT NOT NULL REFERENCES health_events_v2(id) ON DELETE CASCADE,
+        report_id TEXT NOT NULL REFERENCES report_records(id) ON DELETE CASCADE,
+        PRIMARY KEY(event_id, report_id)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS event_relation_changes (
+        id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+        action TEXT NOT NULL CHECK(action IN ('merge','split','undo')),
+        from_event_id TEXT NOT NULL REFERENCES health_events_v2(id),
+        to_event_id TEXT NOT NULL REFERENCES health_events_v2(id),
+        report_ids_json TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        active INTEGER NOT NULL CHECK(active IN (0,1)),
+        parent_change_id TEXT REFERENCES event_relation_changes(id),
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_event_relation_changes_person
+        ON event_relation_changes(person_id, created_at, id);
+      CREATE TABLE IF NOT EXISTS system_analysis_snapshots_v2 (
+        id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
+        system_id TEXT NOT NULL REFERENCES body_system_registry(id), fact_revision INTEGER NOT NULL,
+        context_revision INTEGER NOT NULL, prompt_version TEXT NOT NULL, rules_version TEXT NOT NULL,
+        model_id TEXT NOT NULL, evidence_bundle_hash TEXT NOT NULL, coverage_json TEXT NOT NULL,
+        payload_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_system_analysis_current ON system_analysis_snapshots_v2(person_id, system_id, status, created_at);
+      CREATE TABLE IF NOT EXISTS knowledge_entries (
+        id TEXT PRIMARY KEY, topic_key TEXT NOT NULL, locale TEXT NOT NULL,
+        source_title TEXT NOT NULL, source_url TEXT, reviewed_at TEXT,
+        payload_json TEXT NOT NULL, version TEXT NOT NULL, created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS lifestyle_proposals_v2 (
+        id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id), category TEXT NOT NULL,
+        title TEXT NOT NULL, detail TEXT NOT NULL, consult_professional INTEGER NOT NULL,
+        evidence_refs_json TEXT NOT NULL, structure_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL, source_snapshot_id TEXT,
+        version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_lifestyle_proposals_person ON lifestyle_proposals_v2(person_id, status, updated_at);
+      CREATE TABLE IF NOT EXISTS action_adoptions_v2 (
+        id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
+        proposal_id TEXT REFERENCES lifestyle_proposals_v2(id), title TEXT NOT NULL,
+        details_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+        due_date TEXT, user_revision INTEGER NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS derivation_dependencies (
+        derived_kind TEXT NOT NULL, derived_id TEXT NOT NULL, dependency_kind TEXT NOT NULL,
+        dependency_id TEXT NOT NULL, dependency_revision TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(derived_kind, derived_id, dependency_kind, dependency_id)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS concept_mapping_corrections (
+        id TEXT PRIMARY KEY,
+        observation_id TEXT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+        observation_revision INTEGER NOT NULL,
+        concept_id TEXT REFERENCES concept_definitions(id),
+        normalized_name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('verified','proposed','unmapped')),
+        confidence REAL NOT NULL,
+        reasons_json TEXT NOT NULL,
+        previous_concept_id TEXT REFERENCES concept_definitions(id),
+        previous_normalized_name TEXT NOT NULL,
+        previous_status TEXT NOT NULL CHECK(previous_status IN ('verified','proposed','unmapped')),
+        previous_confidence REAL NOT NULL,
+        previous_reasons_json TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('set','undo')),
+        reason TEXT NOT NULL,
+        active INTEGER NOT NULL CHECK(active IN (0,1)),
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_concept_mapping_corrections_active
+        ON concept_mapping_corrections(observation_id) WHERE active = 1;
+      CREATE INDEX IF NOT EXISTS idx_concept_mapping_corrections_history
+        ON concept_mapping_corrections(observation_id, created_at, id);
+      PRAGMA user_version = 33;
       `);
+
+      this.seedMemberModelV2();
 
       if (upgradingExistingWorkspace) this.failureInjector?.('during_schema_migration');
       this.db.exec('COMMIT');
     } catch (error) {
       if (this.db.inTransaction) this.db.exec('ROLLBACK');
       throw error;
+    }
+  }
+
+  private seedMemberModelV2(): void {
+    const updatedAt = this.now().toISOString();
+    const insertSystem = this.db.prepare(`
+      INSERT INTO body_system_registry (
+        id, registry_version, name, short_name, description, display_order, topics_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        registry_version = excluded.registry_version,
+        name = excluded.name,
+        short_name = excluded.short_name,
+        description = excluded.description,
+        display_order = excluded.display_order,
+        topics_json = excluded.topics_json,
+        updated_at = excluded.updated_at
+    `);
+    for (const system of bodySystemRegistry) {
+      insertSystem.run(system.id, system.version, system.name, system.shortName, system.description, system.order, JSON.stringify(system.topics), updatedAt);
+    }
+
+    const insertDefinition = this.db.prepare(`
+      INSERT INTO concept_definitions (
+        id, dictionary_version, canonical_name, specimen, method, body_site,
+        compatible_units_json, system_links_json, topic_id, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        dictionary_version = excluded.dictionary_version,
+        canonical_name = excluded.canonical_name,
+        specimen = excluded.specimen,
+        method = excluded.method,
+        body_site = excluded.body_site,
+        compatible_units_json = excluded.compatible_units_json,
+        system_links_json = excluded.system_links_json,
+        topic_id = excluded.topic_id,
+        updated_at = excluded.updated_at
+    `);
+    const insertAlias = this.db.prepare(`
+      INSERT INTO concept_aliases (concept_id, alias, normalized_alias, dictionary_version)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(concept_id, normalized_alias) DO UPDATE SET
+        alias = excluded.alias,
+        dictionary_version = excluded.dictionary_version
+    `);
+    for (const definition of conceptDictionary) {
+      insertDefinition.run(
+        definition.id,
+        definition.version,
+        definition.canonicalName,
+        definition.specimen,
+        definition.method,
+        definition.bodySite,
+        JSON.stringify(definition.compatibleUnits),
+        JSON.stringify(definition.systemLinks),
+        definition.topicId,
+        updatedAt
+      );
+      for (const alias of definition.aliases) {
+        const normalized = alias.normalize('NFKC').toLocaleLowerCase('zh-CN').replace(/[\s_()（）\-—–]/g, '');
+        insertAlias.run(definition.id, alias, normalized, definition.version);
+      }
     }
   }
 }

@@ -153,6 +153,87 @@ describe('自动接纳规则', () => {
       .toEqual({ decision: 'reject', reasons: ['unit_not_bound_to_measurement'] });
   });
 
+  it('不把参考范围下限当成检验结果', () => {
+    const quote = '葡萄糖 5.2 mmol/L，参考范围 3.9–6.1 mmol/L';
+    const glucoseManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const glucose: ObservationCandidate = {
+      ...candidate,
+      localKey: 'glucose', originalName: '葡萄糖', standardNameCandidate: '空腹血糖',
+      value: { kind: 'numeric', rawText: '3.9', decimal: '3.9', comparator: 'eq' },
+      unitRaw: 'mmol/L', referenceRangeRaw: '3.9–6.1 mmol/L', clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(glucose, glucoseManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['numeric_value_not_in_evidence'] });
+  });
+
+  it('比较符必须和原文一致，不把小于值改成等于值', () => {
+    const quote = '肌钙蛋白 <0.01 ng/mL';
+    const troponinManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const troponin: ObservationCandidate = {
+      ...candidate,
+      localKey: 'troponin', originalName: '肌钙蛋白', standardNameCandidate: 'cTnI',
+      value: { kind: 'numeric', rawText: '0.01', decimal: '0.01', comparator: 'eq' },
+      unitRaw: 'ng/mL', referenceRangeRaw: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(troponin, troponinManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['numeric_comparator_not_in_evidence'] });
+    expect(evaluateObservationCandidate({
+      ...troponin,
+      value: { kind: 'numeric', rawText: '<0.01', decimal: '0.01', comparator: 'lt' }
+    }, troponinManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'accept_with_warnings', warnings: ['reference_range_not_provided'] });
+  });
+
+  it('定性结果必须绑定当前项目，不借用相邻项的阳性', () => {
+    const quote = '乙肝表面抗原 阴性；乙肝表面抗体 阳性';
+    const hepatitisManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const antigen: ObservationCandidate = {
+      ...candidate,
+      localKey: 'hbsag', originalName: '乙肝表面抗原', standardNameCandidate: 'HBsAg',
+      value: { kind: 'qualitative', rawText: '阳性', category: 'positive' },
+      unitRaw: null, referenceRangeRaw: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(antigen, hepatitisManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+  });
+
+  it('相邻指标数值不能借给当前项目', () => {
+    const quote = '葡萄糖 5.2 mmol/L，尿酸 320 umol/L';
+    const adjacentManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const glucose: ObservationCandidate = {
+      ...candidate,
+      localKey: 'glucose-adjacent', originalName: '葡萄糖', standardNameCandidate: '空腹血糖',
+      value: { kind: 'numeric', rawText: '320', decimal: '320', comparator: 'eq' },
+      unitRaw: 'mmol/L', referenceRangeRaw: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(glucose, adjacentManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['numeric_value_not_in_evidence'] });
+  });
+
   it('甲状腺激素的 pmol/L 单位不会被后续 mIU/mL 项目误判为单位冲突', () => {
     const quote = '血清游离三碘甲状原氨酸 (FT3) 4.80 pmol/l 2.76-6.45 血清促甲状腺激素 (TSH) 6.45 mIU/ml 0.35-5.1';
     const thyroidManifest: SourceManifest = {
@@ -177,6 +258,36 @@ describe('自动接纳规则', () => {
     expect(evaluateObservationCandidate(ft3, thyroidManifest, {
       personConsistent: true, overwritesUserLockedValue: false
     })).toEqual({ decision: 'accept', warnings: [] });
+  });
+
+  it('识别甲状腺常见的 mIU/L 与 IU/mL 单位并绑定到各自指标', () => {
+    const cases: Array<{ name: string; value: string; unit: string }> = [
+      { name: 'TSH', value: '4.8', unit: 'mIU/L' },
+      { name: 'TPOAb', value: '88', unit: 'IU/mL' }
+    ];
+    for (const [index, item] of cases.entries()) {
+      const quote = `2025-05-01 ${item.name} ${item.value} ${item.unit}`;
+      const unitManifest: SourceManifest = {
+        ...manifest,
+        totalUnits: 1,
+        coveredUnitIndexes: [0],
+        spans: [{ ...manifest.spans[0]!, quote }]
+      };
+      const thyroidCandidate: ObservationCandidate = {
+        ...candidate,
+        localKey: `thyroid-unit-${index}`,
+        originalName: item.name,
+        standardNameCandidate: item.name,
+        value: { kind: 'numeric', rawText: item.value, decimal: item.value, comparator: 'eq' },
+        unitRaw: item.unit,
+        referenceRangeRaw: null,
+        clinicalDate: '2025-05-01',
+        evidence: [{ sourceSpanId: 'span-1', quote }]
+      };
+      expect(evaluateObservationCandidate(thyroidCandidate, unitManifest, {
+        personConsistent: true, overwritesUserLockedValue: false
+      })).toEqual({ decision: 'accept_with_warnings', warnings: ['reference_range_not_provided'] });
+    }
   });
 
   it('文字结果仅被 PDF 排版空格断开时仍可接纳，真实文字差异仍拒绝', () => {

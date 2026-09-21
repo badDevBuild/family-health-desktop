@@ -14,6 +14,14 @@ family-health-desktop-review-evidence-*/
 family-health-desktop-review-evidence-*.zip
 fhd-rereview-*/
 family-health-desktop-rereview-*.zip
+fhd-review-*/
+family-health-desktop-review-*.zip
+family-health-member-redesign-v2/
+family-health-member-redesign-v2-*.zip
+artifacts/
+task_plan.md
+findings.md
+progress.md
 *.dmg
 *.exe
 *.blockmap

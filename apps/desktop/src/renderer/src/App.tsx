@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   Archive,
@@ -35,6 +35,7 @@ import type { ActionItem, AiModelOption, AiPreferences, AiReasoningEffort, Creat
 import { createDemoSnapshot } from '../../../../../packages/test-fixtures/src/index.js';
 import { StatusBadge, type Tone } from './components/StatusBadge.js';
 import { TrendChart } from './components/TrendChart.js';
+import { MemberProfileV2 } from './features/member/MemberProfileV2.js';
 
 type Page = 'home' | 'people' | 'inbox' | 'processing' | 'actions' | 'settings';
 type Evidence = {
@@ -112,7 +113,7 @@ function personQuality(person: PersonSummary): { label: string; tone: Tone } {
 function inboxStatusPresentation(status: InboxItem['status']): { label: string; tone: Tone } {
   switch (status) {
     case 'queued': return { label: '尚未发送至 AI', tone: 'info' };
-    case 'needs_review': return { label: '需要确认成员', tone: 'warning' };
+    case 'needs_review': return { label: '需要核对', tone: 'warning' };
     case 'duplicate': return { label: '重复资料', tone: 'neutral' };
     case 'blocked': return { label: '预处理失败', tone: 'alert' };
     case 'processing': return { label: '处理中', tone: 'info' };
@@ -375,12 +376,31 @@ function PeoplePage({ snapshot, selectedPersonId, onSelectPerson, onOpenEvidence
   const [tab, setTab] = useState<'overview' | 'body' | 'metrics' | 'timeline' | 'guide' | 'documents'>('overview');
   const [metricVisibleCount, setMetricVisibleCount] = useState(12);
   if (!person) return <div className="page-stack"><section className="panel personal-empty-state"><Archive size={28} /><div><span className="eyebrow">成员档案</span><h1>当前没有显示中的成员</h1><p>你可以新增成员，或恢复已归档成员。归档不会删除原始报告和历史记录。</p><div className="button-row"><button className="primary-button" onClick={onAddPerson}><Plus size={17} /> 添加成员</button><button className="secondary-button" onClick={onArchivedPeople}><Archive size={17} /> 已归档成员</button></div></div></section></div>;
+  if (snapshot.workspaceMode === 'personal') return <MemberProfileV2
+    key={person.id}
+    snapshot={snapshot}
+    person={person}
+    onSelectPerson={(id) => { setMetricVisibleCount(12); onSelectPerson(id); }}
+    onOpenEvidence={onOpenEvidence}
+    onAddPerson={onAddPerson}
+    onEditPerson={onEditPerson}
+    onArchivedPeople={onArchivedPeople}
+    onAddNote={onAddNote}
+    onExport={onExport}
+    onImport={onImport}
+    onExcludeDocument={onExcludeDocument}
+    onReincludeDocument={onReincludeDocument}
+    onDeleteDocument={onDeleteDocument}
+    onDeletedDocuments={onDeletedDocuments}
+  />;
   const tabs = [
     ['overview', '概览'], ['body', '身体'], ['metrics', '指标'], ['timeline', '时间线'], ['guide', '生活指南'], ['documents', '资料']
   ] as const;
   const isDemo = snapshot.workspaceMode === 'demo';
   const personOrgans = snapshot.organs.filter((organ) => organ.personId === person.id);
   const personTrends = snapshot.trends.filter((trend) => trend.personId === person.id);
+  const comparableTrends = personTrends.filter((trend) => trend.points.length >= 2 && trend.name !== '年龄');
+  const singleRecordTrends = personTrends.filter((trend) => trend.points.length === 1 && trend.name !== '年龄');
   const personGuidance = snapshot.guidance.filter((item) => item.personId === person.id);
   const hasAcceptedFacts = person.acceptedFactCount > 0;
   const personNotes = snapshot.notes.filter((note) => note.personId === person.id);
@@ -389,15 +409,10 @@ function PeoplePage({ snapshot, selectedPersonId, onSelectPerson, onOpenEvidence
     <div className="page-stack">
       <div className="member-header panel">
         <div className="member-header__identity"><span className="avatar avatar--large">{person.avatarInitial}</span><div><span className="eyebrow">成员档案</span><h1>{person.displayName}</h1><p>{person.relation} · {person.documentCount} 份资料 · {person.freshnessLabel}</p></div></div>
-        <div className="member-header__actions">
+        <div className="member-header__controls">
           <select value={person.id} onChange={(event) => { setMetricVisibleCount(12); onSelectPerson(event.target.value); }} aria-label="切换成员">
             {snapshot.persons.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.relation}</option>)}
           </select>
-          {snapshot.workspaceMode === 'personal' && <button className="secondary-button" onClick={onEditPerson}>编辑成员</button>}
-          {snapshot.workspaceMode === 'personal' && <button className="secondary-button" onClick={onAddPerson}><Plus size={17} /> 添加成员</button>}
-          {snapshot.workspaceMode === 'personal' && <button className="secondary-button" onClick={onArchivedPeople}><Archive size={17} /> 已归档成员</button>}
-          {snapshot.workspaceMode === 'personal' && <button className="secondary-button" onClick={onExport}><FileCheck2 size={17} /> 导出摘要</button>}
-          {snapshot.workspaceMode === 'personal' && <button className="primary-button" onClick={onAddNote}><Plus size={17} /> 补充健康资料</button>}
         </div>
       </div>
       <div className="tabs" role="tablist">
@@ -430,8 +445,11 @@ function PeoplePage({ snapshot, selectedPersonId, onSelectPerson, onOpenEvidence
           {hasManualNotes && <ManualNotesCard notes={personNotes} />}
         </div>
       )}
-      {!isDemo && hasAcceptedFacts && tab === 'body' && <section className="panel"><div className="panel__heading"><div><span className="eyebrow">身体轴</span><h2>按器官系统阅读报告事实</h2></div></div><div className="organ-grid organ-grid--roomy">{personOrgans.map((organ) => <button key={organ.id} className="organ-row" disabled={!organ.evidenceSourceSpanId} onClick={() => onOpenEvidence({ title: `${organ.name}说明的依据`, label: organ.evidenceDate ?? '未知资料日期', quote: organ.summary, meta: `${organ.metricCount} 项相关记录`, sourceSpanId: organ.evidenceSourceSpanId })}><span className={`organ-symbol organ-symbol--${organ.status}`}>{organIcon[organ.id]}</span><span><strong>{organ.name}</strong><small>{organ.summary}</small></span><StatusBadge tone={organ.status === 'attention' ? 'warning' : organ.status === 'stable' ? 'success' : 'neutral'}>{organ.status === 'attention' ? '报告有标记' : organ.status === 'stable' ? '报告未标记异常' : '资料不足'}</StatusBadge></button>)}</div></section>}
-      {!isDemo && hasAcceptedFacts && tab === 'metrics' && <section className="panel"><div className="panel__heading"><div><span className="eyebrow">指标轴</span><h2>带日期、同单位的记录</h2></div><StatusBadge tone="neutral">先显示 {Math.min(metricVisibleCount, personTrends.length)} / {personTrends.length} 项</StatusBadge></div>{personTrends.length > 0 ? personTrends.slice(0, metricVisibleCount).map((series) => <div key={series.id} className="metric-detail"><div><strong>{series.name}</strong><p>{series.interpretation}</p></div><TrendChart series={series} onSelectPoint={(index) => { const point = series.points[index]; if (point) onOpenEvidence({ title: series.name, label: point.sourceLabel, quote: `${series.name} ${point.displayValue} ${series.unit ?? ''}`, meta: `报告参考范围：${point.referenceLow ?? '未知'}–${point.referenceHigh ?? '未知'} ${series.unit ?? ''}`, sourceSpanId: point.sourceSpanId, documentId: point.documentId }); }} /></div>) : <div className="table-empty"><Activity size={24} /><strong>没有可连线的数值记录</strong><span>未知日期、定性结果或带比较符的数值不会被伪装成精确趋势。</span></div>}{personTrends.length > metricVisibleCount && <div className="dialog-actions"><button className="secondary-button" onClick={() => setMetricVisibleCount((count) => count + 12)}>再显示 {Math.min(12, personTrends.length - metricVisibleCount)} 项指标</button></div>}</section>}
+      {!isDemo && hasAcceptedFacts && tab === 'body' && <section className="panel"><div className="panel__heading"><div><span className="eyebrow">身体轴</span><h2>按器官系统阅读报告事实</h2></div></div><div className="organ-grid organ-grid--roomy">{personOrgans.map((organ) => <button key={organ.id} className="organ-row" disabled={!organ.evidenceSourceSpanId} onClick={() => onOpenEvidence({ title: `${organ.name}说明的依据`, label: organ.evidenceDate ?? '未知资料日期', quote: organ.summary, meta: `${organ.metricCount} 项相关记录`, sourceSpanId: organ.evidenceSourceSpanId })}><span className={`organ-symbol organ-symbol--${organ.status}`}>{organIcon[organ.id]}</span><span><strong>{organ.name}</strong><small>{organ.summary}</small></span><StatusBadge tone={organ.status === 'attention' ? 'warning' : organ.status === 'stable' ? 'success' : 'neutral'}>{organ.status === 'attention' ? '有需关注记录' : organ.status === 'stable' ? '本次未标记异常' : '资料不足'}</StatusBadge></button>)}</div></section>}
+      {!isDemo && hasAcceptedFacts && tab === 'metrics' && <div className="metric-page-stack">
+        <section className="panel"><div className="panel__heading"><div><span className="eyebrow">可比较趋势</span><h2>至少有两次同口径记录</h2></div><StatusBadge tone="neutral">{comparableTrends.length} 项</StatusBadge></div>{comparableTrends.length > 0 ? comparableTrends.map((series) => <div key={series.id} className="metric-detail"><div><strong>{series.name}</strong><p>{series.interpretation}</p></div><TrendChart series={series} onSelectPoint={(index) => { const point = series.points[index]; if (point) onOpenEvidence({ title: series.name, label: point.sourceLabel, quote: `${series.name} ${point.displayValue} ${series.unit ?? ''}`, meta: `报告参考范围：${point.referenceLow ?? '未知'}–${point.referenceHigh ?? '未知'} ${series.unit ?? ''}`, sourceSpanId: point.sourceSpanId, documentId: point.documentId }); }} /></div>) : <div className="table-empty compact-empty"><Activity size={24} /><strong>暂时没有可靠趋势</strong><span>需要至少两次带日期、同单位的数值记录才会画线。</span></div>}</section>
+        {singleRecordTrends.length > 0 && <section className="panel"><div className="panel__heading"><div><span className="eyebrow">单次记录</span><h2>先看结果，不伪装成趋势</h2></div><StatusBadge tone="neutral">显示 {Math.min(metricVisibleCount, singleRecordTrends.length)} / {singleRecordTrends.length} 项</StatusBadge></div><div className="single-metric-grid">{singleRecordTrends.slice(0, metricVisibleCount).map((series) => { const point = series.points[0]!; return <button key={series.id} onClick={() => onOpenEvidence({ title: series.name, label: point.sourceLabel, quote: `${series.name} ${point.displayValue} ${series.unit ?? ''}`, meta: series.interpretation, sourceSpanId: point.sourceSpanId, documentId: point.documentId })}><span><strong>{series.name}</strong><small>{series.interpretation}</small></span><b>{point.displayValue}<small>{series.unit ?? ''}</small></b><ChevronRight size={16} /></button>; })}</div>{singleRecordTrends.length > metricVisibleCount && <div className="dialog-actions"><button className="secondary-button" onClick={() => setMetricVisibleCount((count) => count + 24)}>再显示 {Math.min(24, singleRecordTrends.length - metricVisibleCount)} 项</button></div>}</section>}
+      </div>}
       {!isDemo && hasAcceptedFacts && tab === 'guide' && personGuidance.length > 0 && <div className="guide-grid"><section className="panel guide-hero"><span className="eyebrow">日常生活指南 · 已复核</span><h2>从低风险、容易坚持的方向开始</h2><p>这些内容基于现有报告事实，不替代医生给出的个体化治疗。</p><div className="priority-list">{personGuidance.map((item, index) => <div key={item.id}><span>{index + 1}</span><p><strong>{item.title}</strong>{item.detail}</p></div>)}</div></section><section className="panel"><span className="eyebrow">证据边界</span><h3>每条建议都有本地事实依据</h3><p className="body-copy">共引用 {personGuidance.reduce((total, item) => total + item.evidenceCount, 0)} 条已接纳事实；标记为需要专业确认的内容仍应带着原报告咨询医生。</p><StatusBadge tone="info">一般教育内容</StatusBadge></section></div>}
       {!isDemo && hasAcceptedFacts && tab === 'guide' && personGuidance.length === 0 && <section className="panel personal-empty-state"><ShieldCheck size={28} /><div><span className="eyebrow">尚未生成这一层内容</span><h2>生活指南需要独立生成与安全复核</h2><p>已接纳的报告事实不会丢失；缺少对应投影时保持空白，不用演示数据替代。</p></div></section>}
       {!isDemo && tab === 'timeline' && <PersonalTimelineView key={`timeline-${person.id}`} snapshot={snapshot} personId={person.id} onOpenEvidence={onOpenEvidence} />}
@@ -466,6 +484,8 @@ const manualNoteLabels: Record<ManualNote['kind'], string> = {
   allergy: '过敏记录',
   medication: '用药记录',
   self_measurement: '本人自测',
+  goal: '生活目标',
+  constraint: '身体或时间限制',
   free_text: '补充说明'
 };
 
@@ -531,7 +551,8 @@ function InboxPage({ snapshot, onProcess, onImport, onDropFiles, onAssign, onIgn
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [visibleCount, setVisibleCount] = useState(50);
-  const inboxItems = snapshot.inbox.filter((item) => !item.inProcessingCenter);
+  const inboxStatuses = new Set<InboxItem['status']>(['discovered', 'stabilizing', 'queued', 'needs_review']);
+  const inboxItems = snapshot.inbox.filter((item) => !item.inProcessingCenter && inboxStatuses.has(item.status));
   const items = inboxItems.filter((item) => (filter === 'all' || item.status === filter)
     && (personFilter === 'all' || (personFilter === 'unassigned' ? item.personId === null : item.personId === personFilter)));
   const visibleItems = items.slice(0, visibleCount);
@@ -556,18 +577,26 @@ function InboxPage({ snapshot, onProcess, onImport, onDropFiles, onAssign, onIgn
 
 function InboxRow({ item, selected, onToggle, onOpen }: { item: InboxItem; selected: boolean; onToggle(): void; onOpen(): void }) {
   const status = inboxStatusPresentation(item.status);
-  return <div className="inbox-table__row inbox-table__row--selectable"><label className="select-cell"><input aria-label={`选中 ${item.displayName}`} type="checkbox" checked={selected} onChange={onToggle} /></label><span className="file-cell"><span className="file-icon"><FileText size={19} /></span><span><strong>{item.displayName}</strong><small>{item.format} · {item.sourceLabel}</small></span></span><span>{item.personLabel ?? <span className="attention-text">待确认</span>}</span><span>{formatDateTime(item.discoveredAt)}</span><span><StatusBadge tone={status.tone}>{status.label}</StatusBadge>{item.issue && <small className="row-note">{item.issue}</small>}</span><button className="icon-button" aria-label={`查看 ${item.displayName} 的来源`} onClick={onOpen}><FileText size={18} /></button></div>;
+  const statusLabel = item.status === 'needs_review' && item.personId === null ? '待确认归属' : status.label;
+  return <div className="inbox-table__row inbox-table__row--selectable"><label className="select-cell"><input aria-label={`选中 ${item.displayName}`} type="checkbox" checked={selected} onChange={onToggle} /></label><span className="file-cell"><span className="file-icon"><FileText size={19} /></span><span><strong>{item.displayName}</strong><small>{item.format} · {item.sourceLabel}</small></span></span><span>{item.personLabel ?? <span className="attention-text">待确认</span>}</span><span>{formatDateTime(item.discoveredAt)}</span><span><StatusBadge tone={status.tone}>{statusLabel}</StatusBadge>{item.issue && <small className="row-note">{item.issue}</small>}</span><button className="icon-button" aria-label={`查看 ${item.displayName} 的来源`} onClick={onOpen}><FileText size={18} /></button></div>;
 }
 
 function ProcessingPage({ snapshot, onCancel, onRetry, onTogglePause, onDetails }: { snapshot: DashboardSnapshot; onCancel(job: JobSummary): void; onRetry(job: JobSummary): void; onTogglePause(): void; onDetails(job: JobSummary): void }) {
+  const isCurrentJob = (job: JobSummary) => job.status !== 'succeeded'
+    && job.status !== 'cancelled'
+    && (job.status !== 'failed' || job.canRetry);
+  const currentJobs = snapshot.jobs.filter(isCurrentJob);
+  const historyJobs = snapshot.jobs.filter((job) => !isCurrentJob(job));
+  const renderJob = (job: JobSummary, compact = false) => <article className={`panel job-card${compact ? ' job-card--history' : ''}`} key={job.id}>
+    <div className="job-card__top"><span className={`job-icon job-icon--${job.status}`}>{job.status === 'running' ? <LoaderCircle className="spin" size={21} /> : job.status === 'succeeded' ? <Check size={21} /> : <Clock3 size={21} />}</span><div><strong>{job.batchLabel}</strong><small>{job.personLabel ?? '待归属资料'} · {job.statusText}</small></div><StatusBadge tone={job.status === 'running' ? 'info' : job.status === 'succeeded' ? 'success' : 'warning'}>{job.status === 'running' ? '处理中' : job.status === 'succeeded' ? '已完成' : job.status === 'failed' ? '处理失败' : job.status === 'cancelled' ? '已停止' : job.status === 'waiting_user' ? '等待核对' : '等待处理'}</StatusBadge></div>
+    {!compact && <div className="progress-row"><div><i style={{ width: `${Math.round(job.completedUnits / job.totalUnits * 100)}%` }} /></div><span>{job.status === 'waiting_user' ? '已检查 ' : ''}{job.completedUnits}/{job.totalUnits}</span></div>}
+    <div className="job-card__footer"><span>最近更新：{formatDateTime(job.updatedAt)}</span><div>{job.canCancel && <button className="text-button" onClick={() => onCancel(job)}>停止</button>}{job.canRetry && <button className="text-button" onClick={() => onRetry(job)}><RefreshCw size={15} /> 重试</button>}<button className="text-button" onClick={() => onDetails(job)}>查看详情 <ChevronRight size={15} /></button></div></div>
+  </article>;
   return <div className="page-stack">
     <section className="page-title-row"><div><span className="eyebrow">处理中心</span><h1>每一步都能看懂、能恢复</h1><p>技术等待不会被误写成健康风险，已保存的事实不会因后续失败回滚。</p></div><button className="secondary-button" onClick={onTogglePause}>{snapshot.queuePaused ? <Play size={17} /> : <Pause size={17} />}{snapshot.queuePaused ? '继续队列' : '暂停队列'}</button></section>
     {snapshot.queuePaused && <div className="info-callout"><Pause size={20} /><div><strong>队列已暂停</strong><p>不会领取新的 AI 任务；正在进行的原子步骤会安全收口，日程设置和已保存资料不受影响。</p></div></div>}
-    <div className="job-grid">{snapshot.jobs.map((job) => <article className="panel job-card" key={job.id}>
-      <div className="job-card__top"><span className={`job-icon job-icon--${job.status}`}>{job.status === 'running' ? <LoaderCircle className="spin" size={21} /> : job.status === 'succeeded' ? <Check size={21} /> : <Clock3 size={21} />}</span><div><strong>{job.batchLabel}</strong><small>{job.personLabel ?? '待归属资料'} · {job.statusText}</small></div><StatusBadge tone={job.status === 'running' ? 'info' : job.status === 'succeeded' ? 'success' : 'warning'}>{job.status === 'running' ? '处理中' : job.status === 'succeeded' ? '已完成' : job.status === 'failed' ? '处理失败' : job.status === 'cancelled' ? '已停止' : job.status === 'waiting_user' ? '等待核对' : '等待处理'}</StatusBadge></div>
-      <div className="progress-row"><div><i style={{ width: `${Math.round(job.completedUnits / job.totalUnits * 100)}%` }} /></div><span>{job.status === 'waiting_user' ? '已检查 ' : ''}{job.completedUnits}/{job.totalUnits}</span></div>
-      <div className="job-card__footer"><span>最近更新：{formatDateTime(job.updatedAt)}</span><div>{job.canCancel && <button className="text-button" onClick={() => onCancel(job)}>停止</button>}{job.canRetry && <button className="text-button" onClick={() => onRetry(job)}><RefreshCw size={15} /> 重试</button>}<button className="text-button" onClick={() => onDetails(job)}>查看详情 <ChevronRight size={15} /></button></div></div>
-    </article>)}</div>
+    {currentJobs.length > 0 && <section className="section-block"><div className="section-heading"><div><h2>正在处理与需要关注</h2><p>只把当前仍可能需要操作的任务放在前面。</p></div><StatusBadge tone="neutral">{currentJobs.length} 项</StatusBadge></div><div className="job-grid">{currentJobs.map((job) => renderJob(job))}</div></section>}
+    {historyJobs.length > 0 && <section className="section-block"><div className="section-heading"><div><h2>最近记录</h2><p>已结束或被新任务替代的记录收在这里，需要时再查看。</p></div><StatusBadge tone="neutral">{historyJobs.length} 项</StatusBadge></div><div className="job-history-list">{historyJobs.map((job) => renderJob(job, true))}</div></section>}
     {snapshot.jobs.length === 0 && <section className="panel table-empty"><Clock3 size={24} /><strong>还没有处理任务</strong><span>导入资料后，可手动开始或等待已启用的每日检查。</span></section>}
     <section className="panel process-explainer"><span className="eyebrow">工作方式</span><h2>模型给候选，应用负责正式保存</h2><div className="process-flow"><span>本地预处理</span><ArrowRight /><span>提取</span><ArrowRight /><span>独立核对</span><ArrowRight /><span>规则接纳</span><ArrowRight /><span>增量更新</span></div><p>正常资料会自动完成。只有成员归属、关键数值冲突或安全问题需要你处理。</p></section>
   </div>;
@@ -582,6 +611,8 @@ const jobStageLabel: Record<JobSummary['stage'], string> = {
   analyze: '综合说明',
   guidance: '生活指南',
   review_derived: '派生内容安全核对',
+  system_analysis: '身体系统综合',
+  system_review: '系统说明独立复核',
   publish: '发布说明'
 };
 
@@ -664,7 +695,7 @@ function ManualNoteDialog({ snapshot, selectedPersonId, onClose, onCreate }: {
       : text.trim();
     return onCreate({ personId, kind, immutableText, effectiveDate: effectiveDate || null, structuredFields, expectedContextRevision: person.clinicalContextRevision });
   };
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog manual-note-dialog" role="dialog" aria-modal="true" aria-labelledby="manual-note-title"><header><div><span className="eyebrow">本人补充</span><h2 id="manual-note-title">补充健康资料</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭补充健康资料"><X size={19} /></button></header><p>原文会按你填写的内容保存在本机，并明确标为本人自述。这里不提供诊断或用药调整建议。</p><div className="action-due-grid"><label>家庭成员<select value={personId} onChange={(event) => setPersonId(event.target.value)}>{snapshot.persons.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.relation}</option>)}</select></label><label>资料类型<select value={kind} onChange={(event) => setKind(event.target.value as CreateManualNoteInput['kind'])}><option value="history">既往情况</option><option value="allergy">过敏记录</option><option value="medication">用药记录</option><option value="self_measurement">本人自测</option><option value="free_text">补充说明</option></select></label></div><label>发生或测量日期（可选）<input type="date" value={effectiveDate} onChange={(event) => setEffectiveDate(event.target.value)} /></label>{isMeasurement ? <><div className="measurement-grid"><label>自测项目<input value={measurementName} maxLength={80} placeholder="例如：晨起血压" onChange={(event) => setMeasurementName(event.target.value)} /></label><label>结果<input value={measurementValue} maxLength={120} placeholder="例如：128/82" onChange={(event) => setMeasurementValue(event.target.value)} /></label><label>单位（可选）<input value={measurementUnit} maxLength={40} placeholder="例如：mmHg" onChange={(event) => setMeasurementUnit(event.target.value)} /></label></div><label>补充说明（可选）<textarea value={text} maxLength={4000} rows={3} placeholder="例如：在家静坐 5 分钟后测量" onChange={(event) => setText(event.target.value)} /></label></> : <label>你要记录的原文<textarea value={text} maxLength={4000} rows={5} placeholder={kind === 'medication' ? '例如：目前在使用……，名称和剂量以药盒或医生记录为准' : kind === 'allergy' ? '例如：本人记得对……出现过……，是否为过敏尚待医生确认' : '请按自己的原话填写'} onChange={(event) => setText(event.target.value)} /></label>}<div className="info-callout compact"><ShieldCheck size={18} /><div><strong>来源会一直保留为 user_reported</strong><p>自测结果不会混入医院检验；新增背景会让该成员旧的 AI 说明标记为待更新。</p></div></div><div className="dialog-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={!canSave || busy} onClick={async () => { setBusy(true); try { if (await save()) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 保存到本机</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog manual-note-dialog" role="dialog" aria-modal="true" aria-labelledby="manual-note-title"><header><div><span className="eyebrow">本人补充</span><h2 id="manual-note-title">补充健康资料</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭补充健康资料"><X size={19} /></button></header><p>原文会按你填写的内容保存在本机，并明确标为本人自述。这里不提供诊断或用药调整建议。</p><div className="action-due-grid"><label>家庭成员<select value={personId} onChange={(event) => setPersonId(event.target.value)}>{snapshot.persons.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.relation}</option>)}</select></label><label>资料类型<select value={kind} onChange={(event) => setKind(event.target.value as CreateManualNoteInput['kind'])}><option value="history">既往情况</option><option value="allergy">过敏记录</option><option value="medication">用药记录</option><option value="self_measurement">本人自测</option><option value="goal">生活目标</option><option value="constraint">身体或时间限制</option><option value="free_text">补充说明</option></select></label></div><label>发生或测量日期（可选）<input type="date" value={effectiveDate} onChange={(event) => setEffectiveDate(event.target.value)} /></label>{isMeasurement ? <><div className="measurement-grid"><label>自测项目<input value={measurementName} maxLength={80} placeholder="例如：晨起血压" onChange={(event) => setMeasurementName(event.target.value)} /></label><label>结果<input value={measurementValue} maxLength={120} placeholder="例如：128/82" onChange={(event) => setMeasurementValue(event.target.value)} /></label><label>单位（可选）<input value={measurementUnit} maxLength={40} placeholder="例如：mmHg" onChange={(event) => setMeasurementUnit(event.target.value)} /></label></div><label>补充说明（可选）<textarea value={text} maxLength={4000} rows={3} placeholder="例如：在家静坐 5 分钟后测量" onChange={(event) => setText(event.target.value)} /></label></> : <label>你要记录的原文<textarea value={text} maxLength={4000} rows={5} placeholder={kind === 'medication' ? '例如：目前在使用……，名称和剂量以药盒或医生记录为准' : kind === 'allergy' ? '例如：本人记得对……出现过……，是否为过敏尚待医生确认' : kind === 'goal' ? '例如：希望先把每周能做到的日常活动稳定下来' : kind === 'constraint' ? '例如：膝盖不适，暂时不适合跑跳；工作日只有晚饭后有空' : '请按自己的原话填写'} onChange={(event) => setText(event.target.value)} /></label>}<div className="info-callout compact"><ShieldCheck size={18} /><div><strong>来源会一直保留为 user_reported</strong><p>自测结果不会混入医院检验；目标与限制会参与生活方案适用性判断；新增背景会让旧的 AI 说明标记为待更新。</p></div></div><div className="dialog-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={!canSave || busy} onClick={async () => { setBusy(true); try { if (await save()) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 保存到本机</button></div></section></div>;
 }
 
 function ExportSummaryDialog({ snapshot, selectedPersonId, onClose, onExport }: {
@@ -878,6 +909,12 @@ const reviewDiffFieldLabels: Record<ReviewIssue['candidateDiffs'][number]['field
 type ReviewCandidate = ReviewIssue['candidateOptions'][number];
 type ReviewDiffField = ReviewIssue['candidateDiffs'][number]['fields'][number];
 
+const comparatorSymbols = { eq: '=', lt: '<', lte: '≤', gt: '>', gte: '≥' } as const;
+
+function numericRawText(comparator: keyof typeof comparatorSymbols, decimal: string): string {
+  return `${comparator === 'eq' ? '' : comparatorSymbols[comparator]}${decimal}`;
+}
+
 function reviewCandidateFieldValue(candidate: ReviewCandidate | null | undefined, field: ReviewDiffField): string {
   if (!candidate) return field === 'presence' ? '未读取到这项' : '—';
   if (field === 'presence') return '读取到这项';
@@ -898,7 +935,21 @@ function ReviewDifferenceEditor({ candidate, fields, included, onIncludedChange,
   const editor = (field: ReviewDiffField) => {
     const label = reviewDiffFieldLabels[field];
     if (field === 'value') {
-      return <label key={field}>{label}<input value={candidate.value.rawText ?? ''} onChange={(event) => onChange((current) => ({ ...current, value: current.value.kind === 'numeric' ? { ...current.value, rawText: event.target.value, decimal: event.target.value } : { ...current.value, rawText: event.target.value } }))} /></label>;
+      if (candidate.value.kind === 'numeric') {
+        return <div className="review-numeric-editor" key={field}>
+          <label>比较符<select aria-label={`${candidate.originalName}比较符`} value={candidate.value.comparator} onChange={(event) => onChange((current) => {
+            if (current.value.kind !== 'numeric') return current;
+            const comparator = event.target.value as keyof typeof comparatorSymbols;
+            return { ...current, value: { ...current.value, comparator, rawText: numericRawText(comparator, current.value.decimal) } };
+          })}><option value="eq">= 等于</option><option value="lt">&lt; 小于</option><option value="lte">≤ 小于等于</option><option value="gt">&gt; 大于</option><option value="gte">≥ 大于等于</option></select></label>
+          <label>{label}<input inputMode="decimal" value={candidate.value.decimal} onChange={(event) => onChange((current) => {
+            if (current.value.kind !== 'numeric') return current;
+            const decimal = event.target.value.trim();
+            return { ...current, value: { ...current.value, decimal, rawText: numericRawText(current.value.comparator, decimal) } };
+          })} /></label>
+        </div>;
+      }
+      return <label key={field}>{label}<input value={candidate.value.rawText ?? ''} onChange={(event) => onChange((current) => ({ ...current, value: { ...current.value, rawText: event.target.value } }))} /></label>;
     }
     if (field === 'clinicalDate') {
       return <label key={field}>{label}<input type="date" value={candidate.clinicalDate ?? ''} onChange={(event) => onChange((current) => ({ ...current, clinicalDate: event.target.value || null }))} /></label>;
@@ -917,9 +968,10 @@ function ReviewDifferenceEditor({ candidate, fields, included, onIncludedChange,
   };
   return <div className="review-correction-fields">
     {fields.includes('presence') && <label className="review-presence-choice"><input type="checkbox" checked={included} onChange={(event) => onIncludedChange(event.target.checked)} /> 原报告中确实有这一项，应纳入健康档案</label>}
+    {fields.includes('issues') && <label className="review-presence-choice"><input type="checkbox" checked={!included} onChange={(event) => onIncludedChange(!event.target.checked)} /> 这一项证据还不够清楚，本次先不写入档案</label>}
     {included && !fields.includes('originalName') && <label>项目名<input value={candidate.originalName} onChange={(event) => onChange((current) => ({ ...current, originalName: event.target.value }))} /></label>}
     {included && editableFields.map(editor)}
-    {fields.includes('issues') && <div className="info-callout compact"><RefreshCw size={18} /><div><strong>这项不能靠猜测修正</strong><p>请稍后让系统重新核对原始依据；未解决前不会写入健康档案。</p></div></div>}
+    {fields.includes('issues') && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>不会因为这一项卡住整份报告</strong><p>保持勾选即会排除这一项，其他已核实的项目仍可正常入库。</p></div></div>}
   </div>;
 }
 
@@ -933,7 +985,9 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const [personId, setPersonId] = useState(snapshot.persons[0]?.id ?? '');
   const [busy, setBusy] = useState(false);
   const [candidates, setCandidates] = useState(review.candidateOptions);
-  const [excludedLocalKeys, setExcludedLocalKeys] = useState<Set<string>>(() => new Set());
+  const [excludedLocalKeys, setExcludedLocalKeys] = useState<Set<string>>(() => new Set(
+    review.candidateDiffs.filter((difference) => difference.fields.includes('issues')).map((difference) => difference.localKey)
+  ));
   const isAssignment = review.kind === 'person_conflict' && review.personId === null;
   const isIdentityConfirmation = review.kind === 'person_conflict' && review.personId !== null && review.reportedName !== null;
   const targetPerson = isIdentityConfirmation
@@ -958,7 +1012,10 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const canRetryModelReview = canRetryAbnormalFlagReview || canRetryEvidenceBindingReview;
   const resolvedCandidates = candidates.filter((candidate) => !excludedLocalKeys.has(candidate.localKey));
   const canCorrect = hasVisibleConflicts
-    && review.candidateDiffs.every((difference) => !difference.fields.includes('issues'))
+    && resolvedCandidates.length > 0
+    && review.candidateDiffs.every((difference) => difference.fields.includes('issues')
+      ? excludedLocalKeys.has(difference.localKey)
+      : !excludedLocalKeys.has(difference.localKey) || difference.fields.includes('presence'))
     && resolvedCandidates.every((candidate) => candidate.value.kind !== 'numeric' || /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(candidate.value.decimal));
   const updateCandidate = (index: number, updater: (candidate: (typeof candidates)[number]) => (typeof candidates)[number]) => {
     setCandidates((current) => current.map((candidate, candidateIndex) => candidateIndex === index ? updater(candidate) : candidate));
@@ -1053,8 +1110,12 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
 }
 
 function EvidencePanel({ evidence, demo, onClose }: { evidence: Evidence | null; demo: boolean; onClose(): void }) {
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (evidence) closeButtonRef.current?.focus();
+  }, [evidence]);
   if (!evidence) return null;
-  return <aside className="evidence-panel" aria-label="证据侧栏"><header><div><span className="eyebrow">证据与来源</span><h2>{evidence.title}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭证据侧栏"><X size={19} /></button></header><div className="evidence-preview">{evidence.previewImageDataUrl ? <img src={evidence.previewImageDataUrl} alt={`${evidence.title}的受控预览`} /> : <div className="evidence-page"><span>{demo ? '虚构资料预览' : '来源摘录'}</span><p>……检验项目与结果……</p><mark>{evidence.quote}</mark><p>……报告其余内容……</p></div>}</div><div className="evidence-meta"><StatusBadge tone="info">来源定位</StatusBadge><strong>{evidence.label}</strong><p>{evidence.meta}</p></div><div className="evidence-note"><ShieldCheck size={18} /><p>界面只按对象 ID 读取资料，不向页面暴露本机文件路径。</p></div></aside>;
+  return <aside className="evidence-panel" aria-label="证据侧栏" onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); onClose(); } }}><header><div><span className="eyebrow">证据与来源</span><h2>{evidence.title}</h2></div><button ref={closeButtonRef} className="icon-button" onClick={onClose} aria-label="关闭证据侧栏"><X size={19} /></button></header><div className="evidence-preview">{evidence.previewImageDataUrl ? <img src={evidence.previewImageDataUrl} alt={`${evidence.title}的受控预览`} /> : <div className="evidence-page"><span>{demo ? '虚构资料预览' : '来源摘录'}</span><p>……检验项目与结果……</p><mark>{evidence.quote}</mark><p>……报告其余内容……</p></div>}</div><div className="evidence-meta"><StatusBadge tone="info">来源定位</StatusBadge><strong>{evidence.label}</strong><p>{evidence.meta}</p></div><div className="evidence-note"><ShieldCheck size={18} /><p>界面只按对象 ID 读取资料，不向页面暴露本机文件路径。</p></div></aside>;
 }
 
 function WorkspaceDialog({ snapshot, onClose, onCreate, onSwitch }: {
@@ -1135,7 +1196,7 @@ function MemberEditDialog({ person, onClose, onSave, onArchive }: {
   const [submitting, setSubmitting] = useState(false);
   const parsedBirthYear = birthYear.trim() ? Number(birthYear) : null;
   const yearValid = parsedBirthYear === null || (Number.isInteger(parsedBirthYear) && parsedBirthYear >= 1900 && parsedBirthYear <= new Date().getFullYear());
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog" role="dialog" aria-modal="true" aria-labelledby="member-edit-title"><header><div><span className="eyebrow">成员档案</span><h2 id="member-edit-title">编辑显示资料</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭成员编辑"><X size={19} /></button></header><p>修改称呼、关系或出生年份不会触发 AI 重算，也不会改变成员 ID、报告归属和历史记录。</p><label>称呼<input autoFocus value={displayName} maxLength={80} onChange={(event) => setDisplayName(event.target.value)} /></label><label>与我的关系<input value={relation} maxLength={40} onChange={(event) => setRelation(event.target.value)} /></label><label>出生年份（可选）<input inputMode="numeric" value={birthYear} onChange={(event) => setBirthYear(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label>{!yearValid && <span className="field-error">请输入 1900 年至今年之间的年份。</span>}<div className="info-callout compact"><Archive size={18} /><div><strong>不再日常查看？可以归档</strong><p>归档会隐藏成员并撤回其目录授权，但不会删除报告、事实、事项或历史版本，之后可以恢复。</p></div></div><div className="dialog-actions"><button className="secondary-button" onClick={onArchive}><Archive size={17} /> 归档成员</button><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={submitting || !displayName.trim() || !relation.trim() || !yearValid} onClick={async () => { setSubmitting(true); try { if (await onSave({ personId: person.id, displayName, relation, birthYear: parsedBirthYear, expectedDisplayRevision: person.displayRevision })) onClose(); } finally { setSubmitting(false); } }}>{submitting ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 保存显示资料</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog" role="dialog" aria-modal="true" aria-labelledby="member-edit-title"><header><div><span className="eyebrow">成员档案</span><h2 id="member-edit-title">编辑显示资料</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭成员编辑"><X size={19} /></button></header><p>称呼和关系只改变显示。如果修改出生年份，已保存事实不变，系统会更新需要用到年龄背景的分析说明。</p><label>称呼<input autoFocus value={displayName} maxLength={80} onChange={(event) => setDisplayName(event.target.value)} /></label><label>与我的关系<input value={relation} maxLength={40} onChange={(event) => setRelation(event.target.value)} /></label><label>出生年份（可选）<input inputMode="numeric" value={birthYear} onChange={(event) => setBirthYear(event.target.value.replace(/\D/g, '').slice(0, 4))} /></label>{!yearValid && <span className="field-error">请输入 1900 年至今年之间的年份。</span>}<div className="info-callout compact"><Archive size={18} /><div><strong>不再日常查看？可以归档</strong><p>归档会隐藏成员并撤回其目录授权，但不会删除报告、事实、事项或历史版本，之后可以恢复。</p></div></div><div className="dialog-actions"><button className="secondary-button" onClick={onArchive}><Archive size={17} /> 归档成员</button><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={submitting || !displayName.trim() || !relation.trim() || !yearValid} onClick={async () => { setSubmitting(true); try { if (await onSave({ personId: person.id, displayName, relation, birthYear: parsedBirthYear, expectedDisplayRevision: person.displayRevision })) onClose(); } finally { setSubmitting(false); } }}>{submitting ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 保存显示资料</button></div></section></div>;
 }
 
 function ArchivePersonDialog({ person, onClose, onConfirm }: {
@@ -1304,7 +1365,7 @@ function InboxDirectoriesDialog({ snapshot, onClose, onNotice }: {
             <label>资料默认归属<select value={personId ?? ''} onChange={(event) => setPersonId(event.target.value || null)}><option value="">公共待归属</option>{snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}</select></label>
             <label className="check-label"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /> 包含子目录中的资料</label>
             <label className="check-label"><input type="checkbox" checked={allowAi} disabled={snapshot.account.status !== 'connected'} onChange={(event) => setAllowAi(event.target.checked)} /> 允许日程任务把必要内容发送给 OpenAI/Codex 处理</label>
-            <p>{snapshot.account.status === 'connected' ? '这项授权绑定当前 Codex 账户、所选目录和成员；综合分析可用去标识化 Web Search 查询通用医学背景。停用目录会同时撤回。' : '当前未连接 Codex，因此只能先启用本地导入。连接后可重新授权自动处理。'}</p>
+            <p>{snapshot.account.status === 'connected' ? '这项授权绑定当前 Codex 账户、所选目录和成员；日程综合分析会带入该成员已接纳的相关历史事实和必要的本人补充，并可用去标识化 Web Search 查询通用医学背景。停用目录会同时撤回。' : '当前未连接 Codex，因此只能先启用本地导入。连接后可重新授权自动处理。'}</p>
             <div className="dialog-actions"><button className="secondary-button" onClick={() => setSelection(null)}>取消</button><button className="primary-button" disabled={busy} onClick={() => void confirmDirectory()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 确认启用</button></div>
           </div>
         )}
@@ -1331,8 +1392,8 @@ function ProcessConsentDialog({ snapshot, documentIds, onClose, onConfirm, onLog
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="member-dialog process-consent-dialog" role="dialog" aria-modal="true" aria-labelledby="process-consent-title">
         <header><div><span className="eyebrow">本次手动处理</span><h2 id="process-consent-title">确认发送范围</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭处理确认"><X size={19} /></button></header>
-        <p>将处理 {readyCount} 份{documentIds ? '选中的' : ''}已归属资料{derivedRefreshCount > 0 ? `，并为 ${derivedRefreshCount} 位成员刷新已过期的综合说明` : ''}。必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>
-        <div className="consent-facts"><span><ShieldCheck size={17} /> 不发送其他成员或未归属资料</span><span><FileCheck2 size={17} /> 事实和派生说明分别复核、分别入库</span><span><CircleHelp size={17} /> 综合分析可用去标识化 Web Search 查询通用医学背景</span><span><Sparkles size={17} /> 使用当前 Codex 账户额度，额度规则可能变化</span></div>
+        <p>将处理 {readyCount} 份{documentIds ? '选中的' : ''}已归属资料{derivedRefreshCount > 0 ? `，并为 ${derivedRefreshCount} 位成员刷新已过期的综合说明` : ''}。除新资料外，综合分析会包含<strong>同一成员的相关已接纳历史事实和必要的本人补充</strong>。这些必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>
+        <div className="consent-facts"><span><ShieldCheck size={17} /> 不发送其他成员或未归属资料</span><span><FileCheck2 size={17} /> 历史事实只限本成员且在授权清单中记录</span><span><FileCheck2 size={17} /> 事实和派生说明分别复核、分别入库</span><span><CircleHelp size={17} /> 综合分析可用去标识化 Web Search 查询通用医学背景</span><span><Sparkles size={17} /> 使用当前 Codex 账户额度，额度规则可能变化</span></div>
         <label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我确认本次接收方、用途和资料范围</label>
         {!connected && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>Codex 尚未连接</strong><p>先完成官方登录，才会建立本次处理授权和任务。</p></div></div>}
         <div className="dialog-actions">
@@ -1353,6 +1414,8 @@ export default function App() {
   const [page, setPage] = useState<Page>('home');
   const [selectedPersonId, setSelectedPersonId] = useState(snapshot.persons[0]?.id ?? '');
   const [evidence, setEvidence] = useState<Evidence | null>(null);
+  const evidenceReturnFocusRef = useRef<HTMLElement | null>(null);
+  const evidenceWasOpenRef = useRef(false);
   const [toast, setToast] = useState<string | null>(null);
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false);
   const [memberDialogOpen, setMemberDialogOpen] = useState(false);
@@ -1501,10 +1564,20 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    const isOpen = evidence !== null;
+    if (!isOpen && evidenceWasOpenRef.current) {
+      evidenceReturnFocusRef.current?.focus();
+      evidenceReturnFocusRef.current = null;
+    }
+    evidenceWasOpenRef.current = isOpen;
+  }, [evidence]);
+
   const openReviews = snapshot.reviews.filter((review) => review.resolutionStatus === 'open');
   const openReview = openReviews[0];
 
   async function handleOpenEvidence(next: Evidence) {
+    if (!evidence && document.activeElement instanceof HTMLElement) evidenceReturnFocusRef.current = document.activeElement;
     setEvidence(next);
     if (snapshot.workspaceMode !== 'personal' || !window.healthDesktop) return;
     const selector = next.sourceSpanId
@@ -1910,7 +1983,7 @@ export default function App() {
       return;
     }
     setSnapshot(await window.healthDesktop.getSnapshot());
-    setToast(['analyze', 'guidance', 'review_derived', 'publish'].includes(job.stage)
+    setToast(['analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish'].includes(job.stage)
       ? '已从派生说明阶段重试，不会重新提取已保存的报告事实。'
       : '已重新核验原授权并排队重试。');
   }

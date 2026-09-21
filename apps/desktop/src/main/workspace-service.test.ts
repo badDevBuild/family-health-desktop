@@ -121,6 +121,251 @@ describe('PersonalWorkspaceService', () => {
     service.close();
   });
 
+  it('混合差异中可排除证据不清的单项，不阻断其余已核实事实入库', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/混合差异报告.txt',
+      bytes: Buffer.from('肌钙蛋白 <0.01 ng/mL\n葡萄糖 5.2 mmol/L')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const bundle = service.store.getDocumentExtractionBundle(documentId);
+    const [troponinSpan, glucoseSpan] = bundle.manifest.spans;
+    const troponin = {
+      localKey: 'troponin', originalName: '肌钙蛋白', standardNameCandidate: 'cTnI',
+      value: { kind: 'numeric' as const, rawText: '<0.01', decimal: '0.01', comparator: 'lt' as const },
+      unitRaw: 'ng/mL', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: troponinSpan!.id, quote: troponinSpan!.quote }], issues: []
+    };
+    const glucose = {
+      localKey: 'glucose', originalName: '葡萄糖', standardNameCandidate: '空腹血糖',
+      value: { kind: 'numeric' as const, rawText: '5.2', decimal: '5.2', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: glucoseSpan!.id, quote: glucoseSpan!.quote }], issues: []
+    };
+    const issueId = service.store.saveExtractionReviewIssue({
+      documentId, kind: 'field_conflict', severity: 'blocking',
+      evidenceRefs: bundle.manifest.spans.map((span) => span.id),
+      candidateOptions: [troponin, glucose],
+      candidateDiffs: [
+        { localKey: troponin.localKey, itemName: troponin.originalName, fields: ['value'] },
+        { localKey: glucose.localKey, itemName: glucose.originalName, fields: ['issues'] }
+      ],
+      reasonCodes: ['FACT_ADJUDICATION_UNRESOLVED'],
+      documentRun: {
+        coverageComplete: true,
+        coveredSourceSpanIds: bundle.manifest.spans.map((span) => span.id),
+        manifestSpanIds: bundle.manifest.spans.map((span) => span.id),
+        chunkCount: 1
+      }
+    });
+
+    service.acceptCorrectedFacts({ issueId, documentId, candidates: [troponin] });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: 'cTnI', rawText: '<0.01', qualifier: 'lt' })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('成员档案 v2 以身体系统读取事实，并把多年度别名组成可审查趋势', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/虚构纵向血脂.txt',
+      bytes: Buffer.from('2022-02-10 LDL-C 3.1 mmol/L\n2024-08-18 低密度脂蛋白 3.6 mmol/L ↑\n2026-09-12 低密度脂蛋白胆固醇 4.2 mmol/L ↑')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const bundle = service.store.getDocumentExtractionBundle(documentId);
+    const names = ['LDL-C', '低密度脂蛋白', '低密度脂蛋白胆固醇'];
+    const dates = ['2022-02-10', '2024-08-18', '2026-09-12'];
+    const values = ['3.1', '3.6', '4.2'];
+    const candidates = bundle.manifest.spans.map((span, index) => ({
+      localKey: `ldl-${index}`,
+      originalName: names[index]!,
+      standardNameCandidate: '低密度脂蛋白胆固醇',
+      value: { kind: 'numeric' as const, rawText: values[index]!, decimal: values[index]!, comparator: 'eq' as const },
+      unitRaw: 'mmol/L',
+      referenceRangeRaw: '0-3.4',
+      reportedAbnormalFlag: index === 0 ? '正常' : '↑',
+      specimen: '血清', method: '酶法', bodySite: null,
+      clinicalDate: dates[index]!,
+      evidence: [{ sourceSpanId: span.id, quote: span.quote }],
+      issues: []
+    }));
+    const issueId = service.store.saveExtractionReviewIssue({
+      documentId,
+      kind: 'field_conflict',
+      severity: 'blocking',
+      evidenceRefs: bundle.manifest.spans.map((span) => span.id),
+      candidateOptions: candidates,
+      candidateDiffs: candidates.map((candidate) => ({ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['value'] })),
+      reasonCodes: ['TEST_FIXTURE'],
+      documentRun: {
+        coverageComplete: true,
+        coveredSourceSpanIds: bundle.manifest.spans.map((span) => span.id),
+        manifestSpanIds: bundle.manifest.spans.map((span) => span.id),
+        chunkCount: 1
+      }
+    });
+    service.acceptCorrectedFacts({ issueId, documentId, candidates });
+
+    const overview = service.getMemberOverview(personId);
+    expect(overview).toMatchObject({ acceptedFactCount: 3, eventCount: 1, attentionSystemIds: ['cardiovascular'] });
+    const systems = service.listBodySystems(personId);
+    expect(systems.find((system) => system.id === 'cardiovascular')).toMatchObject({ factCount: 3, metricCount: 1, status: 'attention' });
+    const detail = service.getBodySystemDetail(personId, 'cardiovascular');
+    expect(detail.metrics[0]).toMatchObject({
+      conceptId: 'loinc-like-ldl-c',
+      trendFacts: { direction: 'increasing', usablePointCount: 3 }
+    });
+    const metric = service.getMetricSeries(personId, detail.metrics[0]!.id);
+    expect(metric.aliasesSeen).toEqual(['低密度脂蛋白胆固醇']);
+    expect(metric.tableRows).toHaveLength(3);
+    expect(service.listHealthEvents(personId)[0]).toMatchObject({ metadataStatus: 'unknown', factCount: 3 });
+    const evidenceId = detail.findings[0]!.evidence[0]!.id;
+    expect(service.getMemberEvidenceBundle(personId, [evidenceId])).toMatchObject({ items: [{ id: evidenceId }], missingIds: [] });
+    service.store.createManualNote({
+      personId,
+      kind: 'medication',
+      immutableText: '纯合成自述：正在记录一种用药，尚未核对剂量。',
+      effectiveDate: '2026-09-01',
+      structuredFields: {},
+      expectedContextRevision: 0
+    });
+    const bundleForAnalysis = service.buildSystemEvidenceBundle(personId, 'cardiovascular');
+    expect(bundleForAnalysis).toMatchObject({
+      identity: { personId, systemId: 'cardiovascular' },
+      scope: { factRevision: 1, contextRevision: 1, clinicalFrom: '2022-02-10', clinicalAsOf: '2026-09-12' },
+      coverage: { selectedObservationIds: expect.arrayContaining(metric.tableRows.map((row) => row.observationId)) }
+    });
+    expect(bundleForAnalysis.directFacts).toHaveLength(3);
+    expect(bundleForAnalysis.contextFacts).toHaveLength(0);
+    expect(bundleForAnalysis.personalContext).toEqual([expect.objectContaining({ source: 'user_reported', kind: 'medication' })]);
+    expect(bundleForAnalysis.trends[0]).toMatchObject({ trendFacts: { direction: 'increasing' } });
+    expect(bundleForAnalysis.scope.inputSignature).toMatch(/^[a-f0-9]{64}$/);
+    const modelASignature = service.buildSystemEvidenceBundle(personId, 'cardiovascular', 'model-a').scope.inputSignature;
+    expect(service.buildSystemEvidenceBundle(personId, 'cardiovascular', 'model-b').scope.inputSignature).not.toBe(modelASignature);
+    const report = service.store.listReportMetadata(personId)[0]!;
+    service.updateReportMetadata({
+      personId,
+      reportId: report.reportId,
+      expectedRevision: report.metadataRevision,
+      title: '本人核对后的血脂检查',
+      organization: '合成医院',
+      department: '检验科',
+      clinicalTime: { value: '2026-09', precision: 'month' },
+      reason: '合成测试：核对报告事件依赖'
+    });
+    const afterMetadataCorrection = service.buildSystemEvidenceBundle(personId, 'cardiovascular', 'model-a');
+    expect(afterMetadataCorrection.scope.inputSignature).not.toBe(modelASignature);
+    expect(afterMetadataCorrection.events).toEqual([
+      expect.objectContaining({ title: '本人核对后的血脂检查', time: expect.objectContaining({ value: '2026-09', precision: 'month' }) })
+    ]);
+    const afterMetadataDefaultSignature = service.buildSystemEvidenceBundle(personId, 'cardiovascular').scope.inputSignature;
+    const unrelatedGoal = service.store.createManualNote({
+      personId,
+      kind: 'goal',
+      immutableText: '希望把日常作息安排得更规律',
+      effectiveDate: null,
+      structuredFields: {},
+      expectedContextRevision: 1
+    });
+    const afterUnrelatedGoal = service.buildSystemEvidenceBundle(personId, 'cardiovascular');
+    expect(afterUnrelatedGoal.scope.contextRevision).toBe(2);
+    expect(afterUnrelatedGoal.scope.inputSignature).toBe(afterMetadataDefaultSignature);
+    expect(afterUnrelatedGoal.coverage.excludedContextIds).toContain(unrelatedGoal.id);
+    service.close();
+  });
+
+  it('事件详情把当前检查与报告引用的历史结果分开，不把当前机构套给历史结果', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/虚构年度对比.txt',
+      bytes: Buffer.from('合成医院 检查日期 2026-09-10\nLDL-C 2024-09-01 3.1 2026-09-10 3.8')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const acceptanceId = service.store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'history-event-input',
+      outputHash: 'history-event-output', reviewRef: null, decision: 'accept'
+    });
+    const observation = (clinicalDate: string, rawText: string) => ({
+      conceptKey: 'LDL-C', rawText, valueKind: 'numeric' as const, decimalValue: rawText, qualifier: 'eq',
+      unit: 'mmol/L', referenceRange: '0-3.4', clinicalDate, abnormalFlag: 'unknown' as const,
+      documentId, sourceSpanId: span.id, acceptanceId, specimen: '血清', method: null, bodySite: null,
+      evidence: [{ sourceSpanId: span.id, quote: `LDL-C ${clinicalDate} ${rawText}` }]
+    });
+    service.store.publishFacts({
+      personId, documentId, documentCommitKey: '1'.repeat(64), expectedRevision: 0,
+      changeSetHash: '2'.repeat(64), summary: '合成历史列事件',
+      reportMetadata: {
+        reportKind: { value: '年度体检报告', evidence: [{ sourceSpanId: span.id, quote: '合成医院' }] },
+        title: { value: '2026 年度体检', evidence: [{ sourceSpanId: span.id, quote: '合成医院' }] },
+        organization: { value: '合成医院', evidence: [{ sourceSpanId: span.id, quote: '合成医院' }] },
+        campus: null, department: null, reportNumber: null, encounterIdentifier: null, sampleIdentifiers: [], examItems: [],
+        times: [
+          { value: '2026-09-10', precision: 'day', role: 'examined', evidence: [{ sourceSpanId: span.id, quote: '检查日期 2026-09-10' }] },
+          { value: '2024-09-01', precision: 'day', role: 'history_quoted', evidence: [{ sourceSpanId: span.id, quote: '2024-09-01 3.1' }] }
+        ]
+      },
+      observations: [observation('2024-09-01', '3.1'), observation('2026-09-10', '3.8')]
+    });
+
+    const event = service.listHealthEvents(personId)[0]!;
+    expect(event.summary).toContain('其中 1 条是本报告引用的历史结果');
+    const detail = service.getHealthEventDetail(personId, event.id);
+    expect(detail.findings).toEqual([expect.objectContaining({ value: '3.8 mmol/L' })]);
+    expect(detail.historicalReferences).toEqual([expect.objectContaining({
+      time: expect.objectContaining({ value: '2024-09-01', role: 'measurement' }),
+      sourceReportTitle: '2026 年度体检',
+      findings: [expect.objectContaining({ value: '3.1 mmol/L' })]
+    })]);
+    service.close();
+  });
+
+  it('旧版生活建议缺少新版安全字段时跳过建议但仍可打开成员档案', () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-legacy-lifestyle-'));
+    directories.push(root);
+    const service = new PersonalWorkspaceService(root, '我的家庭健康', () => new Date('2026-09-18T01:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    const database = new Database(service.store.databasePath);
+    database.prepare(`
+      INSERT INTO derived_snapshots (
+        id, person_id, fact_revision, context_revision, prompt_version,
+        rules_version, model_id, coverage_json, payload_json, status, created_at
+      ) VALUES (?, ?, 0, 0, 'derived-v1', 'derived-safety-v1', 'legacy-model', '[]', ?, 'current', ?)
+    `).run('legacy-derived-snapshot', personId, JSON.stringify({
+      schemaVersion: 1,
+      personId,
+      factRevision: 0,
+      dataQuality: 'partial',
+      claims: [],
+      lifestyleGuidance: [{
+        id: 'legacy-guidance',
+        category: 'nutrition',
+        title: '旧版建议',
+        detail: '旧版记录没有新版所需的目标、步骤、来源和适用边界。',
+        evidenceObservationIds: [],
+        consultProfessional: false
+      }]
+    }), '2026-09-18T01:00:00.000Z');
+    database.close();
+
+    expect(service.getLifestylePlan(personId)).toMatchObject({
+      personId,
+      status: 'current',
+      dataQuality: 'partial',
+      priorities: [],
+      proposals: [],
+      adoptedActions: []
+    });
+    service.close();
+  });
+
   it('已进入处理中心的失败资料不再建立新批次', async () => {
     const service = makeService();
     const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });

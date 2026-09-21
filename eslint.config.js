@@ -11,6 +11,7 @@ export default tseslint.config(
       'coverage/**',
       'schemas/codex/**',
       'family-health-desktop-review-evidence-*/**',
+      'fhd-review-*/**',
       'fhd-rereview-*/**'
     ]
   },

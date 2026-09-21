@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AccountState, ActionItem, AiPreferences, AiSettings, ArchivePersonInput, CleanupReceipt, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, ImportFilesReceipt, InboxBindingSummary, ManualNote, Person, ProcessNowInput, ResolveReviewInput, RestorePersonInput, Result, SetDocumentInclusionInput, UpdatePersonDisplayInput, UpdateScheduleInput } from '@contracts';
+import type { AccountState, ActionItem, AdoptedActionReceipt, AdoptLifestyleProposalInput, AiPreferences, AiSettings, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, CleanupReceipt, ConceptMappingReceipt, ConceptReviewBundle, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, ManualNote, MemberEvidenceBundle, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, Person, ProcessNowInput, ReportMetadataCorrectionReceipt, ResolveReviewInput, RestorePersonInput, Result, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
 
 export interface HealthDesktopBridge {
   getBootstrap(): Promise<{
@@ -11,6 +11,24 @@ export interface HealthDesktopBridge {
     recoveryStatus: { pointCount: number; totalBytes: number; latestAt: string | null };
   }>;
   getSnapshot(): Promise<DashboardSnapshot>;
+  getMemberOverview(personId: string): Promise<Result<MemberOverviewV2>>;
+  listBodySystems(personId: string): Promise<Result<BodySystemSummaryV2[]>>;
+  getConceptReview(personId: string): Promise<Result<ConceptReviewBundle>>;
+  setConceptMapping(input: SetConceptMappingInput): Promise<Result<ConceptMappingReceipt>>;
+  undoConceptMapping(input: UndoConceptMappingInput): Promise<Result<ConceptMappingReceipt>>;
+  getBodySystemDetail(personId: string, systemId: BodySystemId): Promise<Result<BodySystemDetailV2>>;
+  getMetricSeries(personId: string, seriesId: string): Promise<Result<MetricSeriesDetailV2>>;
+  listHealthEvents(input: { personId: string; systemId?: BodySystemId | null; type?: HealthEventV2['type'] | null }): Promise<Result<HealthEventV2[]>>;
+  getHealthEventDetail(personId: string, eventId: string): Promise<Result<HealthEventDetailV2>>;
+  updateReportMetadata(input: UpdateReportMetadataInput): Promise<Result<ReportMetadataCorrectionReceipt>>;
+  undoReportMetadata(input: UndoReportMetadataInput): Promise<Result<ReportMetadataCorrectionReceipt>>;
+  mergeHealthEvents(input: MergeHealthEventsInput): Promise<Result<HealthEventRelationReceipt>>;
+  splitHealthEvent(input: SplitHealthEventInput): Promise<Result<HealthEventRelationReceipt>>;
+  undoHealthEventRelation(input: UndoHealthEventRelationInput): Promise<Result<HealthEventRelationReceipt>>;
+  getMemberEvidenceBundle(personId: string, evidenceIds: string[]): Promise<Result<MemberEvidenceBundle>>;
+  getLifestylePlan(personId: string): Promise<Result<LifestylePlanV2>>;
+  adoptLifestyleProposal(input: AdoptLifestyleProposalInput): Promise<Result<AdoptedActionReceipt>>;
+  setLifestyleProposalDecision(input: SetLifestyleProposalDecisionInput): Promise<Result<LifestyleProposalDecisionReceipt>>;
   getDiagnosticPreview(): Promise<Result<DiagnosticBundle>>;
   exportDiagnostic(): Promise<Result<DiagnosticExportReceipt | null>>;
   cleanupExpiredData(): Promise<Result<CleanupReceipt>>;
@@ -65,6 +83,24 @@ export interface HealthDesktopBridge {
 const bridge: HealthDesktopBridge = {
   getBootstrap: () => ipcRenderer.invoke('app:get-bootstrap'),
   getSnapshot: () => ipcRenderer.invoke('dashboard:get-snapshot'),
+  getMemberOverview: (personId) => ipcRenderer.invoke('members:get-overview', { personId }),
+  listBodySystems: (personId) => ipcRenderer.invoke('body:list-systems', { personId }),
+  getConceptReview: (personId) => ipcRenderer.invoke('concepts:get-review', { personId }),
+  setConceptMapping: (input) => ipcRenderer.invoke('concepts:set-mapping', input),
+  undoConceptMapping: (input) => ipcRenderer.invoke('concepts:undo-mapping', input),
+  getBodySystemDetail: (personId, systemId) => ipcRenderer.invoke('body:get-system-detail', { personId, systemId }),
+  getMetricSeries: (personId, seriesId) => ipcRenderer.invoke('metrics:get-series', { personId, seriesId }),
+  listHealthEvents: (input) => ipcRenderer.invoke('events:list', input),
+  getHealthEventDetail: (personId, eventId) => ipcRenderer.invoke('events:get-detail', { personId, eventId }),
+  updateReportMetadata: (input) => ipcRenderer.invoke('events:update-metadata', input),
+  undoReportMetadata: (input) => ipcRenderer.invoke('events:undo-metadata', input),
+  mergeHealthEvents: (input) => ipcRenderer.invoke('events:merge', input),
+  splitHealthEvent: (input) => ipcRenderer.invoke('events:split', input),
+  undoHealthEventRelation: (input) => ipcRenderer.invoke('events:undo-relation', input),
+  getMemberEvidenceBundle: (personId, evidenceIds) => ipcRenderer.invoke('evidence:get-bundle', { personId, evidenceIds }),
+  getLifestylePlan: (personId) => ipcRenderer.invoke('guidance:get-plan', { personId }),
+  adoptLifestyleProposal: (input) => ipcRenderer.invoke('guidance:adopt-proposal', input),
+  setLifestyleProposalDecision: (input) => ipcRenderer.invoke('guidance:set-proposal-decision', input),
   getDiagnosticPreview: () => ipcRenderer.invoke('diagnostics:get-preview'),
   exportDiagnostic: () => ipcRenderer.invoke('diagnostics:export'),
   cleanupExpiredData: () => ipcRenderer.invoke('privacy:cleanup-expired'),

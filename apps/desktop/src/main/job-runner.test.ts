@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { AccountState, DerivedSafetyReview, DerivedSnapshotCandidate, ExtractionResult } from '@contracts';
+import { DEFAULT_AI_PREFERENCES, type AccountState, type DerivedSafetyReview, type DerivedSnapshotCandidate, type ExtractionResult, type SystemAnalysisCandidate, type SystemAnalysisReview } from '@contracts';
 import type { CodexRuntimeManager } from './codex-runtime.js';
 import { ProcessingJobRunner } from './job-runner.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
@@ -59,18 +59,53 @@ describe('ProcessingJobRunner', () => {
           };
           return { threadId: 'derived-thread', turnId: 'derived-1', output: candidate };
         }
-        const review: DerivedSafetyReview = {
-          schemaVersion: 1, personId, factRevision: 1, overallSafe: true,
-          claimReviews: [{ claimId: candidate!.claims[0]!.id, supported: true, safe: true, issue: null }],
-          guidanceReviews: []
+        if (call === 4) {
+          const review: DerivedSafetyReview = {
+            schemaVersion: 1, personId, factRevision: 1, overallSafe: true,
+            claimReviews: [{ claimId: candidate!.claims[0]!.id, supported: true, safe: true, issue: null }],
+            guidanceReviews: []
+          };
+          return { threadId: 'derived-thread', turnId: 'derived-2', output: review };
+        }
+        const bundle = service.buildSystemEvidenceBundle(personId, 'cardiovascular', DEFAULT_AI_PREFERENCES.modelId);
+        if (call === 5) {
+          const systemCandidate: SystemAnalysisCandidate = {
+            schemaVersion: 2,
+            personId,
+            systemId: 'cardiovascular',
+            inputSignature: bundle.scope.inputSignature,
+            headline: '这份记录中的 LDL-C 带有原报告偏高标记。',
+            dataQuality: 'partial',
+            keyPoints: [{
+              id: 'point-ldl',
+              kind: 'fact_summary',
+              text: 'LDL-C 4.2 mmol/L，高于该报告参考上限 3.4。',
+              evidenceIds: [bundle.directFacts[0]!.evidence.id],
+              limitations: [],
+              trendFactIds: []
+            }],
+            topicSections: [{ topicId: 'lipids', title: '血脂', claimIds: ['point-ldl'], seriesIds: [], findingIds: [] }],
+            conflicts: [],
+            dataGaps: [{ text: '只有一次结果。', consequence: '不能判断趋势。' }],
+            discussionPoints: []
+          };
+          return { threadId: 'system-thread', turnId: 'system-1', output: systemCandidate };
+        }
+        const review: SystemAnalysisReview = {
+          schemaVersion: 1, personId,
+          systemId: 'cardiovascular',
+          inputSignature: bundle.scope.inputSignature,
+          overallSupported: true,
+          itemReviews: [{ itemId: 'point-ldl', supported: true, safe: true, trendConsistent: true, issue: null }]
         };
-        return { threadId: 'derived-thread', turnId: 'derived-2', output: review };
+        return { threadId: 'system-thread', turnId: 'system-2', output: review };
       }
     } as unknown as CodexRuntimeManager;
     await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
-    expect(call).toBe(4);
+    expect(call).toBe(6);
     expect(service.store.listStoredJobs()[0]).toMatchObject({ status: 'succeeded', stage: 'publish', completedUnits: 1 });
     expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);
+    expect(service.store.listSystemAnalysisSnapshots(personId, true)).toHaveLength(1);
     expect(service.getSnapshot(state).persons[0]).toMatchObject({ derivedStatus: 'current', acceptedFactCount: 1 });
     expect(service.getSnapshot(state).inbox[0]).toMatchObject({ sentToAi: true, aiTransmissionStatus: 'completed' });
     service.close();

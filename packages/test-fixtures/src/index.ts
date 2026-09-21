@@ -1,5 +1,7 @@
 import type { DashboardSnapshot } from '@contracts';
 
+export * from './member-v2.js';
+
 export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')): DashboardSnapshot {
   const nextRun = new Date(now);
   nextRun.setHours(20, 0, 0, 0);

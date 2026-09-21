@@ -7,10 +7,12 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, No
 import { is } from '@electron-toolkit/utils';
 import {
   accountStateSchema,
+  adoptLifestyleProposalInputSchema,
   aiPreferencesSchema,
   aiSettingsSchema,
   archivePersonInputSchema,
   confirmInboxBindingInputSchema,
+  setConceptMappingInputSchema,
   cleanupReceiptSchema,
   createActionItemInputSchema,
   createManualNoteInputSchema,
@@ -31,6 +33,13 @@ import {
   inboxBindingSummarySchema,
   importFilesInputSchema,
   jobActionInputSchema,
+  memberEvidenceBundleInputSchema,
+  memberEventInputSchema,
+  memberEventListInputSchema,
+  memberMetricInputSchema,
+  memberPersonInputSchema,
+  memberSystemInputSchema,
+  mergeHealthEventsInputSchema,
   processNowInputSchema,
   personSchema,
   resolveReviewInputSchema,
@@ -38,8 +47,14 @@ import {
   restorePersonInputSchema,
   releaseDeletedDocumentInputSchema,
   setDocumentInclusionInputSchema,
+  setLifestyleProposalDecisionInputSchema,
   setQueuePausedInputSchema,
+  splitHealthEventInputSchema,
   switchWorkspaceInputSchema,
+  undoConceptMappingInputSchema,
+  undoHealthEventRelationInputSchema,
+  undoReportMetadataInputSchema,
+  updateReportMetadataInputSchema,
   updateScheduleInputSchema,
   updateDesktopBehaviorInputSchema,
   updateDisplayPreferencesInputSchema,
@@ -163,6 +178,7 @@ function currentAccountState(): AccountState {
 }
 
 function createWindow(): void {
+  const windowTitle = smokeUserDataDirectory ? '家庭健康看板 · 隔离验收' : '家庭健康看板';
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -170,7 +186,7 @@ function createWindow(): void {
     minHeight: 720,
     show: false,
     backgroundColor: '#FAFAF8',
-    title: '家庭健康看板',
+    title: windowTitle,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: true,
@@ -179,6 +195,11 @@ function createWindow(): void {
       webSecurity: true,
       spellcheck: false
     }
+  });
+
+  mainWindow.on('page-title-updated', (event) => {
+    event.preventDefault();
+    mainWindow?.setTitle(windowTitle);
   });
 
   mainWindow.once('ready-to-show', () => mainWindow?.show());
@@ -573,6 +594,257 @@ function registerIpc(): void {
   ipcMain.handle('dashboard:get-snapshot', (event) => {
     validateSender(event);
     return dashboardSnapshotSchema.parse(currentSnapshot());
+  });
+
+  const memberReadFailure = (error: unknown) => {
+    const code = error instanceof Error ? error.message : 'MEMBER_READ_FAILED';
+    console.error(`[member-read] ${code}`);
+    return {
+      ok: false as const,
+      error: {
+        code,
+        messageKey: 'member.read_failed',
+        retryable: false,
+        correlationId: randomUUID()
+      }
+    };
+  };
+
+  ipcMain.handle('members:get-overview', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberPersonInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getMemberOverview(input.personId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('body:list-systems', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberPersonInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.listBodySystems(input.personId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('concepts:get-review', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberPersonInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getConceptReview(input.personId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('concepts:set-mapping', async (event, rawInput: unknown) => {
+    validateSender(event);
+    if (activeWorkspaceMode !== 'personal' || !personalWorkspace) return memberReadFailure(new Error('PERSONAL_WORKSPACE_REQUIRED'));
+    try {
+      const input = setConceptMappingInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const data = personalWorkspace.setConceptMapping(input);
+      emitSnapshotChanged();
+      return { ok: true, data };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('concepts:undo-mapping', async (event, rawInput: unknown) => {
+    validateSender(event);
+    if (activeWorkspaceMode !== 'personal' || !personalWorkspace) return memberReadFailure(new Error('PERSONAL_WORKSPACE_REQUIRED'));
+    try {
+      const input = undoConceptMappingInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const data = personalWorkspace.undoConceptMapping(input);
+      emitSnapshotChanged();
+      return { ok: true, data };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('body:get-system-detail', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberSystemInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getBodySystemDetail(input.personId, input.systemId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('metrics:get-series', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberMetricInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getMetricSeries(input.personId, input.seriesId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('events:list', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberEventListInputSchema.parse(rawInput);
+      return {
+        ok: true,
+        data: personalWorkspace.listHealthEvents(input.personId, {
+          ...(input.systemId === undefined ? {} : { systemId: input.systemId }),
+          ...(input.type === undefined ? {} : { type: input.type })
+        })
+      };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('events:get-detail', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberEventInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getHealthEventDetail(input.personId, input.eventId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('events:update-metadata', async (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = updateReportMetadataInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const data = personalWorkspace.updateReportMetadata(input);
+      emitSnapshotChanged();
+      return { ok: true, data };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('events:undo-metadata', async (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = undoReportMetadataInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const data = personalWorkspace.undoReportMetadata(input);
+      emitSnapshotChanged();
+      return { ok: true, data };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('events:merge', async (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = mergeHealthEventsInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const data = personalWorkspace.mergeHealthEvents(input);
+      emitSnapshotChanged();
+      return { ok: true, data };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('events:split', async (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = splitHealthEventInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const data = personalWorkspace.splitHealthEvent(input);
+      emitSnapshotChanged();
+      return { ok: true, data };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('events:undo-relation', async (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = undoHealthEventRelationInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const data = personalWorkspace.undoHealthEventRelation(input);
+      emitSnapshotChanged();
+      return { ok: true, data };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('evidence:get-bundle', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberEvidenceBundleInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getMemberEvidenceBundle(input.personId, input.evidenceIds) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('guidance:get-plan', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberPersonInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getLifestylePlan(input.personId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
+  ipcMain.handle('guidance:adopt-proposal', async (event, rawInput: unknown) => {
+    validateSender(event);
+    if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
+      return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
+    }
+    try {
+      const input = adoptLifestyleProposalInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const receipt = personalWorkspace.adoptLifestyleProposal(input);
+      emitSnapshotChanged();
+      return { ok: true, data: receipt };
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'LIFESTYLE_PROPOSAL_ADOPTION_FAILED';
+      return { ok: false, error: { code, messageKey: 'guidance.adopt_failed', retryable: false, correlationId: randomUUID() } };
+    }
+  });
+
+  ipcMain.handle('guidance:set-proposal-decision', async (event, rawInput: unknown) => {
+    validateSender(event);
+    if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
+      return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
+    }
+    try {
+      const input = setLifestyleProposalDecisionInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const receipt = personalWorkspace.setLifestyleProposalDecision(input);
+      emitSnapshotChanged();
+      return { ok: true, data: receipt };
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'LIFESTYLE_PROPOSAL_DECISION_FAILED';
+      return { ok: false, error: { code, messageKey: 'guidance.decision_failed', retryable: false, correlationId: randomUUID() } };
+    }
   });
 
   ipcMain.handle('desktop:update-behavior', (event, rawInput: unknown) => {
@@ -1404,7 +1676,9 @@ function registerIpc(): void {
   });
 }
 
-const gotLock = app.requestSingleInstanceLock();
+// 发行工件冒烟测试使用独立的临时 userData。若仍参与正式实例的
+// 单实例锁，测试进程会把窗口请求转发到真实档案，既无法验收，也有误操作风险。
+const gotLock = smokeUserDataDirectory !== null || app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {

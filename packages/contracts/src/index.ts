@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+export * from './member-v2.js';
+
 export const idSchema = z.string().min(1).max(120);
 export const utcTimestampSchema = z.string().datetime({ offset: true });
 export const localDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine((value) => {
@@ -58,7 +60,11 @@ export type CandidateValue = z.infer<typeof candidateValueSchema>;
 
 export const evidenceRefSchema = z.object({
   sourceSpanId: idSchema,
-  quote: z.string().nullable()
+  quote: z.string().nullable(),
+  // 同一次检查在摘要页和明细页重复出现时，仍只生成一个观测，
+  // 但保留第二处来源。字段可选以保持旧任务和旧工作区可读。
+  sourceRole: z.enum(['primary', 'duplicate_source']).optional(),
+  duplicateBasis: z.enum(['report_structure', 'exam_item_id', 'sample_id']).nullable().optional()
 }).strict();
 
 export const observationCandidateSchema = z.object({
@@ -82,6 +88,42 @@ export const observationCandidateSchema = z.object({
 
 export type ObservationCandidate = z.infer<typeof observationCandidateSchema>;
 
+const metadataTextFieldSchema = z.object({
+  value: z.string().trim().min(1).max(500),
+  evidence: z.array(evidenceRefSchema).min(1)
+}).strict();
+
+const partialClinicalDateSchema = z.string().regex(/^\d{4}(?:-\d{2}(?:-\d{2})?)?$/).refine((value) => {
+  const parts = value.split('-').map(Number);
+  if (parts.length === 1) return parts[0]! >= 1900 && parts[0]! <= 2200;
+  const [year, month, day] = parts;
+  if (!year || !month || month < 1 || month > 12) return false;
+  if (day === undefined) return true;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}, 'Invalid partial clinical date');
+
+export const reportMetadataCandidateSchema = z.object({
+  reportKind: metadataTextFieldSchema.nullable(),
+  title: metadataTextFieldSchema.nullable(),
+  organization: metadataTextFieldSchema.nullable(),
+  campus: metadataTextFieldSchema.nullable(),
+  department: metadataTextFieldSchema.nullable(),
+  reportNumber: metadataTextFieldSchema.nullable(),
+  // 只保留报告明示的同次就诊/检查批次标识和样本标识。
+  // 它们是跨文件事件关联的强证据，不得由同日或同值推断。
+  encounterIdentifier: metadataTextFieldSchema.nullable().optional(),
+  sampleIdentifiers: z.array(metadataTextFieldSchema).optional(),
+  examItems: z.array(metadataTextFieldSchema),
+  times: z.array(z.object({
+    value: partialClinicalDateSchema,
+    precision: z.enum(['year', 'month', 'day']),
+    role: z.enum(['sampled', 'examined', 'encounter', 'report_issued', 'history_quoted', 'unknown']),
+    evidence: z.array(evidenceRefSchema).min(1)
+  }).strict().refine((time) => time.value.split('-').length === ({ year: 1, month: 2, day: 3 } as const)[time.precision], 'Date precision does not match value'))
+}).strict();
+export type ReportMetadataCandidate = z.infer<typeof reportMetadataCandidateSchema>;
+
 export const extractionResultSchema = z.object({
   schemaVersion: z.literal(1),
   documentId: idSchema,
@@ -90,6 +132,7 @@ export const extractionResultSchema = z.object({
     evidence: z.array(evidenceRefSchema),
     confidence: z.enum(['explicit', 'absent', 'uncertain'])
   }).strict(),
+  reportMetadata: reportMetadataCandidateSchema.nullable().optional(),
   coveredSourceSpanIds: z.array(idSchema),
   candidates: z.array(observationCandidateSchema)
 }).strict();
@@ -106,19 +149,48 @@ export const derivedClaimSchema = z.object({
   boundaryNote: z.string().max(300).nullable()
 }).strict();
 
+export const generalKnowledgeEvidenceCandidateSchema = z.object({
+  id: idSchema,
+  sourceTitle: z.string().min(1).max(240),
+  sourceOrganization: z.string().min(1).max(160),
+  sourceUrl: z.string().url().refine((value) => value.startsWith('https://'), 'Knowledge source must use HTTPS'),
+  reviewedAt: localDateSchema,
+  supportedScope: z.string().min(1).max(500)
+}).strict();
+
+export const lifestyleGuidanceCandidateSchema = z.object({
+  id: idSchema,
+  dedupeKey: z.string().trim().min(1).max(120),
+  category: z.enum(['exercise', 'diet', 'sleep', 'monitoring', 'review', 'other']),
+  title: z.string().min(1).max(120),
+  goal: z.string().min(1).max(300),
+  rationale: z.string().min(1).max(800),
+  detail: z.string().min(1).max(800),
+  steps: z.array(z.string().min(1).max(300)).min(1).max(8),
+  startingOptions: z.array(z.string().min(1).max(300)).min(1).max(4),
+  scheduleSuggestion: z.string().min(1).max(300).nullable(),
+  trackingSuggestion: z.string().min(1).max(300),
+  constraints: z.array(z.string().min(1).max(500)).max(12),
+  uncertainties: z.array(z.string().min(1).max(500)).max(12),
+  evidenceObservationIds: z.array(idSchema).min(1),
+  generalKnowledgeEvidence: z.array(generalKnowledgeEvidenceCandidateSchema).max(8),
+  sourceKind: z.enum(['ai_proposed', 'clinician_reported', 'care_preparation']),
+  relatedSystemIds: z.array(idSchema).max(12),
+  consultProfessional: z.boolean()
+}).strict().superRefine((guidance, context) => {
+  if (guidance.sourceKind === 'ai_proposed' && guidance.generalKnowledgeEvidence.length === 0) {
+    context.addIssue({ code: 'custom', path: ['generalKnowledgeEvidence'], message: 'AI lifestyle proposal requires general knowledge evidence' });
+  }
+});
+export type LifestyleGuidanceCandidate = z.infer<typeof lifestyleGuidanceCandidateSchema>;
+
 export const derivedSnapshotCandidateSchema = z.object({
   schemaVersion: z.literal(1),
   personId: idSchema,
   factRevision: z.number().int().nonnegative(),
   dataQuality: dataQualitySchema,
   claims: z.array(derivedClaimSchema).max(40),
-  lifestyleGuidance: z.array(z.object({
-    id: idSchema,
-    title: z.string().min(1).max(120),
-    detail: z.string().min(1).max(800),
-    evidenceObservationIds: z.array(idSchema).min(1),
-    consultProfessional: z.boolean()
-  }).strict()).max(20)
+  lifestyleGuidance: z.array(lifestyleGuidanceCandidateSchema).max(20)
 }).strict();
 
 export type DerivedSnapshotCandidate = z.infer<typeof derivedSnapshotCandidateSchema>;
@@ -190,7 +262,7 @@ export type Person = z.infer<typeof personSchema>;
 export const manualNoteSchema = z.object({
   id: idSchema,
   personId: idSchema,
-  kind: z.enum(['history', 'allergy', 'medication', 'self_measurement', 'free_text']),
+  kind: z.enum(['history', 'allergy', 'medication', 'self_measurement', 'goal', 'constraint', 'free_text']),
   immutableText: z.string().min(1),
   effectiveDate: localDateSchema.nullable(),
   sourceKind: z.literal('user_reported'),
@@ -203,7 +275,7 @@ export type ManualNote = z.infer<typeof manualNoteSchema>;
 
 export const createManualNoteInputSchema = z.object({
   personId: idSchema,
-  kind: z.enum(['history', 'allergy', 'medication', 'self_measurement', 'free_text']),
+  kind: z.enum(['history', 'allergy', 'medication', 'self_measurement', 'goal', 'constraint', 'free_text']),
   immutableText: z.string().trim().min(1).max(4_000),
   effectiveDate: localDateSchema.nullable(),
   structuredFields: z.record(z.string().min(1).max(80), z.string().max(500)),
@@ -302,6 +374,8 @@ export const taskStageSchema = z.enum([
   'analyze',
   'guidance',
   'review_derived',
+  'system_analysis',
+  'system_review',
   'publish'
 ]);
 
@@ -319,7 +393,7 @@ export const jobStatusSchema = z.enum([
 
 export const healthTaskEnvelopeSchema = z.object({
   taskId: idSchema,
-  stage: z.enum(['extract', 'review_facts', 'analyze', 'guidance', 'review_derived']),
+  stage: z.enum(['extract', 'review_facts', 'analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review']),
   personId: idSchema,
   sourceSpanIds: z.array(idSchema),
   inputSignature: z.string().regex(/^[a-f0-9]{64}$/),

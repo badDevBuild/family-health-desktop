@@ -2,7 +2,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { DashboardSnapshot } from '@contracts';
+import type { DashboardSnapshot, ResolveReviewInput } from '@contracts';
 import type { HealthDesktopBridge } from '../../preload/index.js';
 import { createDemoSnapshot } from '../../../../../packages/test-fixtures/src/index.js';
 import App from './App.js';
@@ -63,6 +63,21 @@ afterEach(() => {
 });
 
 describe('App member display editing', () => {
+  it('证据侧栏支持 Escape 关闭并把键盘焦点还给原按钮', async () => {
+    render(<App />);
+
+    const trigger = await screen.findByRole('button', { name: /心血管/ });
+    trigger.focus();
+    fireEvent.click(trigger);
+
+    const closeButton = await screen.findByRole('button', { name: '关闭证据侧栏' });
+    await waitFor(() => expect(document.activeElement).toBe(closeButton));
+    fireEvent.keyDown(closeButton, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByLabelText('证据侧栏')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it('reconciles the demo selection with the loaded personal workspace before opening the editor', async () => {
     installBridge(createPersonalSnapshot());
     render(<App />);
@@ -91,7 +106,7 @@ describe('App member display editing', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '成员档案' }));
     await waitFor(() => expect(screen.getByRole('heading', { name: '测试成员' })).toBeTruthy());
-    fireEvent.click(screen.getByRole('tab', { name: '资料' }));
+    fireEvent.click(screen.getByRole('tab', { name: '原始资料' }));
     fireEvent.click(await screen.findByRole('button', { name: '删除本机档案' }));
 
     expect(await screen.findByRole('dialog', { name: '删除这份本机档案？' })).toBeTruthy();
@@ -187,6 +202,37 @@ describe('App member display editing', () => {
     expect(screen.getByRole('button', { name: '立即处理全部' }).hasAttribute('disabled')).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: '前往处理中心' }));
     expect(await screen.findByRole('heading', { name: '每一步都能看懂、能恢复' })).toBeTruthy();
+  });
+
+  it('已完成资料不再回到只用于接收新资料的收件箱', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.inbox = [{
+      id: 'completed-document', displayName: '已完成报告.pdf', discoveredAt: '2026-09-18T00:00:00.000Z',
+      personId: 'personal-person-1', personLabel: '测试成员', status: 'completed', format: 'PDF', sourceLabel: '手动导入',
+      sentToAi: true, aiTransmissionStatus: 'completed', inProcessingCenter: false, issue: null
+    }];
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '报告收件箱' }));
+    expect(screen.queryByText('已完成报告.pdf')).toBeNull();
+    expect(screen.getByText('新资料已全部移交')).toBeTruthy();
+  });
+
+  it('不可重试且已被新任务替代的失败记录不再冒充当前待办', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.jobs = [{
+      id: 'superseded-job', batchLabel: '旧处理任务', personLabel: '测试成员', stage: 'extract', status: 'failed',
+      completedUnits: 0, totalUnits: 1, statusText: '已有较新的处理任务，请使用上方任务继续',
+      updatedAt: '2026-09-18T00:00:00.000Z', canCancel: false, canRetry: false
+    }];
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '处理中心' }));
+    expect(screen.queryByRole('heading', { name: '正在处理与需要关注' })).toBeNull();
+    expect(screen.getByRole('heading', { name: '最近记录' })).toBeTruthy();
+    expect(screen.getByText('旧处理任务')).toBeTruthy();
   });
 
   it('清楚展示报告姓名与目标成员，并用专门操作确认同一人', async () => {
@@ -298,6 +344,54 @@ describe('App member display editing', () => {
     expect(screen.getByText('99')).toBeTruthy();
     expect(screen.getAllByText('结果').length).toBeGreaterThanOrEqual(1);
     expect(container.querySelector('.review-resolution-scroll')).toBeTruthy();
+  });
+
+  it('混合冲突允许排除证据不清的单项，并正确编辑数值比较符', async () => {
+    const snapshot = createPersonalSnapshot();
+    const troponin = {
+      localKey: 'troponin', originalName: '肌钙蛋白', standardNameCandidate: 'cTnI',
+      value: { kind: 'numeric' as const, rawText: '0.01', decimal: '0.01', comparator: 'eq' as const },
+      unitRaw: 'ng/mL', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-18',
+      evidence: [{ sourceSpanId: 'troponin-span', quote: '肌钙蛋白 <0.01 ng/mL' }], issues: []
+    };
+    const glucose = {
+      ...troponin,
+      localKey: 'glucose', originalName: '葡萄糖', standardNameCandidate: '空腹血糖',
+      value: { kind: 'numeric' as const, rawText: '5.2', decimal: '5.2', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', evidence: [{ sourceSpanId: 'glucose-span', quote: '葡萄糖 5.2 mmol/L' }]
+    };
+    snapshot.reviews = [{
+      id: 'mixed-review', personId: 'personal-person-1', documentId: 'mixed-document',
+      kind: 'field_conflict', severity: 'blocking', title: '发现 2 项需核对内容',
+      description: '一项数值需修正，一项证据仍不清楚。', evidenceRefs: ['troponin-span', 'glucose-span'],
+      candidateOptions: [troponin, glucose],
+      candidateDiffs: [
+        { localKey: troponin.localKey, itemName: troponin.originalName, fields: ['value'], firstCandidate: { ...troponin, value: { kind: 'numeric', rawText: '0.02', decimal: '0.02', comparator: 'eq' } }, secondCandidate: troponin },
+        { localKey: glucose.localKey, itemName: glucose.originalName, fields: ['issues'], firstCandidate: glucose, secondCandidate: glucose }
+      ],
+      reportedName: null, reasonCodes: ['FACT_ADJUDICATION_UNRESOLVED'], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async (_input: ResolveReviewInput) => ({
+      ok: true as const,
+      data: { action: 'accept_correction' as const }
+    }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /发现 2 项需核对内容/ }));
+    expect((await screen.findByRole('checkbox', { name: /这一项证据还不够清楚/ }) as HTMLInputElement).checked).toBe(true);
+    fireEvent.change(screen.getByLabelText('肌钙蛋白比较符'), { target: { value: 'lt' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存修正并纳入' }));
+
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledTimes(1));
+    const submitted = resolveReview.mock.calls[0]![0] as Extract<ResolveReviewInput, { action: 'accept_correction' }>;
+    expect(submitted).toMatchObject({ action: 'accept_correction', issueId: 'mixed-review', documentId: 'mixed-document' });
+    expect(submitted.candidates).toHaveLength(1);
+    expect(submitted.candidates[0]).toMatchObject({
+      localKey: 'troponin', value: { decimal: '0.01', comparator: 'lt', rawText: '<0.01' }
+    });
   });
 
   it('模型仍无法裁决异常标记时用普通语言解释如何确认', async () => {

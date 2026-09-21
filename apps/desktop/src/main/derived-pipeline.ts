@@ -3,7 +3,8 @@ import {
   derivedSafetyReviewSchema,
   derivedSnapshotCandidateSchema,
   type DerivedSafetyReview,
-  type DerivedSnapshotCandidate
+  type DerivedSnapshotCandidate,
+  type LifestyleGuidanceCandidate
 } from '@contracts';
 import type { AcceptedObservationSummary, JobExecutionGuard, WorkspaceStore } from '@storage';
 import {
@@ -83,7 +84,16 @@ function deterministicSafetyIssues(candidate: DerivedSnapshotCandidate, observat
   const issues: string[] = [];
   const allItems = [
     ...candidate.claims.map((claim) => ({ id: claim.id, text: `${claim.title}\n${claim.explanation}`, evidence: claim.evidenceObservationIds, boundaryRequired: claim.level === 'association' || claim.level === 'action', boundaryNote: claim.boundaryNote })),
-    ...candidate.lifestyleGuidance.map((guidance) => ({ id: guidance.id, text: `${guidance.title}\n${guidance.detail}`, evidence: guidance.evidenceObservationIds, boundaryRequired: false, boundaryNote: null }))
+    ...candidate.lifestyleGuidance.map((guidance) => ({
+      id: guidance.id,
+      text: [
+        guidance.title, guidance.goal, guidance.rationale, guidance.detail,
+        ...guidance.steps, ...guidance.startingOptions, ...guidance.constraints, ...guidance.uncertainties
+      ].join('\n'),
+      evidence: guidance.evidenceObservationIds,
+      boundaryRequired: false,
+      boundaryNote: null
+    }))
   ];
   const ids = new Set<string>();
   for (const item of allItems) {
@@ -95,6 +105,42 @@ function deterministicSafetyIssues(candidate: DerivedSnapshotCandidate, observat
     if (dosagePattern.test(item.text)) issues.push(`dosage_boundary:${item.id}`);
   }
   return issues;
+}
+
+function uniqueText(values: string[], limit: number): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].slice(0, limit);
+}
+
+function mergeGuidance(left: LifestyleGuidanceCandidate, right: LifestyleGuidanceCandidate): LifestyleGuidanceCandidate {
+  const knowledge = [...left.generalKnowledgeEvidence, ...right.generalKnowledgeEvidence];
+  const uniqueKnowledge = [...new Map(knowledge.map((item) => [item.sourceUrl, item])).values()].slice(0, 8);
+  return {
+    ...left,
+    // 两条建议命中同一去重键时，保留首条已通过 schema 限长的主叙事。
+    // 可执行步骤、限制和证据仍合并，避免拼接文本后突破字段长度上限。
+    rationale: left.rationale,
+    detail: left.detail,
+    steps: uniqueText([...left.steps, ...right.steps], 8),
+    startingOptions: uniqueText([...left.startingOptions, ...right.startingOptions], 4),
+    scheduleSuggestion: left.scheduleSuggestion ?? right.scheduleSuggestion,
+    trackingSuggestion: left.trackingSuggestion,
+    constraints: uniqueText([...left.constraints, ...right.constraints], 12),
+    uncertainties: uniqueText([...left.uncertainties, ...right.uncertainties], 12),
+    evidenceObservationIds: [...new Set([...left.evidenceObservationIds, ...right.evidenceObservationIds])],
+    generalKnowledgeEvidence: uniqueKnowledge,
+    relatedSystemIds: [...new Set([...left.relatedSystemIds, ...right.relatedSystemIds])].slice(0, 12),
+    consultProfessional: left.consultProfessional || right.consultProfessional
+  };
+}
+
+function normalizeLifestyleGuidance(candidate: DerivedSnapshotCandidate): DerivedSnapshotCandidate {
+  const byKey = new Map<string, LifestyleGuidanceCandidate>();
+  for (const guidance of candidate.lifestyleGuidance) {
+    const key = guidance.dedupeKey.trim().toLocaleLowerCase('zh-CN');
+    const existing = byKey.get(key);
+    byKey.set(key, existing ? mergeGuidance(existing, guidance) : guidance);
+  }
+  return { ...candidate, lifestyleGuidance: [...byKey.values()] };
 }
 
 function canRepairDerivedStructure(issues: string[]): boolean {
@@ -172,6 +218,9 @@ export class DerivedHealthPipeline {
   async process(personId: string): Promise<DerivedPipelineResult> {
     const observations = this.store.listAcceptedObservations(personId);
     if (observations.length === 0) throw new Error('DERIVED_FACTS_REQUIRED');
+    if (this.executionGuard) {
+      this.store.assertObservationScopeActive(this.executionGuard, personId, observations);
+    }
     const factRevision = this.store.getFactRevision(personId);
     const contextRevision = this.store.getClinicalContextRevision(personId);
     const factPackage = buildFactPackage(personId, factRevision, observations, this.store.getDerivedContext(personId));
@@ -181,7 +230,7 @@ export class DerivedHealthPipeline {
       allowWebSearch: true,
       outputSchema: candidateOutputSchema
     });
-    let candidate = derivedSnapshotCandidateSchema.parse(generated.output);
+    let candidate = normalizeLifestyleGuidance(derivedSnapshotCandidateSchema.parse(generated.output));
     if (candidate.personId !== personId || candidate.factRevision !== factRevision) throw new Error('DERIVED_SCOPE_MISMATCH');
     let localIssues = deterministicSafetyIssues(candidate, observations);
     if (canRepairDerivedStructure(localIssues)) {
@@ -194,7 +243,7 @@ export class DerivedHealthPipeline {
         allowWebSearch: false,
         outputSchema: candidateOutputSchema
       });
-      candidate = derivedSnapshotCandidateSchema.parse(repaired.output);
+      candidate = normalizeLifestyleGuidance(derivedSnapshotCandidateSchema.parse(repaired.output));
       if (candidate.personId !== personId || candidate.factRevision !== factRevision) throw new Error('DERIVED_REPAIR_SCOPE_MISMATCH');
       localIssues = deterministicSafetyIssues(candidate, observations);
     }
