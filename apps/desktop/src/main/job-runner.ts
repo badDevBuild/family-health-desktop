@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type { WorkspaceStore } from '@storage';
-import { stableHash } from '@core';
+import { bodySystemRegistry, stableHash } from '@core';
 import { DEFAULT_AI_PREFERENCES, type AiPreferences } from '@contracts';
 import { CodexRuntimeManager } from './codex-runtime.js';
 import { DerivedHealthPipeline } from './derived-pipeline.js';
@@ -61,6 +61,7 @@ export class ProcessingJobRunner extends EventEmitter {
           const resumeDerived = resumeSystem || ['analyze', 'guidance', 'review_derived', 'publish'].includes(job.stage);
           let completedUnits = resumeDerived ? job.documentIds.length : 0;
           let needsReview = false;
+          let hasSystemRejection = false;
           let lastReceipt: { threadId: string; turnId: string } | null = null;
           if (!resumeDerived) {
             for (const documentId of job.documentIds) {
@@ -113,15 +114,41 @@ export class ProcessingJobRunner extends EventEmitter {
               job.documentIds[0]!,
               aiPreferences.modelId
             );
-            for (const systemId of ['cardiovascular', 'endocrine_metabolic'] as const) {
+            const enabledSystemIds = ['cardiovascular', 'endocrine_metabolic'] as const;
+            for (const systemId of enabledSystemIds) {
               const systemResult = await systemPipeline.process(job.personId, systemId);
               if (systemResult.status === 'published') {
                 lastReceipt = { threadId: systemResult.threadId, turnId: systemResult.turnId };
+                store.updateJobSystemOutcome(job.id, {
+                  systemId, status: 'published', reason: null,
+                  inputSignature: store.listSystemAnalysisSnapshots(job.personId, true).find((item) => item.systemId === systemId)?.inputSignature ?? null
+                });
+              } else if (systemResult.status === 'rejected') {
+                hasSystemRejection = true;
+                if (systemResult.threadId && systemResult.turnId) lastReceipt = { threadId: systemResult.threadId, turnId: systemResult.turnId };
+                store.updateJobSystemOutcome(job.id, {
+                  systemId, status: 'rejected', reason: systemResult.reason, inputSignature: null
+                });
+              } else {
+                store.updateJobSystemOutcome(job.id, {
+                  systemId,
+                  status: systemResult.reason === 'no_direct_facts' ? 'skipped_no_data' : 'skipped_cache',
+                  reason: systemResult.reason,
+                  inputSignature: store.listSystemAnalysisSnapshots(job.personId, true).find((item) => item.systemId === systemId)?.inputSignature ?? null
+                });
               }
+            }
+            for (const system of bodySystemRegistry.filter((item) => !enabledSystemIds.includes(item.id as typeof enabledSystemIds[number]))) {
+              store.updateJobSystemOutcome(job.id, {
+                systemId: system.id,
+                status: 'out_of_scope',
+                reason: 'system_analysis_phase_one',
+                inputSignature: null
+              });
             }
           }
           if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
-          const finalStatus = needsReview ? 'waiting_user' : 'succeeded';
+          const finalStatus = needsReview ? 'waiting_user' : hasSystemRejection ? 'completed_with_issues' : 'succeeded';
           if (!needsReview) store.updateJobStage(job.id, 'publish');
           store.finishJob(job.id, finalStatus);
           store.finishJobAttempt({ attemptId, status: finalStatus, ...lastReceipt });

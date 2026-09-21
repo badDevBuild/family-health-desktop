@@ -26,7 +26,7 @@ import type {
 } from '@contracts';
 import { BODY_SYSTEM_REGISTRY_VERSION, CONCEPT_DICTIONARY_VERSION, MEMBER_MODEL_VERSION, bodySystemRegistry, conceptDictionary, linkConceptToSystems, mapConcept, selectContextSystems } from '@core';
 
-export const WORKSPACE_SCHEMA_VERSION = 33;
+export const WORKSPACE_SCHEMA_VERSION = 34;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 function calendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
@@ -262,10 +262,17 @@ export interface StoredJobSummary {
   batchLabel: string;
   personLabel: string | null;
   stage: 'extract' | 'review_facts' | 'analyze' | 'guidance' | 'review_derived' | 'system_analysis' | 'system_review' | 'publish';
-  status: 'queued' | 'running' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'retry_wait' | 'succeeded' | 'failed' | 'cancelled';
+  status: 'queued' | 'running' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'retry_wait' | 'succeeded' | 'completed_with_issues' | 'failed' | 'cancelled';
   completedUnits: number;
   totalUnits: number;
   statusText: string;
+  systemOutcomes: Array<{
+    systemId: string;
+    status: 'published' | 'rejected' | 'skipped_no_data' | 'skipped_cache' | 'out_of_scope';
+    reason: string | null;
+    inputSignature: string | null;
+    updatedAt: string;
+  }>;
   updatedAt: string;
 }
 
@@ -305,6 +312,8 @@ export interface PublishFactsInput {
   reportMetadata?: ReportMetadataCandidate | null;
   observations: Array<{
     conceptKey: string;
+    originalName?: string;
+    modelStandardNameCandidate?: string | null;
     rawText: string;
     valueKind: 'numeric' | 'qualitative' | 'text' | 'unknown';
     decimalValue: string | null;
@@ -334,6 +343,9 @@ export interface AcceptedObservationSummary {
   id: string;
   personId: string;
   conceptKey: string;
+  originalName: string;
+  originalNameStatus: 'recorded' | 'legacy_missing';
+  modelStandardNameCandidate: string | null;
   rawText: string;
   valueKind: 'numeric' | 'qualitative' | 'text' | 'unknown';
   decimalValue: string | null;
@@ -346,6 +358,7 @@ export interface AcceptedObservationSummary {
   sourceQuote: string | null;
   sourceLabel: string;
   documentId: string;
+  eventId: string | null;
   specimen: string | null;
   method: string | null;
   bodySite: string | null;
@@ -423,6 +436,7 @@ export interface StoredLifestyleProposal {
     sourceUrl: string;
     reviewedAt: string;
     supportedScope: string;
+    verificationStatus: 'unverified_model_candidate' | 'controlled_source_verified';
   }>;
   sourceKind: 'ai_proposed' | 'clinician_reported' | 'care_preparation';
   relatedSystemIds: string[];
@@ -442,7 +456,7 @@ export interface StoredActionAdoption {
   plannedTime: string | null;
   owner: string;
   progressNote: string | null;
-  status: 'planned' | 'in_progress' | 'completed' | 'paused' | 'dismissed';
+  status: 'proposed' | 'discussed' | 'planned' | 'in_progress' | 'paused' | 'completed' | 'dismissed';
   dueDate: string | null;
   userRevision: number;
   updatedAt: string;
@@ -834,7 +848,10 @@ export class WorkspaceStore {
         uncertainties: structure.uncertainties ?? [],
         consultProfessional: Number(row.consult_professional) === 1,
         evidenceObservationIds: JSON.parse(String(row.evidence_refs_json)) as string[],
-        generalKnowledgeEvidence: structure.generalKnowledgeEvidence ?? [],
+        generalKnowledgeEvidence: (structure.generalKnowledgeEvidence ?? []).map((item) => ({
+          ...item,
+          verificationStatus: item.verificationStatus ?? 'unverified_model_candidate'
+        })),
         sourceKind: structure.sourceKind ?? 'care_preparation',
         relatedSystemIds: structure.relatedSystemIds ?? [],
         status: String(row.status) as StoredLifestyleProposal['status'],
@@ -922,7 +939,7 @@ export class WorkspaceStore {
     const timestamp = this.now().toISOString();
     const transaction = this.db.transaction(() => {
       const proposal = this.db.prepare(`
-        SELECT id, person_id, title, detail, status FROM lifestyle_proposals_v2
+        SELECT id, person_id, title, detail, status, source_snapshot_id FROM lifestyle_proposals_v2
         WHERE id = ? AND person_id = ?
       `).get(input.proposalId, input.personId) as {
         id: string;
@@ -930,9 +947,15 @@ export class WorkspaceStore {
         title: string;
         detail: string;
         status: string;
+        source_snapshot_id: string | null;
       } | undefined;
       if (!proposal || proposal.status === 'superseded' || proposal.status === 'dismissed') {
         throw new Error('LIFESTYLE_PROPOSAL_NOT_AVAILABLE');
+      }
+      if (proposal.source_snapshot_id) {
+        const source = this.db.prepare(`SELECT status FROM derived_snapshots WHERE id = ? AND person_id = ?`)
+          .get(proposal.source_snapshot_id, input.personId) as { status: string } | undefined;
+        if (!source || source.status !== 'current') throw new Error('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
       }
       const existing = this.db.prepare(`
         SELECT id FROM action_adoptions_v2
@@ -2641,7 +2664,7 @@ export class WorkspaceStore {
   listProcessingDocumentIds(): Set<string> {
     const rows = this.db.prepare(`
       SELECT checkpoint_json FROM jobs
-      WHERE status NOT IN ('cancelled', 'succeeded') AND checkpoint_json IS NOT NULL
+      WHERE status NOT IN ('cancelled', 'succeeded', 'completed_with_issues') AND checkpoint_json IS NOT NULL
     `).all() as Array<{ checkpoint_json: string }>;
     const documentIds = new Set<string>();
     for (const row of rows) {
@@ -2774,7 +2797,7 @@ export class WorkspaceStore {
         checkpoint_json: string | null;
       } | undefined;
       if (!row) throw new Error('JOB_NOT_FOUND');
-      if (row.status === 'succeeded' || row.status === 'cancelled') {
+      if (row.status === 'succeeded' || row.status === 'completed_with_issues' || row.status === 'cancelled') {
         return { running: false, alreadyTerminal: true };
       }
       if (row.status === 'running') {
@@ -2931,8 +2954,12 @@ export class WorkspaceStore {
   retryFailedJob(jobId: string): void {
     const result = this.db.prepare(`
       UPDATE jobs
-      SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-      WHERE id = ? AND status = 'failed'
+      SET status = 'queued',
+          stage = CASE WHEN status = 'completed_with_issues' THEN 'system_analysis' ELSE stage END,
+          lease_owner = NULL,
+          lease_expires_at = NULL,
+          updated_at = ?
+      WHERE id = ? AND status IN ('failed', 'completed_with_issues')
     `).run(this.now().toISOString(), jobId);
     if (result.changes !== 1) throw new Error('JOB_NOT_RETRYABLE');
   }
@@ -2977,6 +3004,27 @@ export class WorkspaceStore {
     );
   }
 
+  updateJobSystemOutcome(jobId: string, outcome: {
+    systemId: string;
+    status: 'published' | 'rejected' | 'skipped_no_data' | 'skipped_cache' | 'out_of_scope';
+    reason: string | null;
+    inputSignature: string | null;
+  }): void {
+    const row = this.db.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ? AND status = 'running'`).get(jobId) as { checkpoint_json: string | null } | undefined;
+    if (!row) throw new Error('JOB_NOT_RUNNING');
+    const checkpoint = row.checkpoint_json ? JSON.parse(row.checkpoint_json) as Record<string, unknown> : {};
+    const current = Array.isArray(checkpoint.systemOutcomes)
+      ? checkpoint.systemOutcomes as Array<Record<string, unknown>>
+      : [];
+    const next = [
+      ...current.filter((item) => item.systemId !== outcome.systemId),
+      { ...outcome, updatedAt: this.now().toISOString() }
+    ];
+    this.db.prepare(`UPDATE jobs SET checkpoint_json = ?, updated_at = ? WHERE id = ? AND status = 'running'`).run(
+      JSON.stringify({ ...checkpoint, systemOutcomes: next }), this.now().toISOString(), jobId
+    );
+  }
+
   updateJobStage(jobId: string, stage: StoredJobSummary['stage']): void {
     const result = this.db.prepare(`
       UPDATE jobs SET stage = ?, updated_at = ? WHERE id = ? AND status = 'running'
@@ -2984,7 +3032,7 @@ export class WorkspaceStore {
     if (result.changes !== 1) throw new Error('JOB_NOT_RUNNING');
   }
 
-  finishJob(jobId: string, status: 'succeeded' | 'failed' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'cancelled'): void {
+  finishJob(jobId: string, status: 'succeeded' | 'completed_with_issues' | 'failed' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'cancelled'): void {
     const result = this.db.prepare(`
       UPDATE jobs SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
       WHERE id = ? AND status = 'running'
@@ -3005,7 +3053,7 @@ export class WorkspaceStore {
 
   finishJobAttempt(input: {
     attemptId: string;
-    status: 'succeeded' | 'failed' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'cancelled';
+    status: 'succeeded' | 'completed_with_issues' | 'failed' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'cancelled';
     errorCode?: string | null;
     threadId?: string | null;
     turnId?: string | null;
@@ -3038,12 +3086,17 @@ export class WorkspaceStore {
       ORDER BY j.created_at DESC, j.rowid DESC
     `).all() as Array<Record<string, unknown>>;
     return rows.map((row) => {
-      const checkpoint = row.checkpoint_json ? JSON.parse(String(row.checkpoint_json)) as { documentIds?: string[]; completedUnits?: number; cancelRequested?: boolean } : {};
+      const checkpoint = row.checkpoint_json ? JSON.parse(String(row.checkpoint_json)) as {
+        documentIds?: string[];
+        completedUnits?: number;
+        cancelRequested?: boolean;
+        systemOutcomes?: StoredJobSummary['systemOutcomes'];
+      } : {};
       const status = String(row.status) as StoredJobSummary['status'];
       const labels: Record<StoredJobSummary['status'], string> = {
         queued: '已排队', running: '正在处理', waiting_auth: '等待连接 Codex',
         waiting_quota: '等待额度恢复', waiting_user: '等待你的确认', retry_wait: '等待重试',
-        succeeded: '已完成', failed: '处理失败', cancelled: '已取消'
+        succeeded: '已完成', completed_with_issues: '事实已保存，部分系统说明未通过', failed: '处理失败', cancelled: '已取消'
       };
       const latestErrorCode = row.latest_error_code === null ? null : String(row.latest_error_code);
       const failedStatusText = latestErrorCode?.includes('failed to load configuration')
@@ -3065,6 +3118,7 @@ export class WorkspaceStore {
         completedUnits: checkpoint.completedUnits ?? 0,
         totalUnits: Math.max(checkpoint.documentIds?.length ?? 1, 1),
         statusText: status === 'running' && checkpoint.cancelRequested ? '正在安全停止' : status === 'failed' ? failedStatusText : labels[status],
+        systemOutcomes: checkpoint.systemOutcomes ?? [],
         updatedAt: String(row.updated_at)
       };
     });
@@ -3077,7 +3131,7 @@ export class WorkspaceStore {
         AND finished_at < ?
         AND job_id IN (
           SELECT j.id FROM jobs j
-          WHERE j.status IN ('succeeded', 'failed', 'cancelled')
+          WHERE j.status IN ('succeeded', 'completed_with_issues', 'failed', 'cancelled')
             AND NOT EXISTS (
               SELECT 1 FROM review_issues r
               WHERE r.job_id = j.id AND r.resolution_status = 'open'
@@ -3103,7 +3157,7 @@ export class WorkspaceStore {
     const definition = input.conceptId ? conceptDictionary.find((item) => item.id === input.conceptId) : null;
     if (input.conceptId && !definition) throw new Error('CONCEPT_NOT_FOUND');
     const nextMapping: ConceptMapping = definition ? {
-      rawName: observation.conceptKey,
+      rawName: observation.originalName,
       normalizedName: definition.canonicalName,
       conceptId: definition.id,
       canonicalName: definition.canonicalName,
@@ -3111,8 +3165,8 @@ export class WorkspaceStore {
       confidence: 1,
       reasons: [`用户确认归入“${definition.canonicalName}”；原始名称保持不变。`]
     } : {
-      rawName: observation.conceptKey,
-      normalizedName: observation.conceptKey,
+      rawName: observation.originalName,
+      normalizedName: observation.originalName,
       conceptId: null,
       canonicalName: null,
       status: 'unmapped',
@@ -3191,7 +3245,7 @@ export class WorkspaceStore {
     const previousConceptId = correction.previous_concept_id === null ? null : String(correction.previous_concept_id);
     const definition = previousConceptId ? conceptDictionary.find((item) => item.id === previousConceptId) : null;
     const restoredMapping: ConceptMapping = {
-      rawName: observation.conceptKey,
+      rawName: observation.originalName,
       normalizedName: String(correction.previous_normalized_name),
       conceptId: previousConceptId,
       canonicalName: definition?.canonicalName ?? null,
@@ -3274,11 +3328,18 @@ export class WorkspaceStore {
       JOIN ranked_observation_ids scoped
         ON scoped.id = o.id AND scoped.person_rank <= ?`;
     const rows = this.db.prepare(`${scopeCte}
-      SELECT o.id, o.person_id, o.concept_key, o.created_at,
+      SELECT o.id, o.person_id, o.concept_key, o.original_name, o.model_standard_name_candidate, o.created_at,
              r.value_kind, r.raw_text, r.decimal_value, r.qualifier, r.unit,
              r.reference_range, r.abnormal_flag, r.source_span_id,
              r.specimen, r.method, r.body_site, r.evidence_json,
              e.clinical_date, ss.quote AS source_quote, d.id AS document_id,
+             (
+               SELECT rr.event_id
+               FROM report_source_links rsl
+               JOIN report_records rr ON rr.id = rsl.report_id
+               WHERE rsl.document_id = d.id
+               ORDER BY rr.created_at DESC LIMIT 1
+             ) AS event_id,
              COALESCE(c.concept_id, m.concept_id) AS mapping_concept_id,
              COALESCE(c.normalized_name, m.normalized_name) AS mapping_normalized_name,
              COALESCE(c.status, m.status) AS mapping_status,
@@ -3314,9 +3375,16 @@ export class WorkspaceStore {
       : [personId ?? null, personId ?? null, limitPerPerson, personId ?? null, personId ?? null]
     )) as Array<Record<string, unknown>>;
     return rows.map((row) => {
+      const legacyNameMissing = row.original_name === null || String(row.original_name).trim() === '';
+      const originalName = legacyNameMissing
+        ? '原项目名待核实（旧记录）'
+        : String(row.original_name);
+      const modelStandardNameCandidate = row.model_standard_name_candidate === null
+        ? legacyNameMissing ? String(row.concept_key) : null
+        : String(row.model_standard_name_candidate);
       const automatic = mapConcept({
-        rawName: String(row.concept_key),
-        standardName: String(row.concept_key),
+        rawName: originalName,
+        standardName: modelStandardNameCandidate,
         specimen: row.specimen === null ? null : String(row.specimen),
         method: row.method === null ? null : String(row.method),
         bodySite: row.body_site === null ? null : String(row.body_site),
@@ -3324,8 +3392,9 @@ export class WorkspaceStore {
       });
       const conceptId = row.mapping_concept_id === null ? automatic.conceptId : String(row.mapping_concept_id);
       const definition = conceptId ? conceptDictionary.find((item) => item.id === conceptId) : null;
-      const mapping: ConceptMapping = row.mapping_status === null ? automatic : {
-        rawName: String(row.concept_key),
+      const storedAutomaticMappingIsTrusted = !legacyNameMissing || row.correction_id !== null;
+      const mapping: ConceptMapping = row.mapping_status === null || !storedAutomaticMappingIsTrusted ? automatic : {
+        rawName: originalName,
         normalizedName: String(row.mapping_normalized_name),
         conceptId,
         canonicalName: definition?.canonicalName ?? null,
@@ -3337,6 +3406,9 @@ export class WorkspaceStore {
       id: String(row.id),
       personId: String(row.person_id),
       conceptKey: String(row.concept_key),
+      originalName,
+      originalNameStatus: legacyNameMissing ? 'legacy_missing' : 'recorded',
+      modelStandardNameCandidate,
       rawText: String(row.raw_text),
       valueKind: String(row.value_kind) as AcceptedObservationSummary['valueKind'],
       decimalValue: row.decimal_value === null ? null : String(row.decimal_value),
@@ -3349,6 +3421,7 @@ export class WorkspaceStore {
       sourceQuote: row.source_quote === null ? null : String(row.source_quote),
       sourceLabel: String(row.source_label ?? '已导入资料'),
       documentId: String(row.document_id),
+      eventId: row.event_id === null ? null : String(row.event_id),
       specimen: row.specimen === null ? null : String(row.specimen),
       method: row.method === null ? null : String(row.method),
       bodySite: row.body_site === null ? null : String(row.body_site),
@@ -3825,12 +3898,6 @@ export class WorkspaceStore {
           evidence_refs_json, structure_json, status, source_snapshot_id, version, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       `);
-      const knowledgeInsert = this.db.prepare(`
-        INSERT OR IGNORE INTO knowledge_entries (
-          id, topic_key, locale, source_title, source_url, reviewed_at,
-          payload_json, version, created_at
-        ) VALUES (?, ?, 'zh-CN', ?, ?, ?, ?, 'knowledge-v1', ?)
-      `);
       for (const guidance of candidate.lifestyleGuidance) {
         const generalKnowledgeEvidence = guidance.generalKnowledgeEvidence.map((knowledge) => {
           const id = `knowledge-${createHash('sha256').update(JSON.stringify({
@@ -3840,19 +3907,9 @@ export class WorkspaceStore {
             reviewedAt: knowledge.reviewedAt,
             supportedScope: knowledge.supportedScope
           })).digest('hex').slice(0, 24)}`;
-          knowledgeInsert.run(
-            id,
-            guidance.dedupeKey,
-            knowledge.sourceTitle,
-            knowledge.sourceUrl,
-            knowledge.reviewedAt,
-            JSON.stringify({
-              sourceOrganization: knowledge.sourceOrganization,
-              supportedScope: knowledge.supportedScope
-            }),
-            proposalTimestamp
-          );
-          return { ...knowledge, id };
+          // 模型填写的网址、机构和“核对日期”只是来源候选。在受控获取、
+          // 原文定位和审核记录完成前，不写入 knowledge_entries，也不宣称已独立核验。
+          return { ...knowledge, id, verificationStatus: 'unverified_model_candidate' as const };
         });
         // 同一方向一旦被用户采纳，新一轮模型输出只更新快照，不再重复要求用户确认。
         // 原提案及其行动保持不变，继续作为用户决定的来源记录。
@@ -4174,9 +4231,16 @@ export class WorkspaceStore {
         }
         const observationId = randomUUID();
         this.db.prepare(`
-          INSERT INTO observations (id, person_id, encounter_id, concept_key, current_revision, created_at)
-          VALUES (?, ?, ?, ?, 1, ?)
-        `).run(observationId, input.personId, encounterId, observation.conceptKey, this.now().toISOString());
+          INSERT INTO observations (
+            id, person_id, encounter_id, concept_key, original_name,
+            model_standard_name_candidate, current_revision, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        `).run(
+          observationId, input.personId, encounterId, observation.conceptKey,
+          observation.originalName ?? observation.conceptKey,
+          observation.modelStandardNameCandidate ?? null,
+          this.now().toISOString()
+        );
         this.db.prepare(`
           INSERT INTO observation_revisions (
             observation_id, revision, value_kind, raw_text, decimal_value,
@@ -4190,8 +4254,8 @@ export class WorkspaceStore {
           observation.bodySite, JSON.stringify(observation.evidence), this.now().toISOString()
         );
         const mapping = mapConcept({
-          rawName: observation.conceptKey,
-          standardName: observation.conceptKey,
+          rawName: observation.originalName ?? observation.conceptKey,
+          standardName: observation.modelStandardNameCandidate ?? null,
           specimen: observation.specimen,
           method: observation.method,
           bodySite: observation.bodySite,
@@ -5901,6 +5965,26 @@ export class WorkspaceStore {
         current = 33;
       }
 
+      if (current === 33) {
+        const observationsTableExists = Boolean(this.db.prepare(`
+          SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'observations'
+        `).get());
+        if (observationsTableExists) {
+          const observationColumns = this.db.pragma('table_info(observations)') as Array<{ name: string }>;
+          if (!observationColumns.some((column) => column.name === 'original_name')) {
+            this.db.exec(`ALTER TABLE observations ADD COLUMN original_name TEXT`);
+          }
+          if (!observationColumns.some((column) => column.name === 'model_standard_name_candidate')) {
+            this.db.exec(`ALTER TABLE observations ADD COLUMN model_standard_name_candidate TEXT`);
+          }
+        }
+        this.db.exec(`
+          UPDATE workspaces SET schema_version = 34;
+          PRAGMA user_version = 34;
+        `);
+        current = 34;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -5987,6 +6071,7 @@ export class WorkspaceStore {
       CREATE TABLE IF NOT EXISTS observations (
         id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
         encounter_id TEXT REFERENCES encounters(id), concept_key TEXT NOT NULL,
+        original_name TEXT, model_standard_name_candidate TEXT,
         current_revision INTEGER NOT NULL, created_at TEXT NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS observation_revisions (
@@ -6229,7 +6314,7 @@ export class WorkspaceStore {
         ON concept_mapping_corrections(observation_id) WHERE active = 1;
       CREATE INDEX IF NOT EXISTS idx_concept_mapping_corrections_history
         ON concept_mapping_corrections(observation_id, created_at, id);
-      PRAGMA user_version = 33;
+      PRAGMA user_version = 34;
       `);
 
       this.seedMemberModelV2();

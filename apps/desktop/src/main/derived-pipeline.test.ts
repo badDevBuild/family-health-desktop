@@ -129,12 +129,15 @@ describe('DerivedHealthPipeline', () => {
     });
     const materialized = new Database(service.store.databasePath, { readonly: true });
     try {
-      expect(materialized.prepare(`SELECT COUNT(*) AS count FROM knowledge_entries`).get()).toEqual({ count: 1 });
+      expect(materialized.prepare(`SELECT COUNT(*) AS count FROM knowledge_entries`).get()).toEqual({ count: 0 });
       const proposalRow = materialized.prepare(`SELECT structure_json FROM lifestyle_proposals_v2 WHERE id = ?`).get(proposal.id) as { structure_json: string };
       expect(JSON.parse(proposalRow.structure_json)).toMatchObject({
         goal: '建立可持续的日常活动习惯',
         relatedSystemIds: ['cardiovascular', 'endocrine_metabolic'],
-        generalKnowledgeEvidence: [expect.objectContaining({ sourceOrganization: '测试机构' })]
+        generalKnowledgeEvidence: [expect.objectContaining({
+          sourceOrganization: '测试机构',
+          verificationStatus: 'unverified_model_candidate'
+        })]
       });
     } finally {
       materialized.close();
@@ -186,15 +189,32 @@ describe('DerivedHealthPipeline', () => {
       proposals: [expect.objectContaining({ id: refreshedProposal.id, status: 'adopted' })],
       adoptedActions: [expect.objectContaining({ id: adopted.id, proposalId: refreshedProposal.id, status: 'planned' })]
     });
+    const discussed = service.updateActionStatus({ actionId: adopted.id, status: 'discussed', expectedRevision: 1 });
+    expect(discussed).toMatchObject({ id: adopted.id, status: 'discussed', userRevision: 2 });
+    expect(service.getLifestylePlan(personId).adoptedActions).toEqual([
+      expect.objectContaining({ id: adopted.id, status: 'discussed' })
+    ]);
+    const inProgress = service.updateActionStatus({ actionId: adopted.id, status: 'in_progress', expectedRevision: 2 });
+    expect(inProgress).toMatchObject({ id: adopted.id, status: 'in_progress', userRevision: 3 });
+    expect(service.getLifestylePlan(personId).adoptedActions).toEqual([
+      expect.objectContaining({ id: adopted.id, status: 'in_progress' })
+    ]);
     const postAdoptionCandidate = service.store.listCurrentDerivedSnapshots()[0]!.payload;
     service.store.publishDerivedSnapshot({
       candidate: {
         ...postAdoptionCandidate,
-        lifestyleGuidance: postAdoptionCandidate.lifestyleGuidance.map((item) => ({
-          ...item,
-          title: '保持规律活动（新报告更新）',
-          detail: '新报告已纳入分析，但同一行动方向无需再次确认。'
-        }))
+        lifestyleGuidance: [
+          ...postAdoptionCandidate.lifestyleGuidance.map((item) => ({
+            ...item,
+            title: '保持规律活动（新报告更新）',
+            detail: '新报告已纳入分析，但同一行动方向无需再次确认。'
+          })),
+          guidanceFixture({
+            id: 'guide-sleep', dedupeKey: 'sleep-routine', category: 'sleep',
+            title: '记录作息变化', detail: '先记录一周作息，不自行做医学结论。',
+            evidenceObservationIds: [observationId]
+          })
+        ]
       },
       expectedFactRevision: service.store.getFactRevision(personId),
       expectedContextRevision: service.store.getClinicalContextRevision(personId),
@@ -206,15 +226,16 @@ describe('DerivedHealthPipeline', () => {
       dedupeKey: refreshedProposal.dedupeKey,
       title: '保持规律活动（新报告更新）'
     });
-    expect(service.store.listLifestyleProposals(personId)).toEqual([
-      expect.objectContaining({ id: refreshedProposal.id, status: 'adopted' })
-    ]);
+    expect(service.store.listLifestyleProposals(personId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: refreshedProposal.id, status: 'adopted' }),
+      expect.objectContaining({ dedupeKey: 'sleep-routine', status: 'proposed' })
+    ]));
     expect(service.store.listActionAdoptions(personId)).toEqual([
-      expect.objectContaining({ id: adopted.id, proposalId: refreshedProposal.id, status: 'planned' })
+      expect.objectContaining({ id: adopted.id, proposalId: refreshedProposal.id, status: 'in_progress' })
     ]);
     expect(service.getSnapshot(null)).toMatchObject({
       persons: [expect.objectContaining({ derivedStatus: 'current', assessmentSummary: candidate.claims[0]!.explanation })],
-      guidance: [expect.objectContaining({ id: 'guide-1', personId })]
+      guidance: expect.arrayContaining([expect.objectContaining({ id: 'guide-1', personId })])
     });
     expect(prompts[0]).toContain('本人补充：近期作息不规律');
     expect(prompts[0]).toContain('userReportedNotes');
@@ -242,6 +263,14 @@ describe('DerivedHealthPipeline', () => {
       personId, kind: 'free_text', immutableText: '新增背景需刷新派生说明', effectiveDate: null,
       structuredFields: {}, expectedContextRevision: 1
     });
+    const staleProposal = service.store.listLifestyleProposals(personId).find((item) => item.dedupeKey === 'sleep-routine')!;
+    expect(() => service.adoptLifestyleProposal({
+      ...adoptionInput,
+      proposalId: staleProposal.id
+    })).toThrow('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
+    expect(service.store.listActionAdoptions(personId)).toEqual([
+      expect.objectContaining({ id: adopted.id, status: 'in_progress' })
+    ]);
     const account: AccountState = {
       status: 'connected', displayLabel: 'fixture@example.test',
       quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },

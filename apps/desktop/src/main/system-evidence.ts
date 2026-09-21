@@ -1,6 +1,6 @@
 import type { BodySystemId, HealthEventV2, MemberEvidenceRef, MetricSeriesSummary, SystemEvidenceBundle, SystemEvidenceFact } from '@contracts';
 import { healthEventV2Schema, systemEvidenceBundleSchema } from '@contracts';
-import { bodySystemRegistry, buildMetricSeries, conceptDictionary, linkConceptToSystems, linkTextToSystems, selectContextSystems, stableHash, type TrendObservationInput } from '@core';
+import { bodySystemRegistry, buildMetricSeries, conceptDictionary, linkConceptToSystems, linkLegacyCandidateToSystems, linkTextToSystems, selectContextSystems, stableHash, type TrendObservationInput } from '@core';
 import type { AcceptedObservationSummary, WorkspaceStore } from '@storage';
 import {
   SYSTEM_ANALYSIS_PROMPT_VERSION,
@@ -16,12 +16,12 @@ function parseReferenceRange(value: string | null): { low: number | null; high: 
   return Number.isFinite(low) && Number.isFinite(high) ? { low, high } : { low: null, high: null };
 }
 
-function evidenceFor(observation: AcceptedObservationSummary): MemberEvidenceRef {
+function evidenceFor(observation: AcceptedObservationSummary, eventId: string | null = null): MemberEvidenceRef {
   return {
-    id: `evidence-${observation.sourceSpanId}`,
+    id: `evidence-${observation.id}-${observation.sourceSpanId}-primary`,
     kind: 'observation',
     observationId: observation.id,
-    eventId: `event-document-${observation.documentId}`,
+    eventId,
     documentId: observation.documentId,
     sourceSpanId: observation.sourceSpanId,
     knowledgeId: null,
@@ -31,7 +31,7 @@ function evidenceFor(observation: AcceptedObservationSummary): MemberEvidenceRef
   };
 }
 
-function evidenceSourcesFor(observation: AcceptedObservationSummary): MemberEvidenceRef[] {
+function evidenceSourcesFor(observation: AcceptedObservationSummary, eventId: string | null = null): MemberEvidenceRef[] {
   const refs = observation.evidence.length > 0
     ? observation.evidence
     : [{ sourceSpanId: observation.sourceSpanId, quote: observation.sourceQuote }];
@@ -39,7 +39,7 @@ function evidenceSourcesFor(observation: AcceptedObservationSummary): MemberEvid
     id: `evidence-${observation.id}-${reference.sourceSpanId}-${index}`,
     kind: 'observation',
     observationId: observation.id,
-    eventId: `event-document-${observation.documentId}`,
+    eventId,
     documentId: observation.documentId,
     sourceSpanId: reference.sourceSpanId,
     knowledgeId: null,
@@ -56,10 +56,37 @@ function mappingFor(observation: AcceptedObservationSummary) {
 }
 
 function linksFor(observation: AcceptedObservationSummary) {
+  if (observation.originalNameStatus === 'legacy_missing') {
+    return linkLegacyCandidateToSystems(observation.mapping, observation.modelStandardNameCandidate);
+  }
   return linkConceptToSystems(mappingFor(observation));
 }
 
-function trendInput(observation: AcceptedObservationSummary): TrendObservationInput {
+function displayNameFor(observation: AcceptedObservationSummary): string {
+  if (observation.originalNameStatus === 'legacy_missing') {
+    return `${observation.modelStandardNameCandidate ?? observation.conceptKey}（旧记录候选名）`;
+  }
+  const mapping = mappingFor(observation);
+  return mapping.status === 'verified'
+    ? mapping.canonicalName ?? observation.originalName
+    : observation.originalName;
+}
+
+function trendMappingFor(observation: AcceptedObservationSummary) {
+  if (observation.originalNameStatus !== 'legacy_missing') return observation.mapping;
+  const name = observation.modelStandardNameCandidate ?? observation.conceptKey;
+  return {
+    rawName: name,
+    normalizedName: name,
+    conceptId: null,
+    canonicalName: null,
+    status: 'unmapped' as const,
+    confidence: 0,
+    reasons: ['旧记录缺少原始项目名，只按原有候选名精确分组。']
+  };
+}
+
+function trendInput(observation: AcceptedObservationSummary, eventId: string | null = null): TrendObservationInput {
   const range = parseReferenceRange(observation.referenceRange);
   const qualifier = ['eq', 'lt', 'lte', 'gt', 'gte'].includes(observation.qualifier ?? '')
     ? observation.qualifier as TrendObservationInput['comparator']
@@ -68,9 +95,11 @@ function trendInput(observation: AcceptedObservationSummary): TrendObservationIn
   return {
     id: observation.id,
     personId: observation.personId,
-    rawName: observation.conceptKey,
-    standardName: observation.conceptKey,
-    resolvedMapping: observation.mapping,
+    rawName: observation.originalNameStatus === 'legacy_missing'
+      ? observation.modelStandardNameCandidate ?? observation.conceptKey
+      : observation.originalName,
+    standardName: observation.modelStandardNameCandidate,
+    resolvedMapping: trendMappingFor(observation),
     rawText: observation.rawText,
     numericValue: numericValue !== null && Number.isFinite(numericValue) ? numericValue : null,
     comparator: qualifier,
@@ -87,13 +116,13 @@ function trendInput(observation: AcceptedObservationSummary): TrendObservationIn
     sourceSpanId: observation.sourceSpanId,
     sourceLabel: observation.sourceLabel,
     quote: observation.sourceQuote,
-    evidenceSources: evidenceSourcesFor(observation),
+    evidenceSources: evidenceSourcesFor(observation, eventId),
     duplicateSourceCount: observation.evidence.filter((reference) => reference.sourceRole === 'duplicate_source').length
   };
 }
 
-function metricSeries(observations: AcceptedObservationSummary[]): MetricSeriesSummary[] {
-  return buildMetricSeries(observations.map(trendInput));
+function metricSeries(observations: AcceptedObservationSummary[], eventIds: Map<string, string>): MetricSeriesSummary[] {
+  return buildMetricSeries(observations.map((observation) => trendInput(observation, eventIds.get(observation.documentId) ?? null)));
 }
 
 function eventsFor(store: WorkspaceStore, personId: string, observations: AcceptedObservationSummary[], systemId: BodySystemId): HealthEventV2[] {
@@ -129,9 +158,20 @@ function eventsFor(store: WorkspaceStore, personId: string, observations: Accept
     const endDate = explicitClinicalTime ? null : eventDate && lastDate !== eventDate ? lastDate : null;
     const eventPrecision = explicitClinicalTime?.precision as 'year' | 'month' | 'day' | undefined
       ?? (eventDate ? 'day' : 'unknown');
-    const looksLikeCheckup = /体检|健康检查/i.test(first.sourceLabel);
+    const verifiedEventText = reports.map((item) => (
+      item.metadataStatus === 'corrected'
+        ? [item.reportKind, item.title]
+        : [item.extracted?.reportKind?.value, item.extracted?.title?.value]
+    ).filter(Boolean).join(' ')).join(' ');
+    const looksLikeCheckup = /体检|健康检查|健康体检/i.test(verifiedEventText);
     const looksLikeImaging = items.some((item) => /超声|彩超|ct|mr|磁共振|x线|dr|影像/i.test(`${item.method ?? ''}${item.conceptKey}`));
-    const type: HealthEventV2['type'] = looksLikeCheckup ? 'checkup' : looksLikeImaging ? 'imaging' : 'laboratory';
+    // 父事件优先使用已提取/已修正的报告元数据。文件名不是临床元数据，
+    // 而年度体检中包含一个影像子项也不应把整个父事件改成“影像”。
+    const type: HealthEventV2['type'] = looksLikeCheckup
+      ? 'checkup'
+      : /(影像|超声|彩超|ct|mr|磁共振|x线|dr)/i.test(verifiedEventText)
+        ? 'imaging'
+        : looksLikeImaging && reports.length === 0 ? 'imaging' : 'laboratory';
     const fallbackTitle = type === 'checkup'
       ? `${eventDate?.slice(0, 4) ?? '日期待确认'} 年度体检`
       : type === 'imaging' ? '影像检查' : '检验记录';
@@ -194,6 +234,7 @@ export function buildSystemEvidenceBundle(
   if (!person) throw new Error('PERSON_NOT_FOUND');
   if (!bodySystemRegistry.some((system) => system.id === systemId)) throw new Error('BODY_SYSTEM_NOT_FOUND');
   const observations = store.listAcceptedObservations(personId);
+  const eventIdsByDocument = new Map(store.listReportMetadata(personId).map((item) => [item.documentId, item.eventId]));
   const selected: Array<{ observation: AcceptedObservationSummary; fact: SystemEvidenceFact }> = [];
   const unclassifiedObservationIds: string[] = [];
   const excludedObservationIds: string[] = [];
@@ -210,7 +251,7 @@ export function buildSystemEvidenceBundle(
       fact: {
         observationId: observation.id,
         conceptId: mapping.conceptId,
-        name: mapping.canonicalName ?? observation.conceptKey,
+        name: displayNameFor(observation),
         value: `${observation.rawText}${observation.unit ? ` ${observation.unit}` : ''}`,
         abnormalFlag: observation.abnormalFlag,
         time: {
@@ -225,7 +266,8 @@ export function buildSystemEvidenceBundle(
         relationReason: link.relation === 'direct'
           ? '该事实属于此身体系统的直接检查或测量。'
           : '该事实只作为可能相关的背景，不能据此推断因果。',
-        evidence: evidenceFor(observation)
+        evidence: evidenceFor(observation, eventIdsByDocument.get(observation.documentId) ?? null),
+        evidenceSources: evidenceSourcesFor(observation, eventIdsByDocument.get(observation.documentId) ?? null)
       }
     });
   }
@@ -279,6 +321,10 @@ export function buildSystemEvidenceBundle(
   const inputSignature = stableHash({
     personId,
     systemId,
+    personalProfile: {
+      birthYear: person.birthYear,
+      genderContext: person.genderContext
+    },
     analysisWindow: options.analysisWindow ?? 'all_history',
     selected: selected.map((item) => ({
       id: item.observation.id,
@@ -302,7 +348,7 @@ export function buildSystemEvidenceBundle(
     selectorVersions: {
       conceptDictionary: conceptDictionary[0]?.version ?? 'unknown',
       systemRegistry: bodySystemRegistry[0]?.version ?? 'unknown',
-      contextSelector: 'context-selector-v1',
+      contextSelector: 'context-selector-v2-global-safety-first',
       actionSelector: 'action-selector-v1',
       analysisWindow: 'all-history-v1'
     },
@@ -312,7 +358,13 @@ export function buildSystemEvidenceBundle(
   });
   return systemEvidenceBundleSchema.parse({
     schemaVersion: 1,
-    identity: { personId, systemId },
+    identity: {
+      personId,
+      systemId,
+      birthYear: person.birthYear,
+      genderContext: person.genderContext,
+      contextSource: 'user_profile'
+    },
     scope: {
       factRevision,
       contextRevision,
@@ -324,7 +376,7 @@ export function buildSystemEvidenceBundle(
     contextFacts: selected.filter((item) => item.fact.relation === 'context').map((item) => item.fact),
     personalContext: notes,
     events: systemEvents,
-    trends: metricSeries(selected.filter((item) => item.fact.relation === 'direct').map((item) => item.observation)),
+    trends: metricSeries(selected.filter((item) => item.fact.relation === 'direct').map((item) => item.observation), eventIdsByDocument),
     existingActions,
     knowledge: [],
     coverage: {

@@ -251,6 +251,12 @@ function HomePage({ snapshot, selectedPersonId, onSelectPerson, onNavigate, onOp
   const selected = snapshot.persons.find((person) => person.id === selectedPersonId) ?? snapshot.persons[0];
   const selectedOrgans = snapshot.organs.filter((organ) => organ.personId === selected?.id);
   const primaryTrend = snapshot.trends.find((trend) => trend.personId === selected?.id);
+  const latestTrendFlag = primaryTrend?.points.at(-1)?.abnormalFlag ?? 'unknown';
+  const trendFlagLabel = latestTrendFlag === 'high' ? '最近一次：报告标记偏高'
+    : latestTrendFlag === 'low' ? '最近一次：报告标记偏低'
+      : latestTrendFlag === 'positive' ? '最近一次：报告标记阳性'
+        : latestTrendFlag === 'normal' || latestTrendFlag === 'negative' ? '最近一次：报告未标记异常'
+          : '最近一次：报告未给出明确标记';
   return (
     <div className="page-stack">
       <section className="welcome-row">
@@ -326,7 +332,10 @@ function HomePage({ snapshot, selectedPersonId, onSelectPerson, onNavigate, onOp
           <span className="getting-started-panel__icon"><ShieldCheck size={24} /></span>
           <div>
             <span className="eyebrow">个人工作区已建立</span>
-            <h2>{primaryTrend ? '报告事实已更新，健康解释仍待独立复核' : selected.documentCount > 0 ? '资料已保存在本机，等待处理' : '先添加一份健康资料'}</h2>
+            <h2>{selected.derivedStatus === 'current' ? '报告事实与综合说明已保存'
+              : selected.derivedStatus === 'stale' ? '报告事实已更新，已有说明基于较早资料'
+                : selected.derivedStatus === 'building' ? '报告事实可查看，综合说明正在更新'
+                  : primaryTrend ? '报告事实已保存，暂无可用的综合说明' : selected.documentCount > 0 ? '资料已保存在本机，等待处理' : '先添加一份健康资料'}</h2>
             <p>{primaryTrend
               ? '下方只展示报告中有来源、带日期且单位一致的数值记录，不把它们自动解释成诊断。'
               : selected.documentCount > 0
@@ -348,7 +357,7 @@ function HomePage({ snapshot, selectedPersonId, onSelectPerson, onNavigate, onOp
               const point = primaryTrend.points[pointIndex];
               if (point) onOpenEvidence({ title: `${primaryTrend.name}原始依据`, label: point.sourceLabel, quote: `${primaryTrend.name} ${point.displayValue} ${primaryTrend.unit ?? ''}`, meta: `报告参考范围：${point.referenceLow ?? '未知'}–${point.referenceHigh ?? '未知'} ${primaryTrend.unit ?? ''}`, sourceSpanId: point.sourceSpanId, documentId: point.documentId });
             }} />
-            <div className="trend-explanation"><StatusBadge tone="warning">报告标记偏高</StatusBadge><p>{primaryTrend.interpretation}</p><small>{primaryTrend.comparisonNote}</small></div>
+            <div className="trend-explanation"><StatusBadge tone={['high', 'low', 'positive'].includes(latestTrendFlag) ? 'warning' : 'neutral'}>{trendFlagLabel}</StatusBadge><p>{primaryTrend.interpretation}</p><small>{primaryTrend.comparisonNote}</small></div>
           </div>
         </section>
       )}
@@ -588,7 +597,7 @@ function ProcessingPage({ snapshot, onCancel, onRetry, onTogglePause, onDetails 
   const currentJobs = snapshot.jobs.filter(isCurrentJob);
   const historyJobs = snapshot.jobs.filter((job) => !isCurrentJob(job));
   const renderJob = (job: JobSummary, compact = false) => <article className={`panel job-card${compact ? ' job-card--history' : ''}`} key={job.id}>
-    <div className="job-card__top"><span className={`job-icon job-icon--${job.status}`}>{job.status === 'running' ? <LoaderCircle className="spin" size={21} /> : job.status === 'succeeded' ? <Check size={21} /> : <Clock3 size={21} />}</span><div><strong>{job.batchLabel}</strong><small>{job.personLabel ?? '待归属资料'} · {job.statusText}</small></div><StatusBadge tone={job.status === 'running' ? 'info' : job.status === 'succeeded' ? 'success' : 'warning'}>{job.status === 'running' ? '处理中' : job.status === 'succeeded' ? '已完成' : job.status === 'failed' ? '处理失败' : job.status === 'cancelled' ? '已停止' : job.status === 'waiting_user' ? '等待核对' : '等待处理'}</StatusBadge></div>
+    <div className="job-card__top"><span className={`job-icon job-icon--${job.status}`}>{job.status === 'running' ? <LoaderCircle className="spin" size={21} /> : job.status === 'succeeded' ? <Check size={21} /> : <Clock3 size={21} />}</span><div><strong>{job.batchLabel}</strong><small>{job.personLabel ?? '待归属资料'} · {job.statusText}</small></div><StatusBadge tone={job.status === 'running' ? 'info' : job.status === 'succeeded' ? 'success' : 'warning'}>{job.status === 'running' ? '处理中' : job.status === 'succeeded' ? '已完成' : job.status === 'completed_with_issues' ? '部分完成' : job.status === 'failed' ? '处理失败' : job.status === 'cancelled' ? '已停止' : job.status === 'waiting_user' ? '等待核对' : '等待处理'}</StatusBadge></div>
     {!compact && <div className="progress-row"><div><i style={{ width: `${Math.round(job.completedUnits / job.totalUnits * 100)}%` }} /></div><span>{job.status === 'waiting_user' ? '已检查 ' : ''}{job.completedUnits}/{job.totalUnits}</span></div>}
     <div className="job-card__footer"><span>最近更新：{formatDateTime(job.updatedAt)}</span><div>{job.canCancel && <button className="text-button" onClick={() => onCancel(job)}>停止</button>}{job.canRetry && <button className="text-button" onClick={() => onRetry(job)}><RefreshCw size={15} /> 重试</button>}<button className="text-button" onClick={() => onDetails(job)}>查看详情 <ChevronRight size={15} /></button></div></div>
   </article>;
@@ -618,7 +627,14 @@ const jobStageLabel: Record<JobSummary['stage'], string> = {
 
 function JobDetailDialog({ job, onClose }: { job: JobSummary; onClose(): void }) {
   const percentage = Math.round(job.completedUnits / job.totalUnits * 100);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog job-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="job-detail-title"><header><div><span className="eyebrow">处理任务</span><h2 id="job-detail-title">{job.batchLabel}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭任务详情"><X size={19} /></button></header><p>{job.personLabel ?? '这批资料尚未完成成员归属'}。这里显示可审查的处理阶段，不展示模型的内部推理。</p><dl className="detail-list"><div><dt>当前阶段</dt><dd>{jobStageLabel[job.stage]}</dd></div><div><dt>当前状态</dt><dd>{job.statusText}</dd></div><div><dt>完成进度</dt><dd>{job.completedUnits}/{job.totalUnits}（{percentage}%）</dd></div><div><dt>最近更新</dt><dd>{formatDateTime(job.updatedAt)}</dd></div></dl><div className="info-callout compact"><ShieldCheck size={18} /><div><strong>失败不会抹掉已保存事实</strong><p>派生说明未通过安全核对时，只阻止发布说明；已经接纳的报告事实仍保留。</p></div></div><div className="dialog-actions"><button className="primary-button" onClick={onClose}>知道了</button></div></section></div>;
+  const systemNames: Record<string, string> = { cardiovascular: '心血管', endocrine_metabolic: '内分泌 / 代谢' };
+  const outcomeLabels: Record<JobSummary['systemOutcomes'][number]['status'], string> = {
+    published: '已更新说明', rejected: '说明未通过核对', skipped_no_data: '暂无直接资料',
+    skipped_cache: '已使用最新结果', out_of_scope: '本轮未处理'
+  };
+  const visibleOutcomes = job.systemOutcomes.filter((outcome) => outcome.status !== 'out_of_scope');
+  const outOfScopeCount = job.systemOutcomes.length - visibleOutcomes.length;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog job-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="job-detail-title"><header><div><span className="eyebrow">处理任务</span><h2 id="job-detail-title">{job.batchLabel}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭任务详情"><X size={19} /></button></header><p>{job.personLabel ?? '这批资料尚未完成成员归属'}。这里显示可审查的处理阶段，不展示模型的内部推理。</p><dl className="detail-list"><div><dt>当前阶段</dt><dd>{jobStageLabel[job.stage]}</dd></div><div><dt>当前状态</dt><dd>{job.statusText}</dd></div><div><dt>完成进度</dt><dd>{job.completedUnits}/{job.totalUnits}（{percentage}%）</dd></div><div><dt>最近更新</dt><dd>{formatDateTime(job.updatedAt)}</dd></div></dl>{job.systemOutcomes.length > 0 && <section className="job-system-outcomes" aria-label="按身体系统处理结果"><h3>各身体系统结果</h3>{visibleOutcomes.map((outcome) => <div key={outcome.systemId}><strong>{systemNames[outcome.systemId] ?? outcome.systemId}</strong><span>{outcomeLabels[outcome.status]}</span>{outcome.reason && outcome.status === 'rejected' && <small>已保留事实，可只重试该系统说明。</small>}</div>)}{outOfScopeCount > 0 && <div><strong>其他 {outOfScopeCount} 个系统</strong><span>本轮仅做事实归集，尚未运行独立综合说明</span></div>}</section>}<div className="info-callout compact"><ShieldCheck size={18} /><div><strong>失败不会抹掉已保存事实</strong><p>派生说明未通过安全核对时，只阻止发布说明；已经接纳的报告事实仍保留。</p></div></div><div className="dialog-actions"><button className="primary-button" onClick={onClose}>知道了</button></div></section></div>;
 }
 
 function CancelJobDialog({ job, onClose, onConfirm }: { job: JobSummary; onClose(): void; onConfirm(): Promise<boolean> }) {
@@ -630,6 +646,8 @@ const actionStatusOptions: Array<{ value: ActionItem['status']; label: string }>
   { value: 'proposed', label: '待讨论' },
   { value: 'discussed', label: '已讨论' },
   { value: 'planned', label: '已安排' },
+  { value: 'in_progress', label: '进行中' },
+  { value: 'paused', label: '已暂停' },
   { value: 'completed', label: '已完成' },
   { value: 'dismissed', label: '不再处理' }
 ];

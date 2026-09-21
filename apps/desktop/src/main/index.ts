@@ -417,6 +417,8 @@ function initializeRuntime(): void {
     if (!Notification.isSupported()) return;
     const presentation = status === 'succeeded'
       ? { title: '家庭健康资料已处理', body: '报告事实和说明已完成保存，可打开看板查看。' }
+      : status === 'completed_with_issues'
+        ? { title: '家庭健康资料已部分处理', body: '报告事实已保存，但有身体系统说明未通过核对，可单独重试。' }
       : status === 'waiting_user'
         ? { title: '家庭健康资料需要确认', body: '有一项来源或内容需要你打开看板核对。' }
         : status === 'cancelled'

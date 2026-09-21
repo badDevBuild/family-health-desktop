@@ -164,7 +164,13 @@ describe('PersonalWorkspaceService', () => {
 
     service.acceptCorrectedFacts({ issueId, documentId, candidates: [troponin] });
     expect(service.store.listAcceptedObservations(personId)).toEqual([
-      expect.objectContaining({ conceptKey: 'cTnI', rawText: '<0.01', qualifier: 'lt' })
+      expect.objectContaining({
+        conceptKey: '肌钙蛋白',
+        originalName: '肌钙蛋白',
+        modelStandardNameCandidate: 'cTnI',
+        rawText: '<0.01',
+        qualifier: 'lt'
+      })
     ]);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();
@@ -222,7 +228,7 @@ describe('PersonalWorkspaceService', () => {
       trendFacts: { direction: 'increasing', usablePointCount: 3 }
     });
     const metric = service.getMetricSeries(personId, detail.metrics[0]!.id);
-    expect(metric.aliasesSeen).toEqual(['低密度脂蛋白胆固醇']);
+    expect(metric.aliasesSeen).toEqual(['LDL-C', '低密度脂蛋白', '低密度脂蛋白胆固醇']);
     expect(metric.tableRows).toHaveLength(3);
     expect(service.listHealthEvents(personId)[0]).toMatchObject({ metadataStatus: 'unknown', factCount: 3 });
     const evidenceId = detail.findings[0]!.evidence[0]!.id;
@@ -277,6 +283,71 @@ describe('PersonalWorkspaceService', () => {
     expect(afterUnrelatedGoal.scope.contextRevision).toBe(2);
     expect(afterUnrelatedGoal.scope.inputSignature).toBe(afterMetadataDefaultSignature);
     expect(afterUnrelatedGoal.coverage.excludedContextIds).toContain(unrelatedGoal.id);
+    service.updateMemberDisplay({
+      personId,
+      displayName: '测试用户',
+      relation: '本人',
+      birthYear: 1990,
+      expectedDisplayRevision: 1
+    });
+    const afterBirthYear = service.buildSystemEvidenceBundle(personId, 'cardiovascular');
+    expect(afterBirthYear.identity).toMatchObject({
+      birthYear: 1990,
+      genderContext: null,
+      contextSource: 'user_profile'
+    });
+    expect(afterBirthYear.scope.inputSignature).not.toBe(afterUnrelatedGoal.scope.inputSignature);
+    service.close();
+  });
+
+  it('旧记录缺少原项目名时恢复可查看的系统归类，但不把候选名当成已验证事实', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/合成旧版血脂.txt',
+      bytes: Buffer.from('2026-09-10 低密度脂蛋白胆固醇 3.8 mmol/L')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const acceptanceId = service.store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'legacy-name-input',
+      outputHash: 'legacy-name-output', reviewRef: null, decision: 'accept'
+    });
+    service.store.publishFacts({
+      personId,
+      documentId,
+      documentCommitKey: 'e'.repeat(64),
+      expectedRevision: 0,
+      changeSetHash: 'f'.repeat(64),
+      summary: '合成旧版项目名兼容测试',
+      observations: [{
+        conceptKey: '低密度脂蛋白胆固醇',
+        originalName: '低密度脂蛋白胆固醇',
+        modelStandardNameCandidate: '低密度脂蛋白胆固醇',
+        rawText: '3.8', valueKind: 'numeric', decimalValue: '3.8', qualifier: 'eq', unit: 'mmol/L',
+        referenceRange: '0-3.4', clinicalDate: '2026-09-10', abnormalFlag: 'high', documentId,
+        sourceSpanId: span.id, acceptanceId, specimen: '血清', method: null, bodySite: null,
+        evidence: [{ sourceSpanId: span.id, quote: span.quote }]
+      }]
+    });
+    const database = new Database(service.store.databasePath);
+    database.prepare('UPDATE observations SET original_name = NULL WHERE person_id = ?').run(personId);
+    database.close();
+
+    expect(service.store.listAcceptedObservations(personId)[0]).toMatchObject({
+      originalNameStatus: 'legacy_missing',
+      mapping: { status: 'proposed' }
+    });
+    expect(service.listBodySystems(personId).find((system) => system.id === 'cardiovascular')).toMatchObject({
+      status: 'building', factCount: 1, metricCount: 1, attentionCount: 0
+    });
+    const detail = service.getBodySystemDetail(personId, 'cardiovascular');
+    expect(detail.metrics[0]).toMatchObject({ name: '低密度脂蛋白胆固醇', conceptId: null, mappingStatus: 'unmapped' });
+    expect(detail.findings[0]?.title).toBe('低密度脂蛋白胆固醇（旧记录候选名）');
+    expect(service.buildSystemEvidenceBundle(personId, 'cardiovascular')).toMatchObject({
+      directFacts: [],
+      contextFacts: [{ name: '低密度脂蛋白胆固醇（旧记录候选名）', relation: 'context' }]
+    });
     service.close();
   });
 
@@ -327,7 +398,46 @@ describe('PersonalWorkspaceService', () => {
     service.close();
   });
 
-  it('旧版生活建议缺少新版安全字段时跳过建议但仍可打开成员档案', () => {
+  it('仅修改文件名不会改变检查事件类别', async () => {
+    const eventTypeFor = async (fileName: string) => {
+      const service = makeService();
+      const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+      await service.importFiles([{
+        path: `/tmp/${fileName}`,
+        bytes: Buffer.from('2026-09-17 LDL-C 4.2 mmol/L')
+      }], personId);
+      const documentId = service.getSnapshot(null).inbox[0]!.id;
+      const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+      const candidate = {
+        localKey: 'ldl-file-name', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric' as const, rawText: '4.2', decimal: '4.2', comparator: 'eq' as const },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
+        evidence: [{ sourceSpanId: span.id, quote: '2026-09-17 LDL-C 4.2 mmol/L' }], issues: []
+      };
+      const issueId = service.store.saveExtractionReviewIssue({
+        documentId, kind: 'field_conflict', severity: 'blocking',
+        evidenceRefs: [span.id], candidateOptions: [candidate],
+        candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['value'] }],
+        reasonCodes: ['TEST_FIXTURE'],
+        documentRun: {
+          coverageComplete: true,
+          coveredSourceSpanIds: [span.id],
+          manifestSpanIds: [span.id],
+          chunkCount: 1
+        }
+      });
+      service.acceptCorrectedFacts({ issueId, documentId, candidates: [candidate] });
+      const type = service.listHealthEvents(personId)[0]!.type;
+      service.close();
+      return type;
+    };
+
+    await expect(eventTypeFor('年度体检_胸部影像.txt')).resolves.toBe('laboratory');
+    await expect(eventTypeFor('普通记录.txt')).resolves.toBe('laboratory');
+  });
+
+  it('旧版生活建议缺少新版安全字段时保留可读内容但禁止直接采纳', () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-legacy-lifestyle-'));
     directories.push(root);
     const service = new PersonalWorkspaceService(root, '我的家庭健康', () => new Date('2026-09-18T01:00:00Z'));
@@ -357,10 +467,18 @@ describe('PersonalWorkspaceService', () => {
 
     expect(service.getLifestylePlan(personId)).toMatchObject({
       personId,
-      status: 'current',
+      status: 'stale',
       dataQuality: 'partial',
       priorities: [],
-      proposals: [],
+      proposals: [{
+        id: 'legacy-guidance',
+        category: 'diet',
+        title: '旧版建议',
+        goal: '旧版建议',
+        detail: '旧版记录没有新版所需的目标、步骤、来源和适用边界。',
+        status: 'proposed',
+        sourceKind: 'ai_proposed'
+      }],
       adoptedActions: []
     });
     service.close();

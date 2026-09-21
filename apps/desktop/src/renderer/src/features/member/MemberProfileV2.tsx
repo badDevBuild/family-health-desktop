@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Activity, Archive, CalendarClock, Check, ChevronRight, FileCheck2, FileText, LoaderCircle, Plus, Search, ShieldCheck } from 'lucide-react';
 import type { AdoptLifestyleProposalInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptReviewBundle, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, InboxItem, LifestylePlanV2, MemberEvidenceRef, MemberOverviewV2, MetricSeriesDetailV2, PersonSummary, SetConceptMappingInput, UpdateReportMetadataInput } from '@contracts';
 import { StatusBadge, type Tone } from '../../components/StatusBadge.js';
@@ -20,6 +20,10 @@ const systemSymbol: Record<BodySystemId, string> = {
   cardiovascular: '♥', endocrine_metabolic: '◒', hepatobiliary: '◇', renal_urinary: '◉',
   digestive: '≈', respiratory: '∞', hematology_immune: '✦', musculoskeletal: '⌁',
   neurological: '⌘', sensory_oral: '◎', reproductive: '◌', dermatological: '◍'
+};
+
+const abnormalFlagLabels: Record<MetricSeriesDetailV2['tableRows'][number]['abnormalFlag'], string> = {
+  high: '偏高', low: '偏低', positive: '阳性', negative: '阴性', normal: '正常', unknown: '未标记'
 };
 
 function systemTone(status: BodySystemSummaryV2['status']): Tone {
@@ -89,7 +93,7 @@ function MemberHeader({ snapshot, person, onSelectPerson, onAddPerson, onEditPer
   return <div className="member-header panel">
     <div className="member-header__identity"><span className="avatar avatar--large">{person.avatarInitial}</span><div><span className="eyebrow">连续健康档案</span><h1>{person.displayName}</h1><p>{person.relation} · {person.documentCount} 份资料 · {person.freshnessLabel}</p></div></div>
     <div className="member-header__controls"><select value={person.id} onChange={(event) => onSelectPerson(event.target.value)} aria-label="切换成员">{snapshot.persons.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.relation}</option>)}</select><button className="primary-button" onClick={onAddNote}><Plus size={17} /> 补充健康资料</button></div>
-    <div className="member-header__secondary"><button className="secondary-button" onClick={onEditPerson}>编辑成员</button><button className="secondary-button" onClick={onAddPerson}><Plus size={17} /> 添加成员</button><button className="secondary-button" onClick={onArchivedPeople}><Archive size={17} /> 已归档成员</button><button className="secondary-button" onClick={onExport}><FileCheck2 size={17} /> 导出摘要</button></div>
+    <details className="member-header__secondary member-header__more"><summary>更多管理</summary><div><button className="secondary-button" onClick={onEditPerson}>编辑成员</button><button className="secondary-button" onClick={onAddPerson}><Plus size={17} /> 添加成员</button><button className="secondary-button" onClick={onArchivedPeople}><Archive size={17} /> 已归档成员</button><button className="secondary-button" onClick={onExport}><FileCheck2 size={17} /> 导出摘要</button></div></details>
   </div>;
 }
 
@@ -113,7 +117,7 @@ function MetricDetail({ metric, onOpenEvidence, onBack }: { metric: MetricSeries
       <div role="row" className="metric-history-table__head"><span>临床日期</span><span>结果</span><span>报告标记</span><span>原始依据</span></div>
       {metric.tableRows.map((point) => {
         const sources = point.evidenceSources ?? [point.evidence];
-        return <div role="row" key={point.id}><span>{point.time.displayLabel}</span><strong>{point.displayValue} {point.unit ?? ''}</strong><span>{point.abnormalFlag === 'unknown' ? '未标记' : point.abnormalFlag}</span>{sources.length === 1
+        return <div role="row" key={point.id}><span>{point.time.displayLabel}</span><strong>{point.displayValue} {point.unit ?? ''}</strong><span>{abnormalFlagLabels[point.abnormalFlag]}</span>{sources.length === 1
           ? <button className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${metric.name}原始依据`, sources[0]!))}><FileCheck2 size={16} /> 查看依据</button>
           : <details className="evidence-disclosure evidence-disclosure--compact"><summary><FileCheck2 size={16} /> 查看 {sources.length} 处依据</summary><div className="evidence-source-list">{sources.map((source, index) => <button key={source.id} className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${metric.name}原始依据 ${index + 1}`, source))}>依据 {index + 1}{index > 0 ? ' · 同次检查的重复来源' : ''}</button>)}</div></details>}
         </div>;
@@ -142,9 +146,12 @@ function SystemAnalysisCard({ detail, onOpenEvidence }: { detail: BodySystemDeta
   ].map((item) => [item.id, item])).values()];
   const isCurrent = analysis.status === 'current' && analysis.review.status === 'passed';
   return <article className="system-analysis-card">
-    <div className="panel__heading"><div><span className="eyebrow">AI 整理并复核</span><h3>{displayHeadline}</h3></div><StatusBadge tone={isCurrent ? 'success' : 'info'}>{isCurrent ? '已复核' : '待更新'}</StatusBadge></div>
+    <div className="panel__heading"><div><span className="eyebrow">AI 整理并复核</span><h3>{displayHeadline}</h3><small>资料截至 {analysis.scope.clinicalAsOf ?? '日期未记录'} · 说明生成于 {analysis.generatedAt.slice(0, 10)}</small></div><StatusBadge tone={isCurrent ? 'success' : 'info'}>{isCurrent ? '已复核' : '基于较早资料'}</StatusBadge></div>
+    {!isCurrent && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>旧说明仍可阅读</strong><p>新资料已使这份说明过期，或新一轮尚未通过核对。下方事实保持最新，这段综合说明请按标注日期理解。</p></div></div>}
+    {analysis.topicSections.length > 0 && <div className="system-analysis-topics">{analysis.topicSections.map((topic) => <span key={topic.topicId}>{topic.title}</span>)}</div>}
     {analysis.keyPoints.length > 0 && <div className="system-analysis-points">{analysis.keyPoints.map((point) => <section key={point.id}><StatusBadge tone={point.kind === 'contextual_interpretation' ? 'info' : point.kind === 'question' ? 'neutral' : 'success'}>{point.kind === 'fact_summary' ? '事实' : point.kind === 'trend_description' ? '趋势' : point.kind === 'contextual_interpretation' ? '关联参考' : '待讨论'}</StatusBadge><p>{point.text}</p>{point.limitations.length > 0 && <small>{point.limitations.join(' ')}</small>}</section>)}</div>}
     {analysis.conflicts.length > 0 && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>资料中有需保留的差异</strong><p>{analysis.conflicts.map((item) => item.text).join(' ')}</p></div></div>}
+    {analysis.discussionPoints.length > 0 && <section className="analysis-discussion-points"><h4>下次可与医生讨论</h4><ul>{analysis.discussionPoints.map((point, index) => <li key={`${point.text}-${index}`}>{point.text}</li>)}</ul></section>}
     {analysis.dataGaps.length > 0 && <details className="analysis-boundaries"><summary>查看资料范围与限制</summary>{analysis.dataGaps.map((gap, index) => <p key={`${gap.text}-${index}`}>{gap.text} {gap.consequence}</p>)}{analysis.coverage.incompleteReasons.map((reason) => <p key={reason}>{reason}</p>)}</details>}
     {evidence.length > 0 && <details className="evidence-disclosure"><summary><FileCheck2 size={16} /> 查看全部 {evidence.length} 条个人资料依据</summary><div className="evidence-source-list">{evidence.map((item, index) => <button key={`${item.id}-${index}`} className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${detail.registry.shortName}综合说明依据 ${index + 1}`, item))}>依据 {index + 1} · {item.label}</button>)}</div></details>}
   </article>;
@@ -173,10 +180,11 @@ function SystemDetail({ detail, search, onSearch, selectedMetric, onSelectMetric
   </section>;
 }
 
-function LifestyleProposalCard({ proposal, index, busy, onAdopt, onDecide, onOpenEvidence }: {
+function LifestyleProposalCard({ proposal, index, busy, canAdopt, onAdopt, onDecide, onOpenEvidence }: {
   proposal: LifestylePlanV2['proposals'][number];
   index: number;
   busy: boolean;
+  canAdopt: boolean;
   onAdopt(input: Omit<AdoptLifestyleProposalInput, 'personId' | 'proposalId'>): void;
   onDecide(decision: 'dismiss' | 'restore'): void;
   onOpenEvidence(request: EvidenceRequest): void;
@@ -198,6 +206,7 @@ function LifestyleProposalCard({ proposal, index, busy, onAdopt, onDecide, onOpe
       <div className="panel__heading"><div><span className="eyebrow">{sourceLabel} · {proposal.category === 'exercise' ? '活动' : proposal.category === 'diet' ? '饮食' : proposal.category === 'sleep' ? '作息' : proposal.category === 'monitoring' ? '日常记录' : proposal.category === 'review' ? '就医准备' : '生活方向'}</span><h3>{proposal.title}</h3></div><StatusBadge tone={proposal.status === 'adopted' ? 'success' : 'neutral'}>{statusLabel}</StatusBadge></div>
       <p className="proposal-goal"><strong>目标：</strong>{proposal.goal}</p>
       <p>{proposal.rationale}</p>
+      {!canAdopt && proposal.status === 'proposed' && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>这条建议来自较早资料</strong><p>新资料或新限制出现后，需要先重新核对，再决定是否加入行动。已采纳的行动不受影响。</p></div></div>}
       <details>
         <summary>查看怎么开始、依据与限制</summary>
         <div className="proposal-structure">
@@ -207,7 +216,7 @@ function LifestyleProposalCard({ proposal, index, busy, onAdopt, onDecide, onOpe
           <section><h4>如何低负担记录</h4><p>{proposal.trackingSuggestion}</p></section>
           {(proposal.constraints.length > 0 || proposal.uncertainties.length > 0) && <section><h4>适用边界</h4><ul>{proposal.constraints.map((item) => <li key={item}>{item}</li>)}{proposal.uncertainties.map((item) => <li key={item}>尚不确定：{item}</li>)}</ul></section>}
           <section><h4>为什么适用于此人</h4>{proposal.evidence.length > 0 ? <div className="evidence-source-list">{proposal.evidence.map((evidence, evidenceIndex) => <button key={`${evidence.id}-${evidenceIndex}`} className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${proposal.title}个人依据 ${evidenceIndex + 1}`, evidence))}>个人资料依据 {evidenceIndex + 1}</button>)}</div> : <p>没有个人异常作为依据；这条内容仅用于记录或就医准备。</p>}</section>
-          <section><h4>一般知识依据</h4>{proposal.generalKnowledgeEvidence.length > 0 ? <div className="knowledge-source-list">{proposal.generalKnowledgeEvidence.map((source) => <a key={source.id} href={source.sourceUrl} target="_blank" rel="noreferrer"><strong>{source.sourceTitle}</strong><span>{source.sourceOrganization} · 核对于 {source.reviewedAt}</span><small>{source.supportedScope}</small></a>)}</div> : <p>没有可靠的一般知识来源，因此这条建议不能冒充已证实的具体生活做法。</p>}</section>
+          <section><h4>一般知识来源</h4>{proposal.generalKnowledgeEvidence.length > 0 ? <div className="knowledge-source-list">{proposal.generalKnowledgeEvidence.map((source) => <a key={source.id} href={source.sourceUrl} target="_blank" rel="noreferrer"><strong>{source.sourceTitle}</strong><span>{source.sourceOrganization} · {source.verificationStatus === 'controlled_source_verified' ? '已由应用核验' : 'AI 提供的候选来源，未独立打开核对'}</span><small>{source.supportedScope}</small></a>)}</div> : <p>没有可靠的一般知识来源，因此这条建议不能冒充已证实的具体生活做法。</p>}</section>
           {proposal.consultProfessional && <p className="proposal-boundary">明显改变做法前，建议结合本人限制向医生或营养、运动专业人员确认。</p>}
         </div>
       </details>
@@ -235,7 +244,7 @@ function LifestyleProposalCard({ proposal, index, busy, onAdopt, onDecide, onOpe
         <div className="dialog-actions"><button type="button" className="secondary-button" disabled={busy} onClick={() => setShowAdoptionForm(false)}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? '正在保存' : '确认加入行动'}</button></div>
       </form>}
       <div className="proposal-actions">
-        {proposal.status === 'proposed' && !showAdoptionForm && <><button className="secondary-button" disabled={busy} onClick={() => setShowAdoptionForm(true)}>采纳为我的行动</button><button className="text-button" disabled={busy} onClick={() => onDecide('dismiss')}>暂不采纳</button></>}
+        {proposal.status === 'proposed' && !showAdoptionForm && <><button className="secondary-button" disabled={busy || !canAdopt} onClick={() => setShowAdoptionForm(true)}>{canAdopt ? '采纳为我的行动' : '等待重新核对'}</button>{canAdopt && <button className="text-button" disabled={busy} onClick={() => onDecide('dismiss')}>暂不采纳</button>}</>}
         {proposal.status === 'adopted' && <span className="proposal-adopted"><Check size={16} /> 已加入行动，后续 AI 更新不会重置进度</span>}
         {proposal.status === 'dismissed' && <button className="text-button" disabled={busy} onClick={() => onDecide('restore')}>恢复为待决定</button>}
       </div>
@@ -287,6 +296,8 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+  const [partialLoadError, setPartialLoadError] = useState(false);
+  const metricRequestGeneration = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -299,31 +310,36 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       });
       return () => { active = false; };
     }
-    void Promise.all([
+    void Promise.allSettled([
       bridge.getMemberOverview(person.id),
       bridge.listBodySystems(person.id),
       bridge.listHealthEvents({ personId: person.id }),
       bridge.getLifestylePlan(person.id),
       bridge.getConceptReview(person.id)
-    ]).then(([overviewResult, systemsResult, eventsResult, planResult, conceptResult]) => {
+    ]).then(([overviewSettled, systemsSettled, eventsSettled, planSettled, conceptSettled]) => {
       if (!active) return;
-      if (!overviewResult?.ok || !systemsResult?.ok || !eventsResult?.ok || !planResult?.ok || !conceptResult?.ok) {
+      const overviewResult = overviewSettled.status === 'fulfilled' ? overviewSettled.value : null;
+      const systemsResult = systemsSettled.status === 'fulfilled' ? systemsSettled.value : null;
+      const eventsResult = eventsSettled.status === 'fulfilled' ? eventsSettled.value : null;
+      const planResult = planSettled.status === 'fulfilled' ? planSettled.value : null;
+      const conceptResult = conceptSettled.status === 'fulfilled' ? conceptSettled.value : null;
+      if (!overviewResult?.ok || !systemsResult?.ok || !eventsResult?.ok) {
         setLoadError(true);
         return;
       }
       setOverview(overviewResult.data);
       setSystems(systemsResult.data);
       setEvents(eventsResult.data);
-      setPlan(planResult.data);
-      setConceptReview(conceptResult.data);
+      if (planResult?.ok) setPlan(planResult.data);
+      if (conceptResult?.ok) setConceptReview(conceptResult.data);
+      setPartialLoadError(!planResult?.ok || !conceptResult?.ok);
       setLoadError(false);
-      setSelectedMetric(null);
       setSelectedSystem((current) => current && systemsResult.data.some((system) => system.id === current)
         ? current
         : systemsResult.data.find((system) => system.factCount > 0)?.id ?? systemsResult.data[0]?.id ?? null);
     }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [person.id, snapshot.generatedAt, refreshToken]);
+  }, [person.id, person.dataRevision, refreshToken]);
 
   useEffect(() => {
     if (!selectedSystem) return;
@@ -334,7 +350,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       if (active && result?.ok) setSystemDetail(result.data);
     });
     return () => { active = false; };
-  }, [person.id, selectedSystem, snapshot.generatedAt]);
+  }, [person.id, person.dataRevision, selectedSystem]);
 
   useEffect(() => {
     if (!selectedEventId) return;
@@ -350,17 +366,19 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       }
     });
     return () => { active = false; };
-  }, [person.id, selectedEventId, snapshot.generatedAt, refreshToken]);
+  }, [person.id, person.dataRevision, selectedEventId, refreshToken]);
 
   const chooseMetric = (seriesId: string | null) => {
+    const generation = ++metricRequestGeneration.current;
     if (!seriesId) { setSelectedMetric(null); return; }
     const bridge = window.healthDesktop;
     if (!bridge?.getMetricSeries) return;
     void bridge.getMetricSeries(person.id, seriesId).then((result) => {
-      if (result?.ok) setSelectedMetric(result.data);
+      if (generation === metricRequestGeneration.current && result?.ok) setSelectedMetric(result.data);
     });
   };
   const chooseSystem = (systemId: BodySystemId) => {
+    metricRequestGeneration.current += 1;
     setSelectedMetric(null);
     setSelectedSystem(systemId);
   };
@@ -521,12 +539,13 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
 
   return <div className="page-stack member-profile-v2">
     <MemberHeader snapshot={snapshot} person={person} onSelectPerson={onSelectPerson} onAddPerson={onAddPerson} onEditPerson={onEditPerson} onArchivedPeople={onArchivedPeople} onAddNote={onAddNote} onExport={onExport} />
+    {partialLoadError && <div className="info-callout compact" role="status"><ShieldCheck size={18} /><div><strong>部分辅助内容暂时未读取</strong><p>身体与时间线仍可正常查看；生活方案或概念核对稍后重试即可。</p></div></div>}
     <div className="tabs member-tabs" role="tablist">{tabs.map(([id, label]) => <button role="tab" aria-selected={tab === id} className={tab === id ? 'is-active' : ''} key={id} onClick={() => setTab(id)}>{label}</button>)}</div>
     {(loading || (!loadError && overview?.personId !== person.id)) && <section className="panel table-empty"><LoaderCircle size={24} className="spin" /><strong>正在整理成员档案</strong><span>只读取本机已保存结果，不会发起新的模型任务。</span></section>}
     {!loading && loadError && <section className="panel personal-empty-state"><ShieldCheck size={28} /><div><span className="eyebrow">读取未完成</span><h2>暂时无法打开新版成员档案</h2><p>现有报告和事实没有丢失。可先切换页面后重试；打开页面本身不会调用模型。</p></div></section>}
     {!loading && overview?.personId === person.id && !loadError && overview && tab === 'overview' && <div className="member-v2-overview">
       <section className="panel member-health-headline"><div><span className="eyebrow">当前健康档案</span><h2>{overview.headline}</h2><p>共 {overview.acceptedFactCount} 条已接纳事实，来自 {overview.eventCount} 个检查事件；最近临床日期 {overview.latestClinicalDate ?? '待确认'}。</p></div><StatusBadge tone={overview.dataQuality === 'complete' ? 'success' : overview.dataQuality === 'partial' ? 'info' : 'neutral'}>{overview.dataQuality === 'complete' ? '资料较完整' : overview.dataQuality === 'partial' ? '资料部分' : '资料不足'}</StatusBadge></section>
-      <section className="panel wide-panel"><div className="panel__heading"><div><span className="eyebrow">身体系统</span><h2>从身体进入，不从报告目录进入</h2></div><StatusBadge tone="neutral">不计算健康总分</StatusBadge></div><div className="system-summary-grid">{systems.map((system) => <button key={system.id} onClick={() => { chooseSystem(system.id); setTab('body'); }}><span className={`system-directory__symbol is-${system.status}`}>{systemSymbol[system.id]}</span><span><strong>{system.shortName}</strong><small>{system.summary}</small></span><StatusBadge tone={systemTone(system.status)}>{system.status === 'attention' ? '有需留意记录' : system.status === 'stable' ? '现有记录平稳' : '资料不足'}</StatusBadge><ChevronRight size={17} /></button>)}</div></section>
+      <section className="panel wide-panel"><div className="panel__heading"><div><span className="eyebrow">身体系统</span><h2>从身体进入，不从报告目录进入</h2></div><StatusBadge tone="neutral">不计算健康总分</StatusBadge></div><div className="system-summary-grid">{systems.map((system) => <button key={system.id} onClick={() => { chooseSystem(system.id); setTab('body'); }}><span className={`system-directory__symbol is-${system.status}`}>{systemSymbol[system.id]}</span><span><strong>{system.shortName}</strong><small>{system.summary}</small></span><StatusBadge tone={systemTone(system.status)}>{system.status === 'attention' ? '有需留意记录' : system.status === 'stable' ? '现有记录平稳' : system.status === 'building' ? '旧记录恢复中' : '资料不足'}</StatusBadge><ChevronRight size={17} /></button>)}</div></section>
       <section className="panel"><div className="panel__heading"><h3>最近检查事件</h3><button className="text-button" onClick={() => setTab('timeline')}>查看全部</button></div>{overview.recentChanges.length > 0 ? <div className="recent-event-list">{overview.recentChanges.map((change) => <button key={change.id} onClick={() => setTab('timeline')}><CalendarClock size={18} /><span><strong>{change.title}</strong><small>{change.date ?? '日期待确认'} · {change.detail}</small></span><ChevronRight size={16} /></button>)}</div> : <p className="muted-copy">还没有可归入时间线的检查事件。</p>}</section>
       <section className="panel"><div className="panel__heading"><h3>接下来</h3><button className="text-button" onClick={() => setTab('guidance')}>生活与行动</button></div>{overview.nextActions.length > 0 ? <div className="recent-event-list">{overview.nextActions.map((action) => <div key={action.id}><Check size={17} /><span><strong>{action.title}</strong><small>{action.status}</small></span></div>)}</div> : <p className="muted-copy">目前没有待办事项。生活建议不会自动变成用户计划。</p>}</section>
     </div>}
@@ -563,7 +582,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       <div className="evidence-source-list">{selectedEvent.evidence.map((evidence, index) => <button key={`${evidence.id}-${index}`} className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${selectedEvent.title}依据 ${index + 1}`, evidence))}><FileCheck2 size={16} /> {evidence.label} · {evidence.locator ?? `依据 ${index + 1}`}</button>)}</div>
     </div> : <><div className="panel__heading"><div><span className="eyebrow">检查时间线</span><h2>事件不是文件列表</h2></div><StatusBadge tone="neutral">{filteredEvents.length} / {events.length} 个事件</StatusBadge></div><p className="body-copy">同一次检查可以包含多份文件；报告里的历史对比列不会被误当成多次新就诊。</p><div className="timeline-filters"><label>事件类型<select value={eventType} onChange={(event) => setEventType(event.target.value as HealthEventV2['type'] | 'all')}><option value="all">全部类型</option><option value="checkup">体检</option><option value="laboratory">检验</option><option value="imaging">影像</option><option value="outpatient">门诊</option><option value="inpatient">住院</option><option value="self_measurement">本人测量</option><option value="manual_note">本人补充</option><option value="other">其他</option></select></label><label>身体系统<select value={eventSystem} onChange={(event) => setEventSystem(event.target.value as BodySystemId | 'all')}><option value="all">全部系统</option>{systems.map((system) => <option key={system.id} value={system.id}>{system.shortName}</option>)}</select></label></div>{filteredEvents.length > 0 ? <div className="timeline-list">{filteredEvents.map((event) => <button key={event.id} onClick={() => chooseEvent(event.id)}><time>{event.time.displayLabel}</time><i /><span><StatusBadge tone={event.metadataStatus === 'unknown' ? 'neutral' : 'success'}>{event.type === 'checkup' ? '体检' : event.type === 'imaging' ? '影像' : event.type === 'laboratory' ? '检验' : '健康事件'}</StatusBadge><strong>{event.title}</strong><small>{event.summary}</small><em>{event.systemIds.length} 个身体系统 · {event.documentIds.length} 份来源文件</em></span><ChevronRight size={18} /></button>)}</div> : <div className="table-empty"><CalendarClock size={24} /><strong>{events.length > 0 ? '没有符合筛选条件的事件' : '还没有检查事件'}</strong><span>{events.length > 0 ? '可以调整事件类型或身体系统。' : '报告事实接纳后才会出现在这里。'}</span></div>}</>}</section>}
     {!loading && tab === 'guidance' && <div className="guide-grid">{plan && plan.proposals.length > 0 ? <>
-      <section className="panel guide-hero"><span className="eyebrow">本周重点</span><h2>一份成员级生活方案</h2><p>相同方向已跨身体系统合并；建议不会自动变成你的计划，只有主动采纳后才进入行动层。</p><div className="member-proposal-list">{plan.proposals.map((proposal, index) => <LifestyleProposalCard key={proposal.id} proposal={proposal} index={index} busy={adoptingProposalId !== null || decidingProposalId !== null} onAdopt={(adoption) => adoptProposal(proposal, adoption)} onDecide={(decision) => decideProposal(proposal.id, decision)} onOpenEvidence={onOpenEvidence} />)}</div></section>
+      <section className="panel guide-hero"><span className="eyebrow">本周重点</span><h2>一份成员级生活方案</h2><p>相同方向已跨身体系统合并；建议不会自动变成你的计划，只有主动采纳后才进入行动层。</p>{plan.status === 'stale' && <div className="info-callout compact" role="status"><ShieldCheck size={18} /><div><strong>旧版建议已恢复展示</strong><p>内容仍可以阅读，但尚未按当前的来源和安全规则重新复核，所以暂时不能直接采纳。</p></div></div>}<div className="member-proposal-list">{plan.proposals.map((proposal, index) => <LifestyleProposalCard key={proposal.id} proposal={proposal} index={index} busy={adoptingProposalId !== null || decidingProposalId !== null} canAdopt={plan.status === 'current'} onAdopt={(adoption) => adoptProposal(proposal, adoption)} onDecide={(decision) => decideProposal(proposal.id, decision)} onOpenEvidence={onOpenEvidence} />)}</div></section>
       <section className="panel"><div className="panel__heading"><h3>已采纳行动</h3><StatusBadge tone="neutral">{plan.adoptedActions.length} 项</StatusBadge></div>{plan.adoptedActions.length > 0 ? plan.adoptedActions.map((action) => <div className="completed-item adopted-action-card" key={action.id}><Check size={16} /><div><strong>{action.title}</strong><span>{action.userGoal}</span><small>{action.selectedStartingOption} · {action.owner}{action.plannedTime ? ` · ${action.plannedTime}` : ''}{action.dueDate ? ` · ${action.dueDate} 回顾` : ''}</small>{action.progressNote && <small>备注：{action.progressNote}</small>}</div></div>) : <p className="muted-copy">还没有主动采纳的行动。</p>}</section>
     </> : <section className="panel personal-empty-state"><ShieldCheck size={28} /><div><span className="eyebrow">生活与行动</span><h2>尚未生成经过复核的生活建议</h2><p>已接纳事实不会丢失；缺少安全复核结果时保持空白，不用通用模板冒充个性化建议。</p></div></section>}</div>}
     {!loading && tab === 'sources' && <section className="panel"><div className="panel__heading"><div><span className="eyebrow">原始资料</span><h2>报告只作为证据来源</h2></div><button className="primary-button" onClick={onImport}><Plus size={17} /> 添加资料</button></div><p className="body-copy">这里管理文件与来源；阅读健康状况请回到“身体与指标”或“检查时间线”。</p>{personDocuments.length > 0 ? <div className="source-document-list">{personDocuments.map((document) => <article key={document.id}><span className="file-icon"><FileText size={18} /></span><div><strong>{document.displayName}</strong><small>{document.format} · {document.sourceLabel}</small></div><StatusBadge tone={document.status === 'completed' ? 'success' : document.status === 'queued' ? 'info' : 'neutral'}>{document.status === 'completed' ? '已处理' : document.status === 'queued' ? '待处理' : document.status}</StatusBadge><button className="text-button" onClick={() => onOpenEvidence({ title: document.displayName, label: document.sourceLabel, quote: '正在读取受控来源片段…', meta: '界面不会获取本机文件路径。', documentId: document.id })}>查看原件</button>{document.status === 'ignored' ? <button className="text-button" onClick={() => onReincludeDocument(document)}>重新纳入</button> : <button className="text-button" onClick={() => onExcludeDocument(document)}>移出分析</button>}<button className="text-button is-danger" aria-label="删除本机档案" onClick={() => onDeleteDocument(document)}>删除</button></article>)}</div> : <div className="table-empty"><FileText size={24} /><strong>还没有原始资料</strong><span>添加报告后，文件会先保存在本机。</span></div>}<div className="dialog-actions"><button className="secondary-button" onClick={onDeletedDocuments}>查看已删除资料记录</button></div></section>}

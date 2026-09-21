@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { actionStatusSchema } from './action-status.js';
 
 const idSchema = z.string().min(1).max(160);
 const localDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -204,6 +205,9 @@ export const trendFactsSchema = z.object({
   latestValue: z.number().finite().nullable(),
   absoluteChange: z.number().finite().nullable(),
   relativeChangePercent: z.number().finite().nullable(),
+  latestChange: z.number().finite().nullable(),
+  segmentDirections: z.array(z.enum(['up', 'down', 'flat'])),
+  reportedFlagChanges: z.number().int().nonnegative(),
   referenceBoundaryCrossings: z.number().int().nonnegative(),
   reasons: z.array(z.string().min(1)),
   statement: z.string().min(1)
@@ -562,7 +566,8 @@ export const lifestylePlanV2Schema = z.object({
       sourceOrganization: z.string().min(1),
       sourceUrl: z.string().url(),
       reviewedAt: localDateSchema,
-      supportedScope: z.string().min(1)
+      supportedScope: z.string().min(1),
+      verificationStatus: z.enum(['unverified_model_candidate', 'controlled_source_verified']).default('unverified_model_candidate')
     }).strict()),
     sourceKind: z.enum(['ai_proposed', 'clinician_reported', 'care_preparation']),
     relatedSystemIds: z.array(bodySystemIdSchema)
@@ -576,7 +581,7 @@ export const lifestylePlanV2Schema = z.object({
     plannedTime: z.string().nullable(),
     owner: z.string().min(1),
     progressNote: z.string().nullable(),
-    status: z.enum(['planned', 'in_progress', 'completed', 'paused', 'dismissed']),
+    status: actionStatusSchema,
     dueDate: localDateSchema.nullable(),
     updatedAt: utcTimestampSchema
   }).strict())
@@ -623,7 +628,7 @@ export const adoptedActionReceiptSchema = z.object({
   plannedTime: z.string().nullable(),
   owner: z.string().min(1),
   progressNote: z.string().nullable(),
-  status: z.enum(['planned', 'in_progress', 'completed', 'paused', 'dismissed']),
+  status: actionStatusSchema,
   dueDate: localDateSchema.nullable(),
   updatedAt: utcTimestampSchema
 }).strict();
@@ -650,13 +655,20 @@ export const systemEvidenceFactSchema = z.object({
   time: clinicalTimeSchema,
   relation: z.enum(['direct', 'context']),
   relationReason: z.string().min(1),
-  evidence: memberEvidenceRefSchema
+  evidence: memberEvidenceRefSchema,
+  evidenceSources: z.array(memberEvidenceRefSchema).min(1)
 }).strict();
 export type SystemEvidenceFact = z.infer<typeof systemEvidenceFactSchema>;
 
 export const systemEvidenceBundleSchema = z.object({
   schemaVersion: z.literal(1),
-  identity: z.object({ personId: idSchema, systemId: bodySystemIdSchema }).strict(),
+  identity: z.object({
+    personId: idSchema,
+    systemId: bodySystemIdSchema,
+    birthYear: z.number().int().min(1900).max(2200).nullable(),
+    genderContext: z.string().max(120).nullable(),
+    contextSource: z.literal('user_profile')
+  }).strict(),
   scope: z.object({
     factRevision: z.number().int().nonnegative(),
     contextRevision: z.number().int().nonnegative(),

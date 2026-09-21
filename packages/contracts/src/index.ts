@@ -1,6 +1,8 @@
 import { z } from 'zod';
+import { actionStatusSchema } from './action-status.js';
 
 export * from './member-v2.js';
+export * from './action-status.js';
 
 export const idSchema = z.string().min(1).max(120);
 export const utcTimestampSchema = z.string().datetime({ offset: true });
@@ -387,6 +389,7 @@ export const jobStatusSchema = z.enum([
   'waiting_user',
   'retry_wait',
   'succeeded',
+  'completed_with_issues',
   'failed',
   'cancelled'
 ]);
@@ -454,7 +457,7 @@ export const actionItemSchema = z.object({
   title: z.string().min(1),
   detail: z.string(),
   origin: z.enum(['clinician_document', 'user_created', 'ai_proposed']),
-  status: z.enum(['proposed', 'discussed', 'planned', 'completed', 'dismissed']),
+  status: actionStatusSchema,
   dueDate: localDateSchema.nullable(),
   dueText: z.string().nullable(),
   evidenceLabel: z.string().nullable(),
@@ -513,6 +516,7 @@ export const personSummarySchema = z.object({
   changeSummary: z.string(),
   derivedStatus: derivedStatusSchema,
   assessmentSummary: z.string().nullable(),
+  dataRevision: z.string().regex(/^[a-f0-9]{64}$/),
   displayRevision: z.number().int().nonnegative(),
   clinicalContextRevision: z.number().int().nonnegative()
 }).strict();
@@ -599,6 +603,16 @@ export const timelineEventSchema = z.object({
 
 export type TimelineEvent = z.infer<typeof timelineEventSchema>;
 
+export const jobSystemOutcomeSchema = z.object({
+  systemId: idSchema,
+  status: z.enum(['published', 'rejected', 'skipped_no_data', 'skipped_cache', 'out_of_scope']),
+  reason: z.string().nullable(),
+  inputSignature: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+  updatedAt: utcTimestampSchema
+}).strict();
+
+export type JobSystemOutcome = z.infer<typeof jobSystemOutcomeSchema>;
+
 export const jobSummarySchema = z.object({
   id: idSchema,
   batchLabel: z.string(),
@@ -608,6 +622,7 @@ export const jobSummarySchema = z.object({
   completedUnits: z.number().int().nonnegative(),
   totalUnits: z.number().int().positive(),
   statusText: z.string(),
+  systemOutcomes: z.array(jobSystemOutcomeSchema),
   updatedAt: utcTimestampSchema,
   canCancel: z.boolean(),
   canRetry: z.boolean()
@@ -705,7 +720,7 @@ export type DashboardSnapshot = z.infer<typeof dashboardSnapshotSchema>;
 
 export const updateActionStatusInputSchema = z.object({
   actionId: idSchema,
-  status: z.enum(['proposed', 'discussed', 'planned', 'completed', 'dismissed']),
+  status: actionStatusSchema,
   expectedRevision: z.number().int().nonnegative()
 }).strict();
 

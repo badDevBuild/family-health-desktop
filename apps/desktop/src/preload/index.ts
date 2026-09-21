@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AccountState, ActionItem, AdoptedActionReceipt, AdoptLifestyleProposalInput, AiPreferences, AiSettings, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, CleanupReceipt, ConceptMappingReceipt, ConceptReviewBundle, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, ManualNote, MemberEvidenceBundle, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, Person, ProcessNowInput, ReportMetadataCorrectionReceipt, ResolveReviewInput, RestorePersonInput, Result, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
+import type { AccountState, ActionItem, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, AiPreferences, AiSettings, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, CleanupReceipt, ConceptMappingReceipt, ConceptReviewBundle, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, ManualNote, MemberEvidenceBundle, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, Person, ProcessNowInput, ReportMetadataCorrectionReceipt, ResolveReviewInput, RestorePersonInput, Result, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
 
 export interface HealthDesktopBridge {
   getBootstrap(): Promise<{
@@ -72,7 +72,7 @@ export interface HealthDesktopBridge {
   onTrayProcessRequested(listener: () => void): () => void;
   setActionStatus(input: {
     actionId: string;
-    status: 'proposed' | 'discussed' | 'planned' | 'completed' | 'dismissed';
+    status: ActionStatus;
     expectedRevision: number;
   }): Promise<Result<ActionItem>>;
   createAction(input: CreateActionItemInput): Promise<Result<ActionItem>>;

@@ -74,8 +74,13 @@ export function mapConcept(input: {
   bodySite?: string | null;
   unit?: string | null;
 }): ConceptMapping {
-  const names = [input.standardName, input.rawName].filter((value): value is string => Boolean(value)).map(compact);
-  const exact = conceptDictionary.find((definition) => definition.aliases.some((alias) => names.includes(compact(alias))));
+  const rawName = compact(input.rawName);
+  const candidateName = input.standardName ? compact(input.standardName) : null;
+  const rawExact = conceptDictionary.find((definition) => definition.aliases.some((alias) => compact(alias) === rawName));
+  const candidateExact = candidateName
+    ? conceptDictionary.find((definition) => definition.aliases.some((alias) => compact(alias) === candidateName))
+    : undefined;
+  const exact = rawExact ?? candidateExact;
   if (!exact) {
     return {
       rawName: input.rawName,
@@ -91,7 +96,9 @@ export function mapConcept(input: {
   const unit = normalizeUnit(input.unit ?? null);
   const unitKnownButIncompatible = Boolean(unit && exact.compatibleUnits.length > 0 && !exact.compatibleUnits.includes(unit));
   const specimenConflict = Boolean(input.specimen && exact.specimen && compact(input.specimen) !== compact(exact.specimen));
-  if (unitKnownButIncompatible || specimenConflict) {
+  const candidateOnly = !rawExact && Boolean(candidateExact);
+  const candidateConflictsWithRaw = Boolean(rawExact && candidateExact && rawExact.id !== candidateExact.id);
+  if (candidateOnly || candidateConflictsWithRaw || unitKnownButIncompatible || specimenConflict) {
     return {
       rawName: input.rawName,
       normalizedName: exact.canonicalName,
@@ -100,6 +107,8 @@ export function mapConcept(input: {
       status: 'proposed',
       confidence: 0.65,
       reasons: [
+        ...(candidateOnly ? ['只有模型候选名命中词典；原报告名称尚未核实为同一概念。'] : []),
+        ...(candidateConflictsWithRaw ? ['原报告名称与模型候选名指向不同概念。'] : []),
         ...(unitKnownButIncompatible ? [`单位 ${input.unit} 与已验证定义不一致。`] : []),
         ...(specimenConflict ? [`标本 ${input.specimen} 与已验证定义不一致。`] : [])
       ]
@@ -154,11 +163,13 @@ export function selectContextSystems(input: {
     .split(/[,;\s]+/)
     .filter((value): value is BodySystemId => valid.has(value as BodySystemId)))];
   if (explicit.length > 0) return { systemIds: explicit, basis: 'explicit' };
-  const matched = linkTextToSystems([input.text, ...Object.values(input.structuredFields)].join(' '));
-  if (matched.length > 0) return { systemIds: matched, basis: 'keyword' };
+  // 过敏、用药和身体限制是全局安全背景。即使文本中命中了某个系统关键词，
+  // 也不能把它缩小到单一系统，否则其他系统的建议可能遗漏安全限制。
   if (['allergy', 'medication', 'constraint'].includes(input.kind)) {
     return { systemIds: bodySystemRegistry.map((system) => system.id), basis: 'global_safety' };
   }
+  const matched = linkTextToSystems([input.text, ...Object.values(input.structuredFields)].join(' '));
+  if (matched.length > 0) return { systemIds: matched, basis: 'keyword' };
   if (['history', 'free_text'].includes(input.kind)) {
     return { systemIds: bodySystemRegistry.map((system) => system.id), basis: 'global_history' };
   }
@@ -166,10 +177,32 @@ export function selectContextSystems(input: {
 }
 
 export function linkConceptToSystems(mapping: ConceptMapping): Array<{ systemId: BodySystemId; relation: 'direct' | 'context' }> {
-  const definition = mapping.conceptId ? conceptDictionary.find((item) => item.id === mapping.conceptId) : null;
+  const definition = mapping.status === 'verified' && mapping.conceptId
+    ? conceptDictionary.find((item) => item.id === mapping.conceptId)
+    : null;
   if (definition) return [...definition.systemLinks];
-  return linkTextToSystems(mapping.normalizedName)
+  // 候选映射不能按已确认概念进入正式系统分组。仍可根据原始名称做可审查的临时归类。
+  const fallbackName = mapping.status === 'verified' ? mapping.normalizedName : mapping.rawName;
+  return linkTextToSystems(fallbackName)
     .map((systemId) => ({ systemId, relation: 'direct' as const }));
+}
+
+/**
+ * 旧版数据只保留了模型给出的标准名候选，没有保留原报告项目名。
+ * 这里只用候选名恢复“可查看的背景归类”，永远不把它升格为已验证概念或直接事实。
+ */
+export function linkLegacyCandidateToSystems(
+  mapping: ConceptMapping,
+  candidateName: string | null
+): Array<{ systemId: BodySystemId; relation: 'context' }> {
+  if (!candidateName?.trim()) return [];
+  const definition = mapping.conceptId
+    ? conceptDictionary.find((item) => item.id === mapping.conceptId)
+    : null;
+  const systemIds = definition
+    ? definition.systemLinks.map((link) => link.systemId)
+    : linkTextToSystems(candidateName);
+  return [...new Set(systemIds)].map((systemId) => ({ systemId, relation: 'context' as const }));
 }
 
 export interface TrendObservationInput {
@@ -231,6 +264,9 @@ function buildTrendFacts(points: TrendPointV2[]): TrendFacts {
       latestValue: numeric.at(-1)?.numericValue ?? null,
       absoluteChange: null,
       relativeChangePercent: null,
+      latestChange: null,
+      segmentDirections: [],
+      reportedFlagChanges: 0,
       referenceBoundaryCrossings: 0,
       reasons: ['至少需要两次可比较的带日期数值记录。'],
       statement: numeric.length === 1 ? '目前只有 1 次可比较记录，暂不能判断变化。' : '现有记录不能形成可比较的时间序列。'
@@ -243,18 +279,32 @@ function buildTrendFacts(points: TrendPointV2[]): TrendFacts {
   const change = latestValue - firstValue;
   const relative = firstValue === 0 ? null : (change / Math.abs(firstValue)) * 100;
   const spanDays = Math.round((latest.timestamp! - first.timestamp!) / 86_400_000);
-  const boundaryStates = numeric.map((point) => ['high', 'low', 'positive'].includes(point.abnormalFlag));
-  const boundaryCrossings = boundaryStates.slice(1).reduce((count, value, index) => count + (value !== boundaryStates[index] ? 1 : 0), 0);
+  const rangeState = (point: TrendPointV2): 'low' | 'within' | 'high' | 'unknown' => {
+    if (point.numericValue === null) return 'unknown';
+    if (point.referenceLow !== null && point.numericValue < point.referenceLow) return 'low';
+    if (point.referenceHigh !== null && point.numericValue > point.referenceHigh) return 'high';
+    if (point.referenceLow !== null || point.referenceHigh !== null) return 'within';
+    return 'unknown';
+  };
+  const boundaryStates = numeric.map(rangeState);
+  const boundaryCrossings = boundaryStates.slice(1).reduce((count, value, index) => {
+    const previous = boundaryStates[index]!;
+    return count + (value !== 'unknown' && previous !== 'unknown' && value !== previous ? 1 : 0);
+  }, 0);
+  const reportStates = numeric.map((point) => point.abnormalFlag);
+  const reportedFlagChanges = reportStates.slice(1).reduce((count, value, index) => {
+    const previous = reportStates[index]!;
+    return count + (value !== 'unknown' && previous !== 'unknown' && value !== previous ? 1 : 0);
+  }, 0);
+  const deltas = numeric.slice(1).map((point, index) => point.numericValue! - numeric[index]!.numericValue!);
+  const segmentDirections = deltas.map((delta) => delta > 0 ? 'up' as const : delta < 0 ? 'down' as const : 'flat' as const);
 
   let direction: TrendFacts['direction'] = 'insufficient';
   if (numeric.length >= 3) {
-    const deltas = numeric.slice(1).map((point, index) => point.numericValue! - numeric[index]!.numericValue!);
-    const tolerance = Math.max(Math.abs(firstValue) * 0.03, 0.000001);
-    const meaningful = deltas.filter((delta) => Math.abs(delta) > tolerance);
-    if (Math.abs(change) <= tolerance && meaningful.length <= 1) direction = 'stable';
-    else if (meaningful.length > 0 && meaningful.every((delta) => delta > 0)) direction = 'increasing';
-    else if (meaningful.length > 0 && meaningful.every((delta) => delta < 0)) direction = 'decreasing';
-    else if (meaningful.some((delta) => delta > 0) && meaningful.some((delta) => delta < 0)) direction = 'fluctuating';
+    if (deltas.every((delta) => delta === 0)) direction = 'stable';
+    else if (deltas.every((delta) => delta > 0)) direction = 'increasing';
+    else if (deltas.every((delta) => delta < 0)) direction = 'decreasing';
+    else if (deltas.some((delta) => delta > 0) && deltas.some((delta) => delta < 0)) direction = 'fluctuating';
     else direction = 'mixed';
   }
 
@@ -276,6 +326,9 @@ function buildTrendFacts(points: TrendPointV2[]): TrendFacts {
     latestValue,
     absoluteChange: change,
     relativeChangePercent: relative,
+    latestChange: deltas.at(-1) ?? null,
+    segmentDirections,
+    reportedFlagChanges,
     referenceBoundaryCrossings: boundaryCrossings,
     reasons: [
       ...(hasUnknownContext ? ['部分标本、方法或部位未记录，因此比较结果需保留条件。'] : []),
@@ -296,7 +349,9 @@ export function buildMetricSeries(observations: TrendObservationInput[]): Metric
       bodySite: observation.bodySite,
       unit: observation.unit
     });
-    const identity = mapping.conceptId ?? `raw:${compact(mapping.normalizedName)}`;
+    const identity = mapping.status === 'verified' && mapping.conceptId
+      ? mapping.conceptId
+      : `raw:${compact(mapping.rawName)}`;
     const key = `${identity}\u0000${contextKey(observation)}`;
     const current = grouped.get(key) ?? { mapping, rows: [] };
     current.rows.push(observation);
@@ -305,6 +360,10 @@ export function buildMetricSeries(observations: TrendObservationInput[]): Metric
 
   return [...grouped.entries()].map(([key, group]) => {
     const contextUnknown = group.rows.some((row) => !row.specimen || !row.method || !row.bodySite);
+    const definition = group.mapping.status === 'verified' && group.mapping.conceptId
+      ? conceptDictionary.find((item) => item.id === group.mapping.conceptId)
+      : null;
+    const requiresKnownUnit = Boolean(definition && definition.compatibleUnits.length > 0);
     const points: TrendPointV2[] = group.rows.map((row): TrendPointV2 => {
       const timestamp = parseTimestamp(row.clinicalDate);
       const evidence: MemberEvidenceRef = {
@@ -338,11 +397,13 @@ export function buildMetricSeries(observations: TrendObservationInput[]): Metric
         referenceLow: row.referenceLow,
         referenceHigh: row.referenceHigh,
         abnormalFlag: row.abnormalFlag,
-        comparable: row.numericValue !== null && row.comparator === 'eq' && timestamp !== null,
+        comparable: row.numericValue !== null && row.comparator === 'eq' && timestamp !== null
+          && (!requiresKnownUnit || normalizeUnit(row.unit) !== null),
         comparabilityReasons: [
           ...(row.numericValue === null ? ['not_numeric'] : []),
           ...(row.comparator && row.comparator !== 'eq' ? ['bounded_value_not_exact'] : []),
           ...(timestamp === null ? ['clinical_date_unknown'] : []),
+          ...(requiresKnownUnit && normalizeUnit(row.unit) === null ? ['unit_unknown_for_dimensional_concept'] : []),
           ...(contextUnknown ? ['comparison_context_unknown'] : [])
         ],
         evidence,
@@ -354,8 +415,10 @@ export function buildMetricSeries(observations: TrendObservationInput[]): Metric
     const latest = [...points].filter((point) => point.timestamp !== null).at(-1) ?? points.at(-1);
     return {
       id: `series-${stableId(key)}`,
-      conceptId: group.mapping.conceptId,
-      name: group.mapping.canonicalName ?? group.mapping.normalizedName,
+      conceptId: group.mapping.status === 'verified' ? group.mapping.conceptId : null,
+      name: group.mapping.status === 'verified'
+        ? group.mapping.canonicalName ?? group.mapping.normalizedName
+        : group.mapping.rawName,
       unit: points.find((point) => point.unit)?.unit ?? null,
       latestValue: latest?.displayValue ?? null,
       latestDate: latest?.time.value ?? null,

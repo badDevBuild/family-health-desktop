@@ -63,6 +63,27 @@ afterEach(() => {
 });
 
 describe('App member display editing', () => {
+  it('家庭总览读取成员的真实分析状态和最近一次报告标记', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.persons[0]!.documentCount = 1;
+    snapshot.persons[0]!.acceptedFactCount = 3;
+    snapshot.persons[0]!.derivedStatus = 'current';
+    snapshot.trends = [{
+      ...createDemoSnapshot().trends[0]!,
+      personId: snapshot.persons[0]!.id,
+      points: createDemoSnapshot().trends[0]!.points.map((point, index, points) => (
+        index === points.length - 1 ? { ...point, abnormalFlag: 'normal' as const } : point
+      ))
+    }];
+    installBridge(snapshot);
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: '报告事实与综合说明已保存' })).toBeTruthy();
+    expect(screen.getByText('最近一次：报告未标记异常')).toBeTruthy();
+    expect(screen.queryByText(/健康解释仍待独立复核/)).toBeNull();
+    expect(screen.queryByText(/报告标记偏高/)).toBeNull();
+  });
+
   it('证据侧栏支持 Escape 关闭并把键盘焦点还给原按钮', async () => {
     render(<App />);
 
@@ -224,7 +245,7 @@ describe('App member display editing', () => {
     snapshot.jobs = [{
       id: 'superseded-job', batchLabel: '旧处理任务', personLabel: '测试成员', stage: 'extract', status: 'failed',
       completedUnits: 0, totalUnits: 1, statusText: '已有较新的处理任务，请使用上方任务继续',
-      updatedAt: '2026-09-18T00:00:00.000Z', canCancel: false, canRetry: false
+      systemOutcomes: [], updatedAt: '2026-09-18T00:00:00.000Z', canCancel: false, canRetry: false
     }];
     installBridge(snapshot);
     render(<App />);
@@ -233,6 +254,30 @@ describe('App member display editing', () => {
     expect(screen.queryByRole('heading', { name: '正在处理与需要关注' })).toBeNull();
     expect(screen.getByRole('heading', { name: '最近记录' })).toBeTruthy();
     expect(screen.getByText('旧处理任务')).toBeTruthy();
+  });
+
+  it('部分完成任务在详情中说清哪个系统失败以及未覆盖范围', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.jobs = [{
+      id: 'partial-job', batchLabel: '部分完成任务', personLabel: '测试成员', stage: 'publish', status: 'completed_with_issues',
+      completedUnits: 1, totalUnits: 1, statusText: '事实已保存，部分系统说明未通过',
+      systemOutcomes: [
+        { systemId: 'cardiovascular', status: 'rejected', reason: 'evidence_mismatch', inputSignature: null, updatedAt: '2026-09-18T00:00:00.000Z' },
+        { systemId: 'endocrine_metabolic', status: 'published', reason: null, inputSignature: 'a'.repeat(64), updatedAt: '2026-09-18T00:00:00.000Z' },
+        { systemId: 'renal_urinary', status: 'out_of_scope', reason: 'system_analysis_phase_one', inputSignature: null, updatedAt: '2026-09-18T00:00:00.000Z' }
+      ],
+      updatedAt: '2026-09-18T00:00:00.000Z', canCancel: false, canRetry: true
+    }];
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '处理中心' }));
+    fireEvent.click(screen.getByRole('button', { name: '查看详情' }));
+    expect(await screen.findByRole('heading', { name: '部分完成任务' })).toBeTruthy();
+    expect(screen.getByText('心血管')).toBeTruthy();
+    expect(screen.getByText('说明未通过核对')).toBeTruthy();
+    expect(screen.getByText('其他 1 个系统')).toBeTruthy();
+    expect(screen.getByText(/已保留事实，可只重试该系统说明/)).toBeTruthy();
   });
 
   it('清楚展示报告姓名与目标成员，并用专门操作确认同一人', async () => {

@@ -194,6 +194,9 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .member-header__controls, .member-header__secondary { display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
 .member-header__secondary { grid-column: 1 / -1; padding-top: 12px; border-top: 1px solid var(--warm-200); }
 .member-header__controls button, .member-header__secondary button { white-space: nowrap; }
+.member-header__more { position: relative; justify-self: end; padding: 0; border-top: 0; }
+.member-header__more summary { min-height: 44px; display: inline-flex; align-items: center; padding: 0 13px; border: 1px solid var(--warm-200); border-radius: 12px; color: var(--warm-600); background: #fff; font-size: 14px; font-weight: 650; cursor: pointer; }
+.member-header__more > div { position: absolute; z-index: 4; right: 20px; display: grid; gap: 8px; min-width: 190px; margin-top: 8px; padding: 12px; border: 1px solid var(--warm-200); border-radius: 14px; background: #fff; box-shadow: 0 1px 3px rgba(44,40,36,.06), 0 4px 12px rgba(44,40,36,.04); }
 .member-header select { min-width: 190px; height: 44px; padding: 0 36px 0 13px; border: 1px solid var(--warm-200); border-radius: 12px; color: var(--warm-900); background: #fff; }
 .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--warm-200); }
 .tabs button { min-width: 70px; min-height: 43px; padding: 0 13px; border: 0; border-bottom: 2px solid transparent; color: var(--warm-600); background: transparent; cursor: pointer; }
@@ -202,6 +205,11 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .narrative-panel h2 { max-width: 680px; margin: 7px 0 12px; font-size: 21px; line-height: 1.4; }
 .narrative-panel > p { margin: 0; color: var(--warm-600); font-size: 15px; line-height: 1.8; }
 .evidence-link { min-height: 42px; display: inline-flex; align-items: center; gap: 7px; margin-top: 14px; padding: 0 11px; border: 0; border-radius: 10px; color: var(--info); background: var(--info-bg); font-weight: 600; cursor: pointer; }
+.system-analysis-topics { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.system-analysis-topics span { min-height: 32px; display: inline-flex; align-items: center; padding: 0 10px; border-radius: 8px; color: var(--primary-dark); background: var(--primary-light); font-size: 14px; }
+.analysis-discussion-points { margin-top: 16px; padding: 16px; border-radius: 12px; background: var(--warm-100); }
+.analysis-discussion-points h4 { margin: 0 0 8px; font-size: 16px; }
+.analysis-discussion-points ul { margin: 0; padding-left: 22px; color: var(--warm-600); font-size: 16px; line-height: 1.65; }
 .coverage-panel h2 { margin: 6px 0 15px; font-size: 24px; }
 .coverage-panel > p { margin: 14px 0 0; color: var(--warm-400); font-size: 12px; line-height: 1.5; }
 .coverage-list { display: grid; gap: 10px; }
@@ -427,6 +435,12 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .detail-list > div:last-child { border-bottom: 0; }
 .detail-list dt { color: var(--warm-400); font-size: 12px; }
 .detail-list dd { margin: 0; color: var(--warm-700); font-size: 13px; font-weight: 600; }
+.job-system-outcomes { display: grid; gap: 8px; }
+.job-system-outcomes h3 { margin: 0 0 2px; font-size: 14px; }
+.job-system-outcomes > div { display: grid; grid-template-columns: minmax(120px, auto) 1fr; gap: 4px 12px; padding: 10px 12px; border: 1px solid var(--warm-200); border-radius: 12px; background: var(--warm-50); }
+.job-system-outcomes strong, .job-system-outcomes span { font-size: 13px; }
+.job-system-outcomes span { color: var(--warm-600); }
+.job-system-outcomes small { grid-column: 1 / -1; color: var(--warm-500); }
 .measurement-grid { display: grid; grid-template-columns: 1.35fr 1fr .75fr; gap: 10px; }
 .manual-note-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
 .manual-note-list article { display: grid; gap: 8px; padding: 13px; border: 1px solid var(--warm-200); border-radius: 13px; background: var(--warm-50); }
@@ -744,6 +758,8 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
   .member-header { grid-template-columns: 1fr; }
   .member-header__controls, .member-header__secondary { justify-content: flex-start; flex-wrap: wrap; }
   .member-header__secondary { grid-column: 1; }
+  .member-header__more { justify-self: start; }
+  .member-header__more > div { right: auto; left: 20px; }
   .single-metric-grid { grid-template-columns: 1fr; }
   .system-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .body-workspace { grid-template-columns: 250px minmax(0, 1fr); }

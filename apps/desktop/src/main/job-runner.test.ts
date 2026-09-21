@@ -14,7 +14,10 @@ afterEach(() => {
 });
 
 describe('ProcessingJobRunner', () => {
-  it('一次性授权任务依次完成事实与派生阶段', async () => {
+  it.each([
+    { label: '一次性授权任务依次完成事实与派生阶段', rejectSystem: false, expectedStatus: 'succeeded', expectedCalls: 6 },
+    { label: '系统说明未通过时保留事实并标记部分完成', rejectSystem: true, expectedStatus: 'completed_with_issues', expectedCalls: 5 }
+  ])('$label', async ({ rejectSystem, expectedStatus, expectedCalls }) => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-runner-'));
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '测试工作区', () => new Date('2026-09-18T00:00:00Z'));
@@ -43,7 +46,7 @@ describe('ProcessingJobRunner', () => {
     let candidate: DerivedSnapshotCandidate | null = null;
     const runtime = {
       getState: () => state,
-      runStructuredTurn: async () => {
+      runStructuredTurn: async (input: { prompt: string }) => {
         call += 1;
         if (call <= 2) return { threadId: 'extract-thread', turnId: `extract-${call}`, output: extraction };
         const observationId = service.store.listAcceptedObservations(personId)[0]!.id;
@@ -68,7 +71,9 @@ describe('ProcessingJobRunner', () => {
           return { threadId: 'derived-thread', turnId: 'derived-2', output: review };
         }
         const bundle = service.buildSystemEvidenceBundle(personId, 'cardiovascular', DEFAULT_AI_PREFERENCES.modelId);
-        if (call === 5) {
+        if (call === 5 || (rejectSystem && call === 6)) {
+          const citedEvidenceId = input.prompt.match(/evidence-[^"\\]+-primary/)?.[0]
+            ?? bundle.directFacts[0]!.evidence.id;
           const systemCandidate: SystemAnalysisCandidate = {
             schemaVersion: 2,
             personId,
@@ -80,7 +85,7 @@ describe('ProcessingJobRunner', () => {
               id: 'point-ldl',
               kind: 'fact_summary',
               text: 'LDL-C 4.2 mmol/L，高于该报告参考上限 3.4。',
-              evidenceIds: [bundle.directFacts[0]!.evidence.id],
+              evidenceIds: [rejectSystem && call === 5 ? 'missing-fact-evidence' : citedEvidenceId],
               limitations: [],
               trendFactIds: []
             }],
@@ -101,13 +106,39 @@ describe('ProcessingJobRunner', () => {
         return { threadId: 'system-thread', turnId: 'system-2', output: review };
       }
     } as unknown as CodexRuntimeManager;
-    await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
-    expect(call).toBe(6);
-    expect(service.store.listStoredJobs()[0]).toMatchObject({ status: 'succeeded', stage: 'publish', completedUnits: 1 });
+    const runner = new ProcessingJobRunner(runtime);
+    await runner.runAvailableJobs(service.store);
+    expect(call).toBe(expectedCalls);
+    expect(service.store.listStoredJobs()[0]).toMatchObject({
+      status: expectedStatus,
+      stage: 'publish',
+      completedUnits: 1,
+      systemOutcomes: expect.arrayContaining([
+        expect.objectContaining({ systemId: 'cardiovascular', status: rejectSystem ? 'rejected' : 'published' }),
+        expect.objectContaining({ systemId: 'endocrine_metabolic', status: 'skipped_no_data' }),
+        expect.objectContaining({ systemId: 'renal_urinary', status: 'out_of_scope' })
+      ])
+    });
     expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);
-    expect(service.store.listSystemAnalysisSnapshots(personId, true)).toHaveLength(1);
+    expect(service.store.listSystemAnalysisSnapshots(personId, true)).toHaveLength(rejectSystem ? 0 : 1);
     expect(service.getSnapshot(state).persons[0]).toMatchObject({ derivedStatus: 'current', acceptedFactCount: 1 });
     expect(service.getSnapshot(state).inbox[0]).toMatchObject({ sentToAi: true, aiTransmissionStatus: 'completed' });
+    if (rejectSystem) {
+      const jobId = service.store.listStoredJobs()[0]!.id;
+      service.store.retryFailedJob(jobId);
+      await runner.runAvailableJobs(service.store);
+      expect(call).toBe(7);
+      expect(service.store.listStoredJobs()[0]).toMatchObject({
+        status: 'succeeded',
+        systemOutcomes: expect.arrayContaining([
+          expect.objectContaining({ systemId: 'cardiovascular', status: 'published' }),
+          expect.objectContaining({ systemId: 'endocrine_metabolic', status: 'skipped_no_data' })
+        ])
+      });
+      expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+      expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);
+      expect(service.store.listSystemAnalysisSnapshots(personId, true)).toHaveLength(1);
+    }
     service.close();
   });
 

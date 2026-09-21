@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
-import type { AccountState, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
+import type { AccountState, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
 import { adoptedActionReceiptSchema, bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, lifestyleProposalDecisionReceiptSchema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
-import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, stableHash, type TrendObservationInput } from '@core';
+import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, stableHash, type TrendObservationInput } from '@core';
 import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
@@ -143,10 +143,10 @@ function historicalTimeForObservation(
 
 function memberEvidence(observation: AcceptedObservationSummary): MemberEvidenceRef {
   return {
-    id: `evidence-${observation.sourceSpanId}`,
+    id: `evidence-${observation.id}-${observation.sourceSpanId}-primary`,
     kind: 'observation',
     observationId: observation.id,
-    eventId: `event-document-${observation.documentId}`,
+    eventId: observation.eventId,
     documentId: observation.documentId,
     sourceSpanId: observation.sourceSpanId,
     knowledgeId: null,
@@ -164,7 +164,7 @@ function memberEvidenceSources(observation: AcceptedObservationSummary): MemberE
     id: `evidence-${observation.id}-${reference.sourceSpanId}-${index}`,
     kind: 'observation',
     observationId: observation.id,
-    eventId: `event-document-${observation.documentId}`,
+    eventId: observation.eventId,
     documentId: observation.documentId,
     sourceSpanId: reference.sourceSpanId,
     knowledgeId: null,
@@ -181,7 +181,34 @@ function memberMapping(observation: AcceptedObservationSummary) {
 }
 
 function memberSystemLinks(observation: AcceptedObservationSummary) {
+  if (observation.originalNameStatus === 'legacy_missing') {
+    return linkLegacyCandidateToSystems(observation.mapping, observation.modelStandardNameCandidate);
+  }
   return linkConceptToSystems(memberMapping(observation));
+}
+
+function memberDisplayName(observation: AcceptedObservationSummary): string {
+  if (observation.originalNameStatus === 'legacy_missing') {
+    return `${observation.modelStandardNameCandidate ?? observation.conceptKey}（旧记录候选名）`;
+  }
+  const mapping = memberMapping(observation);
+  return mapping.status === 'verified'
+    ? mapping.canonicalName ?? observation.originalName
+    : observation.originalName;
+}
+
+function trendMapping(observation: AcceptedObservationSummary) {
+  if (observation.originalNameStatus !== 'legacy_missing') return observation.mapping;
+  const name = observation.modelStandardNameCandidate ?? observation.conceptKey;
+  return {
+    rawName: name,
+    normalizedName: name,
+    conceptId: null,
+    canonicalName: null,
+    status: 'unmapped' as const,
+    confidence: 0,
+    reasons: ['旧记录缺少原始项目名，只按原有候选名精确分组，不做别名合并。']
+  };
 }
 
 function asTrendObservation(observation: AcceptedObservationSummary): TrendObservationInput {
@@ -193,9 +220,11 @@ function asTrendObservation(observation: AcceptedObservationSummary): TrendObser
   return {
     id: observation.id,
     personId: observation.personId,
-    rawName: observation.conceptKey,
-    standardName: observation.conceptKey,
-    resolvedMapping: observation.mapping,
+    rawName: observation.originalNameStatus === 'legacy_missing'
+      ? observation.modelStandardNameCandidate ?? observation.conceptKey
+      : observation.originalName,
+    standardName: observation.modelStandardNameCandidate,
+    resolvedMapping: trendMapping(observation),
     rawText: observation.rawText,
     numericValue: numericValue !== null && Number.isFinite(numericValue) ? numericValue : null,
     comparator: qualifier,
@@ -274,7 +303,7 @@ export class PersonalWorkspaceService {
       })),
       items: observations.map((observation) => ({
         observationId: observation.id,
-        rawName: observation.conceptKey,
+        rawName: observation.originalName,
         displayValue: observation.rawText,
         unit: observation.unit,
         clinicalDate: observation.clinicalDate,
@@ -302,8 +331,10 @@ export class PersonalWorkspaceService {
   }
 
   private currentSystemAnalysis(personId: string, systemId: BodySystemId, observations: AcceptedObservationSummary[]): SystemAnalysisSnapshot | null {
-    const systemSnapshot = this.store.listSystemAnalysisSnapshots(personId, true)
-      .find((item) => item.systemId === systemId);
+    const allSystemSnapshots = this.store.listSystemAnalysisSnapshots(personId, false)
+      .filter((item) => item.systemId === systemId);
+    const systemSnapshot = allSystemSnapshots.find((item) => item.status === 'current')
+      ?? allSystemSnapshots.find((item) => item.status === 'stale');
     if (systemSnapshot) return systemSnapshot;
     const snapshot = this.store.listCurrentDerivedSnapshots().find((item) => item.personId === personId);
     if (!snapshot) return null;
@@ -371,9 +402,10 @@ export class PersonalWorkspaceService {
       const related = observations.filter((observation) => memberSystemLinks(observation).some((link) => link.systemId === registry.id));
       const direct = observations.filter((observation) => memberSystemLinks(observation).some((link) => link.systemId === registry.id && link.relation === 'direct'));
       const attention = direct.filter((observation) => ['high', 'low', 'positive'].includes(observation.abnormalFlag));
-      const relatedConceptIds = new Set(related.map((observation) => memberMapping(observation).conceptId).filter(Boolean));
-      const relatedSeries = series.filter((item) => item.conceptId ? relatedConceptIds.has(item.conceptId) : related.some((observation) => memberMapping(observation).normalizedName === item.name));
+      const relatedObservationIds = new Set(related.map((observation) => observation.id));
+      const relatedSeries = series.filter((item) => item.points.some((point) => relatedObservationIds.has(point.observationId)));
       const analysis = this.currentSystemAnalysis(personId, registry.id, observations);
+      const legacyRelatedCount = related.filter((observation) => observation.originalNameStatus === 'legacy_missing').length;
       const topicCounts = new Map<string, number>();
       for (const observation of related) {
         const mapping = memberMapping(observation);
@@ -384,9 +416,13 @@ export class PersonalWorkspaceService {
         id: registry.id,
         name: registry.name,
         shortName: registry.shortName,
-        status: direct.length === 0 ? 'insufficient' : attention.length > 0 ? 'attention' : 'stable',
+        status: direct.length === 0
+          ? legacyRelatedCount > 0 ? 'building' : 'insufficient'
+          : attention.length > 0 ? 'attention' : 'stable',
         summary: direct.length === 0
-          ? related.length > 0
+          ? legacyRelatedCount > 0
+            ? `已找回 ${legacyRelatedCount} 条旧版记录的身体系统归属；原项目名待重建，暂不判断平稳或异常。`
+            : related.length > 0
             ? `有 ${related.length} 条跨系统关联背景，但还没有本系统的直接记录。`
             : '尚无经过接纳的相关记录。'
           : attention.length > 0
@@ -408,12 +444,15 @@ export class PersonalWorkspaceService {
     const events = this.listHealthEvents(personId);
     const actions = this.store.listActionItems(personId).filter((item) => !['completed', 'dismissed'].includes(item.status));
     const attentionSystems = systems.filter((system) => system.status === 'attention');
+    const legacyObservationCount = observations.filter((item) => item.originalNameStatus === 'legacy_missing').length;
     return memberOverviewV2Schema.parse({
       personId,
       generatedAt: this.now().toISOString(),
-      dataQuality: observations.length === 0 ? 'insufficient' : observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
+      dataQuality: observations.length === 0 ? 'insufficient' : legacyObservationCount > 0 || observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
       headline: observations.length === 0
         ? '还没有可展示的健康事实。'
+        : legacyObservationCount > 0
+          ? `已接纳事实仍完整，其中 ${legacyObservationCount} 条旧记录正在恢复项目名。`
         : attentionSystems.length > 0
           ? `${attentionSystems.map((system) => system.shortName).slice(0, 2).join('、')}有原报告标记需要留意的记录。`
           : '现有报告事实已整理到身体系统中。',
@@ -441,13 +480,10 @@ export class PersonalWorkspaceService {
     const summary = this.listBodySystems(personId).find((item) => item.id === systemId)!;
     const related = observations.filter((observation) => memberSystemLinks(observation).some((link) => link.systemId === systemId));
     const mappings = related.map((observation) => ({ observation, mapping: memberMapping(observation) }));
-    const conceptIds = new Set(mappings.map(({ mapping }) => mapping.conceptId).filter(Boolean));
-    const names = new Set(mappings.map(({ mapping }) => mapping.normalizedName));
-    const metrics = buildMemberMetricSeries(related).filter((metric) => metric.conceptId ? conceptIds.has(metric.conceptId) : names.has(metric.name));
+    const metrics = buildMemberMetricSeries(related);
     const latestByName = new Map<string, AcceptedObservationSummary>();
     for (const observation of related) {
-      const mapping = memberMapping(observation);
-      const name = mapping.canonicalName ?? mapping.normalizedName;
+      const name = memberDisplayName(observation);
       const previous = latestByName.get(name);
       if (!previous || (observation.clinicalDate ?? observation.createdAt) >= (previous.clinicalDate ?? previous.createdAt)) latestByName.set(name, observation);
     }
@@ -491,7 +527,9 @@ export class PersonalWorkspaceService {
       personId,
       systemIds: definition?.systemLinks.map((link) => link.systemId) ?? [...new Set(rows.flatMap((observation) => memberSystemLinks(observation).map((link) => link.systemId)))],
       comparisonConditions: { specimen: first?.specimen ?? null, method: first?.method ?? null, bodySite: first?.bodySite ?? null },
-      aliasesSeen: [...new Set(rows.map((observation) => observation.conceptKey))],
+      aliasesSeen: [...new Set(rows.map((observation) => observation.originalNameStatus === 'legacy_missing'
+        ? `${observation.modelStandardNameCandidate ?? observation.conceptKey}（旧记录候选名）`
+        : observation.originalName))],
       tableRows: series.points
     });
   }
@@ -526,9 +564,18 @@ export class PersonalWorkspaceService {
       const eventPrecision = explicitClinicalTime?.precision as 'year' | 'month' | 'day' | undefined
         ?? (eventDate ? 'day' : 'unknown');
       const systemIds = [...new Set(items.flatMap((item) => memberSystemLinks(item).map((link) => link.systemId)))];
-      const looksLikeCheckup = /体检|健康检查/i.test(first.sourceLabel);
+      const verifiedEventText = reports.map((item) => (
+        item.metadataStatus === 'corrected'
+          ? [item.reportKind, item.title]
+          : [item.extracted?.reportKind?.value, item.extracted?.title?.value]
+      ).filter(Boolean).join(' ')).join(' ');
+      const looksLikeCheckup = /体检|健康检查|健康体检/i.test(verifiedEventText);
       const looksLikeImaging = items.some((item) => /超声|彩超|ct|mr|磁共振|x线|dr|影像/i.test(`${item.method ?? ''}${item.conceptKey}`));
-      const eventType: HealthEventV2['type'] = looksLikeCheckup ? 'checkup' : looksLikeImaging ? 'imaging' : 'laboratory';
+      const eventType: HealthEventV2['type'] = looksLikeCheckup
+        ? 'checkup'
+        : /(影像|超声|彩超|ct|mr|磁共振|x线|dr)/i.test(verifiedEventText)
+          ? 'imaging'
+          : looksLikeImaging && reports.length === 0 ? 'imaging' : 'laboratory';
       const fallbackTitle = eventType === 'checkup'
         ? `${eventDate?.slice(0, 4) ?? '日期待确认'} 年度体检`
         : eventType === 'imaging'
@@ -680,6 +727,16 @@ export class PersonalWorkspaceService {
       byId.set(evidence.id, evidence);
       byId.set(observation.id, evidence);
       byId.set(observation.sourceSpanId, evidence);
+      const legacyEvidenceId = `evidence-${observation.sourceSpanId}`;
+      if (!byId.has(legacyEvidenceId)) {
+        byId.set(legacyEvidenceId, {
+          ...evidence,
+          id: legacyEvidenceId,
+          kind: 'source_span',
+          observationId: null,
+          label: `${observation.sourceLabel}（旧版页面级依据）`
+        });
+      }
       for (const source of memberEvidenceSources(observation)) {
         byId.set(source.id, source);
         if (source.sourceSpanId) byId.set(source.sourceSpanId, source);
@@ -702,7 +759,10 @@ export class PersonalWorkspaceService {
     const useMaterializedPlan = storedProposals.length > 0 || storedAdoptions.length > 0;
     const legacyActions = useMaterializedPlan ? [] : this.store.listActionItems(personId);
     const proposalSchema = lifestylePlanV2Schema.shape.proposals.element;
+    let legacyProjectionUsed = false;
     const legacyProposals = useMaterializedPlan ? [] : (derived?.payload.lifestyleGuidance ?? []).flatMap((guidance) => {
+      const evidenceObservations = guidance.evidenceObservationIds?.map((id) => byId.get(id))
+        .filter((item): item is AcceptedObservationSummary => Boolean(item)) ?? [];
       const parsed = proposalSchema.safeParse({
         id: guidance.id,
         category: guidance.category,
@@ -718,16 +778,52 @@ export class PersonalWorkspaceService {
         uncertainties: guidance.uncertainties,
         consultProfessional: guidance.consultProfessional,
         status: 'proposed' as const,
-        evidence: guidance.evidenceObservationIds?.map((id) => byId.get(id)).filter((item): item is AcceptedObservationSummary => Boolean(item)).map(memberEvidence) ?? [],
+        evidence: evidenceObservations.map(memberEvidence),
         generalKnowledgeEvidence: guidance.generalKnowledgeEvidence,
         sourceKind: guidance.sourceKind,
         relatedSystemIds: guidance.relatedSystemIds
       });
-      return parsed.success ? [parsed.data] : [];
+      if (parsed.success) return [parsed.data];
+
+      // v1/v2 快照可能只有标题和一段说明。保留它们供人阅读，
+      // 但明确标为 stale，且不允许直接采纳成行动。
+      const title = typeof guidance.title === 'string' ? guidance.title.trim() : '';
+      const detail = typeof guidance.detail === 'string' ? guidance.detail.trim() : '';
+      if (!title || !detail) return [];
+      const legacyCategory = String(guidance.category ?? '').toLocaleLowerCase('zh-CN');
+      const category = /exercise|activity|运动|活动/.test(legacyCategory) ? 'exercise'
+        : /diet|nutrition|饮食|营养/.test(legacyCategory) ? 'diet'
+          : /sleep|睡眠|作息/.test(legacyCategory) ? 'sleep'
+            : /monitor|记录|监测/.test(legacyCategory) ? 'monitoring'
+              : /review|check|复查|就医/.test(legacyCategory) ? 'review'
+                : 'other';
+      const fallback = proposalSchema.safeParse({
+        id: guidance.id,
+        category,
+        title,
+        goal: title,
+        rationale: detail,
+        detail,
+        steps: [detail],
+        startingOptions: ['先保留为参考，等待新版复核后再决定是否采纳'],
+        scheduleSuggestion: null,
+        trackingSuggestion: '当前为旧版建议，重新复核前不自动创建跟进行动。',
+        constraints: ['旧版记录缺少新版所需的适用边界，不能直接采纳为行动。'],
+        uncertainties: ['尚未按当前提示词和安全规则重新复核。'],
+        consultProfessional: Boolean(guidance.consultProfessional),
+        status: 'proposed' as const,
+        evidence: evidenceObservations.map(memberEvidence),
+        generalKnowledgeEvidence: [],
+        sourceKind: 'ai_proposed' as const,
+        relatedSystemIds: [...new Set(evidenceObservations.flatMap((observation) => memberSystemLinks(observation).map((link) => link.systemId)))]
+      });
+      if (!fallback.success) return [];
+      legacyProjectionUsed = true;
+      return [fallback.data];
     });
     return lifestylePlanV2Schema.parse({
       personId,
-      status: derived?.status ?? 'unavailable',
+      status: legacyProjectionUsed ? 'stale' : derived?.status ?? 'unavailable',
       dataQuality: derived?.payload.dataQuality ?? (observations.length > 0 ? 'partial' : 'insufficient'),
       updatedAt: storedProposals[0]?.updatedAt ?? storedAdoptions[0]?.updatedAt ?? derived?.createdAt ?? null,
       priorities: derived?.payload.claims.filter((claim) => claim.level === 'action').slice(0, 3).map((claim) => ({
@@ -781,7 +877,7 @@ export class PersonalWorkspaceService {
           plannedTime: action.dueText,
           owner: '本人',
           progressNote: null,
-          status: action.status === 'proposed' || action.status === 'discussed' ? 'planned' : action.status === 'completed' ? 'completed' : action.status === 'dismissed' ? 'dismissed' : 'in_progress',
+          status: action.status,
           dueDate: action.dueDate,
           updatedAt: action.updatedAt
         }))
@@ -914,7 +1010,9 @@ export class PersonalWorkspaceService {
       });
       const firstEvidence = candidate.evidence[0]!;
       return {
-        conceptKey: candidate.standardNameCandidate ?? candidate.originalName,
+        conceptKey: candidate.originalName,
+        originalName: candidate.originalName,
+        modelStandardNameCandidate: candidate.standardNameCandidate,
         rawText: candidate.value.rawText ?? '',
         valueKind: candidate.value.kind,
         decimalValue: candidate.value.kind === 'numeric' ? candidate.value.decimal : null,
@@ -948,7 +1046,7 @@ export class PersonalWorkspaceService {
     });
   }
 
-  updateActionStatus(input: { actionId: string; status: 'proposed' | 'discussed' | 'planned' | 'completed' | 'dismissed'; expectedRevision: number }) {
+  updateActionStatus(input: { actionId: string; status: ActionStatus; expectedRevision: number }) {
     return this.store.updateActionStatus(input);
   }
 
@@ -1239,6 +1337,7 @@ export class PersonalWorkspaceService {
       .filter((observation) => activePersonIds.has(observation.personId));
     const derivedByPerson = new Map(this.store.listCurrentDerivedSnapshots().map((snapshot) => [snapshot.personId, snapshot]));
     const latestDerivedByPerson = new Map(this.store.listLatestDerivedSnapshots().map((snapshot) => [snapshot.personId, snapshot]));
+    const allActions = this.store.listActionItems();
     const persons = storedPersons.filter((person) => person.archivedAt === null).map((person) => {
       const documentCount = counts.get(person.id) ?? 0;
       const pendingCount = imported.filter((document) => document.personId === person.id && document.status === 'queued' && !processingDocumentIds.has(document.id)).length;
@@ -1247,6 +1346,9 @@ export class PersonalWorkspaceService {
       const attentionCount = stats.attentionCount;
       const lastDocumentDate = stats.latestClinicalDate;
       const derived = latestDerivedByPerson.get(person.id);
+      const systemAnalyses = this.store.listSystemAnalysisSnapshots(person.id, false);
+      const proposals = this.store.listLifestyleProposals(person.id);
+      const personActions = allActions.filter((action) => action.personId === person.id);
       return {
         id: person.id,
         displayName: person.displayName,
@@ -1269,6 +1371,15 @@ export class PersonalWorkspaceService {
             : documentCount > 0 ? '资料已安全保存在本机，尚未形成健康结论' : '可以先添加一份体检或门诊资料'),
         derivedStatus: derived?.status ?? 'unavailable' as const,
         assessmentSummary: derived?.status === 'current' ? derived.payload.claims[0]?.explanation ?? null : null,
+        dataRevision: stableHash({
+          factRevision: this.store.getFactRevision(person.id),
+          clinicalContextRevision: person.clinicalContextRevision,
+          displayRevision: person.displayRevision,
+          derived: derived ? { id: derived.id, status: derived.status, createdAt: derived.createdAt } : null,
+          systemAnalyses: systemAnalyses.map((analysis) => ({ id: analysis.id, status: analysis.status, generatedAt: analysis.generatedAt })),
+          proposals: proposals.map((proposal) => ({ id: proposal.id, status: proposal.status, version: proposal.version, updatedAt: proposal.updatedAt })),
+          actions: personActions.map((action) => ({ id: action.id, userRevision: action.userRevision, status: action.status }))
+        }),
         displayRevision: person.displayRevision,
         clinicalContextRevision: person.clinicalContextRevision
       };
@@ -1470,7 +1581,7 @@ export class PersonalWorkspaceService {
           statusText: superseded ? '已有较新的处理任务，请使用上方任务继续' : job.statusText,
           canCancel: !superseded && ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status)
             && job.statusText !== '正在安全停止',
-          canRetry: !superseded && job.status === 'failed'
+          canRetry: !superseded && ['failed', 'completed_with_issues'].includes(job.status)
         };
       }),
       reviews,

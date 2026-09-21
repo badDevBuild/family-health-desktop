@@ -425,11 +425,12 @@ describe('DocumentExtractionPipeline', () => {
     expect(service.store.getFactRevision(personId)).toBe(1);
     expect(service.getSnapshot(null).inbox[0]).toMatchObject({ status: 'completed' });
     expect(service.store.listAcceptedObservations(personId)[0]).toMatchObject({
-      conceptKey: 'LDL-C', clinicalDate: '2026-09-17', abnormalFlag: 'high', documentId
+      conceptKey: '低密度脂蛋白胆固醇', originalName: '低密度脂蛋白胆固醇',
+      modelStandardNameCandidate: 'LDL-C', clinicalDate: '2026-09-17', abnormalFlag: 'high', documentId
     });
     expect(service.getSnapshot(null)).toMatchObject({
       persons: [expect.objectContaining({ id: personId, attentionCount: 1, lastDocumentDate: '2026-09-17' })],
-      trends: [expect.objectContaining({ personId, name: 'LDL-C', points: [expect.objectContaining({ numericValue: 4.2, referenceHigh: 3.4, abnormalFlag: 'high' })] })],
+      trends: [expect.objectContaining({ personId, name: '低密度脂蛋白胆固醇', points: [expect.objectContaining({ numericValue: 4.2, referenceHigh: 3.4, abnormalFlag: 'high' })] })],
       timeline: [expect.objectContaining({ personId, type: 'health_report', date: '2026-09-17', documentId })]
     });
     service.close();
@@ -1140,7 +1141,10 @@ describe('DocumentExtractionPipeline', () => {
 
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
     expect(service.store.listAcceptedObservations(personId)).toEqual([
-      expect.objectContaining({ conceptKey: 'Height', decimalValue: '187', clinicalDate: '2023-10-08' })
+      expect.objectContaining({
+        conceptKey: '身高', originalName: '身高', modelStandardNameCandidate: 'Height',
+        decimalValue: '187', clinicalDate: '2023-10-08'
+      })
     ]);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();

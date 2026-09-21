@@ -34,6 +34,9 @@ describe('成员档案 v2 的术语与身体系统规则', () => {
     });
     expect(selectContextSystems({ kind: 'goal', text: '希望更有规律地生活', structuredFields: {} })).toEqual({ systemIds: [], basis: 'unscoped' });
     expect(selectContextSystems({ kind: 'constraint', text: '近期时间有限', structuredFields: {} }).systemIds).toHaveLength(12);
+    expect(selectContextSystems({ kind: 'constraint', text: '膝关节不适，不能长时间走路', structuredFields: {} })).toMatchObject({
+      basis: 'global_safety', systemIds: expect.arrayContaining(['cardiovascular', 'musculoskeletal'])
+    });
     expect(selectContextSystems({ kind: 'free_text', text: '一条不能安全缩小范围的补充', structuredFields: { systemIds: 'renal_urinary;cardiovascular' } })).toEqual({
       systemIds: ['renal_urinary', 'cardiovascular'], basis: 'explicit'
     });
@@ -74,6 +77,63 @@ describe('成员档案 v2 的确定性趋势规则', () => {
     const facts = buildMetricSeries(two)[0]!.trendFacts;
     expect(facts.direction).toBe('insufficient');
     expect(facts.statement).toContain('不足以判断长期趋势');
+  });
+
+  it('先升后降不会被统一阈值误写为连续上升', () => {
+    const base = asTrendInput(cardiovascularLongitudinalFixture[0]);
+    const rows: TrendObservationInput[] = [100, 106, 104].map((value, index) => ({
+      ...base,
+      id: `non-monotonic-${index}`,
+      rawText: String(value),
+      numericValue: value,
+      clinicalDate: `${2022 + index}-01-01`,
+      abnormalFlag: 'unknown'
+    }));
+    const facts = buildMetricSeries(rows)[0]!.trendFacts;
+    expect(facts).toMatchObject({
+      direction: 'fluctuating', latestChange: -2,
+      segmentDirections: ['up', 'down'], referenceBoundaryCrossings: 0
+    });
+    expect(facts.statement).toContain('有升有降');
+  });
+
+  it('量纲概念缺少单位时不标为无条件可比', () => {
+    const rows = cardiovascularLongitudinalFixture.slice(0, 2).map((item, index) => ({
+      ...asTrendInput(item), id: `missing-unit-${index}`, unit: null
+    }));
+    const result = buildMetricSeries(rows)[0]!;
+    expect(result.trendFacts.status).toBe('not_comparable');
+    expect(result.points[0]!.comparabilityReasons).toContain('unit_unknown_for_dimensional_concept');
+  });
+
+  it('报告标记从偏高变成未知不算参考边界跨越', () => {
+    const base = asTrendInput(cardiovascularLongitudinalFixture[0]);
+    const rows: TrendObservationInput[] = [
+      { ...base, id: 'flag-high', rawText: '4', numericValue: 4, abnormalFlag: 'high', clinicalDate: '2025-01-01', referenceLow: null, referenceHigh: null },
+      { ...base, id: 'flag-unknown', rawText: '4', numericValue: 4, abnormalFlag: 'unknown', clinicalDate: '2026-01-01', referenceLow: null, referenceHigh: null }
+    ];
+    expect(buildMetricSeries(rows)[0]!.trendFacts).toMatchObject({
+      referenceBoundaryCrossings: 0,
+      reportedFlagChanges: 0
+    });
+  });
+
+  it('未验证概念候选不使用标准 conceptId 合并趋势', () => {
+    const proposed = mapConcept({ rawName: 'LDL', standardName: 'LDL-C', unit: 'g/L', specimen: '血清' });
+    expect(proposed.status).toBe('proposed');
+    const row = { ...asTrendInput(cardiovascularLongitudinalFixture[0]), rawName: 'LDL', standardName: 'LDL-C', unit: 'g/L', resolvedMapping: proposed };
+    expect(buildMetricSeries([row])[0]).toMatchObject({ conceptId: null, name: 'LDL', mappingStatus: 'proposed' });
+  });
+
+  it('仅模型候选名命中词典时仍需核实，不当成已验证概念', () => {
+    const proposed = mapConcept({
+      rawName: '原项目名待核实（旧记录）',
+      standardName: '空腹血糖',
+      unit: 'mmol/L',
+      specimen: '血清'
+    });
+    expect(proposed).toMatchObject({ conceptId: 'metabolic-fasting-glucose', status: 'proposed' });
+    expect(linkConceptToSystems(proposed)).toEqual([]);
   });
 
   it('不把带比较符的边界值当成精确点', () => {

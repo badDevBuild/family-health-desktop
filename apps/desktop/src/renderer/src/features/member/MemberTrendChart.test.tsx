@@ -62,6 +62,9 @@ function series(points: TrendPointV2[]): MetricSeriesSummary {
       latestValue: 4,
       absoluteChange: 1,
       relativeChangePercent: 33.3,
+      latestChange: 0.5,
+      segmentDirections: ['up', 'up'],
+      reportedFlagChanges: 1,
       referenceBoundaryCrossings: 1,
       reasons: ['相同单位与检测条件'],
       statement: '三个可比时间点显示数值上升。'
@@ -84,11 +87,22 @@ describe('MemberTrendChart', () => {
     const positions = circles.map((circle) => Number(circle.getAttribute('cx')));
     expect(positions).toHaveLength(3);
     expect(positions[1]! - positions[0]!).toBeLessThan((positions[2]! - positions[1]!) / 5);
-    expect(screen.getByLabelText('低密度脂蛋白胆固醇按真实日期间距绘制的趋势图')).toBeTruthy();
+    expect(screen.getByLabelText(/低密度脂蛋白胆固醇按真实日期间距绘制的趋势图/)).toBeTruthy();
   });
 
   it('界限值只保留在表格语义中，不伪装成精确趋势点', () => {
     render(<MemberTrendChart series={series([point('bounded', '2026-01-01', 0.1, 'lt')])} />);
     expect(screen.getByText(/带“< \/ >”的结果会保留在表格中/)).toBeTruthy();
+  });
+
+  it('精确值之间出现界限值时打断折线', () => {
+    const { container } = render(<MemberTrendChart series={series([
+      point('before', '2026-01-01', 3),
+      point('bounded-middle', '2026-01-02', 3.5, 'lt'),
+      point('after', '2026-01-03', 4)
+    ])} />);
+    expect(container.querySelectorAll('path.trend-data-line')).toHaveLength(0);
+    expect(screen.getByLabelText(/2026-01-01，3 mmol\/L/)).toBeTruthy();
+    expect(screen.getByLabelText(/2026-01-03，4 mmol\/L/)).toBeTruthy();
   });
 });

@@ -1095,7 +1095,11 @@ function candidateToObservation(candidate: ObservationCandidate, acceptanceId: s
     ? candidate.value.comparator
     : candidate.value.kind === 'qualitative' ? candidate.value.category : null;
   return {
-    conceptKey: candidate.standardNameCandidate ?? candidate.originalName,
+    // conceptKey 暂作旧读模型的展示键；原始名与模型候选必须分开持久化。
+    // 候选名不得反向改写报告原文。
+    conceptKey: candidate.originalName,
+    originalName: candidate.originalName,
+    modelStandardNameCandidate: candidate.standardNameCandidate,
     rawText: candidate.value.rawText ?? '',
     valueKind: candidate.value.kind,
     decimalValue,

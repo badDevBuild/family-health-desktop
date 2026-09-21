@@ -54,8 +54,8 @@ function candidateIssues(candidate: SystemAnalysisCandidate, bundle: SystemEvide
     issues.push('scope_mismatch');
   }
   const evidenceIds = new Set([
-    ...bundle.directFacts.map((fact) => fact.evidence.id),
-    ...bundle.contextFacts.map((fact) => fact.evidence.id),
+    ...bundle.directFacts.flatMap((fact) => [fact.evidence.id, ...fact.evidenceSources.map((item) => item.id)]),
+    ...bundle.contextFacts.flatMap((fact) => [fact.evidence.id, ...fact.evidenceSources.map((item) => item.id)]),
     ...bundle.personalContext.map((context) => context.id)
   ]);
   const trendIds = new Set(bundle.trends.map((trend) => trend.id));
@@ -105,8 +105,8 @@ function reviewIssues(candidate: SystemAnalysisCandidate, review: SystemAnalysis
 
 function evidenceResolver(bundle: SystemEvidenceBundle): Map<string, MemberEvidenceRef> {
   const entries: Array<[string, MemberEvidenceRef]> = [
-    ...bundle.directFacts.map((fact): [string, MemberEvidenceRef] => [fact.evidence.id, fact.evidence]),
-    ...bundle.contextFacts.map((fact): [string, MemberEvidenceRef] => [fact.evidence.id, fact.evidence]),
+    ...bundle.directFacts.flatMap((fact): Array<[string, MemberEvidenceRef]> => [fact.evidence, ...fact.evidenceSources].map((item) => [item.id, item])),
+    ...bundle.contextFacts.flatMap((fact): Array<[string, MemberEvidenceRef]> => [fact.evidence, ...fact.evidenceSources].map((item) => [item.id, item])),
     ...bundle.personalContext.map((context): [string, MemberEvidenceRef] => [context.id, {
       id: context.id,
       kind: 'user_note',
@@ -120,7 +120,17 @@ function evidenceResolver(bundle: SystemEvidenceBundle): Map<string, MemberEvide
       quote: context.text
     }])
   ];
-  return new Map(entries);
+  const resolver = new Map<string, MemberEvidenceRef>();
+  for (const [id, evidence] of entries) {
+    const existing = resolver.get(id);
+    if (existing && (existing.observationId !== evidence.observationId
+      || existing.sourceSpanId !== evidence.sourceSpanId
+      || existing.kind !== evidence.kind)) {
+      throw new Error(`SYSTEM_EVIDENCE_ID_COLLISION:${id}`);
+    }
+    resolver.set(id, evidence);
+  }
+  return resolver;
 }
 
 function materializeSnapshot(

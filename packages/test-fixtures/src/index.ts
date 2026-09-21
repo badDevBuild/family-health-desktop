@@ -46,6 +46,7 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
         changeSummary: '新增一次年度体检，血脂与肝功能有变化',
         derivedStatus: 'current',
         assessmentSummary: '最近资料里，最值得留意的是血脂变化',
+        dataRevision: '1111111111111111111111111111111111111111111111111111111111111111',
         displayRevision: 1,
         clinicalContextRevision: 2
       },
@@ -65,6 +66,7 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
         changeSummary: '有一份报告等待确认所属成员',
         derivedStatus: 'current',
         assessmentSummary: '已有报告事实和经过复核的说明',
+        dataRevision: '2222222222222222222222222222222222222222222222222222222222222222',
         displayRevision: 1,
         clinicalContextRevision: 1
       },
@@ -84,6 +86,7 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
         changeSummary: '本次没有新增资料',
         derivedStatus: 'current',
         assessmentSummary: '现有资料没有新的派生说明',
+        dataRevision: '3333333333333333333333333333333333333333333333333333333333333333',
         displayRevision: 1,
         clinicalContextRevision: 0
       }
@@ -138,9 +141,9 @@ export function createDemoSnapshot(now = new Date('2026-09-17T10:30:00+08:00')):
       { id: 'inbox-4', displayName: '2025年度体检副本.pdf', discoveredAt: '2026-09-16T06:30:00+00:00', personId: 'person-lin-ming', personLabel: '林明', status: 'duplicate', format: 'PDF · 10 页', sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: '内容与已保存资料相同，未重复处理' }
     ],
     jobs: [
-      { id: 'job-1', batchLabel: '今天 09:40 手动处理', personLabel: '林明', stage: 'review_facts', status: 'running', completedUnits: 4, totalUnits: 10, statusText: '正在核对第 5 页，共 10 页', updatedAt: '2026-09-17T02:30:00+00:00', canCancel: true, canRetry: false },
-      { id: 'job-2', batchLabel: '昨天 20:00 自动批次', personLabel: '周岚', stage: 'publish', status: 'succeeded', completedUnits: 8, totalUnits: 8, statusText: '已保存资料并更新说明', updatedAt: '2026-09-16T12:18:00+00:00', canCancel: false, canRetry: false },
-      { id: 'job-3', batchLabel: '9 月 15 日自动批次', personLabel: null, stage: 'identify', status: 'waiting_user', completedUnits: 1, totalUnits: 2, statusText: '等待确认所属成员', updatedAt: '2026-09-15T12:06:00+00:00', canCancel: true, canRetry: false }
+      { id: 'job-1', batchLabel: '今天 09:40 手动处理', personLabel: '林明', stage: 'review_facts', status: 'running', completedUnits: 4, totalUnits: 10, statusText: '正在核对第 5 页，共 10 页', systemOutcomes: [], updatedAt: '2026-09-17T02:30:00+00:00', canCancel: true, canRetry: false },
+      { id: 'job-2', batchLabel: '昨天 20:00 自动批次', personLabel: '周岚', stage: 'publish', status: 'succeeded', completedUnits: 8, totalUnits: 8, statusText: '已保存资料并更新说明', systemOutcomes: [], updatedAt: '2026-09-16T12:18:00+00:00', canCancel: false, canRetry: false },
+      { id: 'job-3', batchLabel: '9 月 15 日自动批次', personLabel: null, stage: 'identify', status: 'waiting_user', completedUnits: 1, totalUnits: 2, statusText: '等待确认所属成员', systemOutcomes: [], updatedAt: '2026-09-15T12:06:00+00:00', canCancel: true, canRetry: false }
     ],
     reviews: [
       { id: 'review-1', personId: null, documentId: 'document-inbox-3', kind: 'person_conflict', severity: 'blocking', title: '确认门诊报告属于谁', description: '报告里的姓名与文件夹信息不能唯一匹配。确认之前不会把内容写入任何成员档案。', evidenceRefs: ['span-docx-heading'], candidateOptions: [], candidateDiffs: [], reportedName: null, reasonCodes: [], resolutionStatus: 'open' }

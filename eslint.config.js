@@ -12,7 +12,8 @@ export default tseslint.config(
       'schemas/codex/**',
       'family-health-desktop-review-evidence-*/**',
       'fhd-review-*/**',
-      'fhd-rereview-*/**'
+      'fhd-rereview-*/**',
+      'review-*/**'
     ]
   },
   js.configs.recommended,

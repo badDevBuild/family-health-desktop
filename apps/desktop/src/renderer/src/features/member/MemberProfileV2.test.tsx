@@ -46,6 +46,42 @@ describe('MemberProfileV2 event organization', () => {
     expect(systemAnalysisHeading('需要留意的血脂记录', [{ text: 'LDL-C 在原报告中标为偏高' }])).toBe('需要留意的血脂记录');
   });
 
+  it('辅助读模型失败时仍展示核心档案，无关快照刷新不重置页面', async () => {
+    const snapshot = createDemoSnapshot() as DashboardSnapshot;
+    snapshot.workspaceMode = 'personal';
+    snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
+    const overview: MemberOverviewV2 = {
+      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '核心档案仍可读',
+      latestClinicalDate: null, acceptedFactCount: 0, eventCount: 0,
+      attentionSystemIds: [], systems: [], recentChanges: [], nextActions: []
+    };
+    const getMemberOverview = vi.fn(async () => ({ ok: true as const, data: overview }));
+    const listBodySystems = vi.fn(async () => ({ ok: true as const, data: [] }));
+    const listHealthEvents = vi.fn(async () => ({ ok: true as const, data: [] }));
+    window.healthDesktop = {
+      getMemberOverview,
+      listBodySystems,
+      listHealthEvents,
+      getLifestylePlan: vi.fn(async () => { throw new Error('PLAN_TEMPORARILY_UNAVAILABLE'); }),
+      getConceptReview: vi.fn(async () => { throw new Error('CONCEPT_TEMPORARILY_UNAVAILABLE'); })
+    } as unknown as HealthDesktopBridge;
+    const commonProps = {
+      onSelectPerson: vi.fn(), onOpenEvidence: vi.fn(), onAddPerson: vi.fn(), onEditPerson: vi.fn(),
+      onArchivedPeople: vi.fn(), onAddNote: vi.fn(), onExport: vi.fn(), onImport: vi.fn(),
+      onExcludeDocument: vi.fn(), onReincludeDocument: vi.fn(), onDeleteDocument: vi.fn(), onDeletedDocuments: vi.fn()
+    };
+    const view = render(<MemberProfileV2 snapshot={snapshot} person={snapshot.persons[0]!} {...commonProps} />);
+    expect(await screen.findByRole('heading', { name: '核心档案仍可读' })).toBeTruthy();
+    expect(screen.getByText('部分辅助内容暂时未读取')).toBeTruthy();
+    expect(screen.queryByText('暂时无法打开新版成员档案')).toBeNull();
+
+    const backgroundSnapshot = { ...snapshot, generatedAt: '2026-09-21T00:05:00.000Z' };
+    view.rerender(<MemberProfileV2 snapshot={backgroundSnapshot} person={backgroundSnapshot.persons[0]!} {...commonProps} />);
+    await waitFor(() => expect(getMemberOverview).toHaveBeenCalledTimes(1));
+    expect(listBodySystems).toHaveBeenCalledTimes(1);
+    expect(listHealthEvents).toHaveBeenCalledTimes(1);
+  });
+
   it('用白话说明分组规则，并允许把另一事件合并到当前事件', async () => {
     const snapshot = createDemoSnapshot() as DashboardSnapshot;
     snapshot.workspaceMode = 'personal';
@@ -159,7 +195,7 @@ describe('MemberProfileV2 event organization', () => {
         constraints: ['如出现不适就停止'], uncertainties: ['当前活动能力未记录'], consultProfessional: true,
         status: 'proposed',
         evidence: [{ id: 'observation-1', kind: 'observation', observationId: 'observation-1', eventId: null, knowledgeId: null, label: '体重 91 kg', quote: '体重 91 kg', locator: '第 1 页', sourceSpanId: 'span-1', documentId: 'document-1' }],
-        generalKnowledgeEvidence: [{ id: 'knowledge-1', sourceTitle: '身体活动指南', sourceOrganization: '世界卫生组织', sourceUrl: 'https://www.who.int/example', reviewedAt: '2026-09-21', supportedScope: '逐步增加日常活动' }],
+        generalKnowledgeEvidence: [{ id: 'knowledge-1', sourceTitle: '身体活动指南', sourceOrganization: '世界卫生组织', sourceUrl: 'https://www.who.int/example', reviewedAt: '2026-09-21', supportedScope: '逐步增加日常活动', verificationStatus: 'unverified_model_candidate' }],
         sourceKind: 'ai_proposed', relatedSystemIds: ['cardiovascular']
       }],
       adoptedActions: []
@@ -213,5 +249,46 @@ describe('MemberProfileV2 event organization', () => {
       progressNote: '先观察膝盖感受', dueDate: null
     }));
     expect(await screen.findByText(/先观察膝盖感受/)).toBeTruthy();
+  });
+
+  it('旧版生活建议恢复显示时说清待复核，且不提供采纳或忽略操作', async () => {
+    const snapshot = createDemoSnapshot() as DashboardSnapshot;
+    snapshot.workspaceMode = 'personal';
+    snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
+    const overview: MemberOverviewV2 = {
+      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '旧记录恢复中',
+      latestClinicalDate: '2026-09-11', acceptedFactCount: 1, eventCount: 1,
+      attentionSystemIds: [], systems: [], recentChanges: [], nextActions: []
+    };
+    const plan: LifestylePlanV2 = {
+      personId: 'person-1', status: 'stale', dataQuality: 'partial', updatedAt: now, priorities: [],
+      proposals: [{
+        id: 'legacy-proposal', category: 'diet', title: '旧版饮食建议', goal: '旧版饮食建议',
+        rationale: '这是升级前已保存的内容。', detail: '保留原内容供阅读。', steps: ['保留原内容供阅读。'],
+        startingOptions: ['等待新版复核'], scheduleSuggestion: null, trackingSuggestion: '暂不创建跟进行动。',
+        constraints: ['不能直接采纳。'], uncertainties: ['尚未按新规则复核。'], consultProfessional: false,
+        status: 'proposed', evidence: [], generalKnowledgeEvidence: [], sourceKind: 'ai_proposed', relatedSystemIds: []
+      }],
+      adoptedActions: []
+    };
+    window.healthDesktop = {
+      getMemberOverview: async () => ({ ok: true, data: overview }),
+      listBodySystems: async () => ({ ok: true, data: [] }),
+      listHealthEvents: async () => ({ ok: true, data: [] }),
+      getLifestylePlan: async () => ({ ok: true, data: plan }),
+      getConceptReview: async () => ({ ok: true, data: { personId: 'person-1', dictionaryVersion: 'test', catalog: [], items: [] } })
+    } as unknown as HealthDesktopBridge;
+
+    render(<MemberProfileV2
+      snapshot={snapshot} person={snapshot.persons[0]!}
+      onSelectPerson={vi.fn()} onOpenEvidence={vi.fn()} onAddPerson={vi.fn()} onEditPerson={vi.fn()}
+      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()}
+      onExcludeDocument={vi.fn()} onReincludeDocument={vi.fn()} onDeleteDocument={vi.fn()} onDeletedDocuments={vi.fn()}
+    />);
+    fireEvent.click(await screen.findByRole('tab', { name: '生活与行动' }));
+    expect(await screen.findByText('旧版建议已恢复展示')).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '旧版饮食建议' })).toBeTruthy();
+    expect((screen.getByRole('button', { name: '等待重新核对' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: '暂不采纳' })).toBeNull();
   });
 });
