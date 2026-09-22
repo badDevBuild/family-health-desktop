@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
+import { createSyntheticTwoPageScannedPdf } from '../../../../packages/evaluation/src/scanned-pdf-fixture.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
 import { compareIndependentExtractions, DocumentExtractionPipeline, mergeIndependentlyConfirmedEvidence, partitionPdfSpans, partitionSourceSpans, scopeCandidateKeys } from './processing-pipeline.js';
 
@@ -346,6 +347,56 @@ describe('DocumentExtractionPipeline', () => {
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
     expect(observedPaths).toHaveLength(1);
     expect(existsSync(observedPaths[0]!)).toBe(false);
+    service.close();
+  });
+
+  it('双页无文字层 PDF 一次传入两页，跨页日期与各页来源均可接纳', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-two-page-scan-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '双页扫描工作区', () => new Date('2026-09-22T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
+    const receipt = await service.importFiles([{
+      path: '/tmp/纯合成双页扫描件.pdf', bytes: createSyntheticTwoPageScannedPdf()
+    }], personId);
+    expect(receipt.rejected).toEqual([]);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
+    expect(spans.map((span) => [span.page, span.quote])).toEqual([[1, null], [2, null]]);
+    const candidates = [
+      { localKey: 'ldl', originalName: '低密度脂蛋白胆固醇 LDL-C', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric' as const, rawText: '4.2', decimal: '4.2', comparator: 'eq' as const },
+        unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4 mmol/L', reportedAbnormalFlag: '偏高',
+        specimen: null, method: null, bodySite: null, clinicalDate: '2025-06-10',
+        evidence: [{ sourceSpanId: spans[0]!.id, quote: null }], issues: [] },
+      { localKey: 'glucose', originalName: '空腹血糖', standardNameCandidate: '空腹血糖',
+        value: { kind: 'numeric' as const, rawText: '5.1', decimal: '5.1', comparator: 'eq' as const },
+        unitRaw: 'mmol/L', referenceRangeRaw: '3.9-6.1 mmol/L', reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2025-06-10',
+        evidence: [{ sourceSpanId: spans[1]!.id, quote: null }], issues: [] }
+    ];
+    let turns = 0;
+    const observedPaths: string[] = [];
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        turns += 1;
+        expect(input.allowWebSearch).toBe(false);
+        expect(input.imagePaths).toHaveLength(2);
+        expect(input.imagePaths?.every((path) => existsSync(path))).toBe(true);
+        expect(input.prompt).toContain(spans[0]!.id);
+        expect(input.prompt).toContain(spans[1]!.id);
+        observedPaths.push(...input.imagePaths!);
+        return { threadId: 'two-page-scan', turnId: 'two-page-scan', output: {
+          schemaVersion: 1, documentId,
+          subject: { reportedName: '合成成员', evidence: [{ sourceSpanId: spans[0]!.id, quote: null }], confidence: 'explicit' },
+          coveredSourceSpanIds: spans.map((span) => span.id), candidates
+        } satisfies ExtractionResult };
+      }
+    });
+    expect(await pipeline.process(documentId)).toMatchObject({ status: 'published', candidateCount: 2 });
+    expect(turns).toBe(1);
+    expect(observedPaths.every((path) => !existsSync(path))).toBe(true);
+    expect(service.store.listAcceptedObservations(personId).map((fact) => [fact.rawText, fact.clinicalDate]))
+      .toEqual(expect.arrayContaining([['4.2', '2025-06-10'], ['5.1', '2025-06-10']]));
     service.close();
   });
 

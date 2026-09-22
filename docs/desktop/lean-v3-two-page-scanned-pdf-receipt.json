@@ -1,0 +1,26 @@
+{
+  "kind": "TWO_PAGE_SCANNED_PDF_SYNTHETIC_SUMMARY",
+  "syntheticOnly": true,
+  "sourceSha256": "c6cca92555d0179326bf943817c74d585c24164f73ee2932992a60c5cd122cb5",
+  "sourcePages": 2,
+  "textLayerPages": 0,
+  "model": "gpt-5.6-sol",
+  "reasoningEffort": "medium",
+  "webSearchAllowed": false,
+  "turns": [
+    { "stage": "P01", "imageCount": 2, "durationMs": 62492, "webSearches": 0 },
+    { "stage": "P02", "imageCount": 0, "durationMs": 175101, "webSearches": 0 }
+  ],
+  "extraction": {
+    "status": "published",
+    "acceptedFactCount": 3,
+    "ldl": { "value": "4.2", "unit": "mmol/L", "clinicalDate": "2025-06-10", "sourcePage": 1, "quote": null },
+    "fastingGlucose": { "value": "5.1", "unit": "mmol/L", "clinicalDate": "2025-06-10", "sourcePage": 2, "quote": null }
+  },
+  "assessment": { "status": "published", "claimCount": 5, "actionCount": 2 },
+  "limitations": [
+    "仅一份纯合成双页扫描报告，不代表真实报告准确率",
+    "运行中关闭 Web Search，不能证明正式联网隐私门禁 E09 通过",
+    "未经过独立医学专业审核或签名公证安装包验收"
+  ]
+}

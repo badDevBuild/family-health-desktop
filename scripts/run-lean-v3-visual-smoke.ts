@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -9,6 +10,7 @@ import { CodexRuntimeManager } from '../apps/desktop/src/main/codex-runtime.js';
 import { DocumentExtractionPipeline } from '../apps/desktop/src/main/processing-pipeline.js';
 import { MemberAssessmentPipeline } from '../apps/desktop/src/main/member-assessment-pipeline.js';
 import { PersonalWorkspaceService } from '../apps/desktop/src/main/workspace-service.js';
+import { createSyntheticTwoPageScannedPdf } from '../packages/evaluation/src/scanned-pdf-fixture.js';
 
 /** 只用内存生成的虚构 PNG 验证真实 P01 图像链路，不读取家庭工作区或冒称临床准确率。 */
 function syntheticImage(): Buffer {
@@ -39,10 +41,12 @@ function syntheticImage(): Buffer {
   return canvas.encodeSync('png');
 }
 
+const scannedPdf = process.argv.includes('--scanned-pdf');
+const fixtureBytes = scannedPdf ? createSyntheticTwoPageScannedPdf() : syntheticImage();
 if (process.argv.includes('--fixture-only')) {
   const fixtureDirectory = mkdtempSync(join(tmpdir(), 'fhd-lean-v3-visual-fixture-'));
-  const fixturePath = join(fixtureDirectory, 'synthetic-report.png');
-  writeFileSync(fixturePath, syntheticImage(), { mode: 0o600 });
+  const fixturePath = join(fixtureDirectory, scannedPdf ? 'synthetic-two-page-scan.pdf' : 'synthetic-report.png');
+  writeFileSync(fixturePath, fixtureBytes, { mode: 0o600 });
   process.stdout.write(`Synthetic visual fixture: ${fixturePath}\n`);
   process.exit(0);
 }
@@ -75,8 +79,9 @@ const runtime = new CodexRuntimeManager({ executable, runtimeVersion: null,
 const calls: Array<{ stage: 'P01' | 'P01_P03' | 'P02' | 'P02_P03' | 'P04'; durationMs: number; inputTokens: number | null;
   outputTokens: number | null; webSearches: number; imageCount: number }> = [];
 const receipt: Record<string, unknown> = {
-  kind: fullAssessment ? 'P01_P02_IMAGE_SYNTHETIC' : 'P01_IMAGE_ONLY_SYNTHETIC',
-  syntheticOnly: true, modelId, reasoningEffort,
+  kind: scannedPdf ? 'TWO_PAGE_SCANNED_PDF_SYNTHETIC'
+    : fullAssessment ? 'P01_P02_IMAGE_SYNTHETIC' : 'P01_IMAGE_ONLY_SYNTHETIC',
+  syntheticOnly: true, fixtureSha256: createHash('sha256').update(fixtureBytes).digest('hex'), modelId, reasoningEffort,
   webSearchAllowed: false, createdAt: new Date().toISOString(), calls
 };
 
@@ -96,13 +101,14 @@ try {
   if (account.status !== 'connected') throw new Error('CODEX_AUTH_REQUIRED');
   const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
   const imported = await service.importFiles([{
-    path: '/tmp/纯合成图像报告.png', bytes: syntheticImage()
+    path: scannedPdf ? '/tmp/纯合成双页扫描报告.pdf' : '/tmp/纯合成图像报告.png', bytes: fixtureBytes
   }], personId);
   if (imported.rejected.length > 0) throw new Error('SYNTHETIC_IMAGE_IMPORT_REJECTED');
   const documentId = service.getSnapshot(null).inbox[0]?.id;
   if (!documentId) throw new Error('SYNTHETIC_DOCUMENT_MISSING');
   const manifest = service.store.getDocumentExtractionBundle(documentId).manifest;
   receipt.source = { mediaType: manifest.mediaType, spanKinds: manifest.spans.map((span) => span.spanKind),
+    pageNumbers: manifest.spans.map((span) => span.page),
     sourceHasTextQuote: manifest.spans.some((span) => span.quote !== null) };
   const pipeline = new DocumentExtractionPipeline(service.store, {
     runStructuredTurn: (input) => runTrackedTurn(calls.length === 0 ? 'P01' : 'P01_P03', input)
@@ -122,8 +128,21 @@ try {
     glucose: facts.some((fact) => /空腹血糖/.test(fact.name) && fact.value === '5.1')
   };
   receipt.expectedValuesFound = expectedValuesFound;
+  if (scannedPdf) {
+    const secondPageIds = new Set(manifest.spans.filter((span) => span.page === 2).map((span) => span.id));
+    receipt.scannedPageChecks = {
+      pageCount: manifest.totalUnits,
+      bothPagesHaveNoTextLayer: manifest.spans.length === 2 && manifest.spans.every((span) => span.quote === null),
+      bothValuesUseHeaderDate: facts.filter((fact) => /低密度脂蛋白|LDL|空腹血糖/i.test(fact.name))
+        .filter((fact) => fact.value === '4.2' || fact.value === '5.1')
+        .every((fact) => fact.clinicalDate === '2025-06-10'),
+      glucoseCitesSecondPage: facts.some((fact) => /空腹血糖/.test(fact.name) && fact.value === '5.1'
+        && fact.sourceSpanIds.some((id) => secondPageIds.has(id)))
+    };
+  }
   if (result.status !== 'published' || !Object.values(expectedValuesFound).every(Boolean)
-    || calls.some((call) => call.imageCount !== 1 || call.webSearches !== 0)) process.exitCode = 1;
+    || scannedPdf && Object.values(receipt.scannedPageChecks as Record<string, unknown>).some((value) => value === false || value === 0)
+    || calls.some((call) => call.imageCount !== (scannedPdf ? 2 : 1) || call.webSearches !== 0)) process.exitCode = 1;
   if (fullAssessment && result.status === 'published') {
     const assessment = await new MemberAssessmentPipeline(service.store, {
       runStructuredTurn: (input) => runTrackedTurn(input.prompt.includes('REVIEW_REQUEST=') ? 'P04'
