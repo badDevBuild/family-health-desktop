@@ -3,10 +3,29 @@ import type {
   OverviewNode, QuestionNode, SystemNode
 } from '@contracts';
 
-export const CLINICAL_ROUTER_VERSION = 'clinical-router-v1';
+export const CLINICAL_ROUTER_VERSION = 'clinical-router-v2';
 
-const highConsequenceDisease = /(?:恶性肿瘤|癌症|癌变|心肌梗死|脑卒中|脑出血|败血症|脓毒症|急性肾衰|肝衰竭|器官衰竭)/i;
-const nonAffirmative = /(?:排除|待排|未见|无|尚不能|不能确诊|既往|家族史)/i;
+const highConsequenceDisease = /(?:恶性肿瘤|恶性淋巴瘤|癌症|癌变|[\p{Script=Han}]{1,8}癌|心肌梗死|急性冠脉综合征|主动脉夹层|肺栓塞|脑卒中|脑梗死|脑出血|败血症|脓毒症|急性肾衰|急性肾损伤|肝衰竭|器官衰竭)/iu;
+const directlyNegatedDisease = /(?:已排除|明确排除|未见|无|不支持|未确诊|不能确诊|尚不能确诊)\s*$/i;
+
+function onlyDirectlyNegatedDiseaseMentions(claim: HealthClaim): boolean {
+  const disease = claim.diseaseName;
+  if (!disease) return false;
+  // 另一个高后果病名即使与当前 diseaseName 同处一句，也不能被此病名的否定吞掉。
+  if (highConsequenceDisease.test(claim.text.replaceAll(disease, ''))) return false;
+  const clauses = claim.text.split(/[。；;！？!?\n]/).filter((clause) => clause.includes(disease));
+  if (clauses.length === 0) return false;
+  for (const clause of clauses) {
+    let position = clause.indexOf(disease);
+    while (position >= 0) {
+      const prefix = clause.slice(Math.max(0, position - 16), position);
+      // “无症状、但考虑 X”与“不能排除 X”都不是对 X 的明确否定。
+      if (!directlyNegatedDisease.test(prefix) || /(?:不能|尚不能|无法)排除\s*$/i.test(prefix)) return false;
+      position = clause.indexOf(disease, position + disease.length);
+    }
+  }
+  return true;
+}
 
 export interface FocusedReviewRoute {
   targetIds: string[];
@@ -20,7 +39,7 @@ export function routeFocusedReview(candidate: MemberAssessmentCandidateV3): Focu
   for (const claim of candidate.claims) {
     const novel = claim.diagnosticStatus !== 'documented' && claim.kind === 'diagnostic_assessment';
     const highConsequence = novel && highConsequenceDisease.test(`${claim.diseaseName ?? ''} ${claim.text}`)
-      && !nonAffirmative.test(claim.text);
+      && (claim.diagnosticStatus !== 'undetermined' || !onlyDirectlyNegatedDiseaseMentions(claim));
     if (claim.consequenceLevel !== 'high' && !highConsequence) continue;
     targets.add(claim.id);
     reasons.push(highConsequence ? `high_consequence_disease:${claim.id}` : `reported_high_consequence:${claim.id}`);

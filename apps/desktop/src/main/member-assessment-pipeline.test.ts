@@ -396,7 +396,10 @@ describe('MemberAssessmentPipeline', () => {
     service.close();
   });
 
-  it('旧版综合过期时只重做 P02，已接纳报告事实不重新提取', async () => {
+  it.each([
+    { reason: '提示词版本变化', promptVersion: 'member-assessment-v2', rulesVersion: null },
+    { reason: '重点复核路由规则升级', promptVersion: null, rulesVersion: 'lean-health-v3.4' }
+  ])('$reason 时只重做 P02，已接纳报告事实不重新提取', async ({ promptVersion, rulesVersion }) => {
     const { service, personId, built } = await fixture();
     await new MemberAssessmentPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'original', turnId: 'original', output: candidateFor(built.request, built.evidencePackage) })
@@ -404,10 +407,12 @@ describe('MemberAssessmentPipeline', () => {
     const original = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
     const oldSignature = 'f'.repeat(64);
     const database = new Database(service.store.databasePath);
-    database.prepare(`UPDATE member_assessment_snapshots_v3 SET input_signature = ?, prompt_version = ?,
-      payload_json = json_set(payload_json, '$.inputSignature', ?, '$.promptVersion', ?) WHERE id = ?`)
-      .run(oldSignature, 'member-assessment-v2', oldSignature, 'member-assessment-v2', original.id);
+    database.prepare(`UPDATE member_assessment_snapshots_v3 SET input_signature = ?, prompt_version = ?, rules_version = ?,
+      payload_json = json_set(payload_json, '$.inputSignature', ?, '$.promptVersion', ?, '$.rulesVersion', ?) WHERE id = ?`)
+      .run(oldSignature, promptVersion ?? original.promptVersion, rulesVersion ?? original.rulesVersion,
+        oldSignature, promptVersion ?? original.promptVersion, rulesVersion ?? original.rulesVersion, original.id);
     database.close();
+    expect(service.getMemberAssessment(personId)).toBeNull();
     const state: AccountState = { status: 'connected', displayLabel: 'fixture@example.test',
       quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },
       runtimeVersion: 'fixture', lastCheckedAt: '2026-09-22T00:00:00Z' };
