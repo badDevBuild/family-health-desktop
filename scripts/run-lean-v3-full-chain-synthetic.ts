@@ -23,6 +23,10 @@ const fixtures = {
   'partial-thyroid': {
     filename: 'full-chain-partial-thyroid.txt',
     sha256: 'ab0655c2c318b9d415ed893c57d3e93bfd509d1131f01db2e96d80b418c9fd80'
+  },
+  'current-chest-pain': {
+    filename: 'full-chain-current-chest-pain.txt',
+    sha256: 'b9230e7aac3c30589fd119f0d0f3efe6bb52cf28f78b2462783af4c36f4031cd'
   }
 } as const;
 const requestedCase = process.argv.find((arg) => arg.startsWith('--case='))?.slice('--case='.length) ?? 'clear-ldl';
@@ -106,6 +110,14 @@ try {
     facts: facts.map((fact) => ({ name: fact.originalName, value: fact.rawText,
       unit: fact.unit, clinicalDate: fact.clinicalDate })) };
   if (extraction.status === 'published') {
+    if (caseId === 'current-chest-pain') {
+      service.createManualNote({
+        personId, kind: 'history', immutableText: '本人今天自述持续胸痛并伴出汗。',
+        effectiveDate: '2026-09-22', structuredFields: {},
+        expectedContextRevision: service.store.getClinicalContextRevision(personId)
+      });
+      receipt.syntheticManualNote = '本人今天自述持续胸痛并伴出汗。';
+    }
     phase = 'P02';
     const assessment = await new MemberAssessmentPipeline(service.store, { runStructuredTurn: runTrackedTurn },
       undefined, undefined, undefined, modelId, reasoningEffort, '2026-09-22', false).process(personId);
@@ -117,7 +129,9 @@ try {
   }
   receipt.chainPublished = (receipt.extraction as { status: string }).status === 'published'
     && (receipt.assessment as { status?: string } | undefined)?.status === 'published';
-  if (receipt.chainPublished !== true || calls.some((call) => call.webSearches > 0)) process.exitCode = 1;
+  receipt.focusedReviewObserved = calls.some((call) => call.phase === 'P04');
+  if (receipt.chainPublished !== true || calls.some((call) => call.webSearches > 0)
+    || caseId === 'current-chest-pain' && receipt.focusedReviewObserved !== true) process.exitCode = 1;
 } catch (error) {
   receipt.errorCode = error instanceof Error ? error.message.split(':')[0] : 'UNKNOWN';
   receipt.runtimeErrors = runtimeErrors.slice(-4);
