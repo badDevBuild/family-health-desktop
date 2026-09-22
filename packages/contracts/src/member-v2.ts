@@ -399,6 +399,15 @@ export const sourceUrgentNoticeSchema = z.object({
 }).strict();
 export type SourceUrgentNotice = z.infer<typeof sourceUrgentNoticeSchema>;
 
+export const currentSymptomNoticeSchema = z.object({
+  id: idSchema,
+  noteId: idSchema,
+  recordedAt: utcTimestampSchema,
+  sourceLabel: z.literal('本人今天补充'),
+  sourceExcerpt: z.string().min(1).max(200)
+}).strict();
+export type CurrentSymptomNotice = z.infer<typeof currentSymptomNoticeSchema>;
+
 export const memberOverviewV2Schema = z.object({
   personId: idSchema,
   generatedAt: utcTimestampSchema,
@@ -407,6 +416,7 @@ export const memberOverviewV2Schema = z.object({
   overview: z.string().min(1),
   latestClinicalDate: localDateSchema.nullable(),
   sourceUrgentNotices: z.array(sourceUrgentNoticeSchema).max(3),
+  currentSymptomNotices: z.array(currentSymptomNoticeSchema).max(2),
   acceptedFactCount: z.number().int().nonnegative(),
   eventCount: z.number().int().nonnegative(),
   attentionSystemIds: z.array(bodySystemIdSchema),

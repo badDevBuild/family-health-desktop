@@ -404,12 +404,12 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
   }, [person.id, person.dataRevision, refreshToken]);
 
   useEffect(() => {
-    if (!overview?.sourceUrgentNotices.length) return;
+    if (!overview?.sourceUrgentNotices.length && !overview?.currentSymptomNotices.length) return;
     const now = new Date();
     const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
     const timer = window.setTimeout(() => setRefreshToken((current) => current + 1), nextMidnight.getTime() - now.getTime());
     return () => window.clearTimeout(timer);
-  }, [overview?.sourceUrgentNotices.length, refreshToken]);
+  }, [overview?.sourceUrgentNotices.length, overview?.currentSymptomNotices.length, refreshToken]);
 
   useEffect(() => {
     if (!selectedSystem) return;
@@ -609,6 +609,12 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
 
   return <div className="page-stack member-profile-v2">
     <MemberHeader snapshot={snapshot} person={person} onSelectPerson={onSelectPerson} onAddPerson={onAddPerson} onEditPerson={onEditPerson} onArchivedPeople={onArchivedPeople} onAddNote={onAddNote} onExport={onExport} />
+    {overview?.personId === person.id && overview.currentSymptomNotices.length > 0 && <section className="source-urgent-notices" role="alert" aria-label="本人今天记录的症状提示">
+      {overview.currentSymptomNotices.map((notice) => <div className="source-urgent-notice" key={notice.id}>
+        <AlertTriangle size={22} aria-hidden="true" />
+        <div><strong>你今天记录了需要及时处理的症状</strong><p>如果现在仍有持续胸痛并伴大汗或冷汗，请立即拨打 120，不要自己开车去医院。这里依据的是本人自述，不代表应用已诊断病因。</p><details><summary>查看本人记录</summary><p>{notice.sourceLabel}：{notice.sourceExcerpt}</p></details></div>
+      </div>)}
+    </section>}
     {overview?.personId === person.id && overview.sourceUrgentNotices.length > 0 && <section className="source-urgent-notices" role="alert" aria-label="报告原文的及时处理提示">
       {overview.sourceUrgentNotices.map((notice) => <div className="source-urgent-notice" key={notice.id}>
         <AlertTriangle size={22} aria-hidden="true" />

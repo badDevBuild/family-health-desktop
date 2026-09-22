@@ -47,6 +47,22 @@ afterEach(() => {
 });
 
 describe('PersonalWorkspaceService', () => {
+  it('当天本人自述持续胸痛伴冷汗时先显示条件式提醒，旧资料仍可阅读且无需 P02', () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
+    service.store.createManualNote({
+      personId, kind: 'free_text', immutableText: '我现在持续胸痛并伴冷汗。',
+      effectiveDate: '2026-09-18', structuredFields: {}, expectedContextRevision: 0
+    });
+    const overview = service.getMemberOverview(personId);
+    expect(overview.currentSymptomNotices).toMatchObject([{
+      sourceLabel: '本人今天补充', sourceExcerpt: '我现在持续胸痛并伴冷汗'
+    }]);
+    expect(overview.sourceUrgentNotices).toEqual([]);
+    expect(service.getMemberAssessment(personId)).toBeNull();
+    service.close();
+  });
+
   it('明确的近期报告急诊提示在 P01 接纳后、P02 完成前即可读取', async () => {
     const service = makeService();
     const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });

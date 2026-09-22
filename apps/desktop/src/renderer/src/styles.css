@@ -504,6 +504,8 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .source-urgent-notice > div { flex: 1; min-width: 0; }
 .source-urgent-notice strong { display: block; font-size: 17px; line-height: 1.45; }
 .source-urgent-notice p { margin: 5px 0 0; font-size: 16px; line-height: 1.6; }
+.source-urgent-notice details { margin-top: 8px; }
+.source-urgent-notice summary { display: flex; align-items: center; min-height: 44px; width: fit-content; color: var(--primary-hover); font-size: 16px; cursor: pointer; }
 .source-urgent-notice button { flex: 0 0 auto; }
 .member-tabs { position: sticky; top: -22px; z-index: 5; padding-top: 10px; background: linear-gradient(var(--warm-50) 78%, rgba(250, 250, 248, 0)); }
 .member-v2-overview { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(300px, .65fr); gap: 16px; }

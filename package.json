@@ -32,6 +32,7 @@
     "benchmark:local": "vitest run --config vitest.benchmark.config.ts",
     "gold:materialize": "node --experimental-strip-types scripts/materialize-synthetic-gold.ts",
     "assessment:materialize": "node --experimental-strip-types scripts/materialize-assessment-v3-cases.ts",
+    "eval:lean-v3:synthetic": "tsx --tsconfig tsconfig.node.json scripts/run-lean-v3-synthetic-eval.ts",
     "scan:release": "node scripts/scan-release-artifact.mjs",
     "scan:public": "node scripts/scan-public-repository.mjs",
     "docs:check": "node scripts/check-doc-links.mjs"

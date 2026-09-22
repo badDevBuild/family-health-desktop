@@ -62,6 +62,8 @@ describe('MemberProfileV2 event organization', () => {
       sourceUrgentNotices: [{ id: 'source-urgent:test', documentId: 'document-test', sourceSpanId: 'span-test',
         clinicalDate: '2026-09-21', instructionLevel: 'critical_result', itemName: '项目甲', sourceLabel: '合成报告',
         sourceExcerpt: '项目甲 1.0，报告原文标注危急值' }],
+      currentSymptomNotices: [{ id: 'current-symptom:test', noteId: 'note-test', recordedAt: now,
+        sourceLabel: '本人今天补充', sourceExcerpt: '我现在持续胸痛并伴冷汗' }],
       attentionSystemIds: [], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const getMemberOverview = vi.fn(async () => ({ ok: true as const, data: overview }));
@@ -82,6 +84,8 @@ describe('MemberProfileV2 event organization', () => {
     const view = render(<MemberProfileV2 snapshot={snapshot} person={snapshot.persons[0]!} {...commonProps} />);
     expect(await screen.findByRole('heading', { name: '核心档案仍可读' })).toBeTruthy();
     expect(screen.getByRole('alert', { name: '报告原文的及时处理提示' })).toBeTruthy();
+    expect(screen.getByRole('alert', { name: '本人今天记录的症状提示' })).toBeTruthy();
+    expect(screen.getByText(/请立即拨打 120/)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '查看原文' }));
     expect(commonProps.onOpenEvidence).toHaveBeenCalledWith(expect.objectContaining({
       documentId: 'document-test', sourceSpanId: 'span-test'
@@ -109,7 +113,7 @@ describe('MemberProfileV2 event organization', () => {
     const other = healthEvent('event-other', '门诊检验', '2026-09-11', ['document-c']);
     const overview: MemberOverviewV2 = {
       personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '已有检查记录', overview: '已有检查记录的简要说明。',
-      latestClinicalDate: '2026-09-11', acceptedFactCount: 3, eventCount: 2, sourceUrgentNotices: [],
+      latestClinicalDate: '2026-09-11', acceptedFactCount: 3, eventCount: 2, sourceUrgentNotices: [], currentSymptomNotices: [],
       attentionSystemIds: [], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const detail: HealthEventDetailV2 = {
@@ -195,7 +199,7 @@ describe('MemberProfileV2 event organization', () => {
     snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
     const overview: MemberOverviewV2 = {
       personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '已有检查记录', overview: '已有检查记录的简要说明。',
-      latestClinicalDate: '2026-09-11', acceptedFactCount: 1, eventCount: 1, sourceUrgentNotices: [],
+      latestClinicalDate: '2026-09-11', acceptedFactCount: 1, eventCount: 1, sourceUrgentNotices: [], currentSymptomNotices: [],
       attentionSystemIds: ['cardiovascular'], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const plan: LifestylePlanV2 = {
@@ -271,7 +275,7 @@ describe('MemberProfileV2 event organization', () => {
     snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
     const overview: MemberOverviewV2 = {
       personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '旧记录恢复中', overview: '旧记录仍可阅读。',
-      latestClinicalDate: '2026-09-11', acceptedFactCount: 1, eventCount: 1, sourceUrgentNotices: [],
+      latestClinicalDate: '2026-09-11', acceptedFactCount: 1, eventCount: 1, sourceUrgentNotices: [], currentSymptomNotices: [],
       attentionSystemIds: [], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const plan: LifestylePlanV2 = {

@@ -8,6 +8,7 @@ import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
 import { buildSourceUrgentNotices } from './source-urgent-notice.js';
+import { buildCurrentSymptomNotices } from './current-symptom-notice.js';
 import { ACCEPTANCE_RULES_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, promptMetaForStage, SYSTEM_ANALYSIS_PROMPT_VERSION } from './prompts/index.js';
 import { buildSystemEvidenceBundle as buildSystemEvidenceBundleFromStore } from './system-evidence.js';
 
@@ -553,6 +554,7 @@ export class PersonalWorkspaceService {
             : '已有资料不会丢失；综合分析完成后，这里会给出结论、原因和可执行的下一步。')),
       latestClinicalDate: observations.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null,
       sourceUrgentNotices: buildSourceUrgentNotices(observations, this.now()),
+      currentSymptomNotices: buildCurrentSymptomNotices(this.store.listManualNotes(personId), this.now()),
       acceptedFactCount: observations.length,
       eventCount: events.length,
       attentionSystemIds: attentionSystems.map((system) => system.id),
