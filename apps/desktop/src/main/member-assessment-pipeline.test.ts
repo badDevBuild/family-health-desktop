@@ -403,6 +403,11 @@ describe('MemberAssessmentPipeline', () => {
       reportedAbnormalFlag: 'unknown' });
     source.evidenceCatalog.push({ ...source.evidenceCatalog[0]!, id: 'unmapped-evidence',
       observationId: 'unmapped-fact', quote: '未映射项目：原文记录' });
+    source.facts.push({ ...source.facts[0]!, observationId: 'ordinary-fact', originalName: '普通指标',
+      rawValue: '2.0', valueKind: 'numeric', systemIds: [built.request.requestedSystemIds[0]!],
+      evidenceIds: ['ordinary-evidence'], reportedAbnormalFlag: 'unknown' });
+    source.evidenceCatalog.push({ ...source.evidenceCatalog[0]!, id: 'ordinary-evidence',
+      observationId: 'ordinary-fact', quote: '普通指标：2.0' });
     source.criteriaSets.push({ id: 'synthetic-set', sourceId: 'synthetic-knowledge', applicability: '合成条件',
       requiredCriterionIds: ['required-measurement'],
       verifiedRequirements: [{ criterionId: 'required-measurement', evidenceIds: ['unmapped-evidence'] }] });
@@ -423,6 +428,14 @@ describe('MemberAssessmentPipeline', () => {
     expect(aggregate.facts.some((fact) => fact.observationId === 'unmapped-fact')).toBe(true);
     expect(aggregate.criteriaSets).toHaveLength(1);
     expect(aggregate.trends).toEqual(source.trends);
+    expect(aggregate.facts.some((fact) => fact.observationId === 'ordinary-fact')).toBe(false);
+    expect(aggregate.aggregateCoverage).toMatchObject({
+      totalFactCount: source.facts.length,
+      directFactCount: source.facts.length - 1,
+      summarizedOnlyFactCount: 1
+    });
+    expect(aggregate.aggregateCoverage?.byDocument.reduce((sum, item) => sum + item.totalFactCount, 0))
+      .toBe(source.facts.length);
     service.close();
   });
 
@@ -451,9 +464,50 @@ describe('MemberAssessmentPipeline', () => {
     expect(snapshot.mode).toBe('aggregate');
     expect(snapshot.processingPlan).toEqual({
       strategy: 'partitioned', trigger: 'runtime_context_window_exceeded', partitionCount,
-      partitionHeldTargetCount: 0
+      partitionHeldTargetCount: 0, aggregateSummarizedOnlyObservationIds: []
     });
     expect(snapshot.evidenceCatalog.length).toBe(built.evidencePackage.evidenceCatalog.length);
+    service.close();
+  });
+
+  it('聚合省略普通原子事实时保留精确清单，并在成员总览和相关系统显示范围', async () => {
+    const { service, personId } = await fixtureTwoSystems();
+    await service.importFiles([{ path: '/tmp/合成心率报告.txt', bytes: Buffer.from('2026-09-21 心率 64 次/分') }], personId);
+    const documentId = service.getSnapshot(null).inbox.find((item) => item.displayName === '合成心率报告.txt')!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const extraction: ExtractionResult = {
+      schemaVersion: 1, documentId, coveredSourceSpanIds: [span.id],
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      candidates: [{
+        localKey: 'heart-rate', originalName: '心率', standardNameCandidate: '心率',
+        value: { kind: 'numeric', rawText: '64', decimal: '64', comparator: 'eq' },
+        unitRaw: '次/分', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-21',
+        evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+      }]
+    };
+    expect((await new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'heart-rate', turnId: 'heart-rate', output: extraction })
+    }).process(documentId)).status).toBe('published');
+    const heartRateId = service.store.listAcceptedObservations(personId).find((item) => item.originalName === '心率')!.id;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
+        return { threadId: 'p02', turnId: request.mode, output: candidateFor(request, evidence) };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result.status).toBe('published');
+    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(service.store.listAcceptedObservations(personId).some((item) => item.id === heartRateId)).toBe(true);
+    expect(snapshot.processingPlan.aggregateSummarizedOnlyObservationIds).toContain(heartRateId);
+    expect(snapshot.overview.limitations.join(' ')).toContain('仅经分区摘要参与综合');
+    expect(snapshot.systems.find((item) => item.systemId === 'cardiovascular')?.limitations.join(' '))
+      .toContain('仅经分区摘要参与综合');
+    const overview = service.getMemberOverview(personId);
+    expect(overview.dataQuality).toBe('partial');
+    expect(overview.overview).toContain('仅经分区摘要参与综合');
     service.close();
   });
 

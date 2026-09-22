@@ -550,12 +550,16 @@ export class PersonalWorkspaceService {
     return memberOverviewV2Schema.parse({
       personId,
       generatedAt: this.now().toISOString(),
-      dataQuality: observations.length === 0 ? 'insufficient' : legacyObservationCount > 0 || unclassifiedFactCount > 0
+      dataQuality: observations.length === 0 ? 'insufficient' : assessment?.processingPlan.aggregateSummarizedOnlyObservationIds?.length
+        || legacyObservationCount > 0 || unclassifiedFactCount > 0
         || observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
       headline: assessment?.overview.headline ?? (observations.length === 0
         ? '还没有可解读的健康资料。'
         : lead?.headline ?? '报告内容已保存，健康解读正在准备。'),
-      overview: assessment?.overview.summary ?? (observations.length === 0
+      overview: assessment ? [assessment.overview.summary,
+        ...(assessment.processingPlan.aggregateSummarizedOnlyObservationIds?.length
+          ? assessment.overview.limitations.filter((item) => item.includes('仅经分区摘要参与综合')) : [])].join(' ')
+        : (observations.length === 0
         ? '添加体检、门诊或检查资料后，这里会先告诉你最值得知道的情况和下一步。'
         : lead?.overview
           ?? (legacyObservationCount > 0

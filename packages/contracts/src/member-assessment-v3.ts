@@ -206,7 +206,18 @@ export const memberEvidencePackageV3Schema = z.object({
     /** 仅由应用的受控标准匹配器产生，模型不能自行增加合格证据。 */
     verifiedRequirements: z.array(z.object({ criterionId: id, evidenceIds: z.array(id).min(1) }).strict())
   }).strict()),
-  partitionResults: z.array(memberAssessmentCandidateV3Schema)
+  partitionResults: z.array(memberAssessmentCandidateV3Schema),
+  /** 仅聚合模式使用：明确哪些已接纳事实未以原子事实再次送入模型。 */
+  aggregateCoverage: z.object({
+    totalFactCount: z.number().int().nonnegative(),
+    directFactCount: z.number().int().nonnegative(),
+    summarizedOnlyFactCount: z.number().int().nonnegative(),
+    byDocument: z.array(z.object({
+      documentId: id,
+      totalFactCount: z.number().int().nonnegative(),
+      directFactCount: z.number().int().nonnegative()
+    }).strict())
+  }).strict().optional()
 }).strict();
 export type MemberEvidencePackageV3 = z.infer<typeof memberEvidencePackageV3Schema>;
 
@@ -253,7 +264,9 @@ export const memberAssessmentSnapshotV3Schema = memberAssessmentCandidateV3Schem
     trigger: z.enum(['none', 'runtime_context_window_exceeded']),
     partitionCount: z.number().int().nonnegative(),
     /** 分区内被隔离过的节点数；最终通过 P04 后也保留过程审计，不代表仍被隔离。 */
-    partitionHeldTargetCount: z.number().int().nonnegative().optional()
+    partitionHeldTargetCount: z.number().int().nonnegative().optional(),
+    /** 本机审计用；不把长 ID 清单送入聚合模型输入。 */
+    aggregateSummarizedOnlyObservationIds: z.array(id).optional()
   }).strict(),
   /** 仅由应用写入；模型给出 URL 不构成已核验来源。 */
   knowledgeVerifications: z.array(z.object({

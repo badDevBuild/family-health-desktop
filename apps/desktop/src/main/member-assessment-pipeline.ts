@@ -430,7 +430,27 @@ export class MemberAssessmentPipeline {
       const validation = validateAssessmentCandidate(candidate, validationInputFor(analysisRequest, analysisPackage));
       if (validation.issues.length > 0) return reject(validation.issues.join(','));
     }
-    const publishCandidate = canonicalizeAssessmentKnowledge(candidate, evidencePackage);
+    const directlyIncludedIds = new Set(analysisPackage.facts.map((fact) => fact.observationId));
+    const summarizedOnlyFacts = partitionCount > 0
+      ? evidencePackage.facts.filter((fact) => !directlyIncludedIds.has(fact.observationId))
+      : [];
+    const summarizedOnlyIds = summarizedOnlyFacts.map((fact) => fact.observationId);
+    const coverageLimitation = summarizedOnlyIds.length > 0
+      ? `本次资料量较大，${summarizedOnlyIds.length} 条已接纳事实仅经分区摘要参与综合，未作为原始项目再次送入最终聚合；不能据此断言所有检查均无问题。`
+      : null;
+    const publishCandidate = canonicalizeAssessmentKnowledge({
+      ...candidate,
+      overview: coverageLimitation
+        ? { ...candidate.overview, limitations: [...new Set([...candidate.overview.limitations, coverageLimitation])] }
+        : candidate.overview,
+      systems: candidate.systems.map((system) => {
+        const omittedCount = summarizedOnlyFacts.filter((fact) => fact.systemIds.includes(system.systemId)).length;
+        return omittedCount > 0 ? { ...system,
+          limitations: [...new Set([...system.limitations,
+            `本系统另有 ${omittedCount} 条已接纳事实仅经分区摘要参与综合，结论不能视为逐项复核。`])] }
+          : system;
+      })
+    }, evidencePackage);
     const snapshot: Omit<MemberAssessmentSnapshotV3, 'id' | 'status' | 'generatedAt'> = {
       ...publishCandidate,
       factRevision: built.factRevision, contextRevision: built.contextRevision,
@@ -440,6 +460,7 @@ export class MemberAssessmentPipeline {
       reviewedTargetIds, heldTargetIds,
       limitations: [
         ...(heldTargetIds.length ? ['部分判断因数据或依据问题暂未发布。'] : []),
+        ...(coverageLimitation ? [coverageLimitation] : []),
         ...(evidencePackage.facts.some((fact) => fact.systemIds.length === 0)
           ? ['部分来源事实尚未完成身体系统归类；成员总览包含这些资料，但身体系统视图可能不完整。'] : [])
       ],
@@ -447,7 +468,8 @@ export class MemberAssessmentPipeline {
       processingPlan: {
         strategy: partitionCount > 0 ? 'partitioned' : 'full',
         trigger: partitionCount > 0 ? 'runtime_context_window_exceeded' : 'none',
-        partitionCount, partitionHeldTargetCount: partitionHeldIds.length
+        partitionCount, partitionHeldTargetCount: partitionHeldIds.length,
+        ...(partitionCount > 0 ? { aggregateSummarizedOnlyObservationIds: summarizedOnlyIds } : {})
       },
       knowledgeVerifications: buildAssessmentKnowledgeVerifications(publishCandidate, evidencePackage)
     };

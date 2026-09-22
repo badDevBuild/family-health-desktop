@@ -117,10 +117,24 @@ export function buildMemberAggregatePackage(
     set.verifiedRequirements.flatMap((requirement) => requirement.evidenceIds)));
   const facts = source.facts.filter((fact) => sharedClinicalSignal(fact)
     || fact.evidenceIds.some((id) => citedEvidenceIds.has(id) || criteriaEvidenceIds.has(id)));
+  const directIds = new Set(facts.map((fact) => fact.observationId));
+  const documentCounts = new Map<string, { totalFactCount: number; directFactCount: number }>();
+  for (const fact of source.facts) {
+    const counts = documentCounts.get(fact.documentId) ?? { totalFactCount: 0, directFactCount: 0 };
+    counts.totalFactCount += 1;
+    if (directIds.has(fact.observationId)) counts.directFactCount += 1;
+    documentCounts.set(fact.documentId, counts);
+  }
   const packageData = filterEvidencePackage(source, facts, [], results);
   const allCited = new Set([...citedEvidenceIds, ...packageData.evidenceCatalog.map((item) => item.id)]);
   return {
     ...packageData,
-    evidenceCatalog: source.evidenceCatalog.filter((item) => allCited.has(item.id))
+    evidenceCatalog: source.evidenceCatalog.filter((item) => allCited.has(item.id)),
+    aggregateCoverage: {
+      totalFactCount: source.facts.length,
+      directFactCount: facts.length,
+      summarizedOnlyFactCount: source.facts.length - facts.length,
+      byDocument: [...documentCounts].map(([documentId, counts]) => ({ documentId, ...counts }))
+    }
   };
 }
