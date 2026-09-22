@@ -340,7 +340,12 @@ describe('MemberProfileV2 event organization', () => {
         constraints: ['不能直接采纳。'], uncertainties: ['尚未按新规则复核。'], consultProfessional: false,
         status: 'proposed', evidence: [], generalKnowledgeEvidence: [], sourceKind: 'ai_proposed', relatedSystemIds: []
       }],
-      adoptedActions: []
+      adoptedActions: [{
+        id: 'legacy-adoption', proposalId: 'legacy-proposal', assessmentDedupeKey: null,
+        title: '本人已做的准备', userGoal: '整理资料', selectedStartingOption: '整理既往报告',
+        plannedTime: null, owner: '本人', progressNote: '已整理', status: 'completed',
+        dueDate: null, updatedAt: now
+      }]
     };
     window.healthDesktop = {
       getMemberOverview: async () => ({ ok: true, data: overview }),
@@ -359,6 +364,7 @@ describe('MemberProfileV2 event organization', () => {
     fireEvent.click(await screen.findByRole('tab', { name: '生活与行动' }));
     expect(await screen.findByText('旧版建议已恢复展示')).toBeTruthy();
     expect(screen.getByRole('heading', { name: '旧版饮食建议' })).toBeTruthy();
+    expect(screen.getByText('进度：已完成')).toBeTruthy();
     expect((screen.getByRole('button', { name: '等待重新核对' }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByRole('button', { name: '暂不采纳' })).toBeNull();
   });

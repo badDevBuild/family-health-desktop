@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -777,7 +777,7 @@ describe('MemberAssessmentPipeline', () => {
     service.close();
   });
 
-  it('旧版快照与用户修改共存时升级为 V3，重启后仍保留事实、修正和已完成事项', async () => {
+  it('合成 v34 库升级为 V3 后，重启仍保留事实、旧快照、修正和已完成事项', async () => {
     const { service, personId, documentId } = await fixture();
     const root = service.store.rootDirectory;
     const report = service.store.listReportMetadata(personId)[0]!;
@@ -815,7 +815,8 @@ describe('MemberAssessmentPipeline', () => {
       promptVersion: 'derived-v1', rulesVersion: 'derived-safety-v1', modelId: 'legacy-model'
     });
     const legacyProposal = service.store.listLifestyleProposals(personId)[0]!;
-    const adopted = service.adoptLifestyleProposal({
+    // 模拟旧版本已经允许的采纳；现版本服务入口会阻止新增旧建议。
+    const adopted = service.store.adoptLifestyleProposal({
       personId, proposalId: legacyProposal.id, userGoal: '带上报告讨论复查安排',
       selectedStartingOption: '先整理资料', plannedTime: '下次就诊时', owner: '本人',
       progressNote: '已整理旧报告', dueDate: null
@@ -826,7 +827,45 @@ describe('MemberAssessmentPipeline', () => {
     ]);
     service.close();
 
+    // v35 相对 v34 只新增成员综合表；删除这个空表并回退版本号，重开时必须走真实迁移与备份路径。
+    const oldSchema = new Database(join(root, 'health.db'));
+    oldSchema.exec(`
+      DROP TABLE member_assessment_snapshots_v3;
+      UPDATE workspaces SET schema_version = 34;
+      PRAGMA user_version = 34;
+    `);
+    expect(oldSchema.pragma('user_version', { simple: true })).toBe(34);
+    oldSchema.close();
+
     const reopened = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
+    const migratedDatabase = new Database(reopened.store.databasePath, { readonly: true });
+    expect(migratedDatabase.pragma('user_version', { simple: true })).toBe(35);
+    expect(migratedDatabase.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'member_assessment_snapshots_v3'`).get())
+      .toEqual({ name: 'member_assessment_snapshots_v3' });
+    migratedDatabase.close();
+    const backupNames = readdirSync(reopened.store.schemaBackupDirectory).filter((name) => name.endsWith('.db'));
+    expect(backupNames).toHaveLength(1);
+    const preMigrationBackup = new Database(join(reopened.store.schemaBackupDirectory, backupNames[0]!), { readonly: true });
+    expect(preMigrationBackup.pragma('user_version', { simple: true })).toBe(34);
+    expect(preMigrationBackup.prepare(`SELECT id FROM derived_snapshots WHERE id = ?`).get(legacySnapshot.snapshotId))
+      .toEqual({ id: legacySnapshot.snapshotId });
+    expect(preMigrationBackup.prepare(`SELECT status FROM action_adoptions_v2 WHERE id = ?`).get(adopted.id)).toEqual({ status: 'completed' });
+    preMigrationBackup.close();
+    expect(reopened.getMemberAssessment(personId)).toBeNull();
+    expect(reopened.getMemberOverview(personId).headline).toBe('报告内容已保存，健康解读正在准备。');
+    expect(reopened.getLifestylePlan(personId)).toMatchObject({
+      status: 'stale',
+      proposals: [expect.objectContaining({ id: legacyProposal.id, status: 'adopted' })],
+      adoptedActions: [expect.objectContaining({ id: adopted.id, status: 'completed' })]
+    });
+    expect(() => reopened.adoptLifestyleProposal({
+      personId, proposalId: legacyProposal.id, userGoal: '重复采纳旧建议',
+      selectedStartingOption: '先整理资料', plannedTime: null, owner: '本人',
+      progressNote: null, dueDate: null
+    })).toThrow('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
+    expect(reopened.getSnapshot(null).persons.find((person) => person.id === personId)).toMatchObject({
+      derivedStatus: 'stale', assessmentSummary: null
+    });
     let calls = 0;
     const result = await new MemberAssessmentPipeline(reopened.store, {
       runStructuredTurn: async (input) => {

@@ -123,7 +123,10 @@ describe('SystemAnalysisPipeline', () => {
         review: expect.objectContaining({ status: 'passed' })
       })
     ]);
-    expect(service.getBodySystemDetail(personId, 'cardiovascular').analysis).toMatchObject({ headline: candidate.headline });
+    expect(service.getBodySystemDetail(personId, 'cardiovascular').analysis).toMatchObject({
+      headline: candidate.headline, status: 'stale'
+    });
+    expect(service.getMemberOverview(personId).headline).toBe('报告内容已保存，健康解读正在准备。');
     const unrelatedGoal = service.store.createManualNote({
       personId,
       kind: 'goal',

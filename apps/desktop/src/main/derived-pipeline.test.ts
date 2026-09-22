@@ -152,9 +152,12 @@ describe('DerivedHealthPipeline', () => {
       progressNote: '先观察一周的身体感受',
       dueDate: '2026-10-01'
     };
-    const dismissed = service.setLifestyleProposalDecision({ personId, proposalId: proposal.id, decision: 'dismiss' });
+    expect(() => service.setLifestyleProposalDecision({ personId, proposalId: proposal.id, decision: 'dismiss' }))
+      .toThrow('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
+    const dismissed = service.store.setLifestyleProposalDecision({ personId, proposalId: proposal.id, decision: 'dismiss' });
     expect(dismissed).toMatchObject({ proposalId: proposal.id, status: 'dismissed' });
-    expect(() => service.adoptLifestyleProposal(adoptionInput)).toThrow('LIFESTYLE_PROPOSAL_NOT_AVAILABLE');
+    expect(() => service.adoptLifestyleProposal(adoptionInput)).toThrow('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
+    expect(() => service.store.adoptLifestyleProposal(adoptionInput)).toThrow('LIFESTYLE_PROPOSAL_NOT_AVAILABLE');
     const currentCandidate = service.store.listCurrentDerivedSnapshots()[0]!.payload;
     service.store.publishDerivedSnapshot({
       candidate: {
@@ -171,8 +174,9 @@ describe('DerivedHealthPipeline', () => {
     expect(refreshedProposal).toMatchObject({ dedupeKey: proposal.dedupeKey, status: 'dismissed' });
     expect(service.store.listLifestyleProposals(personId)).toHaveLength(1);
     const refreshedAdoptionInput = { ...adoptionInput, proposalId: refreshedProposal.id };
-    expect(service.setLifestyleProposalDecision({ personId, proposalId: refreshedProposal.id, decision: 'restore' })).toMatchObject({ status: 'proposed' });
-    const adopted = service.adoptLifestyleProposal(refreshedAdoptionInput);
+    expect(service.store.setLifestyleProposalDecision({ personId, proposalId: refreshedProposal.id, decision: 'restore' })).toMatchObject({ status: 'proposed' });
+    expect(() => service.adoptLifestyleProposal(refreshedAdoptionInput)).toThrow('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
+    const adopted = service.store.adoptLifestyleProposal(refreshedAdoptionInput);
     expect(adopted).toMatchObject({
       proposalId: refreshedProposal.id,
       title: refreshedProposal.title,
@@ -184,7 +188,7 @@ describe('DerivedHealthPipeline', () => {
       dueDate: adoptionInput.dueDate,
       status: 'planned'
     });
-    expect(service.adoptLifestyleProposal(refreshedAdoptionInput)).toEqual(adopted);
+    expect(service.store.adoptLifestyleProposal(refreshedAdoptionInput)).toEqual(adopted);
     expect(service.getLifestylePlan(personId)).toMatchObject({
       proposals: [expect.objectContaining({ id: refreshedProposal.id, status: 'adopted' })],
       adoptedActions: [expect.objectContaining({ id: adopted.id, proposalId: refreshedProposal.id, status: 'planned' })]
@@ -234,7 +238,7 @@ describe('DerivedHealthPipeline', () => {
       expect.objectContaining({ id: adopted.id, proposalId: refreshedProposal.id, status: 'in_progress' })
     ]);
     expect(service.getSnapshot(null)).toMatchObject({
-      persons: [expect.objectContaining({ derivedStatus: 'current', assessmentSummary: candidate.claims[0]!.explanation })],
+      persons: [expect.objectContaining({ derivedStatus: 'stale', assessmentSummary: null })],
       guidance: expect.arrayContaining([expect.objectContaining({ id: 'guide-1', personId })])
     });
     expect(prompts[0]).toContain('本人补充：近期作息不规律');

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import type { AccountState, ActionItem, ActionStatus, AdoptMemberAssessmentActionInput, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
-import { adoptedActionReceiptSchema, bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, lifestyleProposalDecisionReceiptSchema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
+import { bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
 import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, sameAdoptedActionScope, stableHash, type TrendObservationInput } from '@core';
 import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
@@ -9,7 +9,7 @@ import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
 import { buildSourceUrgentNotices } from './source-urgent-notice.js';
 import { buildCurrentSymptomNotices } from './current-symptom-notice.js';
-import { ACCEPTANCE_RULES_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, promptMetaForStage, SYSTEM_ANALYSIS_PROMPT_VERSION } from './prompts/index.js';
+import { ACCEPTANCE_RULES_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, promptMetaForStage } from './prompts/index.js';
 import { buildSystemEvidenceBundle as buildSystemEvidenceBundleFromStore } from './system-evidence.js';
 
 const organNames = [
@@ -366,9 +366,8 @@ export class PersonalWorkspaceService {
       };
       return {
         ...systemSnapshot,
-        status: systemSnapshot.promptVersion === SYSTEM_ANALYSIS_PROMPT_VERSION
-          ? systemSnapshot.status
-          : 'stale',
+        // V3 已接管当前解读；即使旧系统快照当时通过复核，也只能作为带日期的历史说明。
+        status: 'stale',
         overview: legacy.overview ?? systemSnapshot.headline,
         assessmentStatus: legacy.assessmentStatus ?? 'undetermined',
         recommendations: legacy.recommendations ?? [],
@@ -962,7 +961,8 @@ export class PersonalWorkspaceService {
     });
     return lifestylePlanV2Schema.parse({
       personId,
-      status: legacyProjectionUsed ? 'stale' : derived?.status ?? 'unavailable',
+      // V3 的行动方案由成员综合快照提供；旧派生快照及物化建议只供回看。
+      status: legacyProjectionUsed || Boolean(derived) || useMaterializedPlan ? 'stale' : 'unavailable',
       dataQuality: derived?.payload.dataQuality ?? (observations.length > 0 ? 'partial' : 'insufficient'),
       updatedAt: storedProposals[0]?.updatedAt ?? storedAdoptions[0]?.updatedAt
         ?? assessmentAdoptions[0]?.action.updatedAt ?? derived?.createdAt ?? null,
@@ -1033,21 +1033,8 @@ export class PersonalWorkspaceService {
 
   adoptLifestyleProposal(input: AdoptLifestyleProposalInput): AdoptedActionReceipt {
     this.requireActivePerson(input.personId);
-    const action = this.store.adoptLifestyleProposal(input);
-    if (!action.proposalId) throw new Error('LIFESTYLE_PROPOSAL_LINK_MISSING');
-    return adoptedActionReceiptSchema.parse({
-      id: action.id,
-      proposalId: action.proposalId,
-      title: action.title,
-      userGoal: action.userGoal,
-      selectedStartingOption: action.selectedStartingOption,
-      plannedTime: action.plannedTime,
-      owner: action.owner,
-      progressNote: action.progressNote,
-      status: action.status,
-      dueDate: action.dueDate,
-      updatedAt: action.updatedAt
-    });
+    // 不依赖界面禁用按钮：旧版建议不能通过直接 IPC 调用新增行动。
+    throw new Error('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
   }
 
   adoptMemberAssessmentAction(input: AdoptMemberAssessmentActionInput): ActionItem {
@@ -1059,7 +1046,8 @@ export class PersonalWorkspaceService {
 
   setLifestyleProposalDecision(input: SetLifestyleProposalDecisionInput): LifestyleProposalDecisionReceipt {
     this.requireActivePerson(input.personId);
-    return lifestyleProposalDecisionReceiptSchema.parse(this.store.setLifestyleProposalDecision(input));
+    // 旧建议只读兼容；不能绕过页面状态直接恢复为可采纳候选。
+    throw new Error('LIFESTYLE_PROPOSAL_STALE_REVIEW_REQUIRED');
   }
 
   close(): void {
@@ -1538,13 +1526,13 @@ export class PersonalWorkspaceService {
           ? `已接纳 ${stats.acceptedFactCount} 条有来源事实`
           : processingCount > 0 ? `${processingCount} 份资料已进入处理中心`
             : documentCount > 0 ? `${documentCount} 份资料等待处理` : '尚未导入资料',
-        changeSummary: assessment?.overview.headline ?? derived?.payload.claims[0]?.title ?? (stats.acceptedFactCount > 0
+        changeSummary: assessment?.overview.headline ?? (stats.acceptedFactCount > 0
           ? `最近处理已保存 ${stats.acceptedFactCount} 条报告事实；健康解释仍需单独生成和复核`
           : processingCount > 0 ? '资料已安全保存在本机，请到处理中心查看进度或恢复失败任务'
             : documentCount > 0 ? '资料已安全保存在本机，尚未形成健康结论' : '可以先添加一份体检或门诊资料'),
-        derivedStatus: assessment ? 'current' as const : v3HistoryPersonIds.has(person.id)
-          ? 'stale' as const : derived?.status ?? 'unavailable' as const,
-        assessmentSummary: assessment?.overview.summary ?? (derived?.status === 'current' ? derived.payload.claims[0]?.explanation ?? null : null),
+        derivedStatus: assessment ? 'current' as const : derived || v3HistoryPersonIds.has(person.id)
+          ? 'stale' as const : 'unavailable' as const,
+        assessmentSummary: assessment?.overview.summary ?? null,
         dataRevision: stableHash({
           factRevision: this.store.getFactRevision(person.id),
           clinicalContextRevision: person.clinicalContextRevision,
