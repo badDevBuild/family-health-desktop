@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
+import { buildP01Prompt } from './lean.js';
 import {
   ACCEPTANCE_RULES_VERSION,
   DERIVED_PROMPT_VERSION,
@@ -42,16 +43,22 @@ function instructionPart(prompt: string): string {
 
 describe('pipeline prompts', () => {
   it('版本号与阶段签名保持一致', () => {
-    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v4');
+    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v5');
     expect(DERIVED_PROMPT_VERSION).toBe('derived-v4');
     expect(promptMetaForStage('extract')).toEqual({
-      promptVersion: 'extract-v4',
+      promptVersion: 'extract-v5',
       rulesVersion: ACCEPTANCE_RULES_VERSION
     });
     expect(promptMetaForStage('analyze')).toEqual({
       promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION,
       rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION
     });
+  });
+
+  it('V3 提取不把覆盖用的非临床说明写成健康事实', () => {
+    const prompt = buildP01Prompt({ displayName: '合成成员' }, { spans: [{ quote: '此图仅用于软件测试' }] });
+    expect(prompt).toContain('软件测试声明等非临床说明不是个人健康事实');
+    expect(prompt).toContain('不要为了覆盖而把它们建成“报告说明”候选');
   });
 
   it('提取提示词把数据块放在说明之后，并锁定关键硬规则', () => {

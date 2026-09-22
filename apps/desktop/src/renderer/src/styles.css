@@ -750,9 +750,13 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .proposal-adoption-form input, .proposal-adoption-form select, .proposal-adoption-form textarea { width: 100%; min-height: 44px; border: 1px solid var(--warm-300); border-radius: 12px; background: #fff; color: var(--warm-900); font: inherit; padding: 10px 12px; }
 .proposal-adoption-form textarea { min-height: 82px; resize: vertical; }
 .proposal-adoption-form__grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-.adopted-action-card > div { display: grid; gap: 4px; }
-.adopted-action-card span { color: var(--warm-700); font-size: 14px; line-height: 1.45; }
-.adopted-action-card small { line-height: 1.45; }
+.adopted-action-card { align-items: start; padding: 14px; border: 1px solid var(--warm-200); border-radius: 12px; background: #fff; }
+.adopted-action-card > svg { margin-top: 4px; }
+.adopted-action-card > div { min-width: 0; display: grid; gap: 8px; }
+.adopted-action-card strong { color: var(--warm-900); font-size: 16px; line-height: 1.5; text-decoration: none; }
+.adopted-action-card span, .adopted-action-card__detail { color: var(--warm-700); font-size: 16px; line-height: 1.6; }
+.adopted-action-card__detail { margin: 0; white-space: pre-line; overflow-wrap: anywhere; }
+.adopted-action-card small { color: var(--warm-600); font-size: 14px; line-height: 1.6; }
 .source-document-list { display: grid; margin-top: 16px; overflow: hidden; border: 1px solid var(--warm-200); border-radius: 15px; }
 .source-document-list article { min-height: 70px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto auto; align-items: center; gap: 10px; padding: 10px 13px; border-bottom: 1px solid var(--warm-200); background: #fff; }
 .source-document-list article:last-child { border-bottom: 0; }

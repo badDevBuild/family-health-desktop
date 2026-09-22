@@ -86,6 +86,9 @@ describe('MemberProfileV2 event organization', () => {
       personId: 'person-1', snapshotId: 'assessment-1', actionId: 'action-1'
     }));
     expect(await screen.findByText('已加入后续事项')).toBeTruthy();
+    const adoptedCard = document.querySelector('.adopted-action-card');
+    expect(adoptedCard?.querySelector('.adopted-action-card__detail')?.textContent).toBe('整理过去报告。');
+    expect(adoptedCard?.querySelector('span')).toBeNull();
   });
   it('模型给出的网址在页面上不能显示成应用已核验', () => {
     expect(assessmentKnowledgeStatusLabel('model_cited')).toBe('AI 提供的网址；应用尚未核对正文');
