@@ -6,14 +6,28 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
 import { createSyntheticTwoPageScannedPdf } from '../../../../packages/evaluation/src/scanned-pdf-fixture.js';
-import { PersonalWorkspaceService } from './workspace-service.js';
+import { PersonalWorkspaceService as BasePersonalWorkspaceService } from './workspace-service.js';
 import { compareIndependentExtractions, DocumentExtractionPipeline, mergeIndependentlyConfirmedEvidence, partitionPdfSpans, partitionSourceSpans, scopeCandidateKeys } from './processing-pipeline.js';
 
 const roots: string[] = [];
+const openServices = new Set<BasePersonalWorkspaceService>();
 const require = createRequire(import.meta.url);
 
+class PersonalWorkspaceService extends BasePersonalWorkspaceService {
+  constructor(...args: ConstructorParameters<typeof BasePersonalWorkspaceService>) {
+    super(...args);
+    openServices.add(this);
+  }
+
+  override close(): void {
+    if (!openServices.delete(this)) return;
+    super.close();
+  }
+}
+
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const service of [...openServices]) service.close();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 async function setup() {

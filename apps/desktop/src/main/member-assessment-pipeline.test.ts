@@ -13,10 +13,27 @@ import { buildMemberAggregatePackage, buildMemberSystemPartitions, splitMemberPa
 import { validateAssessmentCandidate } from './assessment-validation.js';
 import { buildAssessmentKnowledgeVerifications, canonicalizeAssessmentKnowledge } from './assessment-knowledge.js';
 import { buildMemberSummaryData } from './export-service.js';
-import { PersonalWorkspaceService } from './workspace-service.js';
+import { PersonalWorkspaceService as BasePersonalWorkspaceService } from './workspace-service.js';
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const openServices = new Set<BasePersonalWorkspaceService>();
+
+class PersonalWorkspaceService extends BasePersonalWorkspaceService {
+  constructor(...args: ConstructorParameters<typeof BasePersonalWorkspaceService>) {
+    super(...args);
+    openServices.add(this);
+  }
+
+  override close(): void {
+    if (!openServices.delete(this)) return;
+    super.close();
+  }
+}
+
+afterEach(() => {
+  for (const service of [...openServices]) service.close();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 async function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'family-health-lean-assessment-'));

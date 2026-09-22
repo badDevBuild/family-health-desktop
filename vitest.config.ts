@@ -15,6 +15,8 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
+    // Windows CI 的冷启动 PDF/DOCX 转换与 SQLite 用例会超过 Vitest 默认 5 秒；不放宽其他平台。
+    testTimeout: process.platform === 'win32' ? 30_000 : 5_000,
     include: ['packages/**/*.test.ts', 'apps/**/*.test.{ts,tsx}', 'scripts/**/*.test.ts'],
     exclude: ['scripts/benchmark-local-capacity.test.ts'],
     coverage: {
