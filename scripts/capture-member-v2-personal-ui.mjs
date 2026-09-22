@@ -299,18 +299,54 @@ let adoptionJourney = null;
 if (adoptAction) {
   await clickButton('生活与行动', true);
   await waitFor(`document.querySelector('.member-proposal-list') !== null`);
-  const alreadyAdopted = await evaluate(`document.querySelector('.proposal-adopted') !== null`);
-  if (!alreadyAdopted) {
-    await clickButton('采纳为我的行动', true);
-    await waitFor(`document.querySelector('.proposal-adoption-form') !== null`);
-    const formVisible = await evaluate(`document.querySelector('.proposal-adoption-form') !== null`);
-    await clickButton('确认加入行动', true);
-    await waitFor(`document.querySelector('.proposal-adopted') !== null`);
-    adoptionJourney = { startedFrom: 'proposed', formVisible, adopted: true };
+  const assessmentAction = await evaluate(`document.querySelector('.assessment-action-card') !== null`);
+  if (assessmentAction) {
+    const alreadyAdopted = await evaluate(`document.querySelector('.assessment-action-card')?.textContent?.includes('已加入后续事项') === true`);
+    if (!alreadyAdopted) {
+      const clicked = await evaluate(`(() => {
+        const button = [...document.querySelectorAll('.assessment-action-card button')]
+          .find((element) => element.textContent?.trim() === '加入后续事项');
+        button?.click();
+        return Boolean(button);
+      })()`);
+      if (!clicked) throw new Error('ASSESSMENT_ADOPTION_BUTTON_NOT_FOUND');
+      await waitFor(`document.querySelector('.assessment-action-card')?.textContent?.includes('已加入后续事项') === true`);
+    }
+    const adoptedActionCount = await evaluate(`document.querySelectorAll('.adopted-action-card').length`);
+    await evaluate(`document.querySelector('.adopted-action-card')?.scrollIntoView({ block: 'center' })`);
+    await screenshot('09-adopted-action');
+    await client.send('Page.reload', { ignoreCache: true });
+    await waitFor(`document.querySelector('.app-shell') !== null`);
+    await clickButton('成员档案', true);
+    await waitFor(`[role="tab"] !== null`);
+    await clickButton('生活与行动', true);
+    await waitFor(`document.querySelector('.assessment-action-card') !== null`);
+    const persistedAfterReload = await evaluate(`document.querySelector('.assessment-action-card')?.textContent?.includes('已加入后续事项') === true`);
+    const countAfterReload = await evaluate(`document.querySelectorAll('.adopted-action-card').length`);
+    adoptionJourney = {
+      kind: 'assessment-v3', startedFrom: alreadyAdopted ? 'adopted' : 'proposed',
+      adopted: adoptedActionCount > 0, adoptedActionCount,
+      persistedAfterReload, countAfterReload, noDuplicateAfterReload: countAfterReload === adoptedActionCount
+    };
+    if (!adoptionJourney.adopted || !persistedAfterReload || !adoptionJourney.noDuplicateAfterReload) {
+      throw new Error('ASSESSMENT_ADOPTION_PERSISTENCE_FAILED');
+    }
+    await evaluate(`document.querySelector('.adopted-action-card')?.scrollIntoView({ block: 'center' })`);
+    await screenshot('10-adopted-action-after-reload');
   } else {
-    adoptionJourney = { startedFrom: 'adopted', formVisible: false, adopted: true };
+    const alreadyAdopted = await evaluate(`document.querySelector('.proposal-adopted') !== null`);
+    if (!alreadyAdopted) {
+      await clickButton('采纳为我的行动', true);
+      await waitFor(`document.querySelector('.proposal-adoption-form') !== null`);
+      const formVisible = await evaluate(`document.querySelector('.proposal-adoption-form') !== null`);
+      await clickButton('确认加入行动', true);
+      await waitFor(`document.querySelector('.proposal-adopted') !== null`);
+      adoptionJourney = { kind: 'legacy-proposal', startedFrom: 'proposed', formVisible, adopted: true };
+    } else {
+      adoptionJourney = { kind: 'legacy-proposal', startedFrom: 'adopted', formVisible: false, adopted: true };
+    }
+    await screenshot('09-adopted-action');
   }
-  await screenshot('09-adopted-action');
 }
 
 const accessibilityAudit = await evaluate(`(() => ({
