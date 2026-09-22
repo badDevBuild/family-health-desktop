@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AccountState, AssessmentRequestV3, ExtractionResult, MemberAssessmentCandidateV3, MemberEvidencePackageV3 } from '@contracts';
 import type { CodexRuntimeManager } from './codex-runtime.js';
@@ -8,6 +9,18 @@ import { ProcessingJobRunner } from './job-runner.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
 
 const roots: string[] = [];
+
+function recordedTurnUsage(databasePath: string) {
+  const database = new Database(databasePath, { readonly: true });
+  try {
+    const row = database.prepare('SELECT usage_json FROM job_attempts ORDER BY rowid DESC LIMIT 1')
+      .get() as { usage_json: string | null };
+    return JSON.parse(row.usage_json!) as {
+      attemptedTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      completedTurnResponses: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+    };
+  } finally { database.close(); }
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -97,6 +110,10 @@ describe('ProcessingJobRunner', () => {
     });
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(documentCount);
     expect(service.store.listMemberAssessmentSnapshots(personId, true)).toHaveLength(1);
+    expect(recordedTurnUsage(service.store.databasePath)).toEqual({
+      attemptedTurnRequests: { P01: documentCount, P02: 1, P03: 0, P04: 0, other: 0 },
+      completedTurnResponses: { P01: documentCount, P02: 1, P03: 0, P04: 0, other: 0 }
+    });
     service.close();
   });
 
@@ -188,6 +205,10 @@ describe('ProcessingJobRunner', () => {
     await running;
     expect(service.store.listStoredJobs()[0]).toMatchObject({ id: jobId, status: 'cancelled', completedUnits: 0 });
     expect(service.store.listAcceptedObservations(personId)).toEqual([]);
+    expect(recordedTurnUsage(service.store.databasePath)).toEqual({
+      attemptedTurnRequests: { P01: 1, P02: 0, P03: 0, P04: 0, other: 0 },
+      completedTurnResponses: { P01: 0, P02: 0, P03: 0, P04: 0, other: 0 }
+    });
     service.close();
   });
 

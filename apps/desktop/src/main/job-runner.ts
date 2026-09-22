@@ -7,6 +7,21 @@ import { CodexRuntimeManager } from './codex-runtime.js';
 import { MemberAssessmentPipeline } from './member-assessment-pipeline.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 
+type LeanTurnStage = 'P01' | 'P02' | 'P03' | 'P04' | 'other';
+
+function classifyLeanTurn(prompt: string): LeanTurnStage {
+  // 只看模板边界，不扫描 JSON 数据里的用户原文，避免资料内嵌文本冒充阶段。
+  if (prompt.includes('\nREPAIR_REQUEST=')) return 'P03';
+  if (prompt.includes('\nREVIEW_REQUEST=')) return 'P04';
+  if (prompt.includes('\nASSESSMENT_REQUEST=')) return 'P02';
+  if (prompt.includes('\nTARGET_MEMBER=')) return 'P01';
+  return 'other';
+}
+
+function emptyTurnCounts(): Record<LeanTurnStage, number> {
+  return { P01: 0, P02: 0, P03: 0, P04: 0, other: 0 };
+}
+
 export class ProcessingJobRunner extends EventEmitter {
   private running = false;
   private readonly leaseOwner = `desktop-${randomUUID()}`;
@@ -44,9 +59,15 @@ export class ProcessingJobRunner extends EventEmitter {
         // 每个任务领取时冻结模型设置，避免用户在处理中修改设置导致同一任务混用模型。
         const aiPreferences = structuredClone(this.getAiPreferences());
         const attemptId = store.startJobAttempt(job.id, account.runtimeVersion, aiPreferences.modelId, aiPreferences.reasoningEffort);
+        const turnUsage = { attemptedTurnRequests: emptyTurnCounts(), completedTurnResponses: emptyTurnCounts() };
         const jobRuntime = {
-          runStructuredTurn: <T>(input: Omit<Parameters<CodexRuntimeManager['runStructuredTurn']>[0], 'aiPreferences'>) =>
-            this.runtime.runStructuredTurn<T>({ ...input, aiPreferences })
+          runStructuredTurn: async <T>(input: Omit<Parameters<CodexRuntimeManager['runStructuredTurn']>[0], 'aiPreferences'>) => {
+            const stage = classifyLeanTurn(input.prompt);
+            turnUsage.attemptedTurnRequests[stage] += 1;
+            const result = await this.runtime.runStructuredTurn<T>({ ...input, aiPreferences });
+            turnUsage.completedTurnResponses[stage] += 1;
+            return result;
+          }
         };
         const executionGuard = {
           jobId: job.id,
@@ -106,7 +127,7 @@ export class ProcessingJobRunner extends EventEmitter {
           const finalStatus = needsReview ? 'waiting_user' : hasAssessmentRejection ? 'completed_with_issues' : 'succeeded';
           if (!needsReview) store.updateJobStage(job.id, 'publish');
           store.finishJob(job.id, finalStatus);
-          store.finishJobAttempt({ attemptId, status: finalStatus, ...lastReceipt });
+          store.finishJobAttempt({ attemptId, status: finalStatus, ...lastReceipt, usage: turnUsage });
           this.emit('terminal', { jobId: job.id, status: finalStatus });
         } catch (error) {
           const code = error instanceof Error ? error.message : 'JOB_FAILED';
@@ -121,7 +142,7 @@ export class ProcessingJobRunner extends EventEmitter {
               ? 'waiting_quota'
               : 'failed';
           store.finishJob(job.id, status);
-          store.finishJobAttempt({ attemptId, status, errorCode: code });
+          store.finishJobAttempt({ attemptId, status, errorCode: code, usage: turnUsage });
           this.emit('terminal', { jobId: job.id, status });
         }
         this.emit('changed');

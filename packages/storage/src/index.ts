@@ -3061,14 +3061,19 @@ export class WorkspaceStore {
     errorCode?: string | null;
     threadId?: string | null;
     turnId?: string | null;
+    usage?: {
+      attemptedTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      completedTurnResponses: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+    };
   }): void {
     const result = this.db.prepare(`
       UPDATE job_attempts
-      SET status = ?, error_code = ?, thread_id = ?, turn_id = ?, finished_at = ?
+      SET status = ?, error_code = ?, thread_id = ?, turn_id = ?, usage_json = ?, finished_at = ?
       WHERE id = ? AND status = 'running'
     `).run(
       input.status, input.errorCode ?? null, input.threadId ?? null,
-      input.turnId ?? null, this.now().toISOString(), input.attemptId
+      input.turnId ?? null, input.usage ? JSON.stringify(input.usage) : null,
+      this.now().toISOString(), input.attemptId
     );
     if (result.changes !== 1) throw new Error('JOB_ATTEMPT_NOT_RUNNING');
   }
