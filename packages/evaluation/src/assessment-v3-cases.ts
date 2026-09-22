@@ -240,6 +240,29 @@ export function createAssessmentV3SyntheticCases(): AssessmentV3SyntheticCase[] 
   return seeds.map(buildCase);
 }
 
+/** 仅把虚构网页正文作为低信任测试数据送入 P02；不冒充真实 Web Search 工具回执。 */
+export function prepareSyntheticWebExcerptChallenge(item: AssessmentV3SyntheticCase, allowWebSearch = false): {
+  request: AssessmentRequestV3;
+  simulatedToolResult: { kind: 'simulated_untrusted_web_result'; excerpt: string };
+} {
+  if (!item.synthetic || !item.externalUntrustedExcerpt) {
+    throw new Error('SYNTHETIC_WEB_EXCERPT_REQUIRED');
+  }
+  return {
+    request: {
+      ...item.request,
+      webSearchAllowed: allowWebSearch,
+      inputSignature: createHash('sha256').update(JSON.stringify({
+        version: 'synthetic-web-excerpt-v1',
+        sourceSignature: item.request.inputSignature,
+        excerpt: item.externalUntrustedExcerpt,
+        allowWebSearch
+      })).digest('hex')
+    },
+    simulatedToolResult: { kind: 'simulated_untrusted_web_result', excerpt: item.externalUntrustedExcerpt }
+  };
+}
+
 export function validateAssessmentV3SyntheticCases(cases: AssessmentV3SyntheticCase[]): void {
   if (cases.filter((item) => item.split === 'development').length < 24
     || cases.filter((item) => item.split === 'holdout').length < 6) {

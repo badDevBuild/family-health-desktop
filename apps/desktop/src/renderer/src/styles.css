@@ -448,7 +448,7 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .manual-note-list strong { color: var(--warm-700); font-size: 13px; line-height: 1.55; }
 .member-dialog > .check-label { min-height: 44px; display: flex; align-items: center; gap: 9px; color: var(--warm-700); font-size: 13px; }
 .member-dialog > .check-label input { width: 18px; height: 18px; padding: 0; accent-color: var(--primary); }
-.process-consent-dialog { width: min(540px, calc(100vw - 48px)); }
+.process-consent-dialog { width: min(540px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow-y: auto; }
 .process-consent-dialog > p strong { color: var(--warm-900); }
 .consent-facts { display: grid; gap: 9px; padding: 13px 14px; border-radius: 13px; color: var(--warm-700); background: var(--warm-100); font-size: 13px; }
 .consent-facts span { display: flex; align-items: flex-start; gap: 8px; line-height: 1.5; }

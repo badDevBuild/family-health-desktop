@@ -592,6 +592,7 @@ describe('App member display editing', () => {
     fireEvent.click(screen.getByRole('button', { name: /处理选中项/ }));
     expect(await screen.findByText(/1 份选中的已归属资料/)).toBeTruthy();
     expect(screen.getByText(/无法在发送前逐条检查搜索词/)).toBeTruthy();
+    expect(screen.getByText(/纯合成联网测试已观察到检验数值进入搜索词/)).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: /我确认本次接收方/ }));
     fireEvent.click(screen.getByRole('button', { name: '授权并开始' }));
 

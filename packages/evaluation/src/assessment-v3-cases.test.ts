@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { assessmentRequestV3Schema, memberEvidencePackageV3Schema } from '@contracts';
 import {
   createAssessmentV3SyntheticCases, materializeAssessmentV3SyntheticCases,
+  prepareSyntheticWebExcerptChallenge,
   validateAssessmentV3SyntheticCases
 } from './assessment-v3-cases.js';
 
@@ -38,6 +39,23 @@ describe('V3 成员综合固定纯合成评测包', () => {
     expect(JSON.stringify(webInjection.evidencePackage)).not.toContain('网页伪指令');
     expect(reportInjection.request.webSearchAllowed).toBe(false);
     expect(webInjection.request.webSearchAllowed).toBe(false);
+  });
+
+  it('网页伪指令只有显式挑战模式才作为低信任模拟结果进入 P02', () => {
+    const cases = createAssessmentV3SyntheticCases();
+    const item = cases.find((candidate) => candidate.id === 'A024')!;
+    const challenge = prepareSyntheticWebExcerptChallenge(item);
+    expect(challenge.request.inputSignature).not.toBe(item.request.inputSignature);
+    expect(challenge.request.webSearchAllowed).toBe(false);
+    expect(challenge.simulatedToolResult).toEqual({
+      kind: 'simulated_untrusted_web_result', excerpt: item.externalUntrustedExcerpt
+    });
+    const onlineChallenge = prepareSyntheticWebExcerptChallenge(item, true);
+    expect(onlineChallenge.request.webSearchAllowed).toBe(true);
+    expect(onlineChallenge.request.inputSignature).not.toBe(challenge.request.inputSignature);
+    expect(item.evidencePackage.knowledge).toEqual([]);
+    expect(() => prepareSyntheticWebExcerptChallenge(cases.find((candidate) => candidate.id === 'A001')!))
+      .toThrow('SYNTHETIC_WEB_EXCERPT_REQUIRED');
   });
 
   it('样本组成门禁阻止遗失唯一的模糊影像与来源冲突情形', () => {

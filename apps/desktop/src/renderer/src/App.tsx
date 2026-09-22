@@ -1265,6 +1265,7 @@ function InboxDirectoriesDialog({ snapshot, onClose, onNotice }: {
             <label>资料默认归属<select value={personId ?? ''} onChange={(event) => setPersonId(event.target.value || null)}><option value="">公共待归属</option>{snapshot.persons.map((person) => <option key={person.id} value={person.id}>{person.displayName} · {person.relation}</option>)}</select></label>
             <label className="check-label"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /> 包含子目录中的资料</label>
             <label className="check-label"><input type="checkbox" checked={allowAi} disabled={snapshot.account.status !== 'connected'} onChange={(event) => setAllowAi(event.target.checked)} /> 允许日程任务把必要内容发送给 OpenAI/Codex 处理</label>
+            {snapshot.account.status === 'connected' && <p>纯合成联网测试已观察到检验数值进入搜索词；应用目前无法在发出前拦截真实查询。启用 AI 处理前，请确认你接受这项风险。</p>}
             <p>{snapshot.account.status === 'connected' ? '这项授权绑定当前 Codex 账户、所选目录和成员；综合分析会带入该成员已接纳的相关历史事实和必要的本人补充，并可能使用内置 Web Search。应用要求只搜索通用医学问题，但目前无法在发送前逐条检查真实搜索词；停用目录会撤回后续授权。' : '当前未连接 Codex，因此只能先启用本地导入。连接后可重新授权自动处理。'}</p>
             <div className="dialog-actions"><button className="secondary-button" onClick={() => setSelection(null)}>取消</button><button className="primary-button" disabled={busy} onClick={() => void confirmDirectory()}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 确认启用</button></div>
           </div>
@@ -1293,6 +1294,7 @@ function ProcessConsentDialog({ snapshot, documentIds, onClose, onConfirm, onLog
       <section className="member-dialog process-consent-dialog" role="dialog" aria-modal="true" aria-labelledby="process-consent-title">
         <header><div><span className="eyebrow">本次手动处理</span><h2 id="process-consent-title">确认发送范围</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭处理确认"><X size={19} /></button></header>
         <p>将处理 {readyCount} 份{documentIds ? '选中的' : ''}已归属资料{derivedRefreshCount > 0 ? `，并为 ${derivedRefreshCount} 位成员刷新已过期的综合说明` : ''}。除新资料外，综合分析会包含<strong>同一成员的相关已接纳历史事实和必要的本人补充</strong>。这些必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>
+        <p>纯合成联网测试已观察到检验数值进入搜索词；应用无法在查询发出前拦截。若继续授权，真实报告内容也可能发生同类情况。</p>
         <div className="consent-facts"><span><ShieldCheck size={17} /> 不发送其他成员或未归属资料</span><span><FileCheck2 size={17} /> 历史事实只限本成员且在授权清单中记录</span><span><FileCheck2 size={17} /> 事实入库由应用校验；重要综合判断按需重点复核</span><span><CircleHelp size={17} /> 综合分析可使用内置 Web Search；应用目前无法在发送前逐条检查搜索词，敏感内容可能被错误带入查询</span><span><Sparkles size={17} /> 使用当前 Codex 账户额度，额度规则可能变化</span></div>
         <label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我确认本次接收方、用途和资料范围</label>
         {!connected && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>Codex 尚未连接</strong><p>先完成官方登录，才会建立本次处理授权和任务。</p></div></div>}
