@@ -295,3 +295,10 @@ export function materializeSyntheticGoldDataset(rootDirectory: string): { summar
 
 export { materializeSyntheticBinaryFixtures } from './binary-fixtures.ts';
 export type { BinaryFixtureManifest, BinaryFixtureReceipt } from './binary-fixtures.ts';
+export {
+  ASSESSMENT_V3_CASESET_VERSION,
+  createAssessmentV3SyntheticCases,
+  materializeAssessmentV3SyntheticCases,
+  validateAssessmentV3SyntheticCases
+} from './assessment-v3-cases.ts';
+export type { AssessmentV3SyntheticCase } from './assessment-v3-cases.ts';
