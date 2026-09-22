@@ -623,6 +623,17 @@ function registerIpc(): void {
     }
   });
 
+  ipcMain.handle('members:get-assessment-v3', (event, rawInput: unknown) => {
+    validateSender(event);
+    try {
+      if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+      const input = memberPersonInputSchema.parse(rawInput);
+      return { ok: true, data: personalWorkspace.getMemberAssessment(input.personId) };
+    } catch (error) {
+      return memberReadFailure(error);
+    }
+  });
+
   ipcMain.handle('body:list-systems', (event, rawInput: unknown) => {
     validateSender(event);
     try {

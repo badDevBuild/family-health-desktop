@@ -16,14 +16,9 @@ import { evaluateObservationCandidate, stableHash } from '@core';
 import { buildPdfManifest, INGESTION_LIMITS, renderDocxImagesToFiles, renderHeicImagesToPngs, renderPdfPagesToPngs } from '@ingestion';
 import type { JobExecutionGuard, WorkspaceStore } from '@storage';
 import {
-  ACCEPTANCE_RULES_VERSION,
-  buildAdjudicateAbnormalFlagsPrompt,
-  buildAdjudicateFactDifferencesPrompt,
-  buildExtractPrompt,
-  buildRepairFactValidationPrompt,
-  buildRecoverCoveragePrompt,
-  buildReviewFactsPrompt
+  ACCEPTANCE_RULES_VERSION
 } from './prompts/index.js';
+import { buildP01Prompt, buildP03Prompt } from './prompts/lean.js';
 
 interface StructuredRuntime {
   runStructuredTurn(input: {
@@ -40,24 +35,6 @@ export type ExtractionPipelineResult =
   | { status: 'needs_review'; documentId: string; issueId: string; reason: string; threadId?: string; turnId?: string };
 
 const outputSchema = z.toJSONSchema(extractionResultSchema, { target: 'draft-7' }) as Record<string, unknown>;
-const factDifferenceAdjudicationSchema = z.object({
-  schemaVersion: z.literal(1),
-  decisions: z.array(z.object({
-    differenceIndex: z.number().int().nonnegative(),
-    choice: z.enum(['first', 'second', 'omit', 'unresolved']),
-    reasonCode: z.string().min(1).max(120)
-  }).strict())
-}).strict();
-const factDifferenceAdjudicationOutputSchema = z.toJSONSchema(
-  factDifferenceAdjudicationSchema,
-  { target: 'draft-7' }
-) as Record<string, unknown>;
-
-type FactDifferenceAdjudication = z.infer<typeof factDifferenceAdjudicationSchema>;
-type AdjudicationApplication = {
-  result: ExtractionResult;
-  unresolvedDifferences: ReviewCandidateDiff[];
-};
 type CandidateValidationFailure = {
   localKey: string;
   itemName: string;
@@ -96,108 +73,6 @@ function blockingIssueCodes(candidate: ObservationCandidate): string[] {
     .filter((code) => code.startsWith('blocking_')))].sort();
 }
 
-function onlyReportedAbnormalFlagDifferences(differences: ReviewCandidateDiff[]): boolean {
-  return differences.length > 0
-    && differences.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'reportedAbnormalFlag');
-}
-
-function reviewDifferenceEvidenceRefs(differences: ReviewCandidateDiff[]): string[] {
-  const refs: string[] = [];
-  for (const difference of differences) {
-    for (const candidate of [difference.firstCandidate, difference.secondCandidate]) {
-      for (const evidence of candidate?.evidence ?? []) {
-        if (!refs.includes(evidence.sourceSpanId)) refs.push(evidence.sourceSpanId);
-      }
-    }
-  }
-  return refs;
-}
-
-function isSupportedAdjudicatedAbnormalFlag(value: string | null): boolean {
-  if (value === null) return true;
-  return /^(?:偏高|偏低|阳性|阴性|正常|未见异常|high|low|positive|negative|normal|h|l)$/i.test(value.trim());
-}
-
-function applyReportedAbnormalFlagAdjudication(
-  reviewed: ExtractionResult,
-  adjudicated: ExtractionResult,
-  differences: ReviewCandidateDiff[]
-): AdjudicationApplication {
-  const adjudicatedByKey = new Map(adjudicated.candidates.map((candidate) => [candidate.localKey, candidate]));
-  const targetKeys = new Set(differences.map((difference) => difference.localKey));
-  const flags = new Map<string, string | null>();
-  const unresolvedDifferences: ReviewCandidateDiff[] = [];
-  for (const difference of differences) {
-    const candidate = adjudicatedByKey.get(difference.localKey);
-    if (!candidate
-      || candidate.issues.some((issue) => issue.code.startsWith('blocking_'))
-      || !isSupportedAdjudicatedAbnormalFlag(candidate.reportedAbnormalFlag)) {
-      unresolvedDifferences.push(difference);
-      continue;
-    }
-    flags.set(difference.localKey, candidate.reportedAbnormalFlag);
-  }
-  return {
-    result: {
-      ...reviewed,
-      candidates: reviewed.candidates.map((candidate) => targetKeys.has(candidate.localKey) && flags.has(candidate.localKey)
-        ? { ...candidate, reportedAbnormalFlag: flags.get(candidate.localKey) ?? null }
-        : candidate)
-    },
-    unresolvedDifferences
-  };
-}
-
-function applyFactDifferenceAdjudication(
-  reviewed: ExtractionResult,
-  differences: ReviewCandidateDiff[],
-  adjudication: FactDifferenceAdjudication
-): AdjudicationApplication | null {
-  if (adjudication.decisions.length !== differences.length) return null;
-  const decisions = new Map<number, FactDifferenceAdjudication['decisions'][number]>();
-  for (const decision of adjudication.decisions) {
-    if (decision.differenceIndex >= differences.length || decisions.has(decision.differenceIndex)) return null;
-    decisions.set(decision.differenceIndex, decision);
-  }
-  if (decisions.size !== differences.length) return null;
-
-  const replacements = new Map<string, ObservationCandidate | null>();
-  const additions: ObservationCandidate[] = [];
-  const unresolvedDifferences: ReviewCandidateDiff[] = [];
-  for (const [differenceIndex, difference] of differences.entries()) {
-    const decision = decisions.get(differenceIndex)!;
-    if (decision.choice === 'unresolved') {
-      unresolvedDifferences.push(difference);
-      continue;
-    }
-    const selected = decision.choice === 'first'
-      ? difference.firstCandidate ?? null
-      : decision.choice === 'second'
-        ? difference.secondCandidate ?? null
-        : null;
-    if (decision.choice === 'omit' && difference.firstCandidate && difference.secondCandidate) return null;
-    if (decision.choice !== 'omit' && !selected) return null;
-
-    if (difference.secondCandidate) {
-      replacements.set(difference.secondCandidate.localKey, selected);
-    } else if (selected) {
-      additions.push(selected);
-    }
-  }
-
-  const candidates = reviewed.candidates.flatMap((candidate) => {
-    if (!replacements.has(candidate.localKey)) return [candidate];
-    const replacement = replacements.get(candidate.localKey) ?? null;
-    return replacement ? [replacement] : [];
-  });
-  candidates.push(...additions);
-  const uniqueKeys = new Set(candidates.map((candidate) => candidate.localKey));
-  if (uniqueKeys.size !== candidates.length) return null;
-  return {
-    result: { ...reviewed, candidates },
-    unresolvedDifferences
-  };
-}
 
 function pressureKind(candidate: ObservationCandidate): BloodPressureKind | null {
   const name = `${candidate.originalName} ${candidate.standardNameCandidate ?? ''}`
@@ -598,51 +473,6 @@ function normalizedComparableAbnormalFlag(candidate: ObservationCandidate): stri
   return flag;
 }
 
-function isOptionalNormalSummary(candidate: ObservationCandidate): boolean {
-  const name = normalizedComparableText(candidate.originalName) ?? '';
-  if (!/(?:小结|总结|结论|印象|summary|impression)$/.test(name)) return false;
-  if (candidate.reportedAbnormalFlag !== null
-    && !/^(?:正常|未见异常|无异常|normal|no abnormality)$/.test(normalizedComparableText(candidate.reportedAbnormalFlag) ?? '')) {
-    return false;
-  }
-  if (candidate.value.kind !== 'qualitative' && candidate.value.kind !== 'text') return false;
-  return /^(?:未见异常|无异常|正常|no abnormality detected|normal)$/.test(
-    normalizedComparableText(candidate.value.rawText) ?? ''
-  );
-}
-
-function isOptionalEmptyUnknown(candidate: ObservationCandidate): boolean {
-  return candidate.value.kind === 'unknown'
-    && !(candidate.value.rawText ?? '').trim()
-    && candidate.reportedAbnormalFlag === null
-    && !candidate.issues.some((issue) => issue.code.startsWith('blocking_'));
-}
-
-function isOmittableOneSidedCandidate(candidate: ObservationCandidate): boolean {
-  return isOptionalNormalSummary(candidate) || isOptionalEmptyUnknown(candidate);
-}
-
-function omitOmittableOneSidedCandidates(
-  first: ExtractionResult,
-  second: ExtractionResult
-): { first: ExtractionResult; second: ExtractionResult } {
-  const firstNames = new Set(first.candidates.map((candidate) => normalizedComparableText(candidate.originalName)));
-  const secondNames = new Set(second.candidates.map((candidate) => normalizedComparableText(candidate.originalName)));
-  return {
-    first: {
-      ...first,
-      candidates: first.candidates.filter((candidate) => (
-        !isOmittableOneSidedCandidate(candidate) || secondNames.has(normalizedComparableText(candidate.originalName))
-      ))
-    },
-    second: {
-      ...second,
-      candidates: second.candidates.filter((candidate) => (
-        !isOmittableOneSidedCandidate(candidate) || firstNames.has(normalizedComparableText(candidate.originalName))
-      ))
-    }
-  };
-}
 
 function comparableValue(candidate: ObservationCandidate): unknown {
   if (candidate.value.kind === 'numeric') {
@@ -857,26 +687,6 @@ function candidateValidationFailures(
   });
 }
 
-function repairPreservesUntargetedCandidates(
-  before: ExtractionResult,
-  after: ExtractionResult,
-  failures: CandidateValidationFailure[]
-): boolean {
-  const targetKeys = new Set(failures.map((failure) => failure.localKey));
-  const beforeByKey = new Map(before.candidates.map((candidate) => [candidate.localKey, candidate]));
-  const afterByKey = new Map(after.candidates.map((candidate) => [candidate.localKey, candidate]));
-  if (beforeByKey.size !== before.candidates.length
-    || afterByKey.size !== after.candidates.length
-    || beforeByKey.size !== afterByKey.size) return false;
-  for (const [localKey, candidate] of beforeByKey) {
-    const repaired = afterByKey.get(localKey);
-    if (!repaired) return false;
-    if (!targetKeys.has(localKey) && stableHash(candidate) !== stableHash(repaired)) return false;
-    if (targetKeys.has(localKey)
-      && normalizedComparableText(candidate.originalName) !== normalizedComparableText(repaired.originalName)) return false;
-  }
-  return true;
-}
 
 function normalizedPersonName(value: string): string {
   return value.normalize('NFKC').replace(/[\s·•・·]/g, '').toLocaleLowerCase('zh-CN');
@@ -992,12 +802,6 @@ function aggregateReportMetadata(items: Array<ReportMetadataCandidate | null | u
   };
 }
 
-function hasCompleteCoverage(result: ExtractionResult, expectedSpanIds: string[]): boolean {
-  const covered = new Set(result.coveredSourceSpanIds);
-  return covered.size === result.coveredSourceSpanIds.length
-    && covered.size === expectedSpanIds.length
-    && expectedSpanIds.every((id) => covered.has(id));
-}
 
 function evidenceIsConfinedToChunk(result: ExtractionResult, expectedSpanIds: string[]): boolean {
   const expected = new Set(expectedSpanIds);
@@ -1144,162 +948,6 @@ export class DocumentExtractionPipeline {
     }
   }
 
-  private async recoverIncompleteCoverage(input: {
-    documentId: string;
-    stage: 'extract' | 'review_facts';
-    sourcePackage: string;
-    imagePaths: string[];
-    expectedSpanIds: string[];
-    previousResult: ExtractionResult;
-    candidateToReview?: ExtractionResult;
-  }): Promise<{ result: ExtractionResult; threadId: string; turnId: string }> {
-    const covered = new Set(input.previousResult.coveredSourceSpanIds);
-    const missingSpanIds = input.expectedSpanIds.filter((id) => !covered.has(id));
-    const turn = await this.runTurn(input.documentId, input.stage, {
-      prompt: buildRecoverCoveragePrompt({
-        stage: input.stage,
-        sourcePackage: input.sourcePackage,
-        expectedSpanIds: input.expectedSpanIds,
-        missingSpanIds,
-        previousResult: input.previousResult,
-        ...(input.candidateToReview ? { candidateToReview: input.candidateToReview } : {})
-      }),
-      imagePaths: input.imagePaths,
-      outputSchema,
-      allowWebSearch: false,
-      timeoutMs: 600_000
-    });
-    return {
-      result: extractionResultSchema.parse(turn.output),
-      threadId: turn.threadId,
-      turnId: turn.turnId
-    };
-  }
-
-  private async adjudicateReportedAbnormalFlags(input: {
-    documentId: string;
-    sourcePackage: string;
-    imagePaths: string[];
-    expectedSpanIds: string[];
-    first: ExtractionResult;
-    second: ExtractionResult;
-    differences: ReviewCandidateDiff[];
-    bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>;
-    chunkIndex: number;
-  }): Promise<{ result: ExtractionResult | null; unresolvedDifferences: ReviewCandidateDiff[]; threadId: string; turnId: string }> {
-    const turn = await this.runTurn(input.documentId, 'review_facts', {
-      prompt: buildAdjudicateAbnormalFlagsPrompt({
-        sourcePackage: input.sourcePackage,
-        expectedSpanIds: input.expectedSpanIds,
-        differences: input.differences,
-        first: input.first,
-        second: input.second
-      }),
-      imagePaths: input.imagePaths,
-      outputSchema,
-      allowWebSearch: false,
-      timeoutMs: 600_000
-    });
-    const parsed = extractionResultSchema.safeParse(turn.output);
-    if (!parsed.success
-      || parsed.data.documentId !== input.documentId
-      || !hasCompleteCoverage(parsed.data, input.expectedSpanIds)
-      || !evidenceIsConfinedToChunk(parsed.data, input.expectedSpanIds)
-      || !subjectIsConsistent(parsed.data, input.bundle)) {
-      return {
-        result: null,
-        unresolvedDifferences: input.differences,
-        threadId: turn.threadId,
-        turnId: turn.turnId
-      };
-    }
-    const normalized = {
-      ...parsed.data,
-      candidates: scopeCandidateKeys(
-        normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans),
-        input.chunkIndex
-      )
-    };
-    const application = applyReportedAbnormalFlagAdjudication(input.second, normalized, input.differences);
-    return {
-      result: application.result,
-      unresolvedDifferences: application.unresolvedDifferences,
-      threadId: turn.threadId,
-      turnId: turn.turnId
-    };
-  }
-
-  private async adjudicateFactDifferences(input: {
-    documentId: string;
-    sourcePackage: string;
-    imagePaths: string[];
-    second: ExtractionResult;
-    differences: ReviewCandidateDiff[];
-  }): Promise<{ result: ExtractionResult | null; unresolvedDifferences: ReviewCandidateDiff[]; threadId: string; turnId: string }> {
-    const turn = await this.runTurn(input.documentId, 'review_facts', {
-      prompt: buildAdjudicateFactDifferencesPrompt({
-        sourcePackage: input.sourcePackage,
-        differences: input.differences
-      }),
-      imagePaths: input.imagePaths,
-      outputSchema: factDifferenceAdjudicationOutputSchema,
-      allowWebSearch: false,
-      timeoutMs: 600_000
-    });
-    const parsed = factDifferenceAdjudicationSchema.safeParse(turn.output);
-    const application = parsed.success
-      ? applyFactDifferenceAdjudication(input.second, input.differences, parsed.data)
-      : null;
-    return {
-      result: application?.result ?? null,
-      unresolvedDifferences: application?.unresolvedDifferences ?? input.differences,
-      threadId: turn.threadId,
-      turnId: turn.turnId
-    };
-  }
-
-  private async repairFactValidationIssues(input: {
-    documentId: string;
-    sourcePackage: string;
-    imagePaths: string[];
-    expectedSpanIds: string[];
-    result: ExtractionResult;
-    failures: CandidateValidationFailure[];
-    bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>;
-    chunkIndex: number;
-  }): Promise<{ result: ExtractionResult | null; threadId: string; turnId: string }> {
-    const turn = await this.runTurn(input.documentId, 'review_facts', {
-      prompt: buildRepairFactValidationPrompt({
-        sourcePackage: input.sourcePackage,
-        validationErrors: input.failures,
-        candidate: input.result
-      }),
-      imagePaths: input.imagePaths,
-      outputSchema,
-      allowWebSearch: false,
-      timeoutMs: 600_000
-    });
-    const parsed = extractionResultSchema.safeParse(turn.output);
-    if (!parsed.success
-      || parsed.data.documentId !== input.documentId
-      || !hasCompleteCoverage(parsed.data, input.expectedSpanIds)
-      || !evidenceIsConfinedToChunk(parsed.data, input.expectedSpanIds)
-      || !subjectIsConsistent(parsed.data, input.bundle)) {
-      return { result: null, threadId: turn.threadId, turnId: turn.turnId };
-    }
-    const normalized: ExtractionResult = {
-      ...parsed.data,
-      candidates: scopeCandidateKeys(
-        normalizeCandidates(parsed.data.candidates, input.bundle.manifest.spans),
-        input.chunkIndex
-      )
-    };
-    if (!repairPreservesUntargetedCandidates(input.result, normalized, input.failures)
-      || candidateValidationFailures(normalized, input.bundle).length > 0) {
-      return { result: null, threadId: turn.threadId, turnId: turn.turnId };
-    }
-    return { result: normalized, threadId: turn.threadId, turnId: turn.turnId };
-  }
 
   async process(documentId: string): Promise<ExtractionPipelineResult> {
     let bundle = this.store.getDocumentExtractionBundle(documentId);
@@ -1347,21 +995,20 @@ export class DocumentExtractionPipeline {
     // 在输入预算允许时保持整篇处理，以便模型联系摘要、检验页与结论页。
     // 只有视觉页数、片段数或字节预算触发硬限制时才保护性分块。
     const chunks = partitionSourceSpans(bundle.manifest.spans);
-    const reviewedCandidates: ObservationCandidate[] = [];
+    const acceptedCandidates: ObservationCandidate[] = [];
     const coveredSourceSpanIds: string[] = [];
-    const reviewReceipts: Array<{ extractTurnId: string; reviewTurnId: string }> = [];
-    const reviewedSubjects: ExtractionResult['subject'][] = [];
-    const reviewedMetadata: Array<ReportMetadataCandidate | null | undefined> = [];
-    const pendingCandidateDiffs: ReviewCandidateDiff[] = [];
-    let abnormalFlagAdjudicationUnclear = false;
-    let factAdjudicationUnclear = false;
-    let validationRepairUnclear = false;
+    const subjects: ExtractionResult['subject'][] = [];
+    const metadata: Array<ReportMetadataCandidate | null | undefined> = [];
+    const extractionTurnIds: string[] = [];
+    const unresolved: Array<{ candidate: ObservationCandidate; reasons: string[] }> = [];
+    const uncoveredSpanIds: string[] = [];
     let lastReceipt: { threadId: string; turnId: string } | null = null;
     let temporaryRoot: string | null = null;
     try {
       for (const [chunkIndex, spans] of chunks.entries()) {
         const imagePaths: string[] = [];
         const imageMappings: ImageMapping[] = [];
+        const chunkDirectory = 'chunk-' + (chunkIndex + 1);
         if (isImage && !isHeic) {
           imagePaths.push(bundle.sourcePath);
           imageMappings.push({ imageIndex: 0, page: 1, sourceSpanIds: spans.map((span) => span.id) });
@@ -1373,14 +1020,13 @@ export class DocumentExtractionPipeline {
           chmodSync(temporaryRoot, 0o700);
           const rendered = await renderHeicImagesToPngs({
             bytes: readFileSync(bundle.sourcePath),
-            outputDirectory: join(temporaryRoot, `chunk-${chunkIndex + 1}`),
+            outputDirectory: join(temporaryRoot, chunkDirectory),
             imageIndexes: spans.map((span) => span.page!)
           });
           for (const [imageIndex, image] of rendered.entries()) {
             imagePaths.push(image.path);
             imageMappings.push({
-              imageIndex,
-              page: image.imageIndex,
+              imageIndex, page: image.imageIndex,
               sourceSpanIds: spans.filter((span) => span.page === image.imageIndex).map((span) => span.id)
             });
           }
@@ -1395,14 +1041,13 @@ export class DocumentExtractionPipeline {
             chmodSync(temporaryRoot, 0o700);
             const rendered = await renderPdfPagesToPngs({
               bytes: readFileSync(bundle.sourcePath),
-              outputDirectory: join(temporaryRoot, `chunk-${chunkIndex + 1}`),
+              outputDirectory: join(temporaryRoot, chunkDirectory),
               pageNumbers: visualPages
             });
             for (const [imageIndex, page] of rendered.entries()) {
               imagePaths.push(page.path);
               imageMappings.push({
-                imageIndex,
-                page: page.page,
+                imageIndex, page: page.page,
                 sourceSpanIds: visualSpans.filter((span) => span.page === page.page).map((span) => span.id)
               });
             }
@@ -1411,8 +1056,7 @@ export class DocumentExtractionPipeline {
           const visualSpans = spans.filter((span) => span.spanKind === 'image');
           const indexedSpans = visualSpans.map((span) => {
             const matched = /^image-(\d+)$/.exec(span.blockId ?? '');
-            if (!matched) return null;
-            return { span, imageIndex: Number(matched[1]) };
+            return matched ? { span, imageIndex: Number(matched[1]) } : null;
           });
           if (indexedSpans.some((entry) => entry === null)) {
             return this.needsReview(documentId, 'coverage_gap', visualSpans.map((span) => span.id), 'DOCX_IMAGE_LOCATOR_MISSING');
@@ -1422,14 +1066,13 @@ export class DocumentExtractionPipeline {
             chmodSync(temporaryRoot, 0o700);
             const rendered = await renderDocxImagesToFiles({
               bytes: readFileSync(bundle.sourcePath),
-              outputDirectory: join(temporaryRoot, `chunk-${chunkIndex + 1}`),
+              outputDirectory: join(temporaryRoot, chunkDirectory),
               imageIndexes: indexedSpans.map((entry) => entry!.imageIndex)
             });
             for (const [imageIndex, image] of rendered.entries()) {
               imagePaths.push(image.path);
               imageMappings.push({
-                imageIndex,
-                page: null,
+                imageIndex, page: null,
                 sourceSpanIds: indexedSpans.filter((entry) => entry!.imageIndex === image.imageIndex).map((entry) => entry!.span.id)
               });
             }
@@ -1440,339 +1083,160 @@ export class DocumentExtractionPipeline {
           throw new Error('SOURCE_PACKAGE_LIMIT_EXCEEDED');
         }
         const expectedSpanIds = spans.map((span) => span.id);
-        let extract = await this.runTurn(documentId, 'extract', {
-          prompt: buildExtractPrompt({
-            personDisplayName: bundle.personDisplayName,
-            sourcePackage
-          }),
-          imagePaths,
-          outputSchema,
-          timeoutMs: 600_000
+        const generated = await this.runTurn(documentId, 'extract', {
+          prompt: buildP01Prompt({
+            personId: bundle.personId, displayName: bundle.personDisplayName,
+            note: '显示名只用于归属核对，不能作为报告身份来源。'
+          }, JSON.parse(sourcePackage)),
+          imagePaths, outputSchema, allowWebSearch: false, timeoutMs: 600_000
         });
-        let extracted = extractionResultSchema.parse(extract.output);
-        if (extracted.documentId !== documentId) throw new Error('EXTRACTION_DOCUMENT_MISMATCH');
-        if (!hasCompleteCoverage(extracted, expectedSpanIds) && evidenceIsConfinedToChunk(extracted, expectedSpanIds)) {
-          const recovered = await this.recoverIncompleteCoverage({
-            documentId,
-            stage: 'extract',
-            sourcePackage,
-            imagePaths,
-            expectedSpanIds,
-            previousResult: extracted
-          });
-          extracted = recovered.result;
-          extract = { ...extract, threadId: recovered.threadId, turnId: recovered.turnId, output: recovered.result };
-          if (extracted.documentId !== documentId) throw new Error('EXTRACTION_DOCUMENT_MISMATCH');
+        lastReceipt = { threadId: generated.threadId, turnId: generated.turnId };
+        extractionTurnIds.push(generated.turnId);
+        const parsed = extractionResultSchema.safeParse(generated.output);
+        if (!parsed.success || parsed.data.documentId !== documentId) {
+          return this.needsReview(documentId, 'field_conflict', expectedSpanIds, 'EXTRACTION_SCHEMA_INVALID',
+            generated.threadId, generated.turnId);
         }
-        if (!hasCompleteCoverage(extracted, expectedSpanIds) || !evidenceIsConfinedToChunk(extracted, expectedSpanIds)) {
-          return this.needsReview(documentId, 'coverage_gap', expectedSpanIds, 'EXTRACTION_COVERAGE_INCOMPLETE', extract.threadId, extract.turnId);
-        }
+        let extracted: ExtractionResult = {
+          ...parsed.data,
+          candidates: scopeCandidateKeys(normalizeCandidates(parsed.data.candidates, spans), chunkIndex)
+        };
         if (!subjectIsConsistent(extracted, bundle)) {
           const reportedName = conflictingReportedName(extracted, bundle);
-          return this.needsReview(
-            documentId,
-            reportedName ? 'person_conflict' : 'field_conflict',
-            extracted.subject.evidence.map((item) => item.sourceSpanId),
-            'PERSON_IDENTITY_NOT_CONFIRMED',
-            extract.threadId,
-            extract.turnId,
-            undefined,
-            reportedName ?? undefined
-          );
+          return this.needsReview(documentId, reportedName ? 'person_conflict' : 'field_conflict',
+            extracted.subject.evidence.map((item) => item.sourceSpanId), 'PERSON_IDENTITY_NOT_CONFIRMED',
+            generated.threadId, generated.turnId, undefined, reportedName ?? undefined);
         }
-        const normalizedExtracted: ExtractionResult = {
-          ...extracted,
-          candidates: scopeCandidateKeys(normalizeCandidates(extracted.candidates, spans), chunkIndex)
-        };
-
-        let review = await this.runTurn(documentId, 'review_facts', {
-          prompt: buildReviewFactsPrompt({
-            sourcePackage,
-            candidateToReview: JSON.stringify(normalizedExtracted)
-          }),
-          imagePaths,
-          outputSchema,
-          timeoutMs: 600_000
-        });
-        let reviewed = extractionResultSchema.parse(review.output);
-        lastReceipt = { threadId: review.threadId, turnId: review.turnId };
-        if (reviewed.documentId !== documentId) throw new Error('REVIEW_DOCUMENT_MISMATCH');
-        if (!hasCompleteCoverage(reviewed, expectedSpanIds) && evidenceIsConfinedToChunk(reviewed, expectedSpanIds)) {
-          const recovered = await this.recoverIncompleteCoverage({
-            documentId,
-            stage: 'review_facts',
-            sourcePackage,
-            imagePaths,
-            expectedSpanIds,
-            previousResult: reviewed,
-            candidateToReview: normalizedExtracted
-          });
-          reviewed = recovered.result;
-          review = { ...review, threadId: recovered.threadId, turnId: recovered.turnId, output: recovered.result };
-          lastReceipt = { threadId: recovered.threadId, turnId: recovered.turnId };
-          if (reviewed.documentId !== documentId) throw new Error('REVIEW_DOCUMENT_MISMATCH');
-        }
-        if (!hasCompleteCoverage(reviewed, expectedSpanIds) || !evidenceIsConfinedToChunk(reviewed, expectedSpanIds)) {
-          return this.needsReview(documentId, 'coverage_gap', expectedSpanIds, 'REVIEW_COVERAGE_INCOMPLETE', review.threadId, review.turnId);
-        }
-        if (!subjectIsConsistent(reviewed, bundle)) {
-          const reportedName = conflictingReportedName(reviewed, bundle);
-          return this.needsReview(
-            documentId,
-            reportedName ? 'person_conflict' : 'field_conflict',
-            reviewed.subject.evidence.map((item) => item.sourceSpanId),
-            'PERSON_IDENTITY_NOT_CONFIRMED',
-            review.threadId,
-            review.turnId,
-            undefined,
-            reportedName ?? undefined
-          );
-        }
-        const normalizedReviewed: ExtractionResult = {
-          ...reviewed,
-          candidates: scopeCandidateKeys(normalizeCandidates(reviewed.candidates, spans), chunkIndex)
-        };
-        const aligned = omitOmittableOneSidedCandidates(normalizedExtracted, normalizedReviewed);
-        const reviewedWithMergedEvidence = mergeIndependentlyConfirmedEvidence(aligned.first, aligned.second);
-        const comparison = compareIndependentExtractions(aligned.first, reviewedWithMergedEvidence);
-        let resolvedChunk: ExtractionResult | null = reviewedWithMergedEvidence;
-        let unresolvedChunkDifferences: ReviewCandidateDiff[] = [];
-        let resolutionTurnId = review.turnId;
-        if (!comparison.compatible) {
-          if (onlyReportedAbnormalFlagDifferences(comparison.differences)) {
-            const adjudicated = await this.adjudicateReportedAbnormalFlags({
-              documentId,
-              sourcePackage,
-              imagePaths,
-              expectedSpanIds,
-              first: aligned.first,
-              second: reviewedWithMergedEvidence,
-              differences: comparison.differences,
-              bundle,
-              chunkIndex
-            });
-            lastReceipt = { threadId: adjudicated.threadId, turnId: adjudicated.turnId };
-            resolvedChunk = adjudicated.result;
-            unresolvedChunkDifferences = adjudicated.unresolvedDifferences;
-            resolutionTurnId = adjudicated.turnId;
-            if (!resolvedChunk || unresolvedChunkDifferences.length > 0) factAdjudicationUnclear = true;
-            if (!resolvedChunk || unresolvedChunkDifferences.length > 0) abnormalFlagAdjudicationUnclear = true;
-          } else {
-            const adjudicated = await this.adjudicateFactDifferences({
-              documentId,
-              sourcePackage,
-              imagePaths,
-              second: reviewedWithMergedEvidence,
-              differences: comparison.differences
-            });
-            lastReceipt = { threadId: adjudicated.threadId, turnId: adjudicated.turnId };
-            resolvedChunk = adjudicated.result;
-            unresolvedChunkDifferences = adjudicated.unresolvedDifferences;
-            resolutionTurnId = adjudicated.turnId;
-            if (!resolvedChunk || unresolvedChunkDifferences.length > 0) factAdjudicationUnclear = true;
-          }
-        }
-
-        if (!resolvedChunk) {
-          const reviewedKeys = new Set(reviewedWithMergedEvidence.candidates.map((candidate) => candidate.localKey));
-          const missingCandidates = aligned.first.candidates.filter((candidate) => (
-            !reviewedKeys.has(candidate.localKey)
-            && comparison.differences.some((difference) => difference.localKey === candidate.localKey && difference.fields.includes('presence'))
-          ));
-          const reviewCandidates = [...reviewedWithMergedEvidence.candidates, ...missingCandidates];
-          // 自动裁决仍无法确认时，也先读完整份报告，最后只生成一个汇总核对事项。
-          reviewedCandidates.push(...(reviewCandidates.length > 0 ? reviewCandidates : aligned.first.candidates));
-          pendingCandidateDiffs.push(...comparison.differences);
-          reviewedSubjects.push(aligned.second.subject);
-          reviewedMetadata.push(aligned.second.reportMetadata);
-          coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
-          reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: resolutionTurnId });
-          if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
-          continue;
-        }
-
-        if (unresolvedChunkDifferences.length > 0) {
-          const resolvedKeys = new Set(resolvedChunk.candidates.map((candidate) => candidate.localKey));
-          const unresolvedFirstOnlyCandidates = unresolvedChunkDifferences.flatMap((difference) => (
-            !difference.secondCandidate && difference.firstCandidate && !resolvedKeys.has(difference.firstCandidate.localKey)
-              ? [difference.firstCandidate]
-              : []
-          ));
-          resolvedChunk = {
-            ...resolvedChunk,
-            candidates: [...resolvedChunk.candidates, ...unresolvedFirstOnlyCandidates]
+        let missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
+        let failures = candidateValidationFailures(extracted, bundle);
+        if (missing.length > 0 || failures.length > 0 || !evidenceIsConfinedToChunk(extracted, expectedSpanIds)) {
+          const targetKeys = new Set(failures.map((failure) => failure.localKey));
+          const repairRequest = {
+            stage: 'extraction',
+            targets: [...targetKeys, ...missing],
+            allowedPaths: [
+              ...[...targetKeys].map((key) => 'candidates:' + key),
+              ...missing.map((id) => 'candidates:add-from:' + id),
+              ...(missing.length > 0 ? ['coveredSourceSpanIds'] : [])
+            ],
+            issues: [
+              ...failures.flatMap((failure) => failure.reasons.map((reason) => failure.localKey + ':' + reason)),
+              ...missing.map((id) => 'uncovered_source_span:' + id),
+              ...(!evidenceIsConfinedToChunk(extracted, expectedSpanIds) ? ['evidence_outside_chunk'] : [])
+            ],
+            originalCandidateHash: stableHash(extracted)
           };
-          pendingCandidateDiffs.push(...unresolvedChunkDifferences);
-        }
-
-        const unresolvedCandidateKeys = new Set(unresolvedChunkDifferences.flatMap((difference) => [
-          difference.localKey,
-          difference.firstCandidate?.localKey,
-          difference.secondCandidate?.localKey
-        ].filter((value): value is string => Boolean(value))));
-        const validationFailures = candidateValidationFailures(resolvedChunk, bundle)
-          .filter((failure) => !unresolvedCandidateKeys.has(failure.localKey));
-        if (validationFailures.length > 0) {
-          const repaired = await this.repairFactValidationIssues({
-            documentId,
-            sourcePackage,
-            imagePaths,
-            expectedSpanIds,
-            result: resolvedChunk,
-            failures: validationFailures,
-            bundle,
-            chunkIndex
+          const repairedTurn = await this.runTurn(documentId, 'extraction_repair', {
+            prompt: buildP03Prompt(repairRequest, JSON.parse(sourcePackage), extracted),
+            imagePaths, outputSchema, allowWebSearch: false, timeoutMs: 600_000
           });
-          lastReceipt = { threadId: repaired.threadId, turnId: repaired.turnId };
-          resolutionTurnId = repaired.turnId;
-          if (repaired.result) {
-            resolvedChunk = repaired.result;
-          } else {
-            validationRepairUnclear = true;
-            const candidatesByKey = new Map(resolvedChunk.candidates.map((candidate) => [candidate.localKey, candidate]));
-            pendingCandidateDiffs.push(...validationFailures.map((failure) => {
-              const candidate = candidatesByKey.get(failure.localKey) ?? null;
-              return {
-                localKey: failure.localKey,
-                itemName: failure.itemName,
-                fields: ['issues'] as ReviewDiffField[],
-                firstCandidate: candidate,
-                secondCandidate: candidate
-              };
-            }));
+          lastReceipt = { threadId: repairedTurn.threadId, turnId: repairedTurn.turnId };
+          const repairedParsed = extractionResultSchema.safeParse(repairedTurn.output);
+          if (repairedParsed.success && repairedParsed.data.documentId === documentId
+            && subjectIsConsistent(repairedParsed.data, bundle)
+            && evidenceIsConfinedToChunk(repairedParsed.data, expectedSpanIds)) {
+            const repaired: ExtractionResult = {
+              ...repairedParsed.data,
+              candidates: scopeCandidateKeys(normalizeCandidates(repairedParsed.data.candidates, spans), chunkIndex)
+            };
+            const oldByKey = new Map(extracted.candidates.map((candidate) => [candidate.localKey, candidate]));
+            const newByKey = new Map(repaired.candidates.map((candidate) => [candidate.localKey, candidate]));
+            const preserved = stableHash(extracted.subject) === stableHash(repaired.subject)
+              && stableHash(extracted.reportMetadata ?? null) === stableHash(repaired.reportMetadata ?? null)
+              && oldByKey.size === extracted.candidates.length
+              && newByKey.size === repaired.candidates.length
+              && [...oldByKey].every(([key, candidate]) => {
+                const next = newByKey.get(key);
+                return next && (targetKeys.has(key) || stableHash(candidate) === stableHash(next));
+              })
+              && [...newByKey].every(([key, candidate]) => oldByKey.has(key)
+                || missing.some((id) => candidate.evidence.some((ref) => ref.sourceSpanId === id)));
+            if (preserved) extracted = repaired;
           }
+          missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
+          failures = candidateValidationFailures(extracted, bundle);
         }
-
-        reviewedCandidates.push(...resolvedChunk.candidates);
-        reviewedSubjects.push(aligned.second.subject);
-        reviewedMetadata.push(resolvedChunk.reportMetadata ?? aligned.second.reportMetadata);
-        coveredSourceSpanIds.push(...aligned.second.coveredSourceSpanIds);
-        reviewReceipts.push({ extractTurnId: extract.turnId, reviewTurnId: resolutionTurnId });
-        if (temporaryRoot) rmSync(join(temporaryRoot, `chunk-${chunkIndex + 1}`), { recursive: true, force: true });
+        const failedKeys = new Set(failures.map((failure) => failure.localKey));
+        acceptedCandidates.push(...extracted.candidates.filter((candidate) => !failedKeys.has(candidate.localKey)));
+        for (const failure of failures) {
+          const candidate = extracted.candidates.find((item) => item.localKey === failure.localKey);
+          if (candidate) unresolved.push({ candidate, reasons: failure.reasons });
+        }
+        uncoveredSpanIds.push(...missing);
+        coveredSourceSpanIds.push(...extracted.coveredSourceSpanIds.filter((id) => expectedSpanIds.includes(id)));
+        subjects.push(extracted.subject);
+        metadata.push(extracted.reportMetadata);
+        if (temporaryRoot) rmSync(join(temporaryRoot, chunkDirectory), { recursive: true, force: true });
       }
     } finally {
       if (temporaryRoot) rmSync(temporaryRoot, { recursive: true, force: true });
     }
     if (!lastReceipt) throw new Error('EXTRACTION_RECEIPT_MISSING');
-    if (reviewedCandidates.length === 0) {
-      return this.needsReview(documentId, 'coverage_gap', coveredSourceSpanIds, 'NO_EXTRACTABLE_FACTS_CONFIRMED', lastReceipt.threadId, lastReceipt.turnId);
-    }
-    const manifestSpanIds = bundle.manifest.spans.map((span) => span.id);
-    const uniqueCoveredSpanIds = [...new Set(coveredSourceSpanIds)];
-    const coverageComplete = uniqueCoveredSpanIds.length === manifestSpanIds.length
-      && manifestSpanIds.every((spanId) => uniqueCoveredSpanIds.includes(spanId));
-    if (!coverageComplete) {
-      return this.needsReview(
-        documentId,
-        'coverage_gap',
-        manifestSpanIds,
-        'DOCUMENT_COVERAGE_INCOMPLETE',
-        lastReceipt.threadId,
-        lastReceipt.turnId
-      );
-    }
-    if (pendingCandidateDiffs.length > 0) {
-      const conflictEvidenceRefs = reviewDifferenceEvidenceRefs(pendingCandidateDiffs);
-      return this.needsReview(
-        documentId,
-        'field_conflict',
-        conflictEvidenceRefs.length > 0 ? conflictEvidenceRefs : manifestSpanIds,
-        abnormalFlagAdjudicationUnclear && onlyReportedAbnormalFlagDifferences(pendingCandidateDiffs)
-          ? 'ABNORMAL_FLAG_ADJUDICATION_UNCLEAR'
-          : validationRepairUnclear && pendingCandidateDiffs.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'issues')
-            ? 'FACT_VALIDATION_REPAIR_UNRESOLVED'
-            : factAdjudicationUnclear
-              ? 'FACT_ADJUDICATION_UNRESOLVED'
-          : 'INDEPENDENT_REVIEW_MISMATCH',
-        lastReceipt.threadId,
-        lastReceipt.turnId,
-        reviewedCandidates,
-        undefined,
-        pendingCandidateDiffs,
-        {
-          coverageComplete: true,
-          coveredSourceSpanIds: uniqueCoveredSpanIds,
-          manifestSpanIds,
-          chunkCount: chunks.length
-        }
-      );
+    if (acceptedCandidates.length === 0) {
+      return this.needsReview(documentId, 'coverage_gap', uncoveredSpanIds.length ? uncoveredSpanIds : bundle.manifest.spans.map((span) => span.id),
+        'NO_ACCEPTABLE_FACTS', lastReceipt.threadId, lastReceipt.turnId,
+        unresolved.map((item) => item.candidate));
     }
     const reviewed: ExtractionResult = {
-      schemaVersion: 1,
-      documentId,
-      subject: aggregateReviewedSubject(reviewedSubjects),
-      reportMetadata: aggregateReportMetadata(reviewedMetadata),
-      coveredSourceSpanIds: uniqueCoveredSpanIds,
-      candidates: reviewedCandidates
+      schemaVersion: 1, documentId, subject: aggregateReviewedSubject(subjects),
+      reportMetadata: aggregateReportMetadata(metadata),
+      coveredSourceSpanIds: [...new Set(coveredSourceSpanIds)], candidates: acceptedCandidates
     };
-    const reviewRef = `chunk-review:${stableHash(reviewReceipts)}`;
-
+    const reviewRef = 'lean-extract:' + stableHash(extractionTurnIds);
     const accepted: Array<ReturnType<typeof candidateToObservation>> = [];
-    const finalValidationFailures: Array<{
-      candidate: ObservationCandidate;
-      reasons: string[];
-      decision: 'reject' | 'needs_review';
-    }> = [];
     for (const candidate of reviewed.candidates) {
       const outcome = evaluateObservationCandidate(candidate, bundle.manifest, {
-        personConsistent: reviewedSubjectsAreConsistent(reviewedSubjects),
-        overwritesUserLockedValue: false
+        personConsistent: reviewedSubjectsAreConsistent(subjects), overwritesUserLockedValue: false
       });
-      const inputSignature = stableHash({ documentId, manifestSha256: bundle.manifest.sha256, candidate });
-      const outputHash = stableHash({ candidate, outcome });
-      const acceptanceId = this.store.saveAcceptanceDecision({
-        method: 'auto',
-        actor: 'policy',
-        rulesVersion: ACCEPTANCE_RULES_VERSION,
-        inputSignature,
-        outputHash,
-        reviewRef,
-        decision: outcome.decision
-      });
-      if (outcome.decision === 'reject' || outcome.decision === 'needs_review') {
-        finalValidationFailures.push({ candidate, reasons: outcome.reasons, decision: outcome.decision });
+      if (outcome.decision !== 'accept' && outcome.decision !== 'accept_with_warnings') {
+        unresolved.push({ candidate, reasons: outcome.reasons });
         continue;
       }
+      const inputSignature = stableHash({ documentId, manifestSha256: bundle.manifest.sha256, candidate });
+      const acceptanceId = this.store.saveAcceptanceDecision({
+        method: 'auto', actor: 'policy', rulesVersion: ACCEPTANCE_RULES_VERSION,
+        inputSignature, outputHash: stableHash({ candidate, outcome }), reviewRef, decision: outcome.decision
+      });
       accepted.push(candidateToObservation(candidate, acceptanceId, documentId));
     }
-    if (finalValidationFailures.length > 0) {
-      const reasons = [...new Set(finalValidationFailures.flatMap((failure) => failure.reasons))];
-      return this.needsReview(
-        documentId,
-        finalValidationFailures.some((failure) => failure.decision === 'reject') ? 'field_conflict' : 'coverage_gap',
-        [...new Set(finalValidationFailures.flatMap((failure) => failure.candidate.evidence.map((ref) => ref.sourceSpanId)))],
-        `FACT_VALIDATION_UNRESOLVED:${reasons.join(',')}`,
-        lastReceipt.threadId,
-        lastReceipt.turnId,
-        reviewed.candidates,
-        undefined,
-        finalValidationFailures.map((failure) => ({
-          localKey: failure.candidate.localKey,
-          itemName: failure.candidate.originalName,
-          fields: ['issues']
-        }))
-      );
+    if (accepted.length === 0) {
+      return this.needsReview(documentId, 'field_conflict', bundle.manifest.spans.map((span) => span.id),
+        'NO_ACCEPTABLE_FACTS', lastReceipt.threadId, lastReceipt.turnId,
+        unresolved.map((item) => item.candidate));
     }
-
-    const expectedRevision = this.store.getFactRevision(bundle.personId);
     const publication = this.store.publishFacts({
-      personId: bundle.personId,
-      documentId,
+      personId: bundle.personId, documentId,
       documentCommitKey: stableHash({
-        documentId,
-        sourceSha256: bundle.manifest.sha256,
+        documentId, sourceSha256: bundle.manifest.sha256,
         normalizerVersion: bundle.manifest.normalizerVersion,
-        extractionSchemaVersion: reviewed.schemaVersion,
-        rulesVersion: ACCEPTANCE_RULES_VERSION
+        extractionSchemaVersion: reviewed.schemaVersion, rulesVersion: ACCEPTANCE_RULES_VERSION
       }),
-      expectedRevision,
+      expectedRevision: this.store.getFactRevision(bundle.personId),
       changeSetHash: stableHash({ documentId, reviewed, rulesVersion: ACCEPTANCE_RULES_VERSION }),
-      summary: `从 1 份资料接纳 ${accepted.length} 条有来源事实`,
+      summary: '从 1 份资料接纳 ' + accepted.length + ' 条有来源事实',
       reportMetadata: reviewed.reportMetadata ?? null,
       observations: accepted,
       ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
     });
-    return { status: 'published', documentId, revision: publication.revision, candidateCount: accepted.length, threadId: lastReceipt.threadId, turnId: lastReceipt.turnId };
+    if (unresolved.length > 0 || uncoveredSpanIds.length > 0) {
+      this.store.saveExtractionReviewIssue({
+        documentId,
+        ...(this.executionGuard ? { jobId: this.executionGuard.jobId, attemptId: this.executionGuard.attemptId } : {}),
+        stage: 'extract', kind: unresolved.length > 0 ? 'field_conflict' : 'coverage_gap',
+        severity: 'warning', preserveDocumentStatus: true,
+        evidenceRefs: [...new Set([
+          ...uncoveredSpanIds,
+          ...unresolved.flatMap((item) => item.candidate.evidence.map((ref) => ref.sourceSpanId))
+        ])],
+        candidateOptions: unresolved.map((item) => item.candidate),
+        reasonCodes: [...new Set([
+          ...uncoveredSpanIds.map((id) => 'UNCOVERED_SPAN:' + id),
+          ...unresolved.flatMap((item) => item.reasons)
+        ])]
+      });
+    }
+    return { status: 'published', documentId, revision: publication.revision, candidateCount: accepted.length,
+      threadId: lastReceipt.threadId, turnId: lastReceipt.turnId };
   }
 
   private needsReview(

@@ -6,6 +6,8 @@ export {
   SYSTEM_ANALYSIS_PROMPT_VERSION,
   SYSTEM_ANALYSIS_RULES_VERSION,
   promptMetaForStage,
+  MEMBER_ASSESSMENT_PROMPT_VERSION,
+  MEMBER_ASSESSMENT_RULES_VERSION,
   renderPrompt
 } from './shared.js';
 export {

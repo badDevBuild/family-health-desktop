@@ -116,6 +116,86 @@ export const memberAssessmentCandidateV3Schema = z.object({
 }).strict();
 export type MemberAssessmentCandidateV3 = z.infer<typeof memberAssessmentCandidateV3Schema>;
 
+/** P02 的输入也受约束，避免把展示名或未归属资料误当作临床依据。 */
+export const assessmentRequestV3Schema = z.object({
+  personId: id,
+  inputSignature: signature,
+  mode: assessmentModeSchema,
+  requestedSystemIds: z.array(bodySystemIdSchema),
+  analysisReferenceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  clinicalFrom: z.string().nullable(),
+  clinicalAsOf: z.string().nullable(),
+  webSearchAllowed: z.boolean()
+}).strict();
+export type AssessmentRequestV3 = z.infer<typeof assessmentRequestV3Schema>;
+
+export const memberEvidencePackageV3Schema = z.object({
+  identity: z.object({
+    personId: id,
+    birthYear: z.number().int().nullable(),
+    genderContext: z.string().nullable(),
+    source: z.literal('user_profile')
+  }).strict(),
+  facts: z.array(z.object({
+    observationId: id,
+    originalName: text,
+    modelStandardNameCandidate: z.string().nullable(),
+    rawValue: text,
+    valueKind: z.enum(['numeric', 'qualitative', 'text', 'unknown']),
+    qualifier: z.string().nullable(),
+    unit: z.string().nullable(),
+    referenceRange: z.string().nullable(),
+    clinicalDate: z.string().nullable(),
+    reportedAbnormalFlag: z.enum(['high', 'low', 'positive', 'negative', 'normal', 'unknown']),
+    specimen: z.string().nullable(),
+    method: z.string().nullable(),
+    bodySite: z.string().nullable(),
+    documentId: id,
+    systemIds: z.array(bodySystemIdSchema),
+    evidenceIds: z.array(id).min(1),
+    sourceKind: z.literal('report')
+  }).strict()),
+  evidenceCatalog: z.array(memberEvidenceRefSchema),
+  trends: z.array(z.object({ id, systemIds: z.array(bodySystemIdSchema), payload: z.unknown() }).strict()),
+  personalContext: z.array(z.object({
+    id,
+    kind: z.enum(['history', 'allergy', 'medication', 'self_measurement', 'goal', 'constraint', 'free_text']),
+    text,
+    effectiveDate: z.string().nullable(),
+    recordedAt: z.string(),
+    systemIds: z.array(bodySystemIdSchema),
+    evidenceId: id,
+    sourceKind: z.literal('user_reported')
+  }).strict()),
+  unresolvedScope: z.array(z.object({ documentId: id, reasonCodes: z.array(z.string()) }).strict()),
+  existingActions: z.array(z.object({
+    id,
+    title: text,
+    detail: z.string(),
+    status: z.string(),
+    systemIds: z.array(bodySystemIdSchema)
+  }).strict()),
+  knowledge: z.array(z.object({
+    id,
+    version: id,
+    title: text,
+    content: text,
+    applicability: text,
+    sourceOrganization: text,
+    sourceUrl: z.string().url(),
+    reviewedAt: z.string(),
+    supportedScope: text
+  }).strict()),
+  criteriaSets: z.array(z.object({
+    id,
+    sourceId: id,
+    applicability: text,
+    requiredCriterionIds: z.array(id).min(1)
+  }).strict()),
+  partitionResults: z.array(memberAssessmentCandidateV3Schema)
+}).strict();
+export type MemberEvidencePackageV3 = z.infer<typeof memberEvidencePackageV3Schema>;
+
 export const reviewReplacementSchema = z.discriminatedUnion('nodeType', [
   z.object({ nodeType: z.literal('claim'), value: healthClaimSchema }).strict(),
   z.object({ nodeType: z.literal('action'), value: healthActionSchema }).strict(),

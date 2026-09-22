@@ -1,13 +1,13 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
-import type { AccountState, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
-import { adoptedActionReceiptSchema, bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, lifestyleProposalDecisionReceiptSchema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
+import type { AccountState, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
+import { adoptedActionReceiptSchema, bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, lifestyleProposalDecisionReceiptSchema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
 import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, stableHash, type TrendObservationInput } from '@core';
 import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
-import { ACCEPTANCE_RULES_VERSION, DERIVED_PROMPT_VERSION, promptMetaForStage, SYSTEM_ANALYSIS_PROMPT_VERSION } from './prompts/index.js';
+import { ACCEPTANCE_RULES_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, promptMetaForStage, SYSTEM_ANALYSIS_PROMPT_VERSION } from './prompts/index.js';
 import { buildSystemEvidenceBundle as buildSystemEvidenceBundleFromStore } from './system-evidence.js';
 
 const organNames = [
@@ -287,6 +287,17 @@ export class PersonalWorkspaceService {
     return this.store.listAcceptedObservations(personId);
   }
 
+  getMemberAssessment(personId: string): MemberAssessmentSnapshotV3 | null {
+    this.requireActivePerson(personId);
+    const snapshot = this.store.listMemberAssessmentSnapshots(personId, true)[0];
+    if (!snapshot || snapshot.promptVersion !== MEMBER_ASSESSMENT_PROMPT_VERSION
+      || snapshot.rulesVersion !== MEMBER_ASSESSMENT_RULES_VERSION
+      || snapshot.factRevision !== this.store.getFactRevision(personId)
+      || snapshot.contextRevision !== this.store.getClinicalContextRevision(personId)) return null;
+    const parsed = memberAssessmentSnapshotV3Schema.safeParse(snapshot);
+    return parsed.success ? parsed.data : null;
+  }
+
   getConceptReview(personId: string): ConceptReviewBundle {
     const observations = this.memberObservations(personId);
     return conceptReviewBundleSchema.parse({
@@ -435,6 +446,7 @@ export class PersonalWorkspaceService {
   listBodySystems(personId: string): BodySystemSummaryV2[] {
     const observations = this.memberObservations(personId);
     const series = buildMemberMetricSeries(observations);
+    const assessment = this.getMemberAssessment(personId);
     return bodySystemRegistry.map((registry): BodySystemSummaryV2 => {
       const related = observations.filter((observation) => memberSystemLinks(observation).some((link) => link.systemId === registry.id));
       const direct = observations.filter((observation) => memberSystemLinks(observation).some((link) => link.systemId === registry.id && link.relation === 'direct'));
@@ -442,6 +454,7 @@ export class PersonalWorkspaceService {
       const relatedObservationIds = new Set(related.map((observation) => observation.id));
       const relatedSeries = series.filter((item) => item.points.some((point) => relatedObservationIds.has(point.observationId)));
       const analysis = this.currentSystemAnalysis(personId, registry.id, observations);
+      const v3System = assessment?.systems.find((item) => item.systemId === registry.id);
       const currentAnalysis = analysis?.status === 'current' && analysis.review.status === 'passed'
         ? analysis
         : null;
@@ -456,11 +469,11 @@ export class PersonalWorkspaceService {
         id: registry.id,
         name: registry.name,
         shortName: registry.shortName,
-        status: direct.length === 0
+        status: v3System?.status ?? (direct.length === 0
           ? legacyRelatedCount > 0 ? 'building' : 'insufficient'
           : currentAnalysis?.assessmentStatus === 'attention' || attention.length > 0 ? 'attention'
-            : currentAnalysis?.assessmentStatus === 'undetermined' || !currentAnalysis ? 'building' : 'stable',
-        summary: currentAnalysis?.headline
+            : currentAnalysis?.assessmentStatus === 'undetermined' || !currentAnalysis ? 'building' : 'stable'),
+        summary: v3System?.headline ?? currentAnalysis?.headline
           ?? (direct.length === 0
             ? related.length > 0 ? '有相关背景资料，但还没有本系统的直接检查。' : '尚无相关检查。'
             : '已有相关检查，综合解读正在准备。'),
@@ -468,7 +481,7 @@ export class PersonalWorkspaceService {
         metricCount: relatedSeries.length,
         attentionCount: attention.length,
         latestDate: related.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null,
-        analysisStatus: analysis?.status ?? 'unavailable',
+        analysisStatus: v3System ? 'current' : analysis?.status ?? 'unavailable',
         topics: registry.topics.map((topic) => ({ id: topic.id, name: topic.name, factCount: topicCounts.get(topic.id) ?? 0 }))
       });
     });
@@ -476,6 +489,7 @@ export class PersonalWorkspaceService {
 
   getMemberOverview(personId: string): MemberOverviewV2 {
     const observations = this.memberObservations(personId);
+    const assessment = this.getMemberAssessment(personId);
     const systems = this.listBodySystems(personId);
     const events = this.listHealthEvents(personId);
     const actions = this.store.listActionItems(personId).filter((item) => !['completed', 'dismissed'].includes(item.status));
@@ -492,7 +506,14 @@ export class PersonalWorkspaceService {
           || (right.analysis.scope.clinicalAsOf ?? '').localeCompare(left.analysis.scope.clinicalAsOf ?? '');
       });
     const lead = analyses[0]?.analysis ?? null;
-    const priorityIssues = analyses
+    const priorityIssues = assessment ? assessment.claims
+      .filter((claim) => claim.consequenceLevel !== 'routine' && claim.systemIds.length > 0)
+      .slice(0, 3)
+      .map((claim) => ({
+        id: claim.id, title: claim.text, explanation: claim.rationale,
+        nextStep: assessment.actions.find((action) => action.claimIds.includes(claim.id))?.firstStep ?? null,
+        systemId: claim.systemIds[0]!
+      })) : analyses
       .filter(({ analysis }) => ['attention', 'monitor'].includes(analysis.assessmentStatus))
       .slice(0, 3)
       .map(({ system, analysis }) => ({
@@ -502,7 +523,12 @@ export class PersonalWorkspaceService {
         nextStep: analysis.recommendations[0]?.firstStep ?? null,
         systemId: system.id
       }));
-    const importantChanges = analyses.flatMap(({ system, analysis }) => analysis.keyPoints
+    const importantChanges = assessment ? assessment.claims
+      .filter((claim) => claim.kind === 'trend' && claim.systemIds.length > 0)
+      .slice(0, 4).map((claim) => ({
+        id: claim.id, title: '检查结果的变化', meaning: claim.text,
+        systemId: claim.systemIds[0]!, seriesIds: claim.trendIds
+      })) : analyses.flatMap(({ system, analysis }) => analysis.keyPoints
       .filter((point) => point.kind === 'trend_description')
       .map((point) => ({
         id: `change-${system.id}-${point.id}`,
@@ -515,15 +541,15 @@ export class PersonalWorkspaceService {
       personId,
       generatedAt: this.now().toISOString(),
       dataQuality: observations.length === 0 ? 'insufficient' : legacyObservationCount > 0 || observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
-      headline: observations.length === 0
+      headline: assessment?.overview.headline ?? (observations.length === 0
         ? '还没有可解读的健康资料。'
-        : lead?.headline ?? '报告内容已保存，健康解读正在准备。',
-      overview: observations.length === 0
+        : lead?.headline ?? '报告内容已保存，健康解读正在准备。'),
+      overview: assessment?.overview.summary ?? (observations.length === 0
         ? '添加体检、门诊或检查资料后，这里会先告诉你最值得知道的情况和下一步。'
         : lead?.overview
           ?? (legacyObservationCount > 0
             ? '旧资料仍然保留；系统正在按新的结果优先方式重新整理，完成前不会用数量冒充健康结论。'
-            : '已有资料不会丢失；综合分析完成后，这里会给出结论、原因和可执行的下一步。'),
+            : '已有资料不会丢失；综合分析完成后，这里会给出结论、原因和可执行的下一步。')),
       latestClinicalDate: observations.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null,
       acceptedFactCount: observations.length,
       eventCount: events.length,
@@ -539,7 +565,9 @@ export class PersonalWorkspaceService {
         systemId: event.systemIds[0] ?? null,
         evidence: []
       })),
-      nextActions: actions.slice(0, 5).map((action) => ({ id: action.id, title: action.title, status: action.status }))
+      nextActions: assessment
+        ? assessment.actions.slice(0, 5).map((action) => ({ id: action.id, title: action.title, status: '建议，尚未加入我的计划' }))
+        : actions.slice(0, 5).map((action) => ({ id: action.id, title: action.title, status: action.status }))
     });
   }
 
@@ -1260,44 +1288,18 @@ export class PersonalWorkspaceService {
       byPerson.set(document.personId, group);
     }
     if (!selectedIds) {
-      for (const target of this.store.listDerivedRefreshTargets()) {
-        if (activeDocumentIds.has(target.documentId)) continue;
-        if (!byPerson.has(target.personId)) {
-          byPerson.set(target.personId, { documentIds: [target.documentId], stage: 'analyze' });
-        }
-      }
-      // 提示词或系统分析结构升级后，即使没有新报告、成员级派生快照仍是 current，
-      // 也允许用户通过“立即处理全部”刷新旧档案。刷新复用已经接纳的本地事实，
-      // 不要求重新上传原报告，也不会重新走事实提取。
+      // 旧报告直接复用已接纳事实，按成员刷新唯一的 V3 综合快照。
       for (const person of this.store.listPersons().filter((item) => item.archivedAt === null)) {
         if (byPerson.has(person.id)) continue;
         const observations = this.store.listAcceptedObservations(person.id);
         const sourceDocumentId = observations[0]?.documentId;
-        const currentDerived = this.store.listCurrentDerivedSnapshots().find((snapshot) => snapshot.personId === person.id);
-        if (sourceDocumentId && currentDerived?.promptVersion !== DERIVED_PROMPT_VERSION) {
-          if (!activeDocumentIds.has(sourceDocumentId)) {
-            byPerson.set(person.id, { documentIds: [sourceDocumentId], stage: 'analyze' });
-          }
-          continue;
-        }
-        const directSystemIds = new Set(observations.flatMap((observation) => memberSystemLinks(observation)
-          .filter((link) => link.relation === 'direct')
-          .map((link) => link.systemId)));
-        if (directSystemIds.size === 0) continue;
-        const factRevision = this.store.getFactRevision(person.id);
-        const currentSystemIds = new Set(this.store.listSystemAnalysisSnapshots(person.id, true)
-          .filter((snapshot) => (
-            snapshot.promptVersion === SYSTEM_ANALYSIS_PROMPT_VERSION
-            && snapshot.factRevision === factRevision
-            && directSystemIds.has(snapshot.systemId)
-          ))
-          .map((snapshot) => snapshot.systemId));
-        const missingSystemId = [...directSystemIds].find((systemId) => !currentSystemIds.has(systemId));
-        if (!missingSystemId) continue;
-        const source = observations.find((observation) => memberSystemLinks(observation)
-          .some((link) => link.relation === 'direct' && link.systemId === missingSystemId));
-        if (!source || activeDocumentIds.has(source.documentId)) continue;
-        byPerson.set(person.id, { documentIds: [source.documentId], stage: 'analyze' });
+        if (!sourceDocumentId || activeDocumentIds.has(sourceDocumentId)) continue;
+        const current = this.store.listMemberAssessmentSnapshots(person.id, true)[0];
+        if (current?.promptVersion === MEMBER_ASSESSMENT_PROMPT_VERSION
+          && current.rulesVersion === MEMBER_ASSESSMENT_RULES_VERSION
+          && current.factRevision === this.store.getFactRevision(person.id)
+          && current.contextRevision === this.store.getClinicalContextRevision(person.id)) continue;
+        byPerson.set(person.id, { documentIds: [sourceDocumentId], stage: 'analyze' });
       }
     }
     if (byPerson.size === 0) throw new Error('NO_READY_DOCUMENTS');
@@ -1463,6 +1465,7 @@ export class PersonalWorkspaceService {
       const attentionCount = stats.attentionCount;
       const lastDocumentDate = stats.latestClinicalDate;
       const derived = latestDerivedByPerson.get(person.id);
+      const assessment = this.getMemberAssessment(person.id);
       const systemAnalyses = this.store.listSystemAnalysisSnapshots(person.id, false);
       const proposals = this.store.listLifestyleProposals(person.id);
       const personActions = allActions.filter((action) => action.personId === person.id);
@@ -1482,17 +1485,18 @@ export class PersonalWorkspaceService {
           ? `已接纳 ${stats.acceptedFactCount} 条有来源事实`
           : processingCount > 0 ? `${processingCount} 份资料已进入处理中心`
             : documentCount > 0 ? `${documentCount} 份资料等待处理` : '尚未导入资料',
-        changeSummary: derived?.payload.claims[0]?.title ?? (stats.acceptedFactCount > 0
+        changeSummary: assessment?.overview.headline ?? derived?.payload.claims[0]?.title ?? (stats.acceptedFactCount > 0
           ? `最近处理已保存 ${stats.acceptedFactCount} 条报告事实；健康解释仍需单独生成和复核`
           : processingCount > 0 ? '资料已安全保存在本机，请到处理中心查看进度或恢复失败任务'
             : documentCount > 0 ? '资料已安全保存在本机，尚未形成健康结论' : '可以先添加一份体检或门诊资料'),
-        derivedStatus: derived?.status ?? 'unavailable' as const,
-        assessmentSummary: derived?.status === 'current' ? derived.payload.claims[0]?.explanation ?? null : null,
+        derivedStatus: assessment ? 'current' as const : derived?.status ?? 'unavailable' as const,
+        assessmentSummary: assessment?.overview.summary ?? (derived?.status === 'current' ? derived.payload.claims[0]?.explanation ?? null : null),
         dataRevision: stableHash({
           factRevision: this.store.getFactRevision(person.id),
           clinicalContextRevision: person.clinicalContextRevision,
           displayRevision: person.displayRevision,
           derived: derived ? { id: derived.id, status: derived.status, createdAt: derived.createdAt } : null,
+          memberAssessment: assessment ? { id: assessment.id, inputSignature: assessment.inputSignature } : null,
           systemAnalyses: systemAnalyses.map((analysis) => ({ id: analysis.id, status: analysis.status, generatedAt: analysis.generatedAt })),
           proposals: proposals.map((proposal) => ({ id: proposal.id, status: proposal.status, version: proposal.version, updatedAt: proposal.updatedAt })),
           actions: personActions.map((action) => ({ id: action.id, userRevision: action.userRevision, status: action.status }))

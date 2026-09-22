@@ -376,7 +376,7 @@ export const bodySystemSummaryV2Schema = z.object({
   id: bodySystemIdSchema,
   name: z.string().min(1),
   shortName: z.string().min(1),
-  status: z.enum(['stable', 'attention', 'insufficient', 'building']),
+  status: z.enum(['stable', 'attention', 'monitor', 'no_signal_in_scope', 'insufficient', 'building']),
   summary: z.string().min(1),
   factCount: z.number().int().nonnegative(),
   metricCount: z.number().int().nonnegative(),

@@ -11,7 +11,7 @@
  */
 
 /** 事实提取/复核提示词版本，进入任务 inputSignature。 */
-export const EXTRACTION_PROMPT_VERSION = 'extract-v3';
+export const EXTRACTION_PROMPT_VERSION = 'extract-v4';
 
 /** 派生分析/安全复核提示词版本，写入 derived_snapshots.prompt_version。 */
 export const DERIVED_PROMPT_VERSION = 'derived-v4';
@@ -25,6 +25,8 @@ export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
 /** 成员档案 v2 的系统级综合与独立复核版本。 */
 export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v2';
 export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v2';
+export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v3';
+export const MEMBER_ASSESSMENT_RULES_VERSION = 'lean-health-v3';
 
 export interface PromptSection {
   title: string;
@@ -43,7 +45,7 @@ export function promptMetaForStage(stage: 'extract' | 'analyze'): {
   rulesVersion: string;
 } {
   return stage === 'analyze'
-    ? { promptVersion: DERIVED_PROMPT_VERSION, rulesVersion: DERIVED_SAFETY_RULES_VERSION }
+    ? { promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION, rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION }
     : { promptVersion: EXTRACTION_PROMPT_VERSION, rulesVersion: ACCEPTANCE_RULES_VERSION };
 }
 

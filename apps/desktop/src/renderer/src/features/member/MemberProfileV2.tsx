@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Activity, Archive, CalendarClock, Check, ChevronRight, FileCheck2, FileText, LoaderCircle, Plus, Search, ShieldCheck } from 'lucide-react';
-import type { AdoptLifestyleProposalInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptReviewBundle, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, InboxItem, LifestylePlanV2, MemberEvidenceRef, MemberOverviewV2, MetricSeriesDetailV2, PersonSummary, SetConceptMappingInput, UpdateReportMetadataInput } from '@contracts';
+import type { AdoptLifestyleProposalInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptReviewBundle, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, InboxItem, LifestylePlanV2, MemberAssessmentSnapshotV3, MemberEvidenceRef, MemberOverviewV2, MetricSeriesDetailV2, PersonSummary, SetConceptMappingInput, UpdateReportMetadataInput } from '@contracts';
 import { StatusBadge, type Tone } from '../../components/StatusBadge.js';
 import { ConceptReviewPanel } from './ConceptReviewPanel.js';
 import { MemberTrendChart } from './MemberTrendChart.js';
@@ -27,11 +27,13 @@ const abnormalFlagLabels: Record<MetricSeriesDetailV2['tableRows'][number]['abno
 };
 
 function systemTone(status: BodySystemSummaryV2['status']): Tone {
-  return status === 'attention' ? 'warning' : status === 'stable' ? 'success' : status === 'building' ? 'info' : 'neutral';
+  return status === 'attention' ? 'warning' : status === 'stable' || status === 'no_signal_in_scope' ? 'success' : status === 'building' || status === 'monitor' ? 'info' : 'neutral';
 }
 
 function systemStatusLabel(system: BodySystemSummaryV2): string {
   if (system.status === 'attention') return '建议关注';
+  if (system.status === 'monitor') return '继续观察';
+  if (system.status === 'no_signal_in_scope') return '本次未提示问题';
   if (system.status === 'stable') return '继续保持';
   if (system.status === 'building') return system.factCount > 0 ? '解读待完成' : '整理中';
   return '尚无相关检查';
@@ -169,8 +171,37 @@ function SystemAnalysisCard({ detail, onOpenEvidence }: { detail: BodySystemDeta
   </article>;
 }
 
-function SystemDetail({ detail, search, onSearch, selectedMetric, onSelectMetric, onOpenEvidence }: {
+const diagnosticLabels: Record<NonNullable<MemberAssessmentSnapshotV3['claims'][number]['diagnosticStatus']>, string> = {
+  documented: '报告已有诊断', criteria_met: '根据资料符合标准', likely: '最可能的解释',
+  possible: '需要鉴别', undetermined: '目前不能确定'
+};
+
+function MemberAssessmentSystemCard({ assessment, systemId, onOpenEvidence }: {
+  assessment: MemberAssessmentSnapshotV3;
+  systemId: BodySystemId;
+  onOpenEvidence(request: EvidenceRequest): void;
+}) {
+  const system = assessment.systems.find((item) => item.systemId === systemId);
+  if (!system) return null;
+  const claims = system.claimIds.map((id) => assessment.claims.find((item) => item.id === id))
+    .filter((item): item is MemberAssessmentSnapshotV3['claims'][number] => Boolean(item));
+  const actions = system.actionIds.map((id) => assessment.actions.find((item) => item.id === id))
+    .filter((item): item is MemberAssessmentSnapshotV3['actions'][number] => Boolean(item));
+  return <article className="system-analysis-card">
+    <div className="panel__heading"><div><span className="eyebrow">这部分身体情况</span><h3>{system.headline}</h3></div><StatusBadge tone="success">有来源依据</StatusBadge></div>
+    <p className="system-analysis-overview">{system.summary}</p>
+    {claims.length > 0 && <section className="analysis-explanation"><h4>为什么这样判断</h4><div className="system-analysis-points">{claims.map((claim) => {
+      const evidence = claim.evidenceIds.map((id) => assessment.evidenceCatalog.find((item) => item.id === id)).find(Boolean);
+      return <section key={claim.id}><div className="panel__heading"><p>{claim.text}</p>{claim.diagnosticStatus && <StatusBadge tone="info">{diagnosticLabels[claim.diagnosticStatus]}</StatusBadge>}</div><small>{claim.rationale}</small>{claim.materialUncertainty && <small>仍需注意：{claim.materialUncertainty}</small>}{evidence && <button className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest('判断依据', evidence))}><FileCheck2 size={16} /> 查看原始依据</button>}</section>;
+    })}</div></section>}
+    {actions.length > 0 && <section className="analysis-recommendations"><h4>接下来怎么做</h4><div>{actions.map((action) => <article key={action.id}><h5>{action.title}</h5><p>{action.why}</p><dl><div><dt>第一步</dt><dd>{action.firstStep}</dd></div>{action.timing && <div><dt>何时</dt><dd>{action.timing}</dd></div>}{action.reviewPlan && <div><dt>何时回看</dt><dd>{action.reviewPlan}</dd></div>}</dl>{action.caution && <small>{action.caution}</small>}</article>)}</div></section>}
+    {system.limitations.length > 0 && <details className="analysis-boundaries"><summary>这部分判断的范围</summary>{system.limitations.map((item) => <p key={item}>{item}</p>)}</details>}
+  </article>;
+}
+
+function SystemDetail({ detail, assessment, search, onSearch, selectedMetric, onSelectMetric, onOpenEvidence }: {
   detail: BodySystemDetailV2;
+  assessment: MemberAssessmentSnapshotV3 | null;
   search: string;
   onSearch(value: string): void;
   selectedMetric: MetricSeriesDetailV2 | null;
@@ -183,7 +214,9 @@ function SystemDetail({ detail, search, onSearch, selectedMetric, onSelectMetric
   const findings = detail.findings.filter((finding) => !query || `${finding.title}${finding.value}`.toLocaleLowerCase('zh-CN').includes(query));
   return <section className="system-detail">
     <div className="system-detail__hero"><span className={`system-directory__symbol is-${detail.summary.status}`}>{systemSymbol[detail.registry.id]}</span><div><span className="eyebrow">{detail.registry.name}</span><h2>{detail.registry.shortName}</h2><p>{detail.analysis ? '先看结论和下一步，需要时再展开指标与原始依据。' : detail.summary.summary}</p></div></div>
-    <SystemAnalysisCard detail={detail} onOpenEvidence={onOpenEvidence} />
+    {assessment?.systems.some((item) => item.systemId === detail.registry.id)
+      ? <MemberAssessmentSystemCard assessment={assessment} systemId={detail.registry.id} onOpenEvidence={onOpenEvidence} />
+      : <SystemAnalysisCard detail={detail} onOpenEvidence={onOpenEvidence} />}
     <label className="member-search"><Search size={18} /><span className="sr-only">搜索本系统指标</span><input value={search} onChange={(event) => onSearch(event.target.value)} placeholder={`搜索${detail.registry.shortName}指标`} /></label>
     <div className="system-section-heading"><div><h3>指标与历史</h3><p>点开指标查看按真实日期间隔绘制的历史；不会因点击而调用模型。</p></div><StatusBadge tone="neutral">{metrics.length} 项</StatusBadge></div>
     {metrics.length > 0 ? <div className="system-metric-list">{metrics.map((metric) => <button key={metric.id} onClick={() => onSelectMetric(metric.id)}><span><strong>{metric.name}</strong><small>{metric.trendFacts.statement}</small></span><b>{metric.latestValue ?? '—'} <small>{metric.unit ?? ''}</small></b><ChevronRight size={17} /></button>)}</div> : <div className="table-empty compact-empty"><Activity size={24} /><strong>没有匹配的指标</strong><span>可以清空搜索词，或等待新报告完成事实处理。</span></div>}
@@ -282,6 +315,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
 }) {
   const [tab, setTab] = useState<MemberTab>('overview');
   const [overview, setOverview] = useState<MemberOverviewV2 | null>(null);
+  const [assessment, setAssessment] = useState<MemberAssessmentSnapshotV3 | null>(null);
   const [systems, setSystems] = useState<BodySystemSummaryV2[]>([]);
   const [selectedSystem, setSelectedSystem] = useState<BodySystemId | null>(null);
   const [systemDetail, setSystemDetail] = useState<BodySystemDetailV2 | null>(null);
@@ -327,14 +361,16 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       bridge.listBodySystems(person.id),
       bridge.listHealthEvents({ personId: person.id }),
       bridge.getLifestylePlan(person.id),
-      bridge.getConceptReview(person.id)
-    ]).then(([overviewSettled, systemsSettled, eventsSettled, planSettled, conceptSettled]) => {
+      bridge.getConceptReview(person.id),
+      bridge.getMemberAssessment ? bridge.getMemberAssessment(person.id) : Promise.resolve({ ok: true as const, data: null })
+    ]).then(([overviewSettled, systemsSettled, eventsSettled, planSettled, conceptSettled, assessmentSettled]) => {
       if (!active) return;
       const overviewResult = overviewSettled.status === 'fulfilled' ? overviewSettled.value : null;
       const systemsResult = systemsSettled.status === 'fulfilled' ? systemsSettled.value : null;
       const eventsResult = eventsSettled.status === 'fulfilled' ? eventsSettled.value : null;
       const planResult = planSettled.status === 'fulfilled' ? planSettled.value : null;
       const conceptResult = conceptSettled.status === 'fulfilled' ? conceptSettled.value : null;
+      const assessmentResult = assessmentSettled.status === 'fulfilled' ? assessmentSettled.value : null;
       if (!overviewResult?.ok || !systemsResult?.ok || !eventsResult?.ok) {
         setLoadError(true);
         return;
@@ -344,7 +380,8 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       setEvents(eventsResult.data);
       if (planResult?.ok) setPlan(planResult.data);
       if (conceptResult?.ok) setConceptReview(conceptResult.data);
-      setPartialLoadError(!planResult?.ok || !conceptResult?.ok);
+      setAssessment(assessmentResult?.ok ? assessmentResult.data : null);
+      setPartialLoadError(!planResult?.ok || !conceptResult?.ok || !assessmentResult?.ok);
       setLoadError(false);
       setSelectedSystem((current) => current && systemsResult.data.some((system) => system.id === current)
         ? current
@@ -565,7 +602,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
     </div>}
     {!loading && tab === 'body' && <>
       {selectedEvent && <div className="context-return-bar"><span><strong>正在从检查事件查看身体系统</strong><small>{selectedEvent.time.displayLabel} · {selectedEvent.title}</small></span><button className="secondary-button" onClick={() => setTab('timeline')}>返回这次检查</button></div>}
-      <div className="body-workspace"><aside className="panel"><div className="body-workspace__label"><span className="eyebrow">身体目录</span><strong>12 个系统</strong></div><SystemDirectory systems={systems} selected={selectedSystem} onSelect={chooseSystem} /></aside><main className="panel">{systemDetail && selectedSystem === systemDetail.registry.id ? <SystemDetail detail={systemDetail} search={search} onSearch={setSearch} selectedMetric={selectedMetric} onSelectMetric={chooseMetric} onOpenEvidence={onOpenEvidence} /> : <div className="table-empty"><LoaderCircle size={24} className="spin" /><strong>正在读取系统档案</strong></div>}</main></div>
+      <div className="body-workspace"><aside className="panel"><div className="body-workspace__label"><span className="eyebrow">身体目录</span><strong>12 个系统</strong></div><SystemDirectory systems={systems} selected={selectedSystem} onSelect={chooseSystem} /></aside><main className="panel">{systemDetail && selectedSystem === systemDetail.registry.id ? <SystemDetail detail={systemDetail} assessment={assessment} search={search} onSearch={setSearch} selectedMetric={selectedMetric} onSelectMetric={chooseMetric} onOpenEvidence={onOpenEvidence} /> : <div className="table-empty"><LoaderCircle size={24} className="spin" /><strong>正在读取系统档案</strong></div>}</main></div>
       {conceptError && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>这次归类没有保存</strong><p>原始事实未改变，可以稍后重试。</p></div></div>}
       {conceptReview && <ConceptReviewPanel bundle={conceptReview} busyObservationId={conceptBusyId} onSave={saveConceptMapping} onUndo={undoConceptMapping} onOpenEvidence={onOpenEvidence} />}
     </>}
@@ -595,7 +632,14 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       <div className="system-section-heading"><div><h3>来源与附件</h3><p>每条依据独立定位；文件名只出现在来源层。</p></div><StatusBadge tone="neutral">{selectedEvent.evidence.length} 条</StatusBadge></div>
       <div className="evidence-source-list">{selectedEvent.evidence.map((evidence, index) => <button key={`${evidence.id}-${index}`} className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${selectedEvent.title}依据 ${index + 1}`, evidence))}><FileCheck2 size={16} /> {evidence.label} · {evidence.locator ?? `依据 ${index + 1}`}</button>)}</div>
     </div> : <><div className="panel__heading"><div><span className="eyebrow">检查时间线</span><h2>按时间看每次检查</h2></div><StatusBadge tone="neutral">{filteredEvents.length} / {events.length} 次</StatusBadge></div><p className="body-copy">打开某次检查，可以查看当时发现了什么、涉及哪些身体系统，以及对应的原始依据。</p><div className="timeline-filters"><label>事件类型<select value={eventType} onChange={(event) => setEventType(event.target.value as HealthEventV2['type'] | 'all')}><option value="all">全部类型</option><option value="checkup">体检</option><option value="laboratory">检验</option><option value="imaging">影像</option><option value="outpatient">门诊</option><option value="inpatient">住院</option><option value="self_measurement">本人测量</option><option value="manual_note">本人补充</option><option value="other">其他</option></select></label><label>身体系统<select value={eventSystem} onChange={(event) => setEventSystem(event.target.value as BodySystemId | 'all')}><option value="all">全部系统</option>{systems.map((system) => <option key={system.id} value={system.id}>{system.shortName}</option>)}</select></label></div>{filteredEvents.length > 0 ? <div className="timeline-list">{filteredEvents.map((event) => <button key={event.id} onClick={() => chooseEvent(event.id)}><time>{event.time.displayLabel}</time><i /><span><StatusBadge tone={event.metadataStatus === 'unknown' ? 'neutral' : 'success'}>{event.type === 'checkup' ? '体检' : event.type === 'imaging' ? '影像' : event.type === 'laboratory' ? '检验' : '健康事件'}</StatusBadge><strong>{event.title}</strong><small>{event.summary}</small><em>{event.systemIds.length} 个身体系统 · {event.documentIds.length} 份来源文件</em></span><ChevronRight size={18} /></button>)}</div> : <div className="table-empty"><CalendarClock size={24} /><strong>{events.length > 0 ? '没有符合筛选条件的检查' : '还没有检查记录'}</strong><span>{events.length > 0 ? '可以调整检查类型或身体系统。' : '报告处理完成后会按检查时间显示在这里。'}</span></div>}</>}</section>}
-    {!loading && tab === 'guidance' && <div className="guide-grid">{plan && plan.proposals.length > 0 ? <>
+    {!loading && tab === 'guidance' && assessment && <div className="guide-grid">
+      <section className="panel guide-hero"><span className="eyebrow">生活与行动</span><h2>根据现有资料，先做这些事</h2><p>同一方向已合并为一项建议；建议不会自动变成已采纳计划。</p>
+        {assessment.actions.length > 0 ? <div className="member-proposal-list">{assessment.actions.map((action, index) => <article key={action.id}><div className="panel__heading"><div><span className="eyebrow">第 {index + 1} 项 · {action.kind === 'seek_care' ? '就医准备' : action.kind === 'test_followup' ? '复查' : action.kind === 'treatment_discussion' ? '治疗讨论' : '日常行动'}</span><h3>{action.title}</h3></div><StatusBadge tone={action.urgency === 'urgent' || action.urgency === 'emergency' ? 'warning' : 'info'}>{action.urgency === 'emergency' ? '尽快寻求急救' : action.urgency === 'urgent' ? '及时处理' : action.urgency === 'soon' ? '近期安排' : '按计划进行'}</StatusBadge></div><p>{action.why}</p><dl><div><dt>第一步</dt><dd>{action.firstStep}</dd></div>{action.timing && <div><dt>何时</dt><dd>{action.timing}</dd></div>}{action.reviewPlan && <div><dt>何时回看</dt><dd>{action.reviewPlan}</dd></div>}</dl>{action.caution && <small>{action.caution}</small>}</article>)}</div> : <p className="muted-copy">本轮没有需要新增的统一行动；已有事实和判断仍可在健康总览查看。</p>}
+      </section>
+      {assessment.questions.length > 0 && <section className="panel"><div className="panel__heading"><h3>会改变判断的关键信息</h3></div><ul>{assessment.questions.map((question) => <li key={question.id}><strong>{question.question}</strong><p>{question.whyItMatters}</p></li>)}</ul></section>}
+      <section className="panel"><div className="panel__heading"><h3>已采纳行动</h3><StatusBadge tone="neutral">{plan?.adoptedActions.length ?? 0} 项</StatusBadge></div>{plan?.adoptedActions.length ? plan.adoptedActions.map((action) => <div className="completed-item adopted-action-card" key={action.id}><Check size={16} /><div><strong>{action.title}</strong><span>{action.userGoal}</span><small>{action.selectedStartingOption} · {action.owner}</small>{action.progressNote && <small>备注：{action.progressNote}</small>}</div></div>) : <p className="muted-copy">还没有主动采纳的行动。</p>}</section>
+    </div>}
+    {!loading && tab === 'guidance' && !assessment && <div className="guide-grid">{plan && plan.proposals.length > 0 ? <>
       <section className="panel guide-hero"><span className="eyebrow">本周重点</span><h2>一份成员级生活方案</h2><p>相同方向已跨身体系统合并；建议不会自动变成你的计划，只有主动采纳后才进入行动层。</p>{plan.status === 'stale' && <div className="info-callout compact" role="status"><ShieldCheck size={18} /><div><strong>旧版建议已恢复展示</strong><p>内容仍可以阅读，但尚未按当前的来源和安全规则重新复核，所以暂时不能直接采纳。</p></div></div>}<div className="member-proposal-list">{plan.proposals.map((proposal, index) => <LifestyleProposalCard key={proposal.id} proposal={proposal} index={index} busy={adoptingProposalId !== null || decidingProposalId !== null} canAdopt={plan.status === 'current'} onAdopt={(adoption) => adoptProposal(proposal, adoption)} onDecide={(decision) => decideProposal(proposal.id, decision)} onOpenEvidence={onOpenEvidence} />)}</div></section>
       <section className="panel"><div className="panel__heading"><h3>已采纳行动</h3><StatusBadge tone="neutral">{plan.adoptedActions.length} 项</StatusBadge></div>{plan.adoptedActions.length > 0 ? plan.adoptedActions.map((action) => <div className="completed-item adopted-action-card" key={action.id}><Check size={16} /><div><strong>{action.title}</strong><span>{action.userGoal}</span><small>{action.selectedStartingOption} · {action.owner}{action.plannedTime ? ` · ${action.plannedTime}` : ''}{action.dueDate ? ` · ${action.dueDate} 回顾` : ''}</small>{action.progressNote && <small>备注：{action.progressNote}</small>}</div></div>) : <p className="muted-copy">还没有主动采纳的行动。</p>}</section>
     </> : <section className="panel personal-empty-state"><ShieldCheck size={28} /><div><span className="eyebrow">生活与行动</span><h2>目前还没有适合你的行动方案</h2><p>只有在个人资料依据和安全复核都足够时，这里才会给出具体做法；不会用通用模板冒充个性化建议。</p></div></section>}</div>}

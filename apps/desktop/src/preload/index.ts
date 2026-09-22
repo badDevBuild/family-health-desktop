@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { AccountState, ActionItem, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, AiPreferences, AiSettings, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, CleanupReceipt, ConceptMappingReceipt, ConceptReviewBundle, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, ManualNote, MemberEvidenceBundle, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, Person, ProcessNowInput, ReportMetadataCorrectionReceipt, ResolveReviewInput, RestorePersonInput, Result, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
+import type { AccountState, ActionItem, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, AiPreferences, AiSettings, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, CleanupReceipt, ConceptMappingReceipt, ConceptReviewBundle, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, ManualNote, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, Person, ProcessNowInput, ReportMetadataCorrectionReceipt, ResolveReviewInput, RestorePersonInput, Result, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
 
 export interface HealthDesktopBridge {
   getBootstrap(): Promise<{
@@ -12,6 +12,7 @@ export interface HealthDesktopBridge {
   }>;
   getSnapshot(): Promise<DashboardSnapshot>;
   getMemberOverview(personId: string): Promise<Result<MemberOverviewV2>>;
+  getMemberAssessment(personId: string): Promise<Result<MemberAssessmentSnapshotV3 | null>>;
   listBodySystems(personId: string): Promise<Result<BodySystemSummaryV2[]>>;
   getConceptReview(personId: string): Promise<Result<ConceptReviewBundle>>;
   setConceptMapping(input: SetConceptMappingInput): Promise<Result<ConceptMappingReceipt>>;
@@ -84,6 +85,7 @@ const bridge: HealthDesktopBridge = {
   getBootstrap: () => ipcRenderer.invoke('app:get-bootstrap'),
   getSnapshot: () => ipcRenderer.invoke('dashboard:get-snapshot'),
   getMemberOverview: (personId) => ipcRenderer.invoke('members:get-overview', { personId }),
+  getMemberAssessment: (personId) => ipcRenderer.invoke('members:get-assessment-v3', { personId }),
   listBodySystems: (personId) => ipcRenderer.invoke('body:list-systems', { personId }),
   getConceptReview: (personId) => ipcRenderer.invoke('concepts:get-review', { personId }),
   setConceptMapping: (input) => ipcRenderer.invoke('concepts:set-mapping', input),

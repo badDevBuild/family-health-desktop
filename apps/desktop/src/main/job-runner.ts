@@ -1,12 +1,11 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type { WorkspaceStore } from '@storage';
-import { bodySystemRegistry, stableHash } from '@core';
+import { stableHash } from '@core';
 import { DEFAULT_AI_PREFERENCES, type AiPreferences } from '@contracts';
 import { CodexRuntimeManager } from './codex-runtime.js';
-import { DerivedHealthPipeline } from './derived-pipeline.js';
+import { MemberAssessmentPipeline } from './member-assessment-pipeline.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
-import { SystemAnalysisPipeline } from './system-analysis-pipeline.js';
 
 export class ProcessingJobRunner extends EventEmitter {
   private running = false;
@@ -57,13 +56,12 @@ export class ProcessingJobRunner extends EventEmitter {
         };
         try {
           const pipeline = new DocumentExtractionPipeline(store, jobRuntime, executionGuard);
-          const resumeSystem = ['system_analysis', 'system_review'].includes(job.stage);
-          const resumeDerived = resumeSystem || ['analyze', 'guidance', 'review_derived', 'publish'].includes(job.stage);
-          let completedUnits = resumeDerived ? job.documentIds.length : 0;
+          const resumeAnalysis = ['analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish'].includes(job.stage);
+          let completedUnits = resumeAnalysis ? job.documentIds.length : 0;
           let needsReview = false;
-          let hasSystemRejection = false;
+          let hasAssessmentRejection = false;
           let lastReceipt: { threadId: string; turnId: string } | null = null;
-          if (!resumeDerived) {
+          if (!resumeAnalysis) {
             for (const documentId of job.documentIds) {
               store.assertJobExecutionActive(executionGuard, documentId);
               if (store.hasOpenBlockingReview(documentId)) {
@@ -87,60 +85,25 @@ export class ProcessingJobRunner extends EventEmitter {
               if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
               if (result.status === 'needs_review') {
                 needsReview = true;
-                // 单份资料需要核对时继续处理同批其余资料；最终派生阶段仍等待
-                // 所有阻断事项解决，避免一张模糊图片让整个批次看起来卡住。
+                // 仅隔离该份资料；同批其余已接纳事实仍可参与成员综合。
                 continue;
               }
             }
           }
-          if (!needsReview && !resumeSystem) {
-            if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
-            const derived = await new DerivedHealthPipeline(store, jobRuntime, (stage) => {
+          if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
+          const assessment = await new MemberAssessmentPipeline(
+            store, jobRuntime, (stage) => {
               store.updateJobStage(job.id, stage);
               this.emit('changed');
-            }, executionGuard, job.documentIds[0]!, aiPreferences.modelId).process(job.personId);
-            if (derived.threadId && derived.turnId) lastReceipt = { threadId: derived.threadId, turnId: derived.turnId };
-            if (derived.status === 'needs_review') needsReview = true;
+            }, executionGuard, job.documentIds[0]!,
+            aiPreferences.modelId, aiPreferences.reasoningEffort
+          ).process(job.personId);
+          if ('threadId' in assessment && assessment.threadId && assessment.turnId) {
+            lastReceipt = { threadId: assessment.threadId, turnId: assessment.turnId };
           }
-          if (!needsReview) {
-            const systemPipeline = new SystemAnalysisPipeline(
-              store,
-              jobRuntime,
-              (stage) => {
-                store.updateJobStage(job.id, stage);
-                this.emit('changed');
-              },
-              executionGuard,
-              job.documentIds[0]!,
-              aiPreferences.modelId
-            );
-            for (const system of bodySystemRegistry) {
-              const systemId = system.id;
-              const systemResult = await systemPipeline.process(job.personId, systemId);
-              if (systemResult.status === 'published') {
-                lastReceipt = { threadId: systemResult.threadId, turnId: systemResult.turnId };
-                store.updateJobSystemOutcome(job.id, {
-                  systemId, status: 'published', reason: null,
-                  inputSignature: store.listSystemAnalysisSnapshots(job.personId, true).find((item) => item.systemId === systemId)?.inputSignature ?? null
-                });
-              } else if (systemResult.status === 'rejected') {
-                hasSystemRejection = true;
-                if (systemResult.threadId && systemResult.turnId) lastReceipt = { threadId: systemResult.threadId, turnId: systemResult.turnId };
-                store.updateJobSystemOutcome(job.id, {
-                  systemId, status: 'rejected', reason: systemResult.reason, inputSignature: null
-                });
-              } else {
-                store.updateJobSystemOutcome(job.id, {
-                  systemId,
-                  status: systemResult.reason === 'no_direct_facts' ? 'skipped_no_data' : 'skipped_cache',
-                  reason: systemResult.reason,
-                  inputSignature: store.listSystemAnalysisSnapshots(job.personId, true).find((item) => item.systemId === systemId)?.inputSignature ?? null
-                });
-              }
-            }
-          }
+          if (assessment.status === 'rejected') hasAssessmentRejection = true;
           if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
-          const finalStatus = needsReview ? 'waiting_user' : hasSystemRejection ? 'completed_with_issues' : 'succeeded';
+          const finalStatus = needsReview ? 'waiting_user' : hasAssessmentRejection ? 'completed_with_issues' : 'succeeded';
           if (!needsReview) store.updateJobStage(job.id, 'publish');
           store.finishJob(job.id, finalStatus);
           store.finishJobAttempt({ attemptId, status: finalStatus, ...lastReceipt });
