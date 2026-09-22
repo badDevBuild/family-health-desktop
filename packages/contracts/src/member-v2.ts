@@ -387,6 +387,18 @@ export const bodySystemSummaryV2Schema = z.object({
 }).strict();
 export type BodySystemSummaryV2 = z.infer<typeof bodySystemSummaryV2Schema>;
 
+export const sourceUrgentNoticeSchema = z.object({
+  id: idSchema,
+  documentId: idSchema,
+  sourceSpanId: idSchema,
+  clinicalDate: localDateSchema,
+  instructionLevel: z.enum(['critical_result', 'immediate_care']),
+  itemName: z.string().min(1),
+  sourceLabel: z.string().min(1),
+  sourceExcerpt: z.string().min(1).max(320)
+}).strict();
+export type SourceUrgentNotice = z.infer<typeof sourceUrgentNoticeSchema>;
+
 export const memberOverviewV2Schema = z.object({
   personId: idSchema,
   generatedAt: utcTimestampSchema,
@@ -394,6 +406,7 @@ export const memberOverviewV2Schema = z.object({
   headline: z.string().min(1),
   overview: z.string().min(1),
   latestClinicalDate: localDateSchema.nullable(),
+  sourceUrgentNotices: z.array(sourceUrgentNoticeSchema).max(3),
   acceptedFactCount: z.number().int().nonnegative(),
   eventCount: z.number().int().nonnegative(),
   attentionSystemIds: z.array(bodySystemIdSchema),

@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { stableHash } from '@core';
+import type { ExtractionResult } from '@contracts';
 import { PersonalWorkspaceService } from './workspace-service.js';
+import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { ensureLocalRecoveryPoints } from './recovery-point-service.js';
 import type { LegacyDocConverter } from '@ingestion';
 
@@ -45,6 +47,36 @@ afterEach(() => {
 });
 
 describe('PersonalWorkspaceService', () => {
+  it('明确的近期报告急诊提示在 P01 接纳后、P02 完成前即可读取', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
+    await service.importFiles([{ path: '/tmp/合成及时处理提示.txt',
+      bytes: Buffer.from('2026-09-18 项目甲 1.0，报告要求立即急诊。') }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
+    const span = spans[0]!;
+    const extraction: ExtractionResult = {
+      schemaVersion: 1, documentId, coveredSourceSpanIds: spans.map((item) => item.id),
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      candidates: [{
+        localKey: 'item-a', originalName: '项目甲', standardNameCandidate: '项目甲',
+        value: { kind: 'numeric', rawText: '1.0', decimal: '1.0', comparator: 'eq' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-18',
+        evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+      }]
+    };
+    const result = await new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'synthetic-p01', turnId: 'synthetic-p01', output: extraction })
+    }).process(documentId);
+    expect(result.status).toBe('published');
+    expect(service.getMemberAssessment(personId)).toBeNull();
+    expect(service.getMemberOverview(personId).sourceUrgentNotices).toMatchObject([{
+      documentId, clinicalDate: '2026-09-18', instructionLevel: 'immediate_care'
+    }]);
+    service.close();
+  });
+
   it('初始化成员并生成不含虚构健康结论的个人快照', () => {
     const service = makeService();
     const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });

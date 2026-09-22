@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { Activity, Archive, CalendarClock, Check, ChevronRight, FileCheck2, FileText, LoaderCircle, Plus, Search, ShieldCheck } from 'lucide-react';
+import { Activity, AlertTriangle, Archive, CalendarClock, Check, ChevronRight, FileCheck2, FileText, LoaderCircle, Plus, Search, ShieldCheck } from 'lucide-react';
 import type { AdoptLifestyleProposalInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptReviewBundle, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, InboxItem, LifestylePlanV2, MemberAssessmentSnapshotV3, MemberEvidenceRef, MemberOverviewV2, MetricSeriesDetailV2, PersonSummary, SetConceptMappingInput, UpdateReportMetadataInput } from '@contracts';
 import { StatusBadge, type Tone } from '../../components/StatusBadge.js';
 import { ConceptReviewPanel } from './ConceptReviewPanel.js';
@@ -404,6 +404,14 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
   }, [person.id, person.dataRevision, refreshToken]);
 
   useEffect(() => {
+    if (!overview?.sourceUrgentNotices.length) return;
+    const now = new Date();
+    const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const timer = window.setTimeout(() => setRefreshToken((current) => current + 1), nextMidnight.getTime() - now.getTime());
+    return () => window.clearTimeout(timer);
+  }, [overview?.sourceUrgentNotices.length, refreshToken]);
+
+  useEffect(() => {
     if (!selectedSystem) return;
     let active = true;
     const bridge = window.healthDesktop;
@@ -601,6 +609,17 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
 
   return <div className="page-stack member-profile-v2">
     <MemberHeader snapshot={snapshot} person={person} onSelectPerson={onSelectPerson} onAddPerson={onAddPerson} onEditPerson={onEditPerson} onArchivedPeople={onArchivedPeople} onAddNote={onAddNote} onExport={onExport} />
+    {overview?.personId === person.id && overview.sourceUrgentNotices.length > 0 && <section className="source-urgent-notices" role="alert" aria-label="报告原文的及时处理提示">
+      {overview.sourceUrgentNotices.map((notice) => <div className="source-urgent-notice" key={notice.id}>
+        <AlertTriangle size={22} aria-hidden="true" />
+        <div><strong>{notice.instructionLevel === 'immediate_care' ? '这份近期报告原文要求立即就医' : '这份近期报告原文提示需要及时处理'}</strong><p>{notice.clinicalDate} · {notice.itemName}。{notice.instructionLevel === 'immediate_care' ? '如果尚未处理，请按原报告的急诊/就医要求尽快行动，并联系出具机构核实。' : '如果尚未处理，请尽快联系出具报告的医疗机构核实。'}这里转述的是报告提示，不代表应用判断你现在发生急症。</p></div>
+        <button className="secondary-button" onClick={() => onOpenEvidence({
+          title: '报告原文的及时处理提示', label: notice.sourceLabel,
+          quote: notice.sourceExcerpt, meta: `${notice.clinicalDate} · ${notice.itemName}`,
+          sourceSpanId: notice.sourceSpanId, documentId: notice.documentId
+        })}>查看原文</button>
+      </div>)}
+    </section>}
     {partialLoadError && <div className="info-callout compact" role="status"><ShieldCheck size={18} /><div><strong>部分辅助内容暂时未读取</strong><p>身体与时间线仍可正常查看；生活方案或概念核对稍后重试即可。</p></div></div>}
     <div className="tabs member-tabs" role="tablist">{tabs.map(([id, label]) => <button role="tab" aria-selected={tab === id} className={tab === id ? 'is-active' : ''} key={id} onClick={() => setTab(id)}>{label}</button>)}</div>
     {(loading || (!loadError && overview?.personId !== person.id)) && <section className="panel table-empty"><LoaderCircle size={24} className="spin" /><strong>正在整理成员档案</strong><span>只读取本机已保存结果，不会发起新的模型任务。</span></section>}

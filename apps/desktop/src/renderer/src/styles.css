@@ -498,6 +498,13 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 
 /* 成员连续健康档案 v2 */
 .member-profile-v2 { max-width: 1440px; }
+.source-urgent-notices { display: grid; gap: 12px; }
+.source-urgent-notice { display: flex; align-items: flex-start; gap: 16px; padding: 16px; border: 1px solid var(--alert); border-radius: 16px; color: var(--warm-900); background: var(--alert-bg); box-shadow: var(--shadow); }
+.source-urgent-notice > svg { flex: 0 0 auto; margin-top: 3px; color: var(--alert); }
+.source-urgent-notice > div { flex: 1; min-width: 0; }
+.source-urgent-notice strong { display: block; font-size: 17px; line-height: 1.45; }
+.source-urgent-notice p { margin: 5px 0 0; font-size: 16px; line-height: 1.6; }
+.source-urgent-notice button { flex: 0 0 auto; }
 .member-tabs { position: sticky; top: -22px; z-index: 5; padding-top: 10px; background: linear-gradient(var(--warm-50) 78%, rgba(250, 250, 248, 0)); }
 .member-v2-overview { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(300px, .65fr); gap: 16px; }
 .member-v2-overview > .wide-panel, .member-health-headline { grid-column: 1 / -1; }
@@ -820,6 +827,8 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
   .ai-state > span:not(.ai-state__dot), .ai-state > svg { display: none; }
   .content-area { padding: 18px 16px 40px; }
   .page-stack { gap: 18px; }
+  .source-urgent-notice { flex-wrap: wrap; }
+  .source-urgent-notice button { margin-left: 38px; }
   .welcome-row, .page-title-row, .member-health-headline, .boundary-card { align-items: stretch; flex-direction: column; }
   .welcome-row .primary-button, .page-title-row .primary-button { align-self: flex-start; }
   .metric-strip, .person-grid, .dashboard-columns, .member-v2-overview, .system-summary-grid { grid-template-columns: 1fr; }

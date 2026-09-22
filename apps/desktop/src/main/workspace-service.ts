@@ -7,6 +7,7 @@ import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManif
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
+import { buildSourceUrgentNotices } from './source-urgent-notice.js';
 import { ACCEPTANCE_RULES_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, promptMetaForStage, SYSTEM_ANALYSIS_PROMPT_VERSION } from './prompts/index.js';
 import { buildSystemEvidenceBundle as buildSystemEvidenceBundleFromStore } from './system-evidence.js';
 
@@ -551,6 +552,7 @@ export class PersonalWorkspaceService {
             ? '旧资料仍然保留；系统正在按新的结果优先方式重新整理，完成前不会用数量冒充健康结论。'
             : '已有资料不会丢失；综合分析完成后，这里会给出结论、原因和可执行的下一步。')),
       latestClinicalDate: observations.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null,
+      sourceUrgentNotices: buildSourceUrgentNotices(observations, this.now()),
       acceptedFactCount: observations.length,
       eventCount: events.length,
       attentionSystemIds: attentionSystems.map((system) => system.id),
