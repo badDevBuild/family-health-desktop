@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { extractionResultSchema, knowledgeSourceCandidateSchema, memberAssessmentCandidateV3Schema } from '@contracts';
-import { toCodexOutputSchema } from './structured-output-schema.js';
+import { restoreCodexOptionalFields, toCodexOutputSchema } from './structured-output-schema.js';
 
 function hasKey(value: unknown, target: string): boolean {
   if (Array.isArray(value)) return value.some((item) => hasKey(item, target));
@@ -19,6 +19,28 @@ describe('toCodexOutputSchema', () => {
     expect(hasKey(compatible, 'oneOf')).toBe(false);
     expect(hasKey(compatible, 'anyOf')).toBe(true);
     expect(hasKey(draft7, 'oneOf')).toBe(true);
+  });
+
+  it('传输层把可选字段改为必填可空，收到 null 后恢复原契约的省略语义', () => {
+    const draft7 = z.toJSONSchema(extractionResultSchema, { target: 'draft-7' }) as Record<string, unknown>;
+    const compatible = toCodexOutputSchema(draft7);
+    const subject = compatible.properties as Record<string, Record<string, unknown>>;
+    const evidence = (subject.subject!.properties as Record<string, Record<string, unknown>>).evidence!;
+    const reference = evidence.items as Record<string, unknown>;
+    expect(reference.required).toEqual(['sourceSpanId', 'quote', 'sourceRole', 'duplicateBasis']);
+    expect((reference.properties as Record<string, Record<string, unknown>>).sourceRole!.enum)
+      .toEqual(['primary', 'duplicate_source', null]);
+    expect(compatible.required).toContain('reportMetadata');
+    const restored = restoreCodexOptionalFields({
+      subject: { evidence: [{ sourceSpanId: 'span', quote: null, sourceRole: null, duplicateBasis: null }] },
+      reportMetadata: null,
+      candidates: [{ evidence: [{ sourceSpanId: 'span', quote: null, sourceRole: 'primary', duplicateBasis: null }] }]
+    }, draft7) as Record<string, unknown>;
+    expect(restored).not.toHaveProperty('reportMetadata');
+    expect((restored.subject as { evidence: Array<Record<string, unknown>> }).evidence[0])
+      .toEqual({ sourceSpanId: 'span', quote: null });
+    expect((restored.candidates as Array<{ evidence: Array<Record<string, unknown>> }>)[0]!.evidence[0])
+      .toEqual({ sourceSpanId: 'span', quote: null, sourceRole: 'primary' });
   });
 
   it('拒绝根节点联合，避免把服务端必然拒绝的 Schema 发出去', () => {

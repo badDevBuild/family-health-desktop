@@ -7,7 +7,7 @@ import type { AccountState, AssessmentRequestV3, ClinicalFocusedReviewV1, Extrac
 import type { CodexRuntimeManager } from './codex-runtime.js';
 import { ProcessingJobRunner } from './job-runner.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
-import { MemberAssessmentPipeline } from './member-assessment-pipeline.js';
+import { MemberAssessmentPipeline, repairTargets } from './member-assessment-pipeline.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
 import { buildMemberAggregatePackage, buildMemberSystemPartitions, splitMemberPartition } from './member-assessment-partition.js';
 import { validateAssessmentCandidate } from './assessment-validation.js';
@@ -559,15 +559,28 @@ describe('MemberAssessmentPipeline', () => {
     service.close();
   });
 
+  it('含冒号的节点 ID 仍能精确进入 P03，且不会误选同前缀节点', async () => {
+    const { service, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims.push({ ...candidate.claims[0]!, id: 'claim:thyroid-nodule-2022', topicKey: 'thyroid' });
+    candidate.claims.push({ ...candidate.claims[0]!, id: 'claim:thyroid', topicKey: 'other' });
+    expect(repairTargets(candidate, [
+      'documented_source_not_proven:claim:thyroid-nodule-2022',
+      'unknown_evidence:claim:thyroid-nodule-2022:missing-evidence'
+    ])).toEqual(['claim:thyroid-nodule-2022']);
+    expect(repairTargets(candidate, ['unknown_evidence:system:metabolic:missing-evidence'])).toEqual([]);
+    service.close();
+  });
+
   it('P03 仍未修好一条主张时只隔离该主张，其余有依据内容继续发布', async () => {
     const { service, personId, built } = await fixture();
     const candidate = candidateFor(built.request, built.evidencePackage);
     candidate.claims.push({
-      ...candidate.claims[0]!, id: 'claim-unverified', topicKey: 'unverified',
+      ...candidate.claims[0]!, id: 'claim:unverified', topicKey: 'unverified',
       text: '这条判断的来源引用有误。', evidenceIds: ['nonexistent-evidence']
     });
-    candidate.overview.claimIds.push('claim-unverified');
-    for (const system of candidate.systems) system.claimIds.push('claim-unverified');
+    candidate.overview.claimIds.push('claim:unverified');
+    for (const system of candidate.systems) system.claimIds.push('claim:unverified');
     let calls = 0;
     const result = await new MemberAssessmentPipeline(service.store, {
       runStructuredTurn: async (input) => {
@@ -579,7 +592,7 @@ describe('MemberAssessmentPipeline', () => {
     expect(result).toMatchObject({ status: 'published', callCount: 2 });
     const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
     expect(snapshot.claims.map((item) => item.id)).toEqual(['claim-ldl']);
-    expect(snapshot.heldTargetIds).toContain('claim-unverified');
+    expect(snapshot.heldTargetIds).toContain('claim:unverified');
     expect(snapshot.overview.claimIds).toEqual(['claim-ldl']);
     expect(snapshot.actions.map((item) => item.id)).toEqual(['action-review']);
     expect(snapshot.overview.summary).not.toContain('已核实');

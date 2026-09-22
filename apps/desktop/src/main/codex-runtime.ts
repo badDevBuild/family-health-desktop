@@ -3,7 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { aiModelOptionSchema, aiReasoningEffortSchema, type AccountState, type AiModelOption, type AiPreferences } from '@contracts';
 import { spawnCodexAppServer, type CodexRpcClient } from '@codex';
 import { createHealthThreadStartParams } from './codex-thread-config.js';
-import { toCodexOutputSchema } from './structured-output-schema.js';
+import { restoreCodexOptionalFields, toCodexOutputSchema } from './structured-output-schema.js';
 
 interface RuntimeClient extends EventEmitter {
   initialize(): Promise<unknown>;
@@ -360,7 +360,7 @@ export class CodexRuntimeManager extends EventEmitter {
       if (!message?.text) throw new Error('CODEX_STRUCTURED_OUTPUT_MISSING');
       return {
         threadId: notification.threadId, turnId: notification.turn.id,
-        output: JSON.parse(message.text) as T,
+        output: restoreCodexOptionalFields(JSON.parse(message.text), input.outputSchema) as T,
         metrics: {
           durationMs: Math.max(0, Date.now() - startedAtMs),
           ...webSearchMetrics(capture),

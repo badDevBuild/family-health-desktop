@@ -146,6 +146,30 @@ describe('CodexRuntimeManager', () => {
     manager.shutdown();
   });
 
+  it('服务端严格要求可选字段时发送必填可空契约，接收后恢复省略字段', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    client.turnCompletion = {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed', error: null, items: [{
+        type: 'agentMessage', phase: 'final_answer', text: '{"ok":true,"note":null}'
+      }] }
+    };
+    await manager.start();
+    const result = await manager.runStructuredTurn<{ ok: boolean; note?: string }>({
+      prompt: '只处理纯虚构资料',
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      outputSchema: { type: 'object', properties: { ok: { type: 'boolean' }, note: { type: 'string' } },
+        required: ['ok'], additionalProperties: false }
+    });
+    const turnStart = client.requests.find((request) => request.method === 'turn/start');
+    const sentSchema = (turnStart?.params as { outputSchema?: Record<string, unknown> }).outputSchema;
+    expect(sentSchema).toMatchObject({ required: ['ok', 'note'],
+      properties: { note: { type: ['string', 'null'] } } });
+    expect(result.output).toEqual({ ok: true });
+    manager.shutdown();
+  });
+
   it('完成通知不携带条目时，从 item/completed 接收权威结构化输出', async () => {
     const { manager, client } = setup();
     client.authenticated = true;

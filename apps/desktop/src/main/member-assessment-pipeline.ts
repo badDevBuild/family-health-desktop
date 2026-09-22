@@ -40,11 +40,22 @@ function targetNode(candidate: MemberAssessmentCandidateV3, id: string): unknown
     .find((item) => item.id === id);
 }
 
-function repairTargets(candidate: MemberAssessmentCandidateV3, issues: string[]): string[] {
+/** 问题串的节点 ID 可以含冒号，不能用 split(':')[1] 截断。 */
+function issueOwnerId(issue: string, nodeIds: string[]): string | null {
+  const separator = issue.indexOf(':');
+  if (separator < 0) return null;
+  const detail = issue.slice(separator + 1);
+  return [...nodeIds]
+    .sort((left, right) => right.length - left.length)
+    .find((id) => detail === id || detail.startsWith(`${id}:`)) ?? null;
+}
+
+export function repairTargets(candidate: MemberAssessmentCandidateV3, issues: string[]): string[] {
   const ids = new Set<string>();
+  const nodeIds = ['overview', ...candidate.systems, ...candidate.claims, ...candidate.actions,
+    ...candidate.questions, ...candidate.knowledgeSources].map((node) => typeof node === 'string' ? node : node.id);
   for (const issue of issues) {
-    const parts = issue.split(':');
-    const nodeId = parts[1];
+    const nodeId = issueOwnerId(issue, nodeIds);
     if (nodeId && targetNode(candidate, nodeId)) ids.add(nodeId);
     if (issue === 'overview_missing_claims' || issue.startsWith('unknown_claim:overview:')
       || issue.startsWith('unknown_action:overview:')) ids.add('overview');
@@ -52,7 +63,7 @@ function repairTargets(candidate: MemberAssessmentCandidateV3, issues: string[])
   return [...ids];
 }
 
-function repairChangedOnlyAllowed(
+export function repairChangedOnlyAllowed(
   original: MemberAssessmentCandidateV3,
   repaired: MemberAssessmentCandidateV3,
   allowedIds: string[]
@@ -83,11 +94,12 @@ function isolatableTargets(candidate: MemberAssessmentCandidateV3, issues: strin
     'action_personal_evidence_required', 'direct_medication_change', 'unsourced_probability',
     'unknown_claim'
   ]);
-  const nodes = new Set([...candidate.claims, ...candidate.actions, ...candidate.questions].map((item) => item.id));
+  const nodes = [...candidate.claims, ...candidate.actions, ...candidate.questions].map((item) => item.id);
   const targets = new Set<string>();
   for (const issue of issues) {
-    const [kind, owner] = issue.split(':');
-    if (!kind || !owner || !allowed.has(kind) || !nodes.has(owner)) return null;
+    const kind = issue.slice(0, issue.indexOf(':'));
+    const owner = issueOwnerId(issue, nodes);
+    if (!allowed.has(kind) || !owner) return null;
     targets.add(owner);
   }
   return targets.size > 0 ? [...targets] : null;

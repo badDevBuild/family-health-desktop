@@ -12,10 +12,11 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe('V3 成员综合固定纯合成评测包', () => {
-  it('24 份不同边界、6 份留出集均符合实际 P02 输入契约', () => {
+  it('24 份开发样例另加 6 份留出集均符合实际 P02 输入契约', () => {
     const cases = createAssessmentV3SyntheticCases();
     expect(() => validateAssessmentV3SyntheticCases(cases)).not.toThrow();
-    expect(cases).toHaveLength(24);
+    expect(cases).toHaveLength(30);
+    expect(cases.filter((item) => item.split === 'development')).toHaveLength(24);
     expect(cases.filter((item) => item.split === 'holdout')).toHaveLength(6);
     expect(cases.every((item) => item.request.mode === 'full' && !item.request.webSearchAllowed)).toBe(true);
     expect(cases.every((item) => assessmentRequestV3Schema.safeParse(item.request).success
@@ -23,6 +24,9 @@ describe('V3 成员综合固定纯合成评测包', () => {
     expect(new Set(cases.map((item) => item.dimensions.sourceQuality)).size).toBe(4);
     expect(new Set(cases.map((item) => item.dimensions.riskTheme)).size).toBe(5);
     expect(cases.filter((item) => item.clinicalReferenceStatus === 'requires_clinician_review').length).toBeGreaterThan(10);
+    const withoutSixDevelopmentCases = cases.filter((item) => !['A025', 'A026', 'A027', 'A028', 'A029', 'A030'].includes(item.id));
+    expect(() => validateAssessmentV3SyntheticCases(withoutSixDevelopmentCases))
+      .toThrow('ASSESSMENT_CASESET_COUNT_INSUFFICIENT');
   });
 
   it('报告指令只在来源数据中，网页伪指令不进入个人证据包', () => {
@@ -53,9 +57,9 @@ describe('V3 成员综合固定纯合成评测包', () => {
     const second = mkdtempSync(join(tmpdir(), 'assessment-v3-cases-b-'));
     roots.push(first, second);
     expect(materializeAssessmentV3SyntheticCases(first)).toEqual(materializeAssessmentV3SyntheticCases(second));
-    expect(readdirSync(first).filter((name) => name.endsWith('.json'))).toHaveLength(25);
+    expect(readdirSync(first).filter((name) => name.endsWith('.json'))).toHaveLength(31);
     const manifest = JSON.parse(readFileSync(join(first, 'manifest.json'), 'utf8')) as Record<string, unknown>;
     expect(manifest).toMatchObject({ syntheticOnly: true, scope: 'P02_structured_input_only',
-      extractionQualityStatus: 'NOT_RUN', clinicalQualityStatus: 'NOT_RUN', caseCount: 24, holdoutCount: 6 });
+      extractionQualityStatus: 'NOT_RUN', clinicalQualityStatus: 'NOT_RUN', caseCount: 30, holdoutCount: 6 });
   });
 });
