@@ -242,6 +242,81 @@ describe('App member display editing', () => {
     expect(screen.getByText('新资料已全部移交')).toBeTruthy();
   });
 
+  it('旧资料已有事实但没有新版综合时，可从成员档案和空收件箱进入授权刷新，且不重传旧报告', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.persons[0]!.documentCount = 10;
+    snapshot.persons[0]!.acceptedFactCount = 361;
+    snapshot.persons[0]!.derivedStatus = 'stale';
+    snapshot.account = { ...snapshot.account, status: 'connected', displayLabel: 'masked@example.invalid' };
+    snapshot.inbox = [{
+      id: 'completed-document', displayName: '旧报告.pdf', discoveredAt: '2026-09-18T00:00:00.000Z',
+      personId: 'personal-person-1', personLabel: '测试成员', status: 'completed', format: 'PDF',
+      sourceLabel: '手动导入', sentToAi: true, aiTransmissionStatus: 'completed', inProcessingCenter: false, issue: null
+    }];
+    const processNow = vi.fn(async () => ({ ok: true as const, data: { batchId: 'refresh-batch' }, revision: 1 }));
+    installBridge(snapshot, { processNow });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '成员档案' }));
+    fireEvent.click(await screen.findByRole('button', { name: '查看范围并刷新综合' }));
+    const consent = await screen.findByRole('dialog', { name: '确认发送范围' });
+    expect(consent.textContent).toContain('本次不处理新资料，并为 测试成员刷新综合说明');
+    expect(consent.textContent).toContain('已完成的报告不会重新上传或提取');
+    expect(screen.getByText(/检验数值进入搜索词/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: '授权并开始' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    expect(processNow).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '报告收件箱' }));
+    expect(screen.getByRole('button', { name: '立即处理全部' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '查看范围并刷新' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /我确认本次接收方/ }));
+    fireEvent.click(screen.getByRole('button', { name: '授权并开始' }));
+    await waitFor(() => expect(processNow).toHaveBeenCalledTimes(1));
+    expect(processNow).toHaveBeenCalledWith({ consentVersion: 1, confirmedDataRecipient: 'OpenAI/Codex', documentIds: undefined });
+    expect(await screen.findByText(/正在复用已保存事实生成新版综合/)).toBeTruthy();
+  });
+
+  it('新报告与旧综合属于同一成员时，授权范围不把同一成员重复计算', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.persons[0]!.acceptedFactCount = 3;
+    snapshot.persons[0]!.derivedStatus = 'stale';
+    snapshot.account = { ...snapshot.account, status: 'connected', displayLabel: 'masked@example.invalid' };
+    snapshot.inbox = [{
+      id: 'new-document', displayName: '新资料.txt', discoveredAt: '2026-09-18T00:00:00.000Z',
+      personId: 'personal-person-1', personLabel: '测试成员', status: 'queued', format: '纯文本',
+      sourceLabel: '手动导入', sentToAi: false, aiTransmissionStatus: 'not_sent', inProcessingCenter: false, issue: null
+    }];
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '报告收件箱' }));
+    expect(screen.queryByRole('button', { name: '查看范围并刷新' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '立即处理全部' }));
+    const consent = await screen.findByRole('dialog', { name: '确认发送范围' });
+    expect(consent.textContent).toContain('将处理 1 份已归属新资料');
+    expect(consent.textContent).not.toContain('并为 测试成员刷新综合说明');
+  });
+
+  it('成员综合已有进行中的任务时，不再提示重复刷新', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.persons[0]!.acceptedFactCount = 3;
+    snapshot.persons[0]!.derivedStatus = 'stale';
+    snapshot.inbox = [];
+    snapshot.jobs = [{
+      id: 'active-refresh', batchLabel: '刷新综合', personLabel: '测试成员', stage: 'analyze', status: 'queued',
+      completedUnits: 0, totalUnits: 1, statusText: '等待处理', systemOutcomes: [],
+      updatedAt: '2026-09-18T00:00:00.000Z', canCancel: true, canRetry: false
+    }];
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '成员档案' }));
+    expect(screen.queryByRole('button', { name: '查看范围并刷新综合' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '报告收件箱' }));
+    expect(screen.queryByRole('button', { name: '查看范围并刷新' })).toBeNull();
+  });
+
   it('不可重试且已被新任务替代的失败记录不再冒充当前待办', async () => {
     const snapshot = createPersonalSnapshot();
     snapshot.jobs = [{
@@ -590,7 +665,8 @@ describe('App member display editing', () => {
     expect(screen.queryByText('待归属.txt')).toBeNull();
     fireEvent.click(screen.getByRole('checkbox', { name: '选中 选中的报告.txt' }));
     fireEvent.click(screen.getByRole('button', { name: /处理选中项/ }));
-    expect(await screen.findByText(/1 份选中的已归属资料/)).toBeTruthy();
+    const consent = await screen.findByRole('dialog', { name: '确认发送范围' });
+    expect(consent.textContent).toContain('将处理 1 份选中的已归属新资料');
     expect(screen.getByText(/无法在发送前逐条检查搜索词/)).toBeTruthy();
     expect(screen.getByText(/纯合成联网测试已观察到检验数值进入搜索词/)).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: /我确认本次接收方/ }));

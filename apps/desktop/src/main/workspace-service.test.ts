@@ -400,6 +400,53 @@ describe('PersonalWorkspaceService', () => {
     service.close();
   });
 
+  it('手动授权刷新旧报告时只建立综合任务，不重新提取或改写已接纳事实', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/合成综合刷新报告.txt',
+      bytes: Buffer.from('2026-09-12 LDL-C 4.2 mmol/L')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const candidate = {
+      localKey: 'ldl-refresh-authorized', originalName: 'LDL-C', standardNameCandidate: '低密度脂蛋白胆固醇',
+      value: { kind: 'numeric' as const, rawText: '4.2', decimal: '4.2', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4', reportedAbnormalFlag: '↑',
+      specimen: '血清', method: null, bodySite: null, clinicalDate: '2026-09-12',
+      evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+    };
+    const issueId = service.store.saveExtractionReviewIssue({
+      documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: [span.id],
+      candidateOptions: [candidate],
+      candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['value'] }],
+      reasonCodes: ['TEST_FIXTURE'],
+      documentRun: { coverageComplete: true, coveredSourceSpanIds: [span.id], manifestSpanIds: [span.id], chunkCount: 1 }
+    });
+    service.acceptCorrectedFacts({ issueId, documentId, candidates: [candidate] });
+    const acceptedBefore = service.store.listAcceptedObservations(personId);
+    const factRevisionBefore = service.store.getFactRevision(personId);
+    const accountState = {
+      status: 'connected' as const,
+      displayLabel: 'masked@example.com',
+      quota: { status: 'available' as const, primaryUsedPercent: 1, secondaryUsedPercent: null, resetsAt: null },
+      runtimeVersion: 'test-runtime',
+      lastCheckedAt: '2026-09-18T01:00:00Z'
+    };
+
+    service.processNow({ accountState, consentVersion: 1 });
+
+    expect(service.getSnapshot(null).jobs).toEqual([
+      expect.objectContaining({ stage: 'analyze', status: 'queued' })
+    ]);
+    expect(service.store.listAcceptedObservations(personId)).toEqual(acceptedBefore);
+    expect(service.store.getFactRevision(personId)).toBe(factRevisionBefore);
+    expect(service.getSnapshot(null).inbox).toEqual([
+      expect.objectContaining({ id: documentId, status: 'completed' })
+    ]);
+    service.close();
+  });
+
   it('旧记录缺少原项目名时恢复可查看的系统归类，但不把候选名当成已验证事实', async () => {
     const service = makeService();
     const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });

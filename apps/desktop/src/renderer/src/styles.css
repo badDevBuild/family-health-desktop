@@ -297,6 +297,10 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .info-callout { min-height: 72px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 13px 16px; border: 1px solid #cfe5d8; border-radius: 14px; color: var(--primary-dark); background: var(--primary-light); }
 .info-callout strong { font-size: 14px; }
 .info-callout p { margin: 3px 0 0; color: var(--warm-600); font-size: 12px; }
+.assessment-refresh-callout { margin-bottom: 16px; }
+.assessment-refresh-callout strong { font-size: 17px; }
+.assessment-refresh-callout p { font-size: 16px; line-height: 1.55; }
+.assessment-refresh-callout .primary-button { white-space: nowrap; }
 
 .job-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .job-history-list { display: grid; gap: 8px; }
@@ -850,6 +854,8 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
   .source-urgent-notice { flex-wrap: wrap; }
   .source-urgent-notice button { margin-left: 38px; }
   .welcome-row, .page-title-row, .member-health-headline, .boundary-card { align-items: stretch; flex-direction: column; }
+  .assessment-refresh-callout { grid-template-columns: auto minmax(0, 1fr); }
+  .assessment-refresh-callout .primary-button { grid-column: 2; justify-self: start; white-space: normal; }
   .welcome-row .primary-button, .page-title-row .primary-button { align-self: flex-start; }
   .metric-strip, .person-grid, .dashboard-columns, .member-v2-overview, .system-summary-grid { grid-template-columns: 1fr; }
   .body-workspace { min-height: 0; grid-template-columns: 1fr; }

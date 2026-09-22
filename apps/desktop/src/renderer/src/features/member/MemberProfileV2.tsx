@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { Activity, AlertTriangle, Archive, CalendarClock, Check, ChevronRight, FileCheck2, FileText, LoaderCircle, Plus, Search, ShieldCheck } from 'lucide-react';
+import { Activity, AlertTriangle, Archive, CalendarClock, Check, ChevronRight, FileCheck2, FileText, LoaderCircle, Plus, RefreshCw, Search, ShieldCheck } from 'lucide-react';
 import type { AdoptLifestyleProposalInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptReviewBundle, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, InboxItem, LifestylePlanV2, MemberAssessmentSnapshotV3, MemberEvidenceRef, MemberOverviewV2, MetricSeriesDetailV2, PersonSummary, SetConceptMappingInput, UpdateReportMetadataInput } from '@contracts';
 import { StatusBadge, type Tone } from '../../components/StatusBadge.js';
 import { ConceptReviewPanel } from './ConceptReviewPanel.js';
@@ -315,7 +315,7 @@ function LifestyleProposalCard({ proposal, index, busy, canAdopt, onAdopt, onDec
   </article>;
 }
 
-export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEvidence, onAddPerson, onEditPerson, onArchivedPeople, onAddNote, onExport, onImport, onExcludeDocument, onReincludeDocument, onDeleteDocument, onDeletedDocuments }: {
+export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEvidence, onAddPerson, onEditPerson, onArchivedPeople, onAddNote, onExport, onImport, onRefreshAssessment, onExcludeDocument, onReincludeDocument, onDeleteDocument, onDeletedDocuments }: {
   snapshot: DashboardSnapshot;
   person: PersonSummary;
   onSelectPerson(id: string): void;
@@ -326,6 +326,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
   onAddNote(): void;
   onExport(): void;
   onImport(): void;
+  onRefreshAssessment(): void;
   onExcludeDocument(document: InboxItem): void;
   onReincludeDocument(document: InboxItem): void;
   onDeleteDocument(document: InboxItem): void;
@@ -626,6 +627,14 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
 
   return <div className="page-stack member-profile-v2">
     <MemberHeader snapshot={snapshot} person={person} onSelectPerson={onSelectPerson} onAddPerson={onAddPerson} onEditPerson={onEditPerson} onArchivedPeople={onArchivedPeople} onAddNote={onAddNote} onExport={onExport} />
+    {person.acceptedFactCount > 0 && person.derivedStatus !== 'current'
+      && !snapshot.jobs.some((job) => job.personLabel === person.displayName
+        && ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status))
+      && <section className="info-callout assessment-refresh-callout" role="status">
+      <RefreshCw size={20} aria-hidden="true" />
+      <div><strong>已保存的报告事实还没按新流程综合</strong><p>旧报告不用重新上传；点击后会先核对本次发送范围，不会直接开始处理。</p></div>
+      <button className="primary-button" onClick={onRefreshAssessment}>查看范围并刷新综合</button>
+    </section>}
     {overview?.personId === person.id && overview.currentSymptomNotices.length > 0 && <section className="source-urgent-notices" role="alert" aria-label="本人今天记录的症状提示">
       {overview.currentSymptomNotices.map((notice) => <div className="source-urgent-notice" key={notice.id}>
         <AlertTriangle size={22} aria-hidden="true" />

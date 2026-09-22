@@ -247,7 +247,7 @@ function HomePage({ snapshot, selectedPersonId, onSelectPerson, onNavigate, onAd
   );
 }
 
-function PeoplePage({ snapshot, selectedPersonId, onSelectPerson, onOpenEvidence, onAddPerson, onEditPerson, onArchivedPeople, onAddNote, onExport, onImport, onExcludeDocument, onReincludeDocument, onDeleteDocument, onDeletedDocuments }: {
+function PeoplePage({ snapshot, selectedPersonId, onSelectPerson, onOpenEvidence, onAddPerson, onEditPerson, onArchivedPeople, onAddNote, onExport, onImport, onRefreshAssessment, onExcludeDocument, onReincludeDocument, onDeleteDocument, onDeletedDocuments }: {
   snapshot: DashboardSnapshot;
   selectedPersonId: string;
   onSelectPerson(id: string): void;
@@ -258,6 +258,7 @@ function PeoplePage({ snapshot, selectedPersonId, onSelectPerson, onOpenEvidence
   onAddNote(): void;
   onExport(): void;
   onImport(): void;
+  onRefreshAssessment(): void;
   onExcludeDocument(document: InboxItem): void;
   onReincludeDocument(document: InboxItem): void;
   onDeleteDocument(document: InboxItem): void;
@@ -279,6 +280,7 @@ function PeoplePage({ snapshot, selectedPersonId, onSelectPerson, onOpenEvidence
     onAddNote={onAddNote}
     onExport={onExport}
     onImport={onImport}
+    onRefreshAssessment={onRefreshAssessment}
     onExcludeDocument={onExcludeDocument}
     onReincludeDocument={onReincludeDocument}
     onDeleteDocument={onDeleteDocument}
@@ -433,6 +435,29 @@ function DocumentsView({ onOpenEvidence }: { onOpenEvidence(evidence: Evidence):
   return <section className="panel"><div className="panel__heading"><div><span className="eyebrow">原始资料</span><h2>资料与证据</h2></div><StatusBadge tone="warning">纯虚构资料</StatusBadge></div><div className="document-list">{docs.map(([name, date, status]) => <button key={name} onClick={() => onOpenEvidence({ title: name, label: status, quote: '安全预览会在这里按页或文档块显示。演示模式不包含真实文件。', meta: `${date} · 虚构资料` })}><span className="file-icon"><FileText size={20} /></span><span><strong>{name}</strong><small>{date} · {status}</small></span><ChevronRight size={17} /></button>)}</div></section>;
 }
 
+function manualProcessingScope(snapshot: DashboardSnapshot, documentIds?: string[] | null) {
+  const selectedIds = documentIds ? new Set(documentIds) : null;
+  const readyDocuments = snapshot.inbox.filter((item) => !item.inProcessingCenter && item.status === 'queued'
+    && item.personId !== null && (!selectedIds || selectedIds.has(item.id)));
+  const readyPersonIds = new Set(readyDocuments.map((item) => item.personId));
+  const activePersonLabels = new Set(snapshot.jobs.filter((job) => ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status))
+    .map((job) => job.personLabel).filter((label): label is string => label !== null));
+  const refreshPersons = documentIds ? [] : snapshot.persons.filter((person) => person.acceptedFactCount > 0
+    && person.derivedStatus !== 'current' && !readyPersonIds.has(person.id)
+    && !activePersonLabels.has(person.displayName));
+  return { readyDocuments, refreshPersons };
+}
+
+function InboxRefreshPrompt({ snapshot, onRefresh }: { snapshot: DashboardSnapshot; onRefresh(): void }) {
+  const { readyDocuments, refreshPersons } = manualProcessingScope(snapshot);
+  if (snapshot.workspaceMode !== 'personal' || refreshPersons.length === 0) return null;
+  return <section className="info-callout assessment-refresh-callout" role="status">
+    <RefreshCw size={20} aria-hidden="true" />
+    <div><strong>{refreshPersons.length} 位成员的综合说明待更新</strong><p>已有报告和事实会继续保留；{readyDocuments.length > 0 ? '待处理的新资料也会一并处理。' : '这次只复用已接纳事实，不重新上传或提取旧报告。'}</p></div>
+    <button className="primary-button" onClick={onRefresh}>查看范围并刷新</button>
+  </section>;
+}
+
 function InboxPage({ snapshot, onProcess, onImport, onDropFiles, onAssign, onIgnore, onOpenEvidence, onDirectories, onProcessingCenter }: { snapshot: DashboardSnapshot; onProcess(documentIds?: string[]): void; onImport(): void; onDropFiles(files: File[], personId: string | null): void; onAssign(documentIds: string[], personId: string): Promise<void>; onIgnore(documentIds: string[]): Promise<void>; onOpenEvidence(evidence: Evidence): void; onDirectories(): void; onProcessingCenter(): void }) {
   const [filter, setFilter] = useState<'all' | InboxItem['status']>('all');
   const [personFilter, setPersonFilter] = useState('all');
@@ -448,7 +473,8 @@ function InboxPage({ snapshot, onProcess, onImport, onDropFiles, onAssign, onIgn
     && (personFilter === 'all' || (personFilter === 'unassigned' ? item.personId === null : item.personId === personFilter)));
   const visibleItems = items.slice(0, visibleCount);
   const selected = inboxItems.filter((item) => selectedIds.includes(item.id));
-  const readyInboxCount = inboxItems.filter((item) => item.status === 'queued' && item.personId !== null).length;
+  const { readyDocuments } = manualProcessingScope(snapshot);
+  const readyInboxCount = readyDocuments.length;
   const assignableIds = selected.filter((item) => item.status === 'needs_review' && item.personId === null).map((item) => item.id);
   const processableIds = selected.filter((item) => item.status === 'queued' && item.personId !== null).map((item) => item.id);
   const ignorableIds = selected.filter((item) => item.status !== 'ignored').map((item) => item.id);
@@ -1284,18 +1310,18 @@ function ProcessConsentDialog({ snapshot, documentIds, onClose, onConfirm, onLog
 }) {
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
-  const selectedSet = documentIds ? new Set(documentIds) : null;
-  const readyCount = snapshot.inbox.filter((item) => !item.inProcessingCenter && item.status === 'queued' && item.personId && (!selectedSet || selectedSet.has(item.id))).length;
-  const derivedRefreshCount = documentIds ? 0 : snapshot.persons.filter((person) => person.acceptedFactCount > 0 && person.derivedStatus !== 'current').length;
+  const { readyDocuments, refreshPersons } = manualProcessingScope(snapshot, documentIds);
+  const readyCount = readyDocuments.length;
+  const derivedRefreshCount = refreshPersons.length;
   const processingCount = readyCount + derivedRefreshCount;
   const connected = snapshot.account.status === 'connected';
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="member-dialog process-consent-dialog" role="dialog" aria-modal="true" aria-labelledby="process-consent-title">
         <header><div><span className="eyebrow">本次手动处理</span><h2 id="process-consent-title">确认发送范围</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭处理确认"><X size={19} /></button></header>
-        <p>将处理 {readyCount} 份{documentIds ? '选中的' : ''}已归属资料{derivedRefreshCount > 0 ? `，并为 ${derivedRefreshCount} 位成员刷新已过期的综合说明` : ''}。除新资料外，综合分析会包含<strong>同一成员的相关已接纳历史事实和必要的本人补充</strong>。这些必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>
+        <p>{readyCount > 0 ? `将处理 ${readyCount} 份${documentIds ? '选中的' : ''}已归属新资料` : '本次不处理新资料'}{derivedRefreshCount > 0 ? `，并为 ${refreshPersons.map((person) => person.displayName).join('、')}刷新综合说明` : ''}。{readyCount === 0 ? '已完成的报告不会重新上传或提取；' : '新资料会先提取；'}成员综合会复用<strong>该成员已接纳的相关历史事实和必要的本人补充</strong>。这些必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>
         <p>纯合成联网测试已观察到检验数值进入搜索词；应用无法在查询发出前拦截。若继续授权，真实报告内容也可能发生同类情况。</p>
-        <div className="consent-facts"><span><ShieldCheck size={17} /> 不发送其他成员或未归属资料</span><span><FileCheck2 size={17} /> 历史事实只限本成员且在授权清单中记录</span><span><FileCheck2 size={17} /> 事实入库由应用校验；重要综合判断按需重点复核</span><span><CircleHelp size={17} /> 综合分析可使用内置 Web Search；应用目前无法在发送前逐条检查搜索词，敏感内容可能被错误带入查询</span><span><Sparkles size={17} /> 使用当前 Codex 账户额度，额度规则可能变化</span></div>
+        <div className="consent-facts"><span><ShieldCheck size={17} /> 不发送未归属资料或本次范围外的成员资料</span><span><FileCheck2 size={17} /> 历史事实只限上述成员且在授权清单中记录</span><span><FileCheck2 size={17} /> 事实入库由应用校验；重要综合判断按需重点复核</span><span><CircleHelp size={17} /> 综合分析可使用内置 Web Search；应用目前无法在发送前逐条检查搜索词，敏感内容可能被错误带入查询</span><span><Sparkles size={17} /> 使用当前 Codex 账户额度，额度规则可能变化</span></div>
         <label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我确认本次接收方、用途和资料范围</label>
         {!connected && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>Codex 尚未连接</strong><p>先完成官方登录，才会建立本次处理授权和任务。</p></div></div>}
         <div className="dialog-actions">
@@ -1526,15 +1552,15 @@ export default function App() {
   const content = (() => {
     switch (page) {
       case 'home': return <HomePage snapshot={snapshot} selectedPersonId={selectedPersonId} onSelectPerson={(id) => { setSelectedPersonId(id); setPage('people'); }} onNavigate={setPage} onAddPerson={() => setMemberDialogOpen(true)} />;
-      case 'people': return <PeoplePage snapshot={snapshot} selectedPersonId={selectedPersonId} onSelectPerson={setSelectedPersonId} onOpenEvidence={(next) => void handleOpenEvidence(next)} onAddPerson={() => setMemberDialogOpen(true)} onEditPerson={() => setMemberEditDialogOpen(true)} onArchivedPeople={() => setArchivedPeopleDialogOpen(true)} onAddNote={() => setManualNoteDialogOpen(true)} onExport={() => setExportDialogOpen(true)} onImport={() => void handleImport()} onExcludeDocument={setDocumentToExclude} onReincludeDocument={(document) => void handleSetDocumentIncluded(document, true)} onDeleteDocument={setDocumentToDelete} onDeletedDocuments={() => setDeletedDocumentsDialogOpen(true)} />;
-      case 'inbox': return <InboxPage snapshot={snapshot} onProcess={(documentIds) => {
+      case 'people': return <PeoplePage snapshot={snapshot} selectedPersonId={selectedPersonId} onSelectPerson={setSelectedPersonId} onOpenEvidence={(next) => void handleOpenEvidence(next)} onAddPerson={() => setMemberDialogOpen(true)} onEditPerson={() => setMemberEditDialogOpen(true)} onArchivedPeople={() => setArchivedPeopleDialogOpen(true)} onAddNote={() => setManualNoteDialogOpen(true)} onExport={() => setExportDialogOpen(true)} onImport={() => void handleImport()} onRefreshAssessment={() => { setProcessDocumentIds(null); setProcessConsentOpen(true); }} onExcludeDocument={setDocumentToExclude} onReincludeDocument={(document) => void handleSetDocumentIncluded(document, true)} onDeleteDocument={setDocumentToDelete} onDeletedDocuments={() => setDeletedDocumentsDialogOpen(true)} />;
+      case 'inbox': return <><InboxRefreshPrompt snapshot={snapshot} onRefresh={() => { setProcessDocumentIds(null); setProcessConsentOpen(true); }} /><InboxPage snapshot={snapshot} onProcess={(documentIds) => {
         setProcessDocumentIds(documentIds ?? null);
         if (snapshot.workspaceMode === 'personal') setProcessConsentOpen(true);
         else void handleProcessNow(documentIds);
       }} onImport={() => void handleImport()} onDropFiles={(files, personId) => void handleDroppedFiles(files, personId)} onAssign={handleBatchAssign} onIgnore={handleBatchIgnore} onOpenEvidence={(next) => void handleOpenEvidence(next)} onProcessingCenter={() => setPage('processing')} onDirectories={() => {
         if (snapshot.workspaceMode !== 'personal') setWorkspaceDialogOpen(true);
         else setDirectoryDialogOpen(true);
-      }} />;
+      }} /></>;
       case 'processing': return <ProcessingPage snapshot={snapshot} onCancel={setCancelJob} onRetry={(job) => void handleRetryJob(job)} onTogglePause={() => void handleToggleQueuePause()} onDetails={setJobDetail} />;
       case 'actions': return <ActionsPage snapshot={snapshot} onCreate={() => {
         if (snapshot.workspaceMode !== 'personal') setToast('演示工作区不会保存事项；请先建立或切换到个人工作区。');
@@ -1561,10 +1587,13 @@ export default function App() {
 
   async function handleProcessNow(documentIds?: string[]): Promise<boolean> {
     if (!window.healthDesktop) { setToast('演示模式不会发送资料。'); return false; }
+    const refreshOnly = manualProcessingScope(snapshot, documentIds).readyDocuments.length === 0;
     const result = await window.healthDesktop.processNow({ consentVersion: 1, confirmedDataRecipient: 'OpenAI/Codex', documentIds });
     if (result.ok) {
       setSnapshot(await window.healthDesktop.getSnapshot());
-      setToast(result.revision === 0 ? '这批资料已经在处理中，没有重复创建任务。' : '本次授权已记录，正在通过 Codex 提取资料；随后会按成员整理综合结果。');
+      setToast(result.revision === 0 ? '这批资料已经在处理中，没有重复创建任务。'
+        : refreshOnly ? '本次授权已记录，正在复用已保存事实生成新版综合；旧报告不会重新上传或提取。'
+          : '本次授权已记录，正在通过 Codex 提取新资料；随后会按成员整理综合结果。');
       return true;
     }
     setToast(snapshot.workspaceMode === 'demo'

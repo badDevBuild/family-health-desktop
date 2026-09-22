@@ -75,7 +75,7 @@ describe('MemberProfileV2 event organization', () => {
     render(<MemberProfileV2
       snapshot={snapshot} person={snapshot.persons[0]!}
       onSelectPerson={vi.fn()} onOpenEvidence={vi.fn()} onAddPerson={vi.fn()} onEditPerson={vi.fn()}
-      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()}
+      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()} onRefreshAssessment={vi.fn()}
       onExcludeDocument={vi.fn()} onReincludeDocument={vi.fn()} onDeleteDocument={vi.fn()} onDeletedDocuments={vi.fn()}
     />);
     fireEvent.click(await screen.findByRole('tab', { name: '生活与行动' }));
@@ -130,7 +130,7 @@ describe('MemberProfileV2 event organization', () => {
     } as unknown as HealthDesktopBridge;
     const commonProps = {
       onSelectPerson: vi.fn(), onOpenEvidence: vi.fn(), onAddPerson: vi.fn(), onEditPerson: vi.fn(),
-      onArchivedPeople: vi.fn(), onAddNote: vi.fn(), onExport: vi.fn(), onImport: vi.fn(),
+      onArchivedPeople: vi.fn(), onAddNote: vi.fn(), onExport: vi.fn(), onImport: vi.fn(), onRefreshAssessment: vi.fn(),
       onExcludeDocument: vi.fn(), onReincludeDocument: vi.fn(), onDeleteDocument: vi.fn(), onDeletedDocuments: vi.fn()
     };
     const view = render(<MemberProfileV2 snapshot={snapshot} person={snapshot.persons[0]!} {...commonProps} />);
@@ -216,7 +216,7 @@ describe('MemberProfileV2 event organization', () => {
       snapshot={snapshot}
       person={snapshot.persons[0]!}
       onSelectPerson={vi.fn()} onOpenEvidence={vi.fn()} onAddPerson={vi.fn()} onEditPerson={vi.fn()}
-      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()}
+      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()} onRefreshAssessment={vi.fn()}
       onExcludeDocument={vi.fn()} onReincludeDocument={vi.fn()} onDeleteDocument={vi.fn()} onDeletedDocuments={vi.fn()}
     />);
 
@@ -293,7 +293,7 @@ describe('MemberProfileV2 event organization', () => {
     render(<MemberProfileV2
       snapshot={snapshot} person={snapshot.persons[0]!}
       onSelectPerson={vi.fn()} onOpenEvidence={vi.fn()} onAddPerson={vi.fn()} onEditPerson={vi.fn()}
-      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()}
+      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()} onRefreshAssessment={vi.fn()}
       onExcludeDocument={vi.fn()} onReincludeDocument={vi.fn()} onDeleteDocument={vi.fn()} onDeletedDocuments={vi.fn()}
     />);
 
@@ -358,7 +358,7 @@ describe('MemberProfileV2 event organization', () => {
     render(<MemberProfileV2
       snapshot={snapshot} person={snapshot.persons[0]!}
       onSelectPerson={vi.fn()} onOpenEvidence={vi.fn()} onAddPerson={vi.fn()} onEditPerson={vi.fn()}
-      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()}
+      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()} onRefreshAssessment={vi.fn()}
       onExcludeDocument={vi.fn()} onReincludeDocument={vi.fn()} onDeleteDocument={vi.fn()} onDeletedDocuments={vi.fn()}
     />);
     fireEvent.click(await screen.findByRole('tab', { name: '生活与行动' }));
