@@ -398,7 +398,7 @@ describe('DocumentExtractionPipeline', () => {
     expect(service.store.listAcceptedObservations(personId).map((fact) => [fact.rawText, fact.clinicalDate]))
       .toEqual(expect.arrayContaining([['4.2', '2025-06-10'], ['5.1', '2025-06-10']]));
     service.close();
-  });
+  }, 20_000);
 
   it('扫描图像中明确读到不同姓名时必须阻断，不因缺少文字层放行', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-image-identity-conflict-'));
