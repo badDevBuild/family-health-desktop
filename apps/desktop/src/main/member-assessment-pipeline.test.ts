@@ -10,6 +10,7 @@ import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { MemberAssessmentPipeline } from './member-assessment-pipeline.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
 import { validateAssessmentCandidate } from './assessment-validation.js';
+import { buildAssessmentKnowledgeVerifications, canonicalizeAssessmentKnowledge } from './assessment-knowledge.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
 
 const roots: string[] = [];
@@ -177,6 +178,104 @@ describe('MemberAssessmentPipeline', () => {
     }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
     expect(result).toMatchObject({ status: 'published', callCount: 2 });
     expect(calls).toBe(2);
+    service.close();
+  });
+
+  it('P03 仍未修好一条主张时只隔离该主张，其余有依据内容继续发布', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims.push({
+      ...candidate.claims[0]!, id: 'claim-unverified', topicKey: 'unverified',
+      text: '这条判断的来源引用有误。', evidenceIds: ['nonexistent-evidence']
+    });
+    candidate.overview.claimIds.push('claim-unverified');
+    for (const system of candidate.systems) system.claimIds.push('claim-unverified');
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        calls += 1;
+        if (calls === 2) expect(input.prompt).toContain('REPAIR_REQUEST=');
+        return { threadId: `turn-${calls}`, turnId: `turn-${calls}`, output: candidate };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(snapshot.claims.map((item) => item.id)).toEqual(['claim-ldl']);
+    expect(snapshot.heldTargetIds).toContain('claim-unverified');
+    expect(snapshot.overview.claimIds).toEqual(['claim-ldl']);
+    expect(snapshot.actions.map((item) => item.id)).toEqual(['action-review']);
+    expect(snapshot.overview.summary).not.toContain('已核实');
+    service.close();
+  });
+
+  it('P03 越界改写时不接纳改写，只隔离原候选中可定位的问题节点', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims.push({ ...candidate.claims[0]!, id: 'claim-unverified', topicKey: 'unverified',
+      evidenceIds: ['nonexistent-evidence'] });
+    candidate.overview.claimIds.push('claim-unverified');
+    for (const system of candidate.systems) system.claimIds.push('claim-unverified');
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => {
+        calls += 1;
+        if (calls === 1) return { threadId: 'p02', turnId: 'first', output: candidate };
+        const outOfScope = structuredClone(candidate);
+        outOfScope.claims[0]!.text = '模型越界改写了原本正确的主张。';
+        return { threadId: 'p03', turnId: 'second', output: outOfScope };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(snapshot.claims).toHaveLength(1);
+    expect(snapshot.claims[0]!.text).toBe(candidate.claims[0]!.text);
+    expect(snapshot.heldTargetIds).toContain('claim-unverified');
+    service.close();
+  });
+
+  it('模型自称网址已核验也只能得到应用的 model_cited 状态', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.knowledgeSources.push({ id: 'model-source', title: '模型声称已核验的来源',
+      organization: '合成机构', url: 'https://example.org/medical', origin: 'retrieved',
+      supports: '模型自称已经打开并核验网页正文' });
+    candidate.claims[0]!.knowledgeBasis = 'retrieved';
+    candidate.claims[0]!.knowledgeSourceIds = ['model-source'];
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'p02', turnId: 'first', output: candidate })
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 1 });
+    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(snapshot.knowledgeVerifications).toEqual([{
+      sourceId: 'model-source', status: 'model_cited', checkedAt: null,
+      contentHash: null, toolReceiptId: null
+    }]);
+    expect(service.getMemberAssessment(personId)?.knowledgeVerifications[0]?.status).toBe('model_cited');
+    service.close();
+  });
+
+  it('模型冒用受控知识 ID 时，标题、网址和支持范围仍以应用目录为准', async () => {
+    const { service, built } = await fixture();
+    const evidencePackage = structuredClone(built.evidencePackage);
+    evidencePackage.knowledge.push({
+      id: 'controlled-source', version: 'v1', title: '应用收录的指南', content: '合成受控正文',
+      applicability: '合成适用范围', sourceOrganization: '受控机构',
+      sourceUrl: 'https://official.example.org/guide', reviewedAt: '2026-09-01',
+      supportedScope: '只支持一般说明'
+    });
+    const candidate = candidateFor(built.request, evidencePackage);
+    candidate.knowledgeSources.push({
+      id: 'controlled-source', title: '冒名来源', organization: '假机构',
+      url: 'https://attacker.example.org/', origin: 'catalog', supports: '已核验可确诊'
+    });
+    const normalized = canonicalizeAssessmentKnowledge(candidate, evidencePackage);
+    expect(normalized.knowledgeSources[0]).toEqual({
+      id: 'controlled-source', title: '应用收录的指南', organization: '受控机构',
+      url: 'https://official.example.org/guide', origin: 'catalog', supports: '只支持一般说明'
+    });
+    expect(buildAssessmentKnowledgeVerifications(normalized, evidencePackage)[0]).toMatchObject({
+      sourceId: 'controlled-source', status: 'catalog_curated', checkedAt: '2026-09-01', toolReceiptId: null
+    });
     service.close();
   });
 

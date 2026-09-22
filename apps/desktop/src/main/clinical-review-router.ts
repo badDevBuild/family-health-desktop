@@ -94,7 +94,7 @@ export function applyFocusedReview(
       // 原状态可能只由被隔离的高影响主张支撑，不能沿用“需关注”或“本范围无提示”。
       status: claimIds.length === 0 ? 'insufficient' as const : 'monitor' as const,
       headline: claimIds.length === 0 ? '这部分判断仍需核实' : '部分判断仍需核实',
-      summary: '已核实的资料仍可查看；本系统有重要判断暂未纳入本次解读。',
+      summary: '已接纳的报告事实仍可查看；本系统有部分判断暂未纳入本次解读。',
       limitations: [...node.limitations, '部分判断因证据不足暂未发布。']
     } : node;
   });
@@ -104,7 +104,7 @@ export function applyFocusedReview(
   const overview = overviewChanged ? {
     ...originalOverview,
     headline: '部分健康判断仍需核实',
-    summary: '已核实的资料和行动仍可查看；有重要判断暂未纳入本次总览。',
+    summary: '已接纳的报告事实和其他行动仍可查看；有部分判断暂未纳入本次总览。',
     claimIds: originalOverview.claimIds.filter((id) => !heldClaims.has(id)),
     actionIds: originalOverview.actionIds.filter((id) => !heldActions.has(id)),
     limitations: [...originalOverview.limitations, '部分判断因证据不足暂未发布。']

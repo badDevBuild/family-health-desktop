@@ -8,6 +8,7 @@ import type { JobExecutionGuard, WorkspaceStore } from '@storage';
 import { validateAssessmentCandidate } from './assessment-validation.js';
 import { applyFocusedReview, routeFocusedReview } from './clinical-review-router.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
+import { buildAssessmentKnowledgeVerifications, canonicalizeAssessmentKnowledge } from './assessment-knowledge.js';
 import { buildP02Prompt, buildP03Prompt, buildP04Prompt } from './prompts/lean.js';
 import { MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION } from './prompts/index.js';
 
@@ -68,6 +69,38 @@ function repairChangedOnlyAllowed(
     }
   }
   return true;
+}
+
+/** 只有问题能精确归属于主张、行动或问题节点时，才允许局部隔离。 */
+function isolatableTargets(candidate: MemberAssessmentCandidateV3, issues: string[]): string[] | null {
+  const allowed = new Set([
+    'unknown_evidence', 'unknown_trend', 'unknown_knowledge', 'personal_evidence_required',
+    'personal_diagnostic_evidence_required', 'documented_source_not_proven',
+    'criteria_not_proven', 'criteria_wrong_status', 'diagnostic_fields_without_status',
+    'diagnostic_fields_incomplete', 'claim_system_outside_scope', 'action_system_outside_scope',
+    'action_personal_evidence_required', 'direct_medication_change', 'unsourced_probability',
+    'unknown_claim'
+  ]);
+  const nodes = new Set([...candidate.claims, ...candidate.actions, ...candidate.questions].map((item) => item.id));
+  const targets = new Set<string>();
+  for (const issue of issues) {
+    const [kind, owner] = issue.split(':');
+    if (!kind || !owner || !allowed.has(kind) || !nodes.has(owner)) return null;
+    targets.add(owner);
+  }
+  return targets.size > 0 ? [...targets] : null;
+}
+
+function isolateInvalidNodes(candidate: MemberAssessmentCandidateV3, issues: string[]) {
+  const targets = isolatableTargets(candidate, issues);
+  if (!targets) return null;
+  const review: ClinicalFocusedReviewV1 = {
+    schemaVersion: 1, personId: candidate.personId, inputSignature: candidate.inputSignature,
+    results: targets.map((targetId) => ({
+      targetId, verdict: 'hold', reason: '局部修复后仍无法通过本地证据校验。', replacement: null
+    }))
+  };
+  return applyFocusedReview(candidate, review, targets);
 }
 
 export class MemberAssessmentPipeline {
@@ -144,6 +177,7 @@ export class MemberAssessmentPipeline {
     if (!parsed.success) return reject('assessment_schema_invalid');
     let candidate = parsed.data;
     let validation = validateAssessmentCandidate(candidate, validationInput);
+    let heldTargetIds: string[] = [];
     if (validation.issues.length > 0) {
       // 仅具体节点可修，身份或系统范围冲突不能由自由改写“修正”。
       if (validation.issues.includes('scope_mismatch') || validation.issues.includes('system_scope_mismatch')
@@ -163,14 +197,24 @@ export class MemberAssessmentPipeline {
       lastReceipt = repaired;
       const repairParsed = memberAssessmentCandidateV3Schema.safeParse(repaired.output);
       if (!repairParsed.success || !repairChangedOnlyAllowed(candidate, repairParsed.data, targetIds)) {
-        return reject('assessment_repair_outside_scope');
+        const isolated = isolateInvalidNodes(candidate, validation.issues);
+        if (!isolated) return reject('assessment_repair_outside_scope');
+        candidate = isolated.candidate;
+        heldTargetIds = isolated.heldTargetIds;
+      } else {
+        candidate = repairParsed.data;
       }
-      candidate = repairParsed.data;
       validation = validateAssessmentCandidate(candidate, validationInput);
-      if (validation.issues.length > 0) return reject(validation.issues.join(','));
+      if (validation.issues.length > 0) {
+        const isolated = isolateInvalidNodes(candidate, validation.issues);
+        if (!isolated) return reject(validation.issues.join(','));
+        candidate = isolated.candidate;
+        heldTargetIds = [...new Set([...heldTargetIds, ...isolated.heldTargetIds])];
+        validation = validateAssessmentCandidate(candidate, validationInput);
+        if (validation.issues.length > 0) return reject(validation.issues.join(','));
+      }
     }
     let reviewedTargetIds: string[] = [];
-    let heldTargetIds: string[] = [];
     let validationMode: MemberAssessmentSnapshotV3['validationMode'] = 'local_only';
     const route = routeFocusedReview(candidate);
     if (route.targetIds.length > 0) {
@@ -197,7 +241,7 @@ export class MemberAssessmentPipeline {
       try { applied = applyFocusedReview(candidate, reviewParsed.data, targetIds); }
       catch (error) { return reject(error instanceof Error ? error.message : 'focused_review_invalid'); }
       candidate = applied.candidate;
-      heldTargetIds = applied.heldTargetIds;
+      heldTargetIds = [...new Set([...heldTargetIds, ...applied.heldTargetIds])];
       reviewedTargetIds = targetIds;
       validationMode = 'local_and_focused_review';
       const after = routeFocusedReview(candidate);
@@ -217,14 +261,16 @@ export class MemberAssessmentPipeline {
       validation = validateAssessmentCandidate(candidate, validationInput);
       if (validation.issues.length > 0) return reject(validation.issues.join(','));
     }
+    const publishCandidate = canonicalizeAssessmentKnowledge(candidate, evidencePackage);
     const snapshot: Omit<MemberAssessmentSnapshotV3, 'id' | 'status' | 'generatedAt'> = {
-      ...candidate,
+      ...publishCandidate,
       factRevision: built.factRevision, contextRevision: built.contextRevision,
       promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION, rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION,
       modelId: this.modelId, reasoningEffort: this.reasoningEffort, validationMode,
       reviewedTargetIds, heldTargetIds,
-      limitations: heldTargetIds.length ? ['部分高影响判断因证据不足暂未发布。'] : [],
-      evidenceCatalog: evidencePackage.evidenceCatalog
+      limitations: heldTargetIds.length ? ['部分判断因数据或依据问题暂未发布。'] : [],
+      evidenceCatalog: evidencePackage.evidenceCatalog,
+      knowledgeVerifications: buildAssessmentKnowledgeVerifications(publishCandidate, evidencePackage)
     };
     const published = this.store.publishMemberAssessmentSnapshot({
       snapshot, ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})

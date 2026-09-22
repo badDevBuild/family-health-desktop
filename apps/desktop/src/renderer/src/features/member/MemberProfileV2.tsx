@@ -176,6 +176,12 @@ const diagnosticLabels: Record<NonNullable<MemberAssessmentSnapshotV3['claims'][
   possible: '需要鉴别', undetermined: '目前不能确定'
 };
 
+export function assessmentKnowledgeStatusLabel(status: MemberAssessmentSnapshotV3['knowledgeVerifications'][number]['status'] | undefined): string {
+  if (status === 'tool_content_verified') return '应用已核对网页正文';
+  if (status === 'catalog_curated') return '应用收录的知识条目';
+  return 'AI 提供的网址；应用尚未核对正文';
+}
+
 function MemberAssessmentSystemCard({ assessment, systemId, onOpenEvidence }: {
   assessment: MemberAssessmentSnapshotV3;
   systemId: BodySystemId;
@@ -192,7 +198,14 @@ function MemberAssessmentSystemCard({ assessment, systemId, onOpenEvidence }: {
     <p className="system-analysis-overview">{system.summary}</p>
     {claims.length > 0 && <section className="analysis-explanation"><h4>为什么这样判断</h4><div className="system-analysis-points">{claims.map((claim) => {
       const evidence = claim.evidenceIds.map((id) => assessment.evidenceCatalog.find((item) => item.id === id)).find(Boolean);
-      return <section key={claim.id}><div className="panel__heading"><p>{claim.text}</p>{claim.diagnosticStatus && <StatusBadge tone="info">{diagnosticLabels[claim.diagnosticStatus]}</StatusBadge>}</div><small>{claim.rationale}</small>{claim.materialUncertainty && <small>仍需注意：{claim.materialUncertainty}</small>}{evidence && <button className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest('判断依据', evidence))}><FileCheck2 size={16} /> 查看原始依据</button>}</section>;
+      const knowledgeSources = claim.knowledgeSourceIds.map((id) => assessment.knowledgeSources.find((item) => item.id === id))
+        .filter((item): item is MemberAssessmentSnapshotV3['knowledgeSources'][number] => Boolean(item));
+      return <section key={claim.id}><div className="panel__heading"><p>{claim.text}</p>{claim.diagnosticStatus && <StatusBadge tone="info">{diagnosticLabels[claim.diagnosticStatus]}</StatusBadge>}</div><small>{claim.rationale}</small>{claim.materialUncertainty && <small>仍需注意：{claim.materialUncertainty}</small>}{evidence && <button className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest('判断依据', evidence))}><FileCheck2 size={16} /> 查看原始依据</button>}{knowledgeSources.length > 0 && <details className="evidence-disclosure"><summary>查看医学知识来源</summary><div className="knowledge-source-list">{knowledgeSources.map((source) => {
+        const verification = assessment.knowledgeVerifications.find((item) => item.sourceId === source.id);
+        const label = assessmentKnowledgeStatusLabel(verification?.status);
+        return source.url ? <a key={source.id} href={source.url} target="_blank" rel="noreferrer"><strong>{source.title}</strong><span>{label}</span></a>
+          : <span key={source.id}><strong>{source.title}</strong> · {label}</span>;
+      })}</div></details>}</section>;
     })}</div></section>}
     {actions.length > 0 && <section className="analysis-recommendations"><h4>接下来怎么做</h4><div>{actions.map((action) => <article key={action.id}><h5>{action.title}</h5><p>{action.why}</p><dl><div><dt>第一步</dt><dd>{action.firstStep}</dd></div>{action.timing && <div><dt>何时</dt><dd>{action.timing}</dd></div>}{action.reviewPlan && <div><dt>何时回看</dt><dd>{action.reviewPlan}</dd></div>}</dl>{action.caution && <small>{action.caution}</small>}</article>)}</div></section>}
     {system.limitations.length > 0 && <details className="analysis-boundaries"><summary>这部分判断的范围</summary>{system.limitations.map((item) => <p key={item}>{item}</p>)}</details>}

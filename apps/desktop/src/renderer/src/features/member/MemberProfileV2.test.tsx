@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AdoptLifestyleProposalInput, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, LifestylePlanV2, MemberOverviewV2 } from '@contracts';
 import type { HealthDesktopBridge } from '../../../../preload/index.js';
 import { createDemoSnapshot } from '../../../../../../../packages/test-fixtures/src/index.js';
-import { MemberProfileV2, systemAnalysisHeading } from './MemberProfileV2.js';
+import { assessmentKnowledgeStatusLabel, MemberProfileV2, systemAnalysisHeading } from './MemberProfileV2.js';
 
 const now = '2026-09-21T00:00:00.000Z';
 const eventTime = (value: string) => ({
@@ -38,6 +38,12 @@ afterEach(() => {
 });
 
 describe('MemberProfileV2 event organization', () => {
+  it('模型给出的网址在页面上不能显示成应用已核验', () => {
+    expect(assessmentKnowledgeStatusLabel('model_cited')).toBe('AI 提供的网址；应用尚未核对正文');
+    expect(assessmentKnowledgeStatusLabel(undefined)).toBe('AI 提供的网址；应用尚未核对正文');
+    expect(assessmentKnowledgeStatusLabel('catalog_curated')).toBe('应用收录的知识条目');
+  });
+
   it('综合说明标题已包含要点时不重复展示整段文字', () => {
     expect(systemAnalysisHeading(
       '第一条事实。第二条趋势。',

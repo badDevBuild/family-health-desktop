@@ -233,6 +233,14 @@ export const memberAssessmentSnapshotV3Schema = memberAssessmentCandidateV3Schem
   reviewedTargetIds: z.array(id),
   heldTargetIds: z.array(id),
   limitations: z.array(text),
-  evidenceCatalog: z.array(memberEvidenceRefSchema)
+  evidenceCatalog: z.array(memberEvidenceRefSchema),
+  /** 仅由应用写入；模型给出 URL 不构成已核验来源。 */
+  knowledgeVerifications: z.array(z.object({
+    sourceId: id,
+    status: z.enum(['catalog_curated', 'model_cited', 'tool_content_verified']),
+    checkedAt: z.string().nullable(),
+    contentHash: signature.nullable(),
+    toolReceiptId: id.nullable()
+  }).strict())
 }).strict();
 export type MemberAssessmentSnapshotV3 = z.infer<typeof memberAssessmentSnapshotV3Schema>;

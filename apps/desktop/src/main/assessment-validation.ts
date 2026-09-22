@@ -2,7 +2,7 @@ import type {
   BodySystemId, HealthClaim, MemberAssessmentCandidateV3, MemberEvidenceRef
 } from '@contracts';
 
-export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v3';
+export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v4';
 
 export interface AssessmentValidationInput {
   personId: string;
