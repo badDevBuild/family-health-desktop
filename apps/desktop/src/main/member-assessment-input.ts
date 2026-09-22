@@ -7,7 +7,7 @@ import { HEALTH_PIPELINE_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSES
 import { ASSESSMENT_VALIDATION_RULES_VERSION } from './assessment-validation.js';
 import { CLINICAL_ROUTER_VERSION } from './clinical-review-router.js';
 
-export const MEMBER_EVIDENCE_SELECTOR_VERSION = 'member-evidence-v3';
+export const MEMBER_EVIDENCE_SELECTOR_VERSION = 'member-evidence-v4';
 
 export interface BuiltMemberAssessmentInput {
   request: AssessmentRequestV3;
@@ -111,6 +111,12 @@ export function buildMemberAssessmentInput(
   const unresolvedScope = store.listOpenExtractionReviewIssues()
     .filter((issue) => issue.personId === personId)
     .map((issue) => ({ documentId: issue.documentId, reasonCodes: issue.reasonCodes.length ? issue.reasonCodes : [issue.kind] }));
+  const unmappedDocuments = new Set(facts.filter((fact) => fact.systemIds.length === 0).map((fact) => fact.documentId));
+  for (const documentId of unmappedDocuments) {
+    const existing = unresolvedScope.find((scope) => scope.documentId === documentId);
+    if (existing) existing.reasonCodes = [...new Set([...existing.reasonCodes, 'FACT_SYSTEM_UNMAPPED'])];
+    else unresolvedScope.push({ documentId, reasonCodes: ['FACT_SYSTEM_UNMAPPED'] });
+  }
   const existingActions = store.listActionItems(personId).map((action) => ({
     // 进度由本地覆盖层管理；从计划到完成不改变医学输入签名。
     // 明确“暂不采纳”才是需要尊重的内容偏好。

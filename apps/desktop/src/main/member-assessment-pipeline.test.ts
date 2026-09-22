@@ -9,7 +9,7 @@ import { ProcessingJobRunner } from './job-runner.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { MemberAssessmentPipeline } from './member-assessment-pipeline.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
-import { buildMemberAggregatePackage, buildMemberSystemPartitions } from './member-assessment-partition.js';
+import { buildMemberAggregatePackage, buildMemberSystemPartitions, splitMemberPartition } from './member-assessment-partition.js';
 import { validateAssessmentCandidate } from './assessment-validation.js';
 import { buildAssessmentKnowledgeVerifications, canonicalizeAssessmentKnowledge } from './assessment-knowledge.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
@@ -78,6 +78,34 @@ async function fixtureTwoSystems() {
   return { service, personId, built };
 }
 
+async function fixtureUnclassified() {
+  const root = mkdtempSync(join(tmpdir(), 'family-health-unclassified-assessment-'));
+  roots.push(root);
+  const service = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
+  const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
+  await service.importFiles([{ path: '/tmp/合成未归类检查.txt', bytes: Buffer.from('2026-09-21 合成未归类检查：记录甲。') }], personId);
+  const documentId = service.getSnapshot(null).inbox[0]!.id;
+  const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+  const extraction: ExtractionResult = {
+    schemaVersion: 1, documentId, coveredSourceSpanIds: [span.id],
+    subject: { reportedName: null, evidence: [], confidence: 'absent' },
+    candidates: [{
+      localKey: 'unclassified-result', originalName: '合成未归类检查', standardNameCandidate: null,
+      value: { kind: 'text', rawText: '记录甲' }, unitRaw: null, referenceRangeRaw: null,
+      reportedAbnormalFlag: null, specimen: null, method: null, bodySite: null,
+      clinicalDate: '2026-09-21', evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+    }]
+  };
+  const result = await new DocumentExtractionPipeline(service.store, {
+    runStructuredTurn: async () => ({ threadId: 'p01', turnId: 'p01', output: extraction })
+  }).process(documentId);
+  expect(result.status).toBe('published');
+  const built = buildMemberAssessmentInput(service.store, personId, {
+    modelId: 'test-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: true
+  });
+  return { service, personId, built };
+}
+
 function candidateFor(request: AssessmentRequestV3, source: MemberEvidencePackageV3): MemberAssessmentCandidateV3 {
   const evidenceId = source.facts[0]!.evidenceIds[0]!;
   const systemIds = request.requestedSystemIds;
@@ -114,6 +142,57 @@ function candidateFor(request: AssessmentRequestV3, source: MemberEvidencePackag
 }
 
 describe('MemberAssessmentPipeline', () => {
+  it('事实已接纳但尚未归入系统时仍一次 P02 发布成员总览，不猜系统或重提取', async () => {
+    const { service, personId, built } = await fixtureUnclassified();
+    expect(built.evidencePackage.facts).toHaveLength(1);
+    expect(built.evidencePackage.facts[0]?.systemIds).toEqual([]);
+    expect(built.request.requestedSystemIds).toEqual([]);
+    expect(built.evidencePackage.unresolvedScope).toEqual([{
+      documentId: built.evidencePackage.facts[0]!.documentId, reasonCodes: ['FACT_SYSTEM_UNMAPPED']
+    }]);
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.overview = { ...candidate.overview, headline: '已保存一条检查记录，尚待归类',
+      summary: '报告记录了合成未归类检查的原文结果；目前不猜测它属于哪个身体系统。',
+      limitations: ['该项目尚未完成系统归类。'] };
+    candidate.claims[0] = { ...candidate.claims[0]!, topicKey: 'unclassified', kind: 'source_fact',
+      text: '2026-09-21 报告记录合成未归类检查为“记录甲”。', knowledgeBasis: 'not_applicable' };
+    candidate.actions[0] = { ...candidate.actions[0]!, title: '核对检查项目归类',
+      firstStep: '查看原报告并核对该项目的检查名称。' };
+    let calls = 0;
+    const first = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => { calls += 1; return { threadId: 'p02', turnId: 'only', output: candidate }; }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(first).toMatchObject({ status: 'published', callCount: 1 });
+    expect(calls).toBe(1);
+    const snapshot = service.getMemberAssessment(personId);
+    expect(snapshot?.systems).toEqual([]);
+    expect(snapshot?.claims[0]?.systemIds).toEqual([]);
+    expect(snapshot?.limitations).toContain('部分来源事实尚未完成身体系统归类；成员总览包含这些资料，但身体系统视图可能不完整。');
+    expect(service.getMemberOverview(personId)).toMatchObject({
+      headline: '已保存一条检查记录，尚待归类', unclassifiedFactCount: 1, dataQuality: 'partial'
+    });
+    const again = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => { throw new Error('SHOULD_NOT_CALL'); }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(again).toMatchObject({ status: 'skipped', reason: 'signature_current', callCount: 0 });
+    service.close();
+  });
+
+  it('无系统可分时上下文超限仍可按来源事实分区，不丢掉已接纳项目', async () => {
+    const { service, built } = await fixtureUnclassified();
+    const source = structuredClone(built.evidencePackage);
+    source.facts.push({ ...source.facts[0]!, observationId: 'synthetic-second-fact' });
+    const partitions = buildMemberSystemPartitions(source, []);
+    expect(partitions).toHaveLength(1);
+    expect(partitions[0]?.systemIds).toEqual([]);
+    const children = splitMemberPartition(partitions[0]!);
+    expect(children).toHaveLength(2);
+    expect(children?.flatMap((item) => item.primaryObservationIds)).toEqual(
+      expect.arrayContaining(source.facts.map((fact) => fact.observationId))
+    );
+    service.close();
+  });
+
   it('真实模型的系统 ID 与 undetermined 类型可本地归一化，正常路径仍只需一次 P02', async () => {
     const { service, personId, built } = await fixture();
     const candidate = candidateFor(built.request, built.evidencePackage);

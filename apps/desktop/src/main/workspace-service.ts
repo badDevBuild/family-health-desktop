@@ -497,6 +497,7 @@ export class PersonalWorkspaceService {
     const actions = this.store.listActionItems(personId).filter((item) => !['completed', 'dismissed'].includes(item.status));
     const attentionSystems = systems.filter((system) => system.status === 'attention');
     const legacyObservationCount = observations.filter((item) => item.originalNameStatus === 'legacy_missing').length;
+    const unclassifiedFactCount = observations.filter((item) => memberSystemLinks(item).length === 0).length;
     const analyses = systems
       .map((system) => ({ system, analysis: this.currentSystemAnalysis(personId, system.id, observations) }))
       .filter((item): item is { system: BodySystemSummaryV2; analysis: SystemAnalysisSnapshot } => (
@@ -542,7 +543,8 @@ export class PersonalWorkspaceService {
     return memberOverviewV2Schema.parse({
       personId,
       generatedAt: this.now().toISOString(),
-      dataQuality: observations.length === 0 ? 'insufficient' : legacyObservationCount > 0 || observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
+      dataQuality: observations.length === 0 ? 'insufficient' : legacyObservationCount > 0 || unclassifiedFactCount > 0
+        || observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
       headline: assessment?.overview.headline ?? (observations.length === 0
         ? '还没有可解读的健康资料。'
         : lead?.headline ?? '报告内容已保存，健康解读正在准备。'),
@@ -556,6 +558,7 @@ export class PersonalWorkspaceService {
       sourceUrgentNotices: buildSourceUrgentNotices(observations, this.now()),
       currentSymptomNotices: buildCurrentSymptomNotices(this.store.listManualNotes(personId), this.now()),
       acceptedFactCount: observations.length,
+      unclassifiedFactCount,
       eventCount: events.length,
       attentionSystemIds: attentionSystems.map((system) => system.id),
       systems,

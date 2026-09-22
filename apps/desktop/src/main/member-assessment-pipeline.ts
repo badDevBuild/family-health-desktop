@@ -28,7 +28,7 @@ interface StructuredRuntime {
 
 export type MemberAssessmentPipelineResult =
   | { status: 'published'; snapshotId: string; threadId: string; turnId: string; idempotent: boolean; callCount: number }
-  | { status: 'skipped'; reason: 'no_accepted_facts' | 'no_requested_systems' | 'signature_current'; callCount: 0 }
+  | { status: 'skipped'; reason: 'no_accepted_facts' | 'signature_current'; callCount: 0 }
   | { status: 'rejected'; reason: string; threadId: string | null; turnId: string | null; callCount: number };
 
 const candidateOutputSchema = z.toJSONSchema(memberAssessmentCandidateV3Schema, { target: 'draft-7' }) as Record<string, unknown>;
@@ -143,7 +143,7 @@ export class MemberAssessmentPipeline {
     if (evidencePackage.facts.length === 0 && evidencePackage.personalContext.length === 0) {
       return { status: 'skipped', reason: 'no_accepted_facts', callCount: 0 };
     }
-    if (request.requestedSystemIds.length === 0) return { status: 'skipped', reason: 'no_requested_systems', callCount: 0 };
+    // 已接纳但尚未归入身体系统的事实仍可产生成员总览，不强行猜测器官归属。
     if (this.executionGuard) {
       this.store.assertObservationScopeActive(this.executionGuard, personId, this.store.listAcceptedObservations(personId));
     }
@@ -396,7 +396,11 @@ export class MemberAssessmentPipeline {
       promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION, rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION,
       modelId: this.modelId, reasoningEffort: this.reasoningEffort, validationMode,
       reviewedTargetIds, heldTargetIds,
-      limitations: heldTargetIds.length ? ['部分判断因数据或依据问题暂未发布。'] : [],
+      limitations: [
+        ...(heldTargetIds.length ? ['部分判断因数据或依据问题暂未发布。'] : []),
+        ...(evidencePackage.facts.some((fact) => fact.systemIds.length === 0)
+          ? ['部分来源事实尚未完成身体系统归类；成员总览包含这些资料，但身体系统视图可能不完整。'] : [])
+      ],
       evidenceCatalog: evidencePackage.evidenceCatalog,
       processingPlan: {
         strategy: partitionCount > 0 ? 'partitioned' : 'full',

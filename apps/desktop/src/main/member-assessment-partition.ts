@@ -49,6 +49,11 @@ export function buildMemberSystemPartitions(
   source: MemberEvidencePackageV3,
   requestedSystemIds: BodySystemId[]
 ): AssessmentPartition[] {
+  if (requestedSystemIds.length === 0) return [{
+    systemIds: [], evidencePackage: filterEvidencePackage(source, source.facts, [], []),
+    basis: 'fact_group', label: '尚未归入身体系统的来源事实',
+    primaryObservationIds: source.facts.map((fact) => fact.observationId), contextObservationIds: []
+  }];
   return requestedSystemIds.map((systemId, index) => {
     const primary = source.facts.filter((fact) => fact.systemIds.includes(systemId)
       || (index === 0 && !fact.systemIds.some((id) => requestedSystemIds.includes(id))));

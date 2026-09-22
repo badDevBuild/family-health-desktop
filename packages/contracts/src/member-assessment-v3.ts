@@ -24,7 +24,7 @@ export const criteriaBasisSchema = z.object({
 export const healthClaimSchema = z.object({
   id,
   topicKey: id,
-  systemIds: z.array(bodySystemIdSchema).min(1),
+  systemIds: z.array(bodySystemIdSchema),
   kind: z.enum(['source_fact', 'trend', 'interpretation', 'diagnostic_assessment']),
   text,
   diseaseName: text.nullable(),
@@ -45,7 +45,7 @@ export type HealthClaim = z.infer<typeof healthClaimSchema>;
 export const healthActionSchema = z.object({
   id,
   dedupeKey: id,
-  systemIds: z.array(bodySystemIdSchema).min(1),
+  systemIds: z.array(bodySystemIdSchema),
   claimIds: z.array(id),
   kind: z.enum(['habit', 'self_monitor', 'test_followup', 'seek_care', 'treatment_discussion', 'documented_plan']),
   title: text,

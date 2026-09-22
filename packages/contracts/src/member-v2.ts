@@ -418,6 +418,7 @@ export const memberOverviewV2Schema = z.object({
   sourceUrgentNotices: z.array(sourceUrgentNoticeSchema).max(3),
   currentSymptomNotices: z.array(currentSymptomNoticeSchema).max(2),
   acceptedFactCount: z.number().int().nonnegative(),
+  unclassifiedFactCount: z.number().int().nonnegative(),
   eventCount: z.number().int().nonnegative(),
   attentionSystemIds: z.array(bodySystemIdSchema),
   systems: z.array(bodySystemSummaryV2Schema),
