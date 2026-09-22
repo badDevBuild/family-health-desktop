@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "syntheticOnly": true,
+  "date": "2026-09-22",
+  "productSourceCommitBeforeHarnessChanges": "c599037bc40059563e0e2997df87ef7aab514352",
+  "modelId": "gpt-5.6-sol",
+  "reasoningEffort": "medium",
+  "webSearchAllowed": false,
+  "scope": "Two real-model accepted-facts-to-analysis old/new comparisons use fixed P01 stubs. Separate current-code full-chain runs use real P01 and P02, with P04 when routed. All data are synthetic.",
+  "cases": [
+    {
+      "id": "partial-thyroid",
+      "preflight": {
+        "passed": true,
+        "legacyDirectFacts": 1,
+        "v3Facts": 1,
+        "v3UnresolvedItemNames": ["甲状腺超声"]
+      },
+      "oldNewComparison": {
+        "legacyStatus": "rejected",
+        "legacyReason": "review_not_supported,item_rejected:keypoint-tsh-high",
+        "legacyStages": ["legacy_analysis", "legacy_review"],
+        "legacyDurationMs": [75640, 43919],
+        "v3Status": "published",
+        "v3Stages": ["P02"],
+        "v3DurationMs": [108103],
+        "allWebSearchEvents": 0,
+        "comparisonComplete": true,
+        "temporaryReceiptBasename": "fhd-lean-v3-old-new-compare-VNh9Rr/receipt.json"
+      },
+      "currentFullChain": {
+        "extractionStatus": "published",
+        "assessmentStatus": "published",
+        "stages": ["P01", "P01_P03", "P02"],
+        "durationMs": [46127, 41119, 109958],
+        "acceptedFact": "2025-06-10 TSH 6.8 mIU/L",
+        "ultrasoundRemainsUnresolved": true,
+        "allWebSearchEvents": 0,
+        "temporaryReceiptBasename": "fhd-lean-v3-full-chain-synthetic-5taiKg/receipt.json"
+      }
+    },
+    {
+      "id": "current-chest-pain",
+      "preflight": {
+        "passed": true,
+        "legacyDirectFacts": 1,
+        "v3Facts": 1,
+        "legacyHasSameDayManualNote": true,
+        "v3HasSameDayManualNote": true
+      },
+      "oldNewComparison": {
+        "legacyStatus": "rejected",
+        "legacyReason": "review_not_supported,item_rejected:kp-current-symptoms,item_rejected:recommendation:rec-emergency-now,item_rejected:recommendation:rec-prepare-information,item_rejected:discussion:0",
+        "legacyStages": ["legacy_analysis", "legacy_review"],
+        "legacyDurationMs": [66331, 35033],
+        "v3Status": "published",
+        "v3Stages": ["P02", "P04"],
+        "v3DurationMs": [83232, 46006],
+        "p04Verdicts": { "pass": 5, "replace": 1, "hold": 0 },
+        "allWebSearchEvents": 0,
+        "comparisonComplete": true,
+        "temporaryReceiptBasename": "fhd-lean-v3-old-new-compare-rG7pIL/receipt.json"
+      },
+      "currentFullChain": {
+        "extractionStatus": "published",
+        "assessmentStatus": "published",
+        "stages": ["P01", "P02", "P04"],
+        "durationMs": [31516, 87542, 25313],
+        "acceptedFact": "2023-10-08 ECG report: no obvious abnormality",
+        "sameDayManualNoteAddedAfterP01": true,
+        "p04Verdicts": { "pass": 5, "replace": 0, "hold": 0 },
+        "allWebSearchEvents": 0,
+        "temporaryReceiptBasename": "fhd-lean-v3-full-chain-synthetic-t0FQlf/receipt.json"
+      }
+    }
+  ],
+  "notVerified": [
+    "independent medical professional blind review",
+    "real family reports or data migration",
+    "signed and notarized installers on target machines",
+    "pre-send privacy interception of built-in Web Search queries"
+  ]
+}

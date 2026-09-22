@@ -7,6 +7,7 @@ import { aiReasoningEffortSchema } from '@contracts';
 import { redactSensitiveLog, spawnCodexAppServer } from '../packages/codex-adapter/src/index.js';
 import { completeOldNewComparison } from '../packages/evaluation/src/lean-v3-comparison.js';
 import { CodexRuntimeManager } from '../apps/desktop/src/main/codex-runtime.js';
+import { buildMemberAssessmentInput } from '../apps/desktop/src/main/member-assessment-input.js';
 import { MemberAssessmentPipeline } from '../apps/desktop/src/main/member-assessment-pipeline.js';
 import { DocumentExtractionPipeline } from '../apps/desktop/src/main/processing-pipeline.js';
 import { SystemAnalysisPipeline } from '../apps/desktop/src/main/system-analysis-pipeline.js';
@@ -18,11 +19,16 @@ const reasoningEffort = aiReasoningEffortSchema.parse(
   process.argv.find((arg) => arg.startsWith('--effort='))?.slice('--effort='.length) ?? 'medium'
 );
 const scenarioId = process.argv.find((arg) => arg.startsWith('--case='))?.slice('--case='.length) ?? 'ldl';
-const scenarios: Record<string, {
+const preflightOnly = process.argv.includes('--preflight-only');
+type ComparisonScenario = {
   sourceText: string; originalName: string; rawText: string; quote: string;
   systemId: BodySystemId; value: ObservationCandidate['value']; unitRaw: string | null;
   referenceRangeRaw: string | null; reportedAbnormalFlag: ObservationCandidate['reportedAbnormalFlag'];
-}> = {
+  unresolved?: { originalName: string; quote: string; reason: string };
+  manualNote?: { text: string; effectiveDate: string };
+  expectedV3Stages?: readonly string[];
+};
+const scenarios: Record<string, ComparisonScenario> = {
   ldl: {
     sourceText: '2025-06-10 LDL-C 4.2 mmol/L，参考范围 0-3.4 mmol/L，偏高。此文件仅用于软件测试。',
     originalName: 'LDL-C', rawText: '4.2', quote: '2025-06-10 LDL-C 4.2 mmol/L',
@@ -35,6 +41,28 @@ const scenarios: Record<string, {
     originalName: '肝脏彩超小结', rawText: '脂肪肝', quote: '2025-06-10 肝脏彩超小结。诊断：脂肪肝。',
     systemId: 'hepatobiliary', value: { kind: 'qualitative', rawText: '脂肪肝', category: '脂肪肝' },
     unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null
+  },
+  'partial-thyroid': {
+    sourceText: '2025-06-10 血清促甲状腺激素（TSH）6.8 mIU/L，参考范围 0.27-4.2 mIU/L，偏高。\n甲状腺超声：局部文字模糊，结论无法辨认。',
+    originalName: '血清促甲状腺激素（TSH）', rawText: '6.8',
+    quote: '2025-06-10 血清促甲状腺激素（TSH）6.8 mIU/L，参考范围 0.27-4.2 mIU/L，偏高。',
+    systemId: 'endocrine_metabolic',
+    value: { kind: 'numeric', rawText: '6.8', decimal: '6.8', comparator: 'eq' },
+    unitRaw: 'mIU/L', referenceRangeRaw: '0.27-4.2 mIU/L', reportedAbnormalFlag: '偏高',
+    unresolved: {
+      originalName: '甲状腺超声', quote: '甲状腺超声：局部文字模糊，结论无法辨认。',
+      reason: '超声结论无法辨认'
+    }
+  },
+  'current-chest-pain': {
+    sourceText: '2023-10-08 心电图小结：未见明显异常。',
+    originalName: '心电图小结', rawText: '未见明显异常',
+    quote: '2023-10-08 心电图小结：未见明显异常。',
+    systemId: 'cardiovascular',
+    value: { kind: 'qualitative', rawText: '未见明显异常', category: '未见明显异常' },
+    unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+    manualNote: { text: '本人今天自述持续胸痛并伴出汗。', effectiveDate: '2026-09-22' },
+    expectedV3Stages: ['P02', 'P04']
   }
 };
 const scenario = scenarios[scenarioId];
@@ -53,7 +81,8 @@ let legacyDraft: { headline: string | null; overview: string | null } | null = n
 const receipt: Record<string, unknown> = {
   kind: 'LEGACY_SYSTEM_VS_LEAN_V3_ASSESSMENT_SYNTHETIC', syntheticOnly: true,
   scope: 'accepted_facts_to_analysis_only_P01_stubbed', scenarioId, createdAt: new Date().toISOString(),
-  modelId, reasoningEffort, webSearchAllowed: false, calls
+  modelId, reasoningEffort, webSearchAllowed: false, calls, preflightOnly,
+  expectedV3Stages: scenario.expectedV3Stages ?? ['P02']
 };
 const runtime = new CodexRuntimeManager({ executable, runtimeVersion: null,
   codexHome: process.env.CODEX_HOME ?? resolve(homedir(), '.codex'), workingDirectory,
@@ -86,8 +115,10 @@ async function runTrackedTurn(stage: string, input: {
 }
 
 try {
-  const account = await runtime.refreshAccount();
-  if (account.status !== 'connected') throw new Error('CODEX_AUTH_REQUIRED');
+  if (!preflightOnly) {
+    const account = await runtime.refreshAccount();
+    if (account.status !== 'connected') throw new Error('CODEX_AUTH_REQUIRED');
+  }
   const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
   const imported = await service.importFiles([{
     path: '/tmp/纯合成检查报告.txt', bytes: Buffer.from(scenario.sourceText, 'utf8')
@@ -98,6 +129,10 @@ try {
   const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
   const spanId = spans[0]?.id;
   if (!spanId) throw new Error('SYNTHETIC_SPAN_MISSING');
+  if (!spans[0]?.quote?.includes(scenario.quote)) throw new Error('SYNTHETIC_PRIMARY_QUOTE_MISMATCH');
+  if (scenario.unresolved && !spans[1]?.quote?.includes(scenario.unresolved.quote)) {
+    throw new Error('SYNTHETIC_UNRESOLVED_QUOTE_MISMATCH');
+  }
   const extraction: ExtractionResult = {
     schemaVersion: 1, documentId,
     subject: { reportedName: null, evidence: [], confidence: 'absent' },
@@ -107,9 +142,18 @@ try {
       standardNameCandidate: scenario.originalName, value: scenario.value,
       unitRaw: scenario.unitRaw, referenceRangeRaw: scenario.referenceRangeRaw,
       reportedAbnormalFlag: scenario.reportedAbnormalFlag,
-      specimen: null, method: null, bodySite: null, clinicalDate: '2025-06-10',
+      specimen: null, method: null, bodySite: null,
+      clinicalDate: scenarioId === 'current-chest-pain' ? '2023-10-08' : '2025-06-10',
       evidence: [{ sourceSpanId: spanId, quote: scenario.quote }], issues: []
-    }]
+    }, ...(scenario.unresolved ? [{
+      localKey: `synthetic-${scenarioId}-unresolved`, originalName: scenario.unresolved.originalName,
+      standardNameCandidate: null,
+      value: { kind: 'unknown' as const, rawText: null, reason: scenario.unresolved.reason },
+      unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: '超声', bodySite: '甲状腺', clinicalDate: '2025-06-10',
+      evidence: [{ sourceSpanId: spans[1]!.id, quote: scenario.unresolved.quote }],
+      issues: [{ code: 'unreadable_result', message: scenario.unresolved.reason }]
+    }] : [])]
   };
   const extracted = await new DocumentExtractionPipeline(service.store, {
     runStructuredTurn: async () => ({ threadId: 'synthetic-p01-stub', turnId: 'synthetic-p01-stub', output: extraction })
@@ -119,34 +163,74 @@ try {
   if (facts.length !== 1 || facts[0]?.rawText !== scenario.rawText) throw new Error('SYNTHETIC_FACTS_MISMATCH');
   receipt.acceptedFacts = facts.map((fact) => ({ name: fact.originalName, value: fact.rawText,
     unit: fact.unit, clinicalDate: fact.clinicalDate }));
-
-  let legacyCall = 0;
-  const legacy = await new SystemAnalysisPipeline(service.store, {
-    runStructuredTurn: (input) => runTrackedTurn(++legacyCall === 1 ? 'legacy_analysis' : 'legacy_review', input)
-  }, undefined, undefined, undefined, modelId).process(personId, scenario.systemId);
-  const legacySnapshot = service.store.listSystemAnalysisSnapshots(personId, true)
-    .find((snapshot) => snapshot.systemId === scenario.systemId);
-  receipt.legacy = { status: legacy.status, reason: legacy.status === 'rejected' ? legacy.reason : null,
-    calls: legacyCall, publishedHeadline: legacySnapshot?.headline ?? null,
-    publishedOverview: legacySnapshot?.overview ?? null, draft: legacyDraft };
-
-  let v3Call = 0;
-  const v3 = await new MemberAssessmentPipeline(service.store, {
-    runStructuredTurn: (input) => {
-      v3Call += 1; // 失败请求也属于实际调用尝试。
-      return runTrackedTurn(input.prompt.includes('REVIEW_REQUEST=') ? 'P04'
-        : input.prompt.includes('REPAIR_REQUEST=') ? 'P02_P03' : 'P02', input);
-    }
-  }, undefined, undefined, undefined, modelId, reasoningEffort, '2026-09-22', false).process(personId);
-  const v3Snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0];
-  receipt.v3 = { status: v3.status, reason: v3.status === 'rejected' ? v3.reason : null,
-    calls: v3Call, headline: v3Snapshot?.overview.headline ?? null,
-    summary: v3Snapshot?.overview.summary ?? null };
-  receipt.comparisonComplete = completeOldNewComparison({
-    legacyStatus: legacy.status, legacyCalls: legacyCall,
-    v3Status: v3.status, v3Calls: v3Call, calls
+  if (scenario.manualNote) {
+    service.createManualNote({ personId, kind: 'history', immutableText: scenario.manualNote.text,
+      effectiveDate: scenario.manualNote.effectiveDate, structuredFields: {},
+      expectedContextRevision: service.store.getClinicalContextRevision(personId) });
+    receipt.syntheticManualNote = scenario.manualNote;
+  }
+  if (scenario.unresolved) {
+    receipt.openReviewIssues = service.store.listOpenExtractionReviewIssues()
+      .filter((issue) => issue.documentId === documentId)
+      .map((issue) => ({ kind: issue.kind, reasonCodes: issue.reasonCodes }));
+  }
+  const legacyInput = service.buildSystemEvidenceBundle(personId, scenario.systemId);
+  const v3Input = buildMemberAssessmentInput(service.store, personId, {
+    modelId, reasoningEffort, analysisReferenceDate: '2026-09-22', webSearchAllowed: false
   });
-  if (receipt.comparisonComplete !== true) process.exitCode = 1;
+  const legacyHasNote = scenario.manualNote
+    ? legacyInput.personalContext.some((note) => note.text === scenario.manualNote?.text) : null;
+  const v3HasNote = scenario.manualNote
+    ? v3Input.evidencePackage.personalContext.some((note) => note.text === scenario.manualNote?.text) : null;
+  const v3UnresolvedNames = v3Input.evidencePackage.unresolvedScope
+    .flatMap((scope) => scope.affectedItemNames ?? []);
+  receipt.inputCoverage = {
+    legacyDirectFacts: legacyInput.directFacts.length,
+    v3Facts: v3Input.evidencePackage.facts.length,
+    legacyHasNote, v3HasNote, v3UnresolvedNames
+  };
+  if (legacyInput.directFacts.length !== 1 || v3Input.evidencePackage.facts.length !== 1) {
+    throw new Error('SYNTHETIC_INPUT_FACT_PARITY_FAILED');
+  }
+  if (scenario.manualNote && (!legacyHasNote || !v3HasNote)) {
+    throw new Error('SYNTHETIC_MANUAL_NOTE_SCOPE_MISMATCH');
+  }
+  if (scenario.unresolved && !v3UnresolvedNames.includes(scenario.unresolved.originalName)) {
+    throw new Error('SYNTHETIC_UNRESOLVED_SCOPE_MISSING');
+  }
+
+  if (preflightOnly) receipt.preflightPassed = true;
+  else {
+    let legacyCall = 0;
+    const legacy = await new SystemAnalysisPipeline(service.store, {
+      runStructuredTurn: (input) => runTrackedTurn(++legacyCall === 1 ? 'legacy_analysis' : 'legacy_review', input)
+    }, undefined, undefined, undefined, modelId).process(personId, scenario.systemId);
+    const legacySnapshot = service.store.listSystemAnalysisSnapshots(personId, true)
+      .find((snapshot) => snapshot.systemId === scenario.systemId);
+    receipt.legacy = { status: legacy.status, reason: legacy.status === 'rejected' ? legacy.reason : null,
+      calls: legacyCall, publishedHeadline: legacySnapshot?.headline ?? null,
+      publishedOverview: legacySnapshot?.overview ?? null, draft: legacyDraft };
+
+    let v3Call = 0;
+    const v3 = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: (input) => {
+        v3Call += 1; // 失败请求也属于实际调用尝试。
+        return runTrackedTurn(input.prompt.includes('REVIEW_REQUEST=') ? 'P04'
+          : input.prompt.includes('REPAIR_REQUEST=') ? 'P02_P03' : 'P02', input);
+      }
+    }, undefined, undefined, undefined, modelId, reasoningEffort, '2026-09-22', false).process(personId);
+    const v3Snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0];
+    receipt.v3 = { status: v3.status, reason: v3.status === 'rejected' ? v3.reason : null,
+      calls: v3Call, headline: v3Snapshot?.overview.headline ?? null,
+      summary: v3Snapshot?.overview.summary ?? null };
+    receipt.comparisonComplete = completeOldNewComparison({
+      legacyStatus: legacy.status, legacyCalls: legacyCall,
+      v3Status: v3.status, v3Calls: v3Call,
+      ...(scenario.expectedV3Stages ? { expectedV3Stages: scenario.expectedV3Stages } : {}),
+      calls
+    });
+    if (receipt.comparisonComplete !== true) process.exitCode = 1;
+  }
 } catch (error) {
   receipt.errorCode = error instanceof Error ? error.message.split(':')[0] : 'UNKNOWN';
   receipt.runtimeErrors = runtimeErrors.slice(-3);

@@ -29,4 +29,20 @@ describe('同一合成事实的新旧分析阶段对照回执', () => {
     expect(completeOldNewComparison({ ...base, calls: [base.calls[0]!, base.calls[1]!,
       { stage: 'P02', webSearches: 1 }] })).toBe(false);
   });
+
+  it('高影响病例明确要求 P04，只有真实完成该回合才算完整对照', () => {
+    const input = {
+      legacyStatus: 'rejected' as const, legacyCalls: 1,
+      v3Status: 'published' as const, v3Calls: 2,
+      expectedV3Stages: ['P02', 'P04'],
+      calls: [{ stage: 'legacy_analysis', webSearches: 0 },
+        { stage: 'P02', webSearches: 0 }, { stage: 'P04', webSearches: 0 }]
+    };
+    expect(completeOldNewComparison(input)).toBe(true);
+    expect(completeOldNewComparison({ ...input, calls: input.calls.slice(0, 2) })).toBe(false);
+    expect(completeOldNewComparison({ ...input, calls: [input.calls[0]!, input.calls[1]!,
+      { stage: 'P04', webSearches: 1 }] })).toBe(false);
+    expect(completeOldNewComparison({ ...input, expectedV3Stages: [] })).toBe(false);
+    expect(completeOldNewComparison({ ...input, expectedV3Stages: ['P04', 'P02'] })).toBe(false);
+  });
 });
