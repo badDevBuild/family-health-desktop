@@ -169,7 +169,8 @@ describe('MemberAssessmentPipeline', () => {
     const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
     expect(snapshot.mode).toBe('aggregate');
     expect(snapshot.processingPlan).toEqual({
-      strategy: 'partitioned', trigger: 'runtime_context_window_exceeded', partitionCount
+      strategy: 'partitioned', trigger: 'runtime_context_window_exceeded', partitionCount,
+      partitionHeldTargetCount: 0
     });
     expect(snapshot.evidenceCatalog.length).toBe(built.evidencePackage.evidenceCatalog.length);
     service.close();
@@ -280,6 +281,82 @@ describe('MemberAssessmentPipeline', () => {
     expect(result).toMatchObject({ status: 'published', callCount: built.request.requestedSystemIds.length + 3 });
     expect(reviewCalls).toBe(1);
     expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]!.reviewedTargetIds).toContain('claim-ldl');
+    service.close();
+  });
+
+  it('分区隔离过的节点被聚合带回时先复核，复核通过才可发布', async () => {
+    const { service, personId, built } = await fixtureTwoSystems();
+    let partitionIndex = 0;
+    let repairCalls = 0;
+    let reviewCalls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        if (input.prompt.includes('REPAIR_REQUEST=')) {
+          repairCalls += 1;
+          const candidate = JSON.parse(input.prompt.split('TARGET_CANDIDATE=')[1]!) as MemberAssessmentCandidateV3;
+          return { threadId: 'p03', turnId: 'repair', output: candidate };
+        }
+        if (input.prompt.includes('REVIEW_REQUEST=')) {
+          reviewCalls += 1;
+          const reviewRequest = JSON.parse(input.prompt.split('REVIEW_REQUEST=')[1]!.split('\nSOURCE_CONTEXT=')[0]!) as {
+            targets: string[]; personId: string; inputSignature: string
+          };
+          expect(reviewRequest.targets).toEqual(expect.arrayContaining(['claim-ldl', 'action-review', 'overview']));
+          expect(input.prompt).toContain('partition_held_reintroduced:claim-ldl');
+          return { threadId: 'p04', turnId: 'review', output: {
+            schemaVersion: 1, personId, inputSignature: reviewRequest.inputSignature,
+            results: reviewRequest.targets.map((targetId) => ({
+              targetId, verdict: 'pass', reason: '已核对聚合重新出现的主张及依赖。', replacement: null
+            }))
+          } };
+        }
+        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
+        const candidate = candidateFor(request, evidence);
+        if (request.mode === 'partition' && partitionIndex++ === 0) candidate.claims[0]!.evidenceIds = ['missing-evidence'];
+        return { threadId: 'p02', turnId: `assessment-${partitionIndex}`, output: candidate };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: built.request.requestedSystemIds.length + 4 });
+    expect(repairCalls).toBe(1);
+    expect(reviewCalls).toBe(1);
+    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(snapshot.claims.map((claim) => claim.id)).toContain('claim-ldl');
+    expect(snapshot.heldTargetIds).not.toContain('claim-ldl');
+    expect(snapshot.reviewedTargetIds).toContain('claim-ldl');
+    expect(snapshot.processingPlan.partitionHeldTargetCount).toBeGreaterThan(0);
+    service.close();
+  });
+
+  it('重点复核行动时把行动自己的个人证据也送给复核者', async () => {
+    const { service, personId, built } = await fixtureTwoSystems();
+    const actionEvidenceId = built.evidencePackage.facts.find((fact) => fact.originalName === '谷丙转氨酶')!.evidenceIds[0]!;
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.actions[0]!.urgency = 'emergency';
+    candidate.actions[0]!.evidenceIds = [actionEvidenceId];
+    let reviewCalls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        if (!input.prompt.includes('REVIEW_REQUEST=')) {
+          return { threadId: 'p02', turnId: 'assessment', output: candidate };
+        }
+        reviewCalls += 1;
+        const sourceContext = JSON.parse(input.prompt.split('SOURCE_CONTEXT=')[1]!.split('\nTARGET_NODES=')[0]!) as {
+          evidenceCatalog: Array<{ id: string }>
+        };
+        expect(sourceContext.evidenceCatalog.map((item) => item.id)).toContain(actionEvidenceId);
+        const request = JSON.parse(input.prompt.split('REVIEW_REQUEST=')[1]!.split('\nSOURCE_CONTEXT=')[0]!) as {
+          targets: string[]; personId: string; inputSignature: string
+        };
+        return { threadId: 'p04', turnId: 'review', output: {
+          schemaVersion: 1, personId, inputSignature: request.inputSignature,
+          results: request.targets.map((targetId) => ({ targetId, verdict: 'pass', reason: '合成复核已核对来源。', replacement: null }))
+        } };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    expect(reviewCalls).toBe(1);
     service.close();
   });
 

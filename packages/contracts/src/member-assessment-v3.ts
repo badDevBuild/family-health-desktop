@@ -246,7 +246,9 @@ export const memberAssessmentSnapshotV3Schema = memberAssessmentCandidateV3Schem
   processingPlan: z.object({
     strategy: z.enum(['full', 'partitioned']),
     trigger: z.enum(['none', 'runtime_context_window_exceeded']),
-    partitionCount: z.number().int().nonnegative()
+    partitionCount: z.number().int().nonnegative(),
+    /** 分区内被隔离过的节点数；最终通过 P04 后也保留过程审计，不代表仍被隔离。 */
+    partitionHeldTargetCount: z.number().int().nonnegative().optional()
   }).strict(),
   /** 仅由应用写入；模型给出 URL 不构成已核验来源。 */
   knowledgeVerifications: z.array(z.object({

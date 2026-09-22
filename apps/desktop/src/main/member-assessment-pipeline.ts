@@ -308,11 +308,7 @@ export class MemberAssessmentPipeline {
     let reviewedTargetIds: string[] = [];
     let validationMode: MemberAssessmentSnapshotV3['validationMode'] = 'local_only';
     const route = routeFocusedReview(candidate);
-    for (const [id, reviewedHashes] of partitionHighImpact) {
-      const node = targetNode(candidate, id);
-      // 聚合不能悄悄丢掉分区中尚未隔离的高影响线索。
-      if (!node) return reject(`aggregate_omitted_high_impact:${id}`);
-      if (reviewedHashes.size === 1 && reviewedHashes.has(stableHash(node))) continue;
+    const addTargetAndDependents = (id: string, reason: string) => {
       const linkedClaims = candidate.claims.some((item) => item.id === id) ? [id] : [];
       const linkedActions = candidate.actions.some((item) => item.id === id)
         ? [id]
@@ -323,14 +319,31 @@ export class MemberAssessmentPipeline {
         ...(candidate.overview.claimIds.some((claimId) => linkedClaims.includes(claimId))
           || candidate.overview.actionIds.some((actionId) => linkedActions.includes(actionId)) ? ['overview'] : [])];
       route.targetIds = [...new Set([...route.targetIds, ...dependents])];
-      route.reasons = [...new Set([...route.reasons, `partition_high_impact_changed:${id}`])];
+      route.reasons = [...new Set([...route.reasons, reason])];
+    };
+    for (const [id, reviewedHashes] of partitionHighImpact) {
+      const node = targetNode(candidate, id);
+      // 聚合不能悄悄丢掉分区中尚未隔离的高影响线索。
+      if (!node) return reject(`aggregate_omitted_high_impact:${id}`);
+      if (reviewedHashes.size === 1 && reviewedHashes.has(stableHash(node))) continue;
+      addTargetAndDependents(id, `partition_high_impact_changed:${id}`);
+    }
+    for (const id of new Set(partitionHeldIds)) {
+      // overview/system 是每个分区都会复用的保留 ID，不代表聚合重现同一判断。
+      if (id === 'overview' || id.startsWith('system:') || !targetNode(candidate, id)) continue;
+      // 局部修复隔离过的内容若被聚合带回，先重点复核该节点及其依赖，不能静默发布。
+      addTargetAndDependents(id, `partition_held_reintroduced:${id}`);
     }
     if (route.targetIds.length > 0) {
       this.onStage?.('review_derived');
       const targetIds = route.targetIds;
       const targetNodes = targetIds.map((id) => ({ id, node: targetNode(candidate, id) }));
-      const relevantEvidenceIds = new Set(candidate.claims.filter((item) => targetIds.includes(item.id))
-        .flatMap((item) => [...item.evidenceIds, ...item.counterEvidenceIds]));
+      const relevantEvidenceIds = new Set([
+        ...candidate.claims.filter((item) => targetIds.includes(item.id))
+          .flatMap((item) => [...item.evidenceIds, ...item.counterEvidenceIds]),
+        ...candidate.actions.filter((item) => targetIds.includes(item.id)).flatMap((item) => item.evidenceIds),
+        ...candidate.questions.filter((item) => targetIds.includes(item.id)).flatMap((item) => item.evidenceIds)
+      ]);
       const sourceContext = {
         evidenceCatalog: evidencePackage.evidenceCatalog.filter((item) => relevantEvidenceIds.has(item.id)),
         knowledge: evidencePackage.knowledge,
@@ -348,6 +361,14 @@ export class MemberAssessmentPipeline {
       catch (error) { return reject(error instanceof Error ? error.message : 'focused_review_invalid'); }
       candidate = applied.candidate;
       heldTargetIds = [...new Set([...heldTargetIds, ...applied.heldTargetIds])];
+      for (const result of reviewParsed.data.results) {
+        if (result.verdict === 'pass' || result.verdict === 'replace') {
+          // 分区曾隔离，但本轮 P04 已确认可发布的节点不应继续标成“仍被隔离”。
+          if (partitionHeldIds.includes(result.targetId) && !applied.heldTargetIds.includes(result.targetId)) {
+            heldTargetIds = heldTargetIds.filter((id) => id !== result.targetId);
+          }
+        }
+      }
       reviewedTargetIds = targetIds;
       validationMode = 'local_and_focused_review';
       const after = routeFocusedReview(candidate);
@@ -379,7 +400,7 @@ export class MemberAssessmentPipeline {
       processingPlan: {
         strategy: partitionCount > 0 ? 'partitioned' : 'full',
         trigger: partitionCount > 0 ? 'runtime_context_window_exceeded' : 'none',
-        partitionCount
+        partitionCount, partitionHeldTargetCount: partitionHeldIds.length
       },
       knowledgeVerifications: buildAssessmentKnowledgeVerifications(publishCandidate, evidencePackage)
     };
