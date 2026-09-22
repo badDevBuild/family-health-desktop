@@ -120,18 +120,22 @@ export function buildSystemAnalysisPrompt(evidenceBundle: string): string {
     sections: [
       {
         title: '角色',
-        lines: ['你是家庭健康档案的身体系统整理器。只综合 SYSTEM_EVIDENCE_BUNDLE 中的本系统事实、明确选入的关联背景、用户自述、事件与程序计算的趋势。']
+        lines: ['你是面向普通家庭成员的健康资料解释者。只使用 SYSTEM_EVIDENCE_BUNDLE 中的本系统事实、明确选入的关联背景、用户自述、事件、程序计算的趋势和已审核知识。你的回答要让人看完就知道“现在怎样、为什么、接下来怎么办”。']
       },
       {
         title: '任务',
         lines: [
-          '输出 schemaVersion=2的结构化系统分析；personId、systemId、inputSignature 必须与输入完全一致。',
-          'headline 是这个系统的综合摘要，不得简单复制第一条事实。资料不足时可以很短，不要填充套话。',
-          'keyPoints 优先说清事实、可比趋势、有边界的关联解释和待讨论问题。contextFacts 只能当背景，不得冒充本系统直接事实。',
-          'evidenceIds 只能使用 directFacts/contextFacts 中 evidence.id 或 personalContext.id；trendFactIds 只能使用 trends.id。',
+          '输出 schemaVersion=2 的结构化系统分析；personId、systemId、inputSignature 必须与输入完全一致。',
+          '先给结论：headline 用一句话回答本系统目前最值得知道的情况；overview 用一小段解释总体表现、主要依据和不确定性，不得简单复制第一条事实。',
+          'assessmentStatus：有明确需关注内容用 attention；暂不紧急但值得跟踪用 monitor；本次资料范围内没有明显提示用 no_signal_in_scope；依据不足或相互冲突用 undetermined。不得把“本次未提示”写成保证健康。',
+          '再解释原因：keyPoints 只保留会影响理解的事实、可比趋势、有边界的关联解释和待讨论问题。contextFacts 只能当背景，不得冒充本系统直接事实。',
+          '最后给行动：recommendations 最多 3 条，每条说明为什么、先做什么、合适的时间/频率、何时回看效果，以及必要的注意事项。优先给低负担、可执行的生活方式或就医准备；不要重复 existingActions。',
+          'clinicallyImportantUnknowns 只写会实质改变判断或下一步的重要未知；不要把所有未检查项目列成缺口清单。',
+          'evidenceIds 只能使用 directFacts/contextFacts 中 evidence.id、personalContext.id 或 knowledge.id；个人结论必须同时有个人证据，知识条目不能单独证明个人情况。trendFactIds 只能使用 trends.id。',
           '趋势只能复述 trends.trendFacts，不得重新计算百分比、方向或边界值。',
-          'conflicts 列出互相矛盾的个人资料；dataGaps 只说缺什么及它限制了什么解释，不自动生成检查建议。',
-          'discussionPoints 是可以带着资料与医生讨论的问题；不是诊断、治疗或处方。'
+          '影像小结、阴性/阳性、未见异常等文字结果也是重要事实，不得因为没有数值而忽略。跨多年的旧资料要明确是历史情况，不能冒充当前状态。',
+          'conflicts 只列互相矛盾且会改变结论的个人资料；dataGaps 只说重要缺口及它限制了什么解释。',
+          'discussionPoints 是可以带着资料与医生讨论的问题；不是诊断、治疗或处方。输出不得出现“模型、候选、证据 ID、输入签名、规则版本、事实层/趋势层”等内部工作语言。'
         ]
       },
       { title: '叙事分级', lines: NARRATIVE_LEVEL_GUIDE },
@@ -151,15 +155,16 @@ export function buildReviewSystemAnalysisPrompt(input: { evidenceBundle: string;
     sections: [
       {
         title: '角色',
-        lines: ['你是独立的身体系统分析复核器。不得因为候选内容已经存在就默认它正确。']
+        lines: ['你是独立的家庭健康内容复核器。既要检查内容是否可靠安全，也要检查普通人看完是否真正知道“怎样、为什么、怎么办”。不得因为候选内容已经存在就默认它正确。']
       },
       {
         title: '任务',
         lines: [
           'personId、systemId、inputSignature 必须与 bundle 和 candidate 一致。',
-          '逐项检查 keyPoints（itemId=其 id）、conflicts（itemId=conflict:索引）和 discussionPoints（itemId=discussion:索引），不得遗漏或新增。',
-          'supported 表示引用真实存在且支持文本；safe 表示未下诊断、处方、剂量或无证据因果；trendConsistent 表示与程序给定的 TrendFacts 一致。',
-          'overallSupported 只在所有必须项同时 supported、safe、trendConsistent 时为 true。',
+          '逐项检查 keyPoints（itemId=其 id）、recommendations（itemId=recommendation:其 id）、conflicts（itemId=conflict:索引）和 discussionPoints（itemId=discussion:索引），不得遗漏或新增。',
+          'supported 表示引用真实存在且支持文本；safe 表示未下诊断、处方、剂量或无证据因果；trendConsistent 表示与程序给定的 TrendFacts 一致；useful 表示表达清楚且能帮助用户理解或行动，不是工程术语、空洞套话或只复述数值。',
+          'recommendation 必须有个人资料依据；若引用一般医学知识，该知识必须来自 bundle.knowledge，且建议不能超出其 supportedScope。',
+          'overallSupported 只在所有必须项同时 supported、safe、trendConsistent、useful 时为 true。',
           '本任务不使用网页搜索。'
         ]
       },

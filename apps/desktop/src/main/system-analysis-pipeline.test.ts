@@ -65,6 +65,8 @@ describe('SystemAnalysisPipeline', () => {
       systemId: 'cardiovascular',
       inputSignature: bundle.scope.inputSignature,
       headline: '现有血脂资料中，LDL-C 带有原报告偏高标记。',
+      overview: '这次最值得关注的是 LDL-C 带有偏高标记；目前只有一次结果，不能判断变化趋势。',
+      assessmentStatus: 'attention',
       dataQuality: 'partial',
       keyPoints: [{
         id: 'point-ldl',
@@ -77,7 +79,19 @@ describe('SystemAnalysisPipeline', () => {
       topicSections: [{ topicId: 'lipids', title: '血脂', claimIds: ['point-ldl'], seriesIds: [], findingIds: [] }],
       conflicts: [],
       dataGaps: [{ text: '只有一次可用数值。', consequence: '不能判断变化趋势。' }],
-      discussionPoints: []
+      discussionPoints: [],
+      recommendations: [{
+        id: 'recommendation-consult',
+        title: '带上血脂记录咨询医生',
+        why: '这次 LDL-C 带有偏高标记，完整背景会影响如何理解。',
+        firstStep: '整理这次血脂报告和既往同类结果。',
+        schedule: '下次常规就诊时',
+        reviewPlan: '获得医生意见后再决定后续记录重点。',
+        importantCaution: '应用不提供诊断或用药建议。',
+        evidenceIds: [bundle.directFacts[0]!.evidence.id, bundle.knowledge[0]!.id],
+        trendFactIds: []
+      }],
+      clinicallyImportantUnknowns: ['目前只有一次可用结果。']
     };
     const review: SystemAnalysisReview = {
       schemaVersion: 1,
@@ -85,7 +99,10 @@ describe('SystemAnalysisPipeline', () => {
       systemId: 'cardiovascular',
       inputSignature: bundle.scope.inputSignature,
       overallSupported: true,
-      itemReviews: [{ itemId: 'point-ldl', supported: true, safe: true, trendConsistent: true, issue: null }]
+      itemReviews: [
+        { itemId: 'point-ldl', supported: true, safe: true, trendConsistent: true, useful: true, issue: null },
+        { itemId: 'recommendation:recommendation-consult', supported: true, safe: true, trendConsistent: true, useful: true, issue: null }
+      ]
     };
     let call = 0;
     const allowWebSearch: Array<boolean | undefined> = [];
@@ -102,6 +119,7 @@ describe('SystemAnalysisPipeline', () => {
         schemaVersion: 2,
         systemId: 'cardiovascular',
         headline: candidate.headline,
+        recommendations: [expect.objectContaining({ id: 'recommendation-consult', evidence: expect.any(Array) })],
         review: expect.objectContaining({ status: 'passed' })
       })
     ]);
@@ -164,12 +182,14 @@ describe('SystemAnalysisPipeline', () => {
       systemId: 'cardiovascular',
       inputSignature: bundle.scope.inputSignature,
       headline: '资料需要进一步整理。',
+      overview: '这是一条没有可靠依据的测试说明。',
+      assessmentStatus: 'undetermined',
       dataQuality: 'partial',
       keyPoints: [{
         id: 'unsupported', kind: 'fact_summary', text: '一条没有依据的说明。',
         evidenceIds: ['missing-evidence'], limitations: [], trendFactIds: []
       }],
-      topicSections: [], conflicts: [], dataGaps: [], discussionPoints: []
+      topicSections: [], conflicts: [], dataGaps: [], discussionPoints: [], recommendations: [], clinicallyImportantUnknowns: []
     };
     let call = 0;
     const result = await new SystemAnalysisPipeline(service.store, {

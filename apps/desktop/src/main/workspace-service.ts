@@ -7,7 +7,7 @@ import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManif
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
-import { ACCEPTANCE_RULES_VERSION, promptMetaForStage } from './prompts/index.js';
+import { ACCEPTANCE_RULES_VERSION, DERIVED_PROMPT_VERSION, promptMetaForStage, SYSTEM_ANALYSIS_PROMPT_VERSION } from './prompts/index.js';
 import { buildSystemEvidenceBundle as buildSystemEvidenceBundleFromStore } from './system-evidence.js';
 
 const organNames = [
@@ -335,7 +335,27 @@ export class PersonalWorkspaceService {
       .filter((item) => item.systemId === systemId);
     const systemSnapshot = allSystemSnapshots.find((item) => item.status === 'current')
       ?? allSystemSnapshots.find((item) => item.status === 'stale');
-    if (systemSnapshot) return systemSnapshot;
+    if (systemSnapshot) {
+      // v1 系统快照仍可能保存在本机数据库中。读取时补齐 result-first 字段，
+      // 让升级后的界面可继续显示旧结论；输入签名已经包含 v2 提示词，后续任务会重算。
+      const legacy = systemSnapshot as SystemAnalysisSnapshot & {
+        overview?: string;
+        assessmentStatus?: SystemAnalysisSnapshot['assessmentStatus'];
+        recommendations?: SystemAnalysisSnapshot['recommendations'];
+        clinicallyImportantUnknowns?: string[];
+      };
+      return {
+        ...systemSnapshot,
+        status: systemSnapshot.promptVersion === SYSTEM_ANALYSIS_PROMPT_VERSION
+          ? systemSnapshot.status
+          : 'stale',
+        overview: legacy.overview ?? systemSnapshot.headline,
+        assessmentStatus: legacy.assessmentStatus ?? 'undetermined',
+        recommendations: legacy.recommendations ?? [],
+        clinicallyImportantUnknowns: legacy.clinicallyImportantUnknowns
+          ?? systemSnapshot.dataGaps.map((gap) => `${gap.text} ${gap.consequence}`)
+      };
+    }
     const snapshot = this.store.listCurrentDerivedSnapshots().find((item) => item.personId === personId);
     if (!snapshot) return null;
     const claims = snapshot.payload.claims.filter((claim) => claim.organId && legacyOrganToSystem[claim.organId] === systemId);
@@ -355,9 +375,11 @@ export class PersonalWorkspaceService {
       scope: { from: dates[0] ?? null, to: dates.at(-1) ?? null, clinicalAsOf: dates.at(-1) ?? null },
       factRevision: snapshot.factRevision,
       promptVersion: 'derived-v2-compatibility-projection',
-      status: snapshot.status,
+      status: 'stale',
       dataQuality: snapshot.payload.dataQuality,
       headline: summaryParts.join(' ') || claims.map((claim) => claim.explanation).join(' '),
+      overview: claims.map((claim) => claim.explanation).join(' '),
+      assessmentStatus: 'undetermined',
       keyPoints: claims.map((claim) => ({
         id: claim.id,
         kind: claim.level === 'fact' ? 'fact_summary' : claim.level === 'trend' ? 'trend_description' : claim.level === 'association' ? 'contextual_interpretation' : 'question',
@@ -389,6 +411,21 @@ export class PersonalWorkspaceService {
           .map(memberEvidence),
         source: 'ai_suggested' as const
       })),
+      recommendations: claims.filter((claim) => claim.level === 'action').map((claim) => ({
+        id: `recommendation-${claim.id}`,
+        title: claim.title,
+        why: claim.explanation,
+        firstStep: claim.explanation,
+        schedule: null,
+        reviewPlan: null,
+        importantCaution: claim.boundaryNote,
+        evidence: claim.evidenceObservationIds
+          .map((observationId) => observations.find((observation) => observation.id === observationId))
+          .filter((observation): observation is AcceptedObservationSummary => Boolean(observation))
+          .map(memberEvidence),
+        trendFactIds: []
+      })),
+      clinicallyImportantUnknowns: ['这份说明来自旧版成员级分析，尚未按当前身体系统重新生成。'],
       coverage: { inputCount: evidenceObservationIds.length, linkedEventCount: 0, excludedCount: 0, incompleteReasons: ['待生成 v2 系统级分析。'] },
       review: { status: 'passed', reviewerRunId: null, rulesVersion: 'derived-safety-v1-compatibility' },
       generatedAt: snapshot.createdAt
@@ -405,6 +442,9 @@ export class PersonalWorkspaceService {
       const relatedObservationIds = new Set(related.map((observation) => observation.id));
       const relatedSeries = series.filter((item) => item.points.some((point) => relatedObservationIds.has(point.observationId)));
       const analysis = this.currentSystemAnalysis(personId, registry.id, observations);
+      const currentAnalysis = analysis?.status === 'current' && analysis.review.status === 'passed'
+        ? analysis
+        : null;
       const legacyRelatedCount = related.filter((observation) => observation.originalNameStatus === 'legacy_missing').length;
       const topicCounts = new Map<string, number>();
       for (const observation of related) {
@@ -418,16 +458,12 @@ export class PersonalWorkspaceService {
         shortName: registry.shortName,
         status: direct.length === 0
           ? legacyRelatedCount > 0 ? 'building' : 'insufficient'
-          : attention.length > 0 ? 'attention' : 'stable',
-        summary: direct.length === 0
-          ? legacyRelatedCount > 0
-            ? `已找回 ${legacyRelatedCount} 条旧版记录的身体系统归属；原项目名待重建，暂不判断平稳或异常。`
-            : related.length > 0
-            ? `有 ${related.length} 条跨系统关联背景，但还没有本系统的直接记录。`
-            : '尚无经过接纳的相关记录。'
-          : attention.length > 0
-            ? `${direct.length} 条直接事实中有 ${attention.length} 条带原报告留意标记；点开查看不同维度和来源。`
-            : `${direct.length} 条直接事实目前没有原报告留意标记；点开查看范围和来源。`,
+          : currentAnalysis?.assessmentStatus === 'attention' || attention.length > 0 ? 'attention'
+            : currentAnalysis?.assessmentStatus === 'undetermined' || !currentAnalysis ? 'building' : 'stable',
+        summary: currentAnalysis?.headline
+          ?? (direct.length === 0
+            ? related.length > 0 ? '有相关背景资料，但还没有本系统的直接检查。' : '尚无相关检查。'
+            : '已有相关检查，综合解读正在准备。'),
         factCount: related.length,
         metricCount: relatedSeries.length,
         attentionCount: attention.length,
@@ -445,22 +481,56 @@ export class PersonalWorkspaceService {
     const actions = this.store.listActionItems(personId).filter((item) => !['completed', 'dismissed'].includes(item.status));
     const attentionSystems = systems.filter((system) => system.status === 'attention');
     const legacyObservationCount = observations.filter((item) => item.originalNameStatus === 'legacy_missing').length;
+    const analyses = systems
+      .map((system) => ({ system, analysis: this.currentSystemAnalysis(personId, system.id, observations) }))
+      .filter((item): item is { system: BodySystemSummaryV2; analysis: SystemAnalysisSnapshot } => (
+        item.analysis?.status === 'current' && item.analysis.review.status === 'passed'
+      ))
+      .sort((left, right) => {
+        const order = { attention: 0, monitor: 1, undetermined: 2, no_signal_in_scope: 3 } as const;
+        return order[left.analysis.assessmentStatus] - order[right.analysis.assessmentStatus]
+          || (right.analysis.scope.clinicalAsOf ?? '').localeCompare(left.analysis.scope.clinicalAsOf ?? '');
+      });
+    const lead = analyses[0]?.analysis ?? null;
+    const priorityIssues = analyses
+      .filter(({ analysis }) => ['attention', 'monitor'].includes(analysis.assessmentStatus))
+      .slice(0, 3)
+      .map(({ system, analysis }) => ({
+        id: `priority-${system.id}-${analysis.id}`,
+        title: analysis.headline,
+        explanation: analysis.overview,
+        nextStep: analysis.recommendations[0]?.firstStep ?? null,
+        systemId: system.id
+      }));
+    const importantChanges = analyses.flatMap(({ system, analysis }) => analysis.keyPoints
+      .filter((point) => point.kind === 'trend_description')
+      .map((point) => ({
+        id: `change-${system.id}-${point.id}`,
+        title: `${system.shortName}的变化`,
+        meaning: point.text,
+        systemId: system.id,
+        seriesIds: point.trendFactIds
+      }))).slice(0, 4);
     return memberOverviewV2Schema.parse({
       personId,
       generatedAt: this.now().toISOString(),
       dataQuality: observations.length === 0 ? 'insufficient' : legacyObservationCount > 0 || observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
       headline: observations.length === 0
-        ? '还没有可展示的健康事实。'
-        : legacyObservationCount > 0
-          ? `已接纳事实仍完整，其中 ${legacyObservationCount} 条旧记录正在恢复项目名。`
-        : attentionSystems.length > 0
-          ? `${attentionSystems.map((system) => system.shortName).slice(0, 2).join('、')}有原报告标记需要留意的记录。`
-          : '现有报告事实已整理到身体系统中。',
+        ? '还没有可解读的健康资料。'
+        : lead?.headline ?? '报告内容已保存，健康解读正在准备。',
+      overview: observations.length === 0
+        ? '添加体检、门诊或检查资料后，这里会先告诉你最值得知道的情况和下一步。'
+        : lead?.overview
+          ?? (legacyObservationCount > 0
+            ? '旧资料仍然保留；系统正在按新的结果优先方式重新整理，完成前不会用数量冒充健康结论。'
+            : '已有资料不会丢失；综合分析完成后，这里会给出结论、原因和可执行的下一步。'),
       latestClinicalDate: observations.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null,
       acceptedFactCount: observations.length,
       eventCount: events.length,
       attentionSystemIds: attentionSystems.map((system) => system.id),
       systems,
+      priorityIssues,
+      importantChanges,
       recentChanges: events.slice(0, 5).map((event) => ({
         id: event.id,
         title: event.title,
@@ -480,7 +550,8 @@ export class PersonalWorkspaceService {
     const summary = this.listBodySystems(personId).find((item) => item.id === systemId)!;
     const related = observations.filter((observation) => memberSystemLinks(observation).some((link) => link.systemId === systemId));
     const mappings = related.map((observation) => ({ observation, mapping: memberMapping(observation) }));
-    const metrics = buildMemberMetricSeries(related);
+    const metrics = buildMemberMetricSeries(related)
+      .filter((series) => series.points.some((point) => point.numericValue !== null));
     const latestByName = new Map<string, AcceptedObservationSummary>();
     for (const observation of related) {
       const name = memberDisplayName(observation);
@@ -494,7 +565,9 @@ export class PersonalWorkspaceService {
       summary,
       analysis: this.currentSystemAnalysis(personId, systemId, observations),
       metrics,
-      findings: [...latestByName.entries()].map(([title, observation]) => ({
+      findings: [...latestByName.entries()]
+        .filter(([, observation]) => observation.decimalValue === null)
+        .map(([title, observation]) => ({
         id: `finding-${observation.id}`,
         title,
         value: `${observation.rawText}${observation.unit ? ` ${observation.unit}` : ''}`,
@@ -508,7 +581,7 @@ export class PersonalWorkspaceService {
         },
         abnormalFlag: observation.abnormalFlag,
         evidence: memberEvidenceSources(observation)
-      })),
+        })),
       relatedEventIds: events.map((event) => event.id),
       unmappedFactCount: mappings.filter(({ mapping }) => mapping.status === 'unmapped').length
     });
@@ -583,6 +656,17 @@ export class PersonalWorkspaceService {
           : '检验记录';
       const reportIssued = extracted?.times.find((time) => time.role === 'report_issued' && ['day', 'month', 'year'].includes(time.precision)) ?? null;
       const historicalObservationCount = items.filter((item) => historicalTimeForObservation(item, metadataByDocument.get(item.documentId))).length;
+      const attentionNames = [...new Set(items
+        .filter((item) => ['high', 'low', 'positive'].includes(item.abnormalFlag))
+        .map(memberDisplayName))];
+      const systemNames = systemIds
+        .map((systemId) => bodySystemRegistry.find((system) => system.id === systemId)?.shortName)
+        .filter((name): name is string => Boolean(name));
+      const resultSummary = attentionNames.length > 0
+        ? `${attentionNames.slice(0, 3).join('、')}${attentionNames.length > 3 ? '等项目' : ''}在原报告中标记为需要留意。`
+        : systemNames.length > 0
+          ? `这次检查涉及${systemNames.slice(0, 3).join('、')}，可以打开查看完整结果。`
+          : '可以打开查看这次检查的完整结果。';
       return healthEventV2Schema.parse({
         id: report?.eventId ?? `event-document-${first.documentId}`,
         personId,
@@ -614,7 +698,7 @@ export class PersonalWorkspaceService {
           report?.metadataStatus === 'corrected' ? report.organization : extracted?.organization?.value ?? report?.organization ?? null,
           report?.metadataStatus === 'corrected' ? report.department : extracted?.department?.value ?? null,
           reportIssued ? `报告签发于 ${reportIssued.value}` : null
-        ].filter(Boolean).join(' · ')}${extracted?.organization || report?.organization || extracted?.department || reportIssued ? '；' : ''}${items.length} 条已接纳事实${historicalObservationCount > 0 ? `，其中 ${historicalObservationCount} 条是本报告引用的历史结果` : ''}${dates.length > 1 && !eventDate ? '；报告含跨期历史数据，未据此猜测本次日期' : ''}。`,
+        ].filter(Boolean).join(' · ')}${extracted?.organization || report?.organization || extracted?.department || reportIssued ? '；' : ''}${resultSummary}${historicalObservationCount > 0 ? ' 报告中另有历史对比结果，已与本次检查分开。' : ''}${dates.length > 1 && !eventDate ? ' 报告包含跨期资料，本次检查日期仍待确认。' : ''}`,
         systemIds,
         documentIds,
         factCount: items.length,
@@ -1181,6 +1265,39 @@ export class PersonalWorkspaceService {
         if (!byPerson.has(target.personId)) {
           byPerson.set(target.personId, { documentIds: [target.documentId], stage: 'analyze' });
         }
+      }
+      // 提示词或系统分析结构升级后，即使没有新报告、成员级派生快照仍是 current，
+      // 也允许用户通过“立即处理全部”刷新旧档案。刷新复用已经接纳的本地事实，
+      // 不要求重新上传原报告，也不会重新走事实提取。
+      for (const person of this.store.listPersons().filter((item) => item.archivedAt === null)) {
+        if (byPerson.has(person.id)) continue;
+        const observations = this.store.listAcceptedObservations(person.id);
+        const sourceDocumentId = observations[0]?.documentId;
+        const currentDerived = this.store.listCurrentDerivedSnapshots().find((snapshot) => snapshot.personId === person.id);
+        if (sourceDocumentId && currentDerived?.promptVersion !== DERIVED_PROMPT_VERSION) {
+          if (!activeDocumentIds.has(sourceDocumentId)) {
+            byPerson.set(person.id, { documentIds: [sourceDocumentId], stage: 'analyze' });
+          }
+          continue;
+        }
+        const directSystemIds = new Set(observations.flatMap((observation) => memberSystemLinks(observation)
+          .filter((link) => link.relation === 'direct')
+          .map((link) => link.systemId)));
+        if (directSystemIds.size === 0) continue;
+        const factRevision = this.store.getFactRevision(person.id);
+        const currentSystemIds = new Set(this.store.listSystemAnalysisSnapshots(person.id, true)
+          .filter((snapshot) => (
+            snapshot.promptVersion === SYSTEM_ANALYSIS_PROMPT_VERSION
+            && snapshot.factRevision === factRevision
+            && directSystemIds.has(snapshot.systemId)
+          ))
+          .map((snapshot) => snapshot.systemId));
+        const missingSystemId = [...directSystemIds].find((systemId) => !currentSystemIds.has(systemId));
+        if (!missingSystemId) continue;
+        const source = observations.find((observation) => memberSystemLinks(observation)
+          .some((link) => link.relation === 'direct' && link.systemId === missingSystemId));
+        if (!source || activeDocumentIds.has(source.documentId)) continue;
+        byPerson.set(person.id, { documentIds: [source.documentId], stage: 'analyze' });
       }
     }
     if (byPerson.size === 0) throw new Error('NO_READY_DOCUMENTS');

@@ -42,13 +42,13 @@ function instructionPart(prompt: string): string {
 describe('pipeline prompts', () => {
   it('版本号与阶段签名保持一致', () => {
     expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v3');
-    expect(DERIVED_PROMPT_VERSION).toBe('derived-v3');
+    expect(DERIVED_PROMPT_VERSION).toBe('derived-v4');
     expect(promptMetaForStage('extract')).toEqual({
       promptVersion: 'extract-v3',
       rulesVersion: ACCEPTANCE_RULES_VERSION
     });
     expect(promptMetaForStage('analyze')).toEqual({
-      promptVersion: 'derived-v3',
+      promptVersion: 'derived-v4',
       rulesVersion: DERIVED_SAFETY_RULES_VERSION
     });
   });
@@ -188,6 +188,8 @@ describe('pipeline prompts', () => {
     const instructions = instructionPart(prompt);
     expect(instructions).toContain('contextFacts 只能当背景');
     expect(instructions).toContain('只能复述 trends.trendFacts');
+    expect(instructions).toContain('现在怎样、为什么、接下来怎么办');
+    expect(instructions).toContain('recommendations');
     expect(instructions).toContain('本任务不使用网页搜索');
     expect(prompt).toContain('SYSTEM_EVIDENCE_BUNDLE=');
   });
@@ -198,6 +200,7 @@ describe('pipeline prompts', () => {
     expect(instructions).toContain('conflict:索引');
     expect(instructions).toContain('discussion:索引');
     expect(instructions).toContain('trendConsistent');
+    expect(instructions).toContain('useful');
     expect(prompt).toContain('SYSTEM_ANALYSIS_CANDIDATE=');
   });
 });

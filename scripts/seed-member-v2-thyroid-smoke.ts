@@ -158,6 +158,8 @@ try {
     systemId: 'endocrine_metabolic',
     inputSignature: endocrine.scope.inputSignature,
     headline: '甲状腺资料已按功能、抗体和超声发现分开整理；名称别名已归一，左右侧和不确定病灶仍保留区别。',
+    overview: '甲状腺功能、抗体和超声结果已分开理解；左右侧和不能确认是否同一病灶的内容继续保留区别。',
+    assessmentStatus: 'monitor',
     dataQuality: 'partial',
     keyPoints: [
       {
@@ -186,7 +188,9 @@ try {
     }],
     conflicts: [{ text: '右叶两次超声所见是否为同一病灶尚不确定。', evidenceIds: allEvidenceIds.slice(6) }],
     dataGaps: [{ text: '缺少病灶唯一编号或明确对应关系。', consequence: '不计算尺寸增长，只并列展示原报告发现。' }],
-    discussionPoints: []
+    discussionPoints: [],
+    recommendations: [],
+    clinicallyImportantUnknowns: ['右叶两次超声所见是否为同一病灶尚不确定。']
   };
   const analysisReview: SystemAnalysisReview = {
     schemaVersion: 1,
@@ -200,9 +204,10 @@ try {
         supported: true,
         safe: true,
         trendConsistent: true,
+        useful: true,
         issue: null
       })),
-      { itemId: 'conflict:0', supported: true, safe: true, trendConsistent: true, issue: null }
+      { itemId: 'conflict:0', supported: true, safe: true, trendConsistent: true, useful: true, issue: null }
     ]
   };
   let turn = 0;

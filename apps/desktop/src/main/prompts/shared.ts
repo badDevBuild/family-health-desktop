@@ -14,7 +14,7 @@
 export const EXTRACTION_PROMPT_VERSION = 'extract-v3';
 
 /** 派生分析/安全复核提示词版本，写入 derived_snapshots.prompt_version。 */
-export const DERIVED_PROMPT_VERSION = 'derived-v3';
+export const DERIVED_PROMPT_VERSION = 'derived-v4';
 
 /** 本地事实接纳规则版本，与 health-core 的 evaluateObservationCandidate 对齐。 */
 export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v3';
@@ -23,8 +23,8 @@ export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v3';
 export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
 
 /** 成员档案 v2 的系统级综合与独立复核版本。 */
-export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v1';
-export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v1';
+export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v2';
+export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v2';
 
 export interface PromptSection {
   title: string;
@@ -97,7 +97,7 @@ export const NARRATIVE_LEVEL_GUIDE: string[] = [
   'fact 事实层：复述报告事实。先用一句日常语言解释术语，再给数值与参考范围，例如“低密度脂蛋白（俗称坏胆固醇）4.2 mmol/L，高于报告参考上限 3.4”。',
   'trend 趋势层：只有同一项目有至少 2 个不同日期、单位一致、参考范围口径可比时才写，例如“近三年 LDL-C 3.6 → 3.9 → 4.2，逐年上升”。不同医院或不同参考范围的结果不直接比高低；带比较符（<、>）的值不伪造精确趋势；日期未知的值不进入趋势。',
   'association 关联层：跨指标/跨系统的关联提示，必须写明“仅供参考”，例如“结合血压偏高与体重偏重，心血管方面的整体情况值得关注（仅供参考）”。不得把关联写成因果或诊断。',
-  'action 行动层：止步于“建议带着这份报告咨询医生”或“下次体检时复查”；可以说明大致去哪个科、大致什么时候、带哪些资料；不得写“需要治疗”“需要用药”。'
+  'action 行动层：给出安全、具体、低负担的下一步，可以包括生活方式起点、记录方法、复查或就医准备，并说明为什么、先做什么、何时回看；不得下诊断、开药、调整药物或给剂量。'
 ];
 
 /**
@@ -106,7 +106,7 @@ export const NARRATIVE_LEVEL_GUIDE: string[] = [
 export const FAMILY_TONE_RULES: string[] = [
   '读者是这位成员本人和家人，可能是 60 岁以上、不了解医学的老人：用平静、尊重、日常的语言，专业术语先用白话解释再给数值。',
   '只呈现最终结论，不叙述工作过程：不要写“经核对”“模型判断”“系统检测到”“两轮读取”之类的话。',
-  '不用恐吓性措辞（危险、严重、必须立刻、恶化），也不用空洞的安慰；用事实与温和的提醒代替。',
+  '不用无证据的恐吓性措辞，也不用空洞安慰；若资料本身出现需要及时就医的明确线索，要用平静、直接、可行动的方式说清楚。',
   '说明中不得出现姓名、内部 ID、文件名或本机路径。'
 ];
 

@@ -244,6 +244,8 @@ export const systemAnalysisSnapshotSchema = z.object({
   status: z.enum(['current', 'stale', 'building', 'failed', 'unavailable', 'needs_review']),
   dataQuality: z.enum(['complete', 'partial', 'insufficient']),
   headline: z.string().min(1),
+  overview: z.string().min(1),
+  assessmentStatus: z.enum(['attention', 'monitor', 'no_signal_in_scope', 'undetermined']),
   keyPoints: z.array(z.object({
     id: idSchema,
     kind: z.enum(['fact_summary', 'trend_description', 'contextual_interpretation', 'question']),
@@ -272,6 +274,18 @@ export const systemAnalysisSnapshotSchema = z.object({
     evidence: z.array(memberEvidenceRefSchema),
     source: z.enum(['ai_suggested', 'clinician_reported'])
   }).strict()),
+  recommendations: z.array(z.object({
+    id: idSchema,
+    title: z.string().min(1),
+    why: z.string().min(1),
+    firstStep: z.string().min(1),
+    schedule: z.string().nullable(),
+    reviewPlan: z.string().nullable(),
+    importantCaution: z.string().nullable(),
+    evidence: z.array(memberEvidenceRefSchema),
+    trendFactIds: z.array(idSchema)
+  }).strict()),
+  clinicallyImportantUnknowns: z.array(z.string().min(1)),
   coverage: z.object({
     inputCount: z.number().int().nonnegative(),
     linkedEventCount: z.number().int().nonnegative(),
@@ -302,6 +316,8 @@ export const systemAnalysisCandidateSchema = z.object({
   systemId: bodySystemIdSchema,
   inputSignature: z.string().regex(/^[a-f0-9]{64}$/),
   headline: z.string().min(1).max(300),
+  overview: z.string().min(1).max(1_800),
+  assessmentStatus: z.enum(['attention', 'monitor', 'no_signal_in_scope', 'undetermined']),
   dataQuality: z.enum(['complete', 'partial', 'insufficient']),
   keyPoints: z.array(systemAnalysisKeyPointCandidateSchema).max(20),
   topicSections: z.array(z.object({
@@ -323,7 +339,19 @@ export const systemAnalysisCandidateSchema = z.object({
     text: z.string().min(1).max(800),
     evidenceIds: z.array(idSchema),
     source: z.enum(['ai_suggested', 'clinician_reported'])
-  }).strict()).max(20)
+  }).strict()).max(20),
+  recommendations: z.array(z.object({
+    id: idSchema,
+    title: z.string().min(1).max(160),
+    why: z.string().min(1).max(800),
+    firstStep: z.string().min(1).max(500),
+    schedule: z.string().min(1).max(300).nullable(),
+    reviewPlan: z.string().min(1).max(500).nullable(),
+    importantCaution: z.string().min(1).max(500).nullable(),
+    evidenceIds: z.array(idSchema),
+    trendFactIds: z.array(idSchema)
+  }).strict()).max(8),
+  clinicallyImportantUnknowns: z.array(z.string().min(1).max(500)).max(8)
 }).strict();
 export type SystemAnalysisCandidate = z.infer<typeof systemAnalysisCandidateSchema>;
 
@@ -338,6 +366,7 @@ export const systemAnalysisReviewSchema = z.object({
     supported: z.boolean(),
     safe: z.boolean(),
     trendConsistent: z.boolean(),
+    useful: z.boolean(),
     issue: z.string().nullable()
   }).strict())
 }).strict();
@@ -363,11 +392,26 @@ export const memberOverviewV2Schema = z.object({
   generatedAt: utcTimestampSchema,
   dataQuality: z.enum(['complete', 'partial', 'insufficient']),
   headline: z.string().min(1),
+  overview: z.string().min(1),
   latestClinicalDate: localDateSchema.nullable(),
   acceptedFactCount: z.number().int().nonnegative(),
   eventCount: z.number().int().nonnegative(),
   attentionSystemIds: z.array(bodySystemIdSchema),
   systems: z.array(bodySystemSummaryV2Schema),
+  priorityIssues: z.array(z.object({
+    id: idSchema,
+    title: z.string().min(1),
+    explanation: z.string().min(1),
+    nextStep: z.string().nullable(),
+    systemId: bodySystemIdSchema
+  }).strict()),
+  importantChanges: z.array(z.object({
+    id: idSchema,
+    title: z.string().min(1),
+    meaning: z.string().min(1),
+    systemId: bodySystemIdSchema,
+    seriesIds: z.array(idSchema)
+  }).strict()),
   recentChanges: z.array(z.object({
     id: idSchema,
     title: z.string().min(1),
@@ -698,7 +742,17 @@ export const systemEvidenceBundleSchema = z.object({
     relatedSystemIds: z.array(bodySystemIdSchema),
     selectionReason: z.string().min(1)
   }).strict()),
-  knowledge: z.array(z.object({ id: idSchema, version: z.string().min(1), title: z.string().min(1) }).strict()),
+  knowledge: z.array(z.object({
+    id: idSchema,
+    version: z.string().min(1),
+    title: z.string().min(1),
+    content: z.string().min(1),
+    applicability: z.string().min(1),
+    sourceOrganization: z.string().min(1),
+    sourceUrl: z.string().url().refine((value) => value.startsWith('https://'), 'Knowledge source must use HTTPS'),
+    reviewedAt: localDateSchema,
+    supportedScope: z.string().min(1)
+  }).strict()),
   coverage: z.object({
     selectedObservationIds: z.array(idSchema),
     excludedObservationIds: z.array(idSchema),

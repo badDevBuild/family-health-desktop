@@ -114,8 +114,8 @@ export class ProcessingJobRunner extends EventEmitter {
               job.documentIds[0]!,
               aiPreferences.modelId
             );
-            const enabledSystemIds = ['cardiovascular', 'endocrine_metabolic'] as const;
-            for (const systemId of enabledSystemIds) {
+            for (const system of bodySystemRegistry) {
+              const systemId = system.id;
               const systemResult = await systemPipeline.process(job.personId, systemId);
               if (systemResult.status === 'published') {
                 lastReceipt = { threadId: systemResult.threadId, turnId: systemResult.turnId };
@@ -137,14 +137,6 @@ export class ProcessingJobRunner extends EventEmitter {
                   inputSignature: store.listSystemAnalysisSnapshots(job.personId, true).find((item) => item.systemId === systemId)?.inputSignature ?? null
                 });
               }
-            }
-            for (const system of bodySystemRegistry.filter((item) => !enabledSystemIds.includes(item.id as typeof enabledSystemIds[number]))) {
-              store.updateJobSystemOutcome(job.id, {
-                systemId: system.id,
-                status: 'out_of_scope',
-                reason: 'system_analysis_phase_one',
-                inputSignature: null
-              });
             }
           }
           if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');

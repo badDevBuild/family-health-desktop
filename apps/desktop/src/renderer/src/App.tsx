@@ -104,12 +104,6 @@ function importReceiptMessage(receipt: ImportFilesReceipt): string {
   return base;
 }
 
-function personQuality(person: PersonSummary): { label: string; tone: Tone } {
-  if (person.dataQuality === 'complete') return { label: '资料较完整', tone: 'success' };
-  if (person.dataQuality === 'partial') return { label: '资料部分', tone: 'info' };
-  return { label: '资料不足', tone: 'neutral' };
-}
-
 function inboxStatusPresentation(status: InboxItem['status']): { label: string; tone: Tone } {
   switch (status) {
     case 'queued': return { label: '尚未发送至 AI', tone: 'info' };
@@ -194,81 +188,37 @@ function Topbar({ snapshot, onLogin, onProcessing }: { snapshot: DashboardSnapsh
   );
 }
 
-function MetricStrip({ snapshot, onNavigate }: { snapshot: DashboardSnapshot; onNavigate(page: Page): void }) {
-  const active = snapshot.jobs.find((job) => job.status === 'running');
-  return (
-    <div className="metric-strip">
-      <button onClick={() => onNavigate('inbox')}>
-        <span className="metric-strip__icon mint"><Inbox size={21} /></span>
-        <span><strong>{snapshot.pendingInboxCount}</strong><small>份资料待处理</small></span>
-        <ChevronRight size={17} />
-      </button>
-      <button onClick={() => onNavigate('processing')}>
-        <span className="metric-strip__icon blue"><LoaderCircle size={21} className={active ? 'spin' : ''} /></span>
-        <span><strong>{active ? '正在核对' : '没有运行任务'}</strong><small>{active?.statusText ?? '队列处于空闲状态'}</small></span>
-        <ChevronRight size={17} />
-      </button>
-      <button onClick={() => onNavigate('actions')}>
-        <span className="metric-strip__icon amber"><ListChecks size={21} /></span>
-        <span><strong>{snapshot.actions.filter((item) => !['completed', 'dismissed'].includes(item.status)).length}</strong><small>项后续事项</small></span>
-        <ChevronRight size={17} />
-      </button>
-      <button onClick={() => onNavigate('settings')}>
-        <span className="metric-strip__icon warm"><CalendarClock size={21} /></span>
-        <span><strong>{formatDateTime(snapshot.nextScheduledRun)}</strong><small>下次自动处理</small></span>
-        <ChevronRight size={17} />
-      </button>
-    </div>
-  );
-}
-
 function PersonCard({ person, selected, onClick }: { person: PersonSummary; selected: boolean; onClick(): void }) {
-  const quality = personQuality(person);
   return (
     <button className={selected ? 'person-card is-selected' : 'person-card'} onClick={onClick}>
       <div className="person-card__top">
         <span className="avatar">{person.avatarInitial}</span>
         <span className="person-card__identity"><strong>{person.displayName}</strong><small>{person.relation}</small></span>
-        <StatusBadge tone={quality.tone}>{quality.label}</StatusBadge>
+        <ChevronRight size={18} />
       </div>
-      <p>{person.changeSummary}</p>
-      <div className="person-card__meta">
-        <span>{person.freshnessLabel}</span>
-        {person.attentionCount > 0 && <span className="attention-text">{person.attentionCount} 项需关注</span>}
-      </div>
+      <span className="person-card__cta">查看健康解读</span>
     </button>
   );
 }
 
-function HomePage({ snapshot, selectedPersonId, onSelectPerson, onNavigate, onOpenEvidence, onAddPerson }: {
+function HomePage({ snapshot, selectedPersonId, onSelectPerson, onNavigate, onAddPerson }: {
   snapshot: DashboardSnapshot;
   selectedPersonId: string;
   onSelectPerson(id: string): void;
   onNavigate(page: Page): void;
-  onOpenEvidence(evidence: Evidence): void;
   onAddPerson(): void;
 }) {
   const selected = snapshot.persons.find((person) => person.id === selectedPersonId) ?? snapshot.persons[0];
-  const selectedOrgans = snapshot.organs.filter((organ) => organ.personId === selected?.id);
-  const primaryTrend = snapshot.trends.find((trend) => trend.personId === selected?.id);
-  const latestTrendFlag = primaryTrend?.points.at(-1)?.abnormalFlag ?? 'unknown';
-  const trendFlagLabel = latestTrendFlag === 'high' ? '最近一次：报告标记偏高'
-    : latestTrendFlag === 'low' ? '最近一次：报告标记偏低'
-      : latestTrendFlag === 'positive' ? '最近一次：报告标记阳性'
-        : latestTrendFlag === 'normal' || latestTrendFlag === 'negative' ? '最近一次：报告未标记异常'
-          : '最近一次：报告未给出明确标记';
   return (
     <div className="page-stack">
       <section className="welcome-row">
         <div>
           <span className="eyebrow">家庭总览</span>
           <h1>{new Date().getHours() < 12 ? '早上好' : new Date().getHours() < 18 ? '下午好' : '晚上好'}</h1>
-          <p>这里汇总了家人最近的资料变化。已有档案离线也能查看。</p>
+          <p>选择一位家人，直接查看身体情况和下一步。</p>
         </div>
         <button className="primary-button" onClick={() => onNavigate('inbox')}><Plus size={18} /> 添加健康资料</button>
       </section>
-
-      <MetricStrip snapshot={snapshot} onNavigate={onNavigate} />
 
       <section className="section-block">
         <div className="section-heading">
@@ -281,86 +231,18 @@ function HomePage({ snapshot, selectedPersonId, onSelectPerson, onNavigate, onOp
         </div>
       </section>
 
-      {selected && snapshot.workspaceMode === 'demo' && (
-        <section className="dashboard-columns">
-          <div className="panel organ-panel">
-            <div className="panel__heading">
-              <div><span className="eyebrow">{selected.displayName} · 身体概览</span><h2>有来源的身体信息</h2></div>
-              <StatusBadge tone="info">截至 {selected.lastDocumentDate ?? '未知日期'}</StatusBadge>
-            </div>
-            <div className="organ-grid">
-              {selectedOrgans.map((organ) => (
-                <button key={organ.id} className="organ-row" onClick={() => onOpenEvidence({
-                  title: `${organ.name}说明的依据`,
-                  label: organ.evidenceDate ? `${organ.evidenceDate} 的虚构体检资料` : '资料不足',
-                  quote: organ.summary,
-                  meta: `${organ.metricCount} 项已记录指标 · ${organ.status === 'insufficient' ? '暂不作健康判断' : 'AI 整理，非医生审核'}`,
-                  sourceSpanId: organ.evidenceSourceSpanId
-                })}>
-                  <span className={`organ-symbol organ-symbol--${organ.status}`}>{organIcon[organ.id]}</span>
-                  <span><strong>{organ.name}</strong><small>{organ.summary}</small></span>
-                  <StatusBadge tone={organ.status === 'attention' ? 'warning' : organ.status === 'stable' ? 'success' : 'neutral'}>
-                    {organ.status === 'attention' ? '需关注' : organ.status === 'stable' ? '记录平稳' : '资料不足'}
-                  </StatusBadge>
-                  <ChevronRight size={17} />
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <aside className="right-stack">
-            <div className="panel calm-note">
-              <span className="eyebrow">本次变化</span>
-              <h3>先关注两件事</h3>
-              <ol>
-                <li><span>1</span><div><strong>血脂记录较前升高</strong><p>这是趋势描述，不等于诊断。建议带着原报告咨询医生。</p></div></li>
-                <li><span>2</span><div><strong>肝功能有一项轻度偏高</strong><p>需要结合近期饮酒、用药与医生意见核实。</p></div></li>
-              </ol>
-            </div>
-            <div className="panel compact-actions">
-              <div className="panel__heading"><h3>接下来</h3><button className="text-button" onClick={() => onNavigate('actions')}>查看全部</button></div>
-              {snapshot.actions.filter((item) => item.personId === selected.id && item.status !== 'completed').slice(0, 2).map((item) => (
-                <div key={item.id} className="mini-action"><span className="check-ring" /><div><strong>{item.title}</strong><small>{item.dueText ?? '没有固定日期'}</small></div></div>
-              ))}
-            </div>
-          </aside>
-        </section>
-      )}
-
-      {selected && snapshot.workspaceMode === 'personal' && (
+      {selected && snapshot.workspaceMode === 'personal' && selected.documentCount === 0 && (
         <section className="panel getting-started-panel">
           <span className="getting-started-panel__icon"><ShieldCheck size={24} /></span>
           <div>
-            <span className="eyebrow">个人工作区已建立</span>
-            <h2>{selected.derivedStatus === 'current' ? '报告事实与综合说明已保存'
-              : selected.derivedStatus === 'stale' ? '报告事实已更新，已有说明基于较早资料'
-                : selected.derivedStatus === 'building' ? '报告事实可查看，综合说明正在更新'
-                  : primaryTrend ? '报告事实已保存，暂无可用的综合说明' : selected.documentCount > 0 ? '资料已保存在本机，等待处理' : '先添加一份健康资料'}</h2>
-            <p>{primaryTrend
-              ? '下方只展示报告中有来源、带日期且单位一致的数值记录，不把它们自动解释成诊断。'
-              : selected.documentCount > 0
-              ? '当前没有经过接纳的健康结论，因此不会显示虚构趋势或健康判断。连接 Codex 并授权后才能开始 AI 处理。'
-              : '支持 PDF、图片、DOCX 和纯文本；旧版 .doc 会先由经校验的本机兼容组件转换。导入到本地与发送给 AI 是两件分开的事。'}</p>
+            <span className="eyebrow">从第一份资料开始</span>
+            <h2>为 {selected.displayName} 添加一份健康资料</h2>
+            <p>支持 PDF、图片、DOCX 和纯文本。资料先保存在本机，只有你明确授权后才会发送给 Codex 处理。</p>
           </div>
           <button className="primary-button" onClick={() => onNavigate('inbox')}><Plus size={18} /> 前往收件箱</button>
         </section>
       )}
 
-      {primaryTrend && (
-        <section className="panel trend-panel">
-          <div className="panel__heading">
-            <div><span className="eyebrow">可比较趋势</span><h2>{primaryTrend.name}</h2></div>
-            <strong className="latest-value">{primaryTrend.points.at(-1)?.displayValue}<small>{primaryTrend.unit}</small></strong>
-          </div>
-          <div className="trend-panel__body">
-            <TrendChart series={primaryTrend} onSelectPoint={(pointIndex) => {
-              const point = primaryTrend.points[pointIndex];
-              if (point) onOpenEvidence({ title: `${primaryTrend.name}原始依据`, label: point.sourceLabel, quote: `${primaryTrend.name} ${point.displayValue} ${primaryTrend.unit ?? ''}`, meta: `报告参考范围：${point.referenceLow ?? '未知'}–${point.referenceHigh ?? '未知'} ${primaryTrend.unit ?? ''}`, sourceSpanId: point.sourceSpanId, documentId: point.documentId });
-            }} />
-            <div className="trend-explanation"><StatusBadge tone={['high', 'low', 'positive'].includes(latestTrendFlag) ? 'warning' : 'neutral'}>{trendFlagLabel}</StatusBadge><p>{primaryTrend.interpretation}</p><small>{primaryTrend.comparisonNote}</small></div>
-          </div>
-        </section>
-      )}
     </div>
   );
 }
@@ -1641,7 +1523,7 @@ export default function App() {
 
   const content = (() => {
     switch (page) {
-      case 'home': return <HomePage snapshot={snapshot} selectedPersonId={selectedPersonId} onSelectPerson={(id) => { setSelectedPersonId(id); setPage('people'); }} onNavigate={setPage} onOpenEvidence={(next) => void handleOpenEvidence(next)} onAddPerson={() => setMemberDialogOpen(true)} />;
+      case 'home': return <HomePage snapshot={snapshot} selectedPersonId={selectedPersonId} onSelectPerson={(id) => { setSelectedPersonId(id); setPage('people'); }} onNavigate={setPage} onAddPerson={() => setMemberDialogOpen(true)} />;
       case 'people': return <PeoplePage snapshot={snapshot} selectedPersonId={selectedPersonId} onSelectPerson={setSelectedPersonId} onOpenEvidence={(next) => void handleOpenEvidence(next)} onAddPerson={() => setMemberDialogOpen(true)} onEditPerson={() => setMemberEditDialogOpen(true)} onArchivedPeople={() => setArchivedPeopleDialogOpen(true)} onAddNote={() => setManualNoteDialogOpen(true)} onExport={() => setExportDialogOpen(true)} onImport={() => void handleImport()} onExcludeDocument={setDocumentToExclude} onReincludeDocument={(document) => void handleSetDocumentIncluded(document, true)} onDeleteDocument={setDocumentToDelete} onDeletedDocuments={() => setDeletedDocumentsDialogOpen(true)} />;
       case 'inbox': return <InboxPage snapshot={snapshot} onProcess={(documentIds) => {
         setProcessDocumentIds(documentIds ?? null);

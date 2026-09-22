@@ -98,6 +98,8 @@ try {
     systemId: 'cardiovascular',
     inputSignature: cardiovascular.scope.inputSignature,
     headline: '四次记录显示低密度脂蛋白胆固醇先升高、最近一次略有回落，但仍带有原报告偏高标记。',
+    overview: '四次可比记录显示 LDL-C 先升高后略有回落，但最近一次仍带偏高标记，适合继续跟踪并准备咨询医生。',
+    assessmentStatus: 'attention',
     dataQuality: 'partial',
     keyPoints: [{
       id: 'synthetic-ldl-trend-v2',
@@ -116,7 +118,9 @@ try {
     }],
     conflicts: [],
     dataGaps: [{ text: '缺少更完整的心血管背景资料。', consequence: '目前只呈现报告事实和趋势，不做诊断。' }],
-    discussionPoints: []
+    discussionPoints: [],
+    recommendations: [],
+    clinicallyImportantUnknowns: ['缺少更完整的个人心血管背景。']
   };
   const analysisReview: SystemAnalysisReview = {
     schemaVersion: 1,
@@ -124,7 +128,7 @@ try {
     systemId: 'cardiovascular',
     inputSignature: cardiovascular.scope.inputSignature,
     overallSupported: true,
-    itemReviews: [{ itemId: 'synthetic-ldl-trend-v2', supported: true, safe: true, trendConsistent: true, issue: null }]
+    itemReviews: [{ itemId: 'synthetic-ldl-trend-v2', supported: true, safe: true, trendConsistent: true, useful: true, issue: null }]
   };
   let systemTurn = 0;
   const analysisResult = await new SystemAnalysisPipeline(service.store, {

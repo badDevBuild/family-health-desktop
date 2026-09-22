@@ -41,6 +41,7 @@ const dosagePattern = /\d+(?:\.\d+)?\s*(?:mg|mcg|μg|iu|毫克|微克|国际单�
 function allReviewItemIds(candidate: SystemAnalysisCandidate): string[] {
   return [
     ...candidate.keyPoints.map((item) => item.id),
+    ...candidate.recommendations.map((item) => `recommendation:${item.id}`),
     ...candidate.conflicts.map((_, index) => `conflict:${index}`),
     ...candidate.discussionPoints.map((_, index) => `discussion:${index}`)
   ];
@@ -56,13 +57,15 @@ function candidateIssues(candidate: SystemAnalysisCandidate, bundle: SystemEvide
   const evidenceIds = new Set([
     ...bundle.directFacts.flatMap((fact) => [fact.evidence.id, ...fact.evidenceSources.map((item) => item.id)]),
     ...bundle.contextFacts.flatMap((fact) => [fact.evidence.id, ...fact.evidenceSources.map((item) => item.id)]),
-    ...bundle.personalContext.map((context) => context.id)
+    ...bundle.personalContext.map((context) => context.id),
+    ...bundle.knowledge.map((item) => item.id)
   ]);
   const trendIds = new Set(bundle.trends.map((trend) => trend.id));
   const itemIds = allReviewItemIds(candidate);
   if (new Set(itemIds).size !== itemIds.length) issues.push('duplicate_item_id');
   const citedEvidence = [
     ...candidate.keyPoints.flatMap((item) => item.evidenceIds.map((id) => ({ itemId: item.id, id }))),
+    ...candidate.recommendations.flatMap((item) => item.evidenceIds.map((id) => ({ itemId: `recommendation:${item.id}`, id }))),
     ...candidate.conflicts.flatMap((item, index) => item.evidenceIds.map((id) => ({ itemId: `conflict:${index}`, id }))),
     ...candidate.discussionPoints.flatMap((item, index) => item.evidenceIds.map((id) => ({ itemId: `discussion:${index}`, id })))
   ];
@@ -73,9 +76,30 @@ function candidateIssues(candidate: SystemAnalysisCandidate, bundle: SystemEvide
     if (point.trendFactIds.some((id) => !trendIds.has(id))) issues.push(`trend_mismatch:${point.id}`);
     if (point.kind !== 'question' && point.evidenceIds.length === 0) issues.push(`evidence_required:${point.id}`);
   }
+  const personalEvidenceIds = new Set([
+    ...bundle.directFacts.flatMap((fact) => [fact.evidence.id, ...fact.evidenceSources.map((item) => item.id)]),
+    ...bundle.contextFacts.flatMap((fact) => [fact.evidence.id, ...fact.evidenceSources.map((item) => item.id)]),
+    ...bundle.personalContext.map((context) => context.id)
+  ]);
+  for (const point of candidate.keyPoints) {
+    if (point.kind !== 'question' && !point.evidenceIds.some((id) => personalEvidenceIds.has(id))) {
+      issues.push(`personal_evidence_required:${point.id}`);
+    }
+  }
+  for (const recommendation of candidate.recommendations) {
+    if (recommendation.evidenceIds.length === 0
+      || !recommendation.evidenceIds.some((id) => personalEvidenceIds.has(id))) {
+      issues.push(`personal_evidence_required:recommendation:${recommendation.id}`);
+    }
+    if (recommendation.trendFactIds.some((id) => !trendIds.has(id))) {
+      issues.push(`trend_mismatch:recommendation:${recommendation.id}`);
+    }
+  }
   const texts = [
     candidate.headline,
+    candidate.overview,
     ...candidate.keyPoints.map((item) => item.text),
+    ...candidate.recommendations.flatMap((item) => [item.title, item.why, item.firstStep, item.schedule ?? '', item.reviewPlan ?? '', item.importantCaution ?? '']),
     ...candidate.conflicts.map((item) => item.text),
     ...candidate.discussionPoints.map((item) => item.text)
   ];
@@ -98,7 +122,7 @@ function reviewIssues(candidate: SystemAnalysisCandidate, review: SystemAnalysis
     || actual.length !== expected.length
     || expected.some((id) => !actual.includes(id))) issues.push('review_coverage');
   for (const item of review.itemReviews) {
-    if (!item.supported || !item.safe || !item.trendConsistent) issues.push(`item_rejected:${item.itemId}`);
+    if (!item.supported || !item.safe || !item.trendConsistent || !item.useful) issues.push(`item_rejected:${item.itemId}`);
   }
   return [...new Set(issues)];
 }
@@ -118,6 +142,18 @@ function evidenceResolver(bundle: SystemEvidenceBundle): Map<string, MemberEvide
       label: '本人补充',
       locator: context.effectiveDate,
       quote: context.text
+    }]),
+    ...bundle.knowledge.map((item): [string, MemberEvidenceRef] => [item.id, {
+      id: item.id,
+      kind: 'knowledge',
+      observationId: null,
+      eventId: null,
+      documentId: null,
+      sourceSpanId: null,
+      knowledgeId: item.id,
+      label: item.sourceOrganization,
+      locator: item.sourceUrl,
+      quote: item.content
     }])
   ];
   const resolver = new Map<string, MemberEvidenceRef>();
@@ -154,6 +190,8 @@ function materializeSnapshot(
     promptVersion: SYSTEM_ANALYSIS_PROMPT_VERSION,
     dataQuality: candidate.dataQuality,
     headline: candidate.headline,
+    overview: candidate.overview,
+    assessmentStatus: candidate.assessmentStatus,
     keyPoints: candidate.keyPoints.map((item) => ({
       id: item.id,
       kind: item.kind,
@@ -170,6 +208,18 @@ function materializeSnapshot(
       evidence: resolve(item.evidenceIds),
       source: item.source
     })),
+    recommendations: candidate.recommendations.map((item) => ({
+      id: item.id,
+      title: item.title,
+      why: item.why,
+      firstStep: item.firstStep,
+      schedule: item.schedule,
+      reviewPlan: item.reviewPlan,
+      importantCaution: item.importantCaution,
+      evidence: resolve(item.evidenceIds),
+      trendFactIds: item.trendFactIds
+    })),
+    clinicallyImportantUnknowns: candidate.clinicallyImportantUnknowns,
     coverage: {
       inputCount: bundle.coverage.selectedObservationIds.length + bundle.personalContext.length,
       linkedEventCount: bundle.events.length,

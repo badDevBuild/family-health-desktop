@@ -117,6 +117,8 @@ async function publishCardiovascularAnalysis(personId: string, modelId: string, 
     systemId: 'cardiovascular',
     inputSignature: bundle.scope.inputSignature,
     headline,
+    overview: headline,
+    assessmentStatus: 'undetermined',
     dataQuality: 'partial',
     keyPoints: [{
       id: `exception-summary-${modelId}`,
@@ -135,7 +137,9 @@ async function publishCardiovascularAnalysis(personId: string, modelId: string, 
     }],
     conflicts: [],
     dataGaps: [],
-    discussionPoints: []
+    discussionPoints: [],
+    recommendations: [],
+    clinicallyImportantUnknowns: []
   };
   const review: SystemAnalysisReview = {
     schemaVersion: 1,
@@ -143,7 +147,7 @@ async function publishCardiovascularAnalysis(personId: string, modelId: string, 
     systemId: 'cardiovascular',
     inputSignature: bundle.scope.inputSignature,
     overallSupported: true,
-    itemReviews: [{ itemId: candidate.keyPoints[0]!.id, supported: true, safe: true, trendConsistent: true, issue: null }]
+    itemReviews: [{ itemId: candidate.keyPoints[0]!.id, supported: true, safe: true, trendConsistent: true, useful: true, issue: null }]
   };
   let turn = 0;
   const result = await new SystemAnalysisPipeline(service.store, {

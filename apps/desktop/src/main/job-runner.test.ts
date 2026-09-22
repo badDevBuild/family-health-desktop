@@ -80,6 +80,8 @@ describe('ProcessingJobRunner', () => {
             systemId: 'cardiovascular',
             inputSignature: bundle.scope.inputSignature,
             headline: '这份记录中的 LDL-C 带有原报告偏高标记。',
+            overview: 'LDL-C 带有原报告偏高标记；目前只有一次结果，不能判断长期变化。',
+            assessmentStatus: 'attention',
             dataQuality: 'partial',
             keyPoints: [{
               id: 'point-ldl',
@@ -92,7 +94,9 @@ describe('ProcessingJobRunner', () => {
             topicSections: [{ topicId: 'lipids', title: '血脂', claimIds: ['point-ldl'], seriesIds: [], findingIds: [] }],
             conflicts: [],
             dataGaps: [{ text: '只有一次结果。', consequence: '不能判断趋势。' }],
-            discussionPoints: []
+            discussionPoints: [],
+            recommendations: [],
+            clinicallyImportantUnknowns: ['目前只有一次结果。']
           };
           return { threadId: 'system-thread', turnId: 'system-1', output: systemCandidate };
         }
@@ -101,7 +105,7 @@ describe('ProcessingJobRunner', () => {
           systemId: 'cardiovascular',
           inputSignature: bundle.scope.inputSignature,
           overallSupported: true,
-          itemReviews: [{ itemId: 'point-ldl', supported: true, safe: true, trendConsistent: true, issue: null }]
+          itemReviews: [{ itemId: 'point-ldl', supported: true, safe: true, trendConsistent: true, useful: true, issue: null }]
         };
         return { threadId: 'system-thread', turnId: 'system-2', output: review };
       }
@@ -116,7 +120,7 @@ describe('ProcessingJobRunner', () => {
       systemOutcomes: expect.arrayContaining([
         expect.objectContaining({ systemId: 'cardiovascular', status: rejectSystem ? 'rejected' : 'published' }),
         expect.objectContaining({ systemId: 'endocrine_metabolic', status: 'skipped_no_data' }),
-        expect.objectContaining({ systemId: 'renal_urinary', status: 'out_of_scope' })
+        expect.objectContaining({ systemId: 'renal_urinary', status: 'skipped_no_data' })
       ])
     });
     expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);

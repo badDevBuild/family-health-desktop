@@ -231,7 +231,7 @@ describe('PersonalWorkspaceService', () => {
     expect(metric.aliasesSeen).toEqual(['LDL-C', '低密度脂蛋白', '低密度脂蛋白胆固醇']);
     expect(metric.tableRows).toHaveLength(3);
     expect(service.listHealthEvents(personId)[0]).toMatchObject({ metadataStatus: 'unknown', factCount: 3 });
-    const evidenceId = detail.findings[0]!.evidence[0]!.id;
+    const evidenceId = metric.tableRows[0]!.evidence.id;
     expect(service.getMemberEvidenceBundle(personId, [evidenceId])).toMatchObject({ items: [{ id: evidenceId }], missingIds: [] });
     service.store.createManualNote({
       personId,
@@ -300,6 +300,58 @@ describe('PersonalWorkspaceService', () => {
     service.close();
   });
 
+  it('系统分析版本升级后可复用已接纳事实刷新，不要求重新上传报告', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/合成刷新报告.txt',
+      bytes: Buffer.from('2026-09-12 LDL-C 4.2 mmol/L')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const candidate = {
+      localKey: 'ldl-refresh', originalName: 'LDL-C', standardNameCandidate: '低密度脂蛋白胆固醇',
+      value: { kind: 'numeric' as const, rawText: '4.2', decimal: '4.2', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4', reportedAbnormalFlag: '↑',
+      specimen: '血清', method: null, bodySite: null, clinicalDate: '2026-09-12',
+      evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+    };
+    const issueId = service.store.saveExtractionReviewIssue({
+      documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: [span.id],
+      candidateOptions: [candidate],
+      candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['value'] }],
+      reasonCodes: ['TEST_FIXTURE'],
+      documentRun: {
+        coverageComplete: true, coveredSourceSpanIds: [span.id], manifestSpanIds: [span.id], chunkCount: 1
+      }
+    });
+    service.acceptCorrectedFacts({ issueId, documentId, candidates: [candidate] });
+    service.store.publishDerivedSnapshot({
+      candidate: {
+        schemaVersion: 1,
+        personId,
+        factRevision: service.store.getFactRevision(personId),
+        dataQuality: 'partial',
+        claims: [],
+        lifestyleGuidance: []
+      },
+      expectedFactRevision: service.store.getFactRevision(personId),
+      expectedContextRevision: service.store.getClinicalContextRevision(personId),
+      promptVersion: 'derived-v3',
+      rulesVersion: 'derived-safety-v2',
+      modelId: 'test-model'
+    });
+    expect(service.store.listDerivedRefreshTargets()).toEqual([]);
+    expect(service.store.listCurrentDerivedSnapshots()[0]?.promptVersion).toBe('derived-v3');
+
+    const batch = service.processNow();
+    expect(service.getSnapshot(null).jobs).toEqual([
+      expect.objectContaining({ stage: 'analyze', status: 'waiting_auth' })
+    ]);
+    expect(service.processNow()).toMatchObject({ batchId: batch.batchId, idempotent: true });
+    service.close();
+  });
+
   it('旧记录缺少原项目名时恢复可查看的系统归类，但不把候选名当成已验证事实', async () => {
     const service = makeService();
     const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
@@ -343,7 +395,7 @@ describe('PersonalWorkspaceService', () => {
     });
     const detail = service.getBodySystemDetail(personId, 'cardiovascular');
     expect(detail.metrics[0]).toMatchObject({ name: '低密度脂蛋白胆固醇', conceptId: null, mappingStatus: 'unmapped' });
-    expect(detail.findings[0]?.title).toBe('低密度脂蛋白胆固醇（旧记录候选名）');
+    expect(detail.findings).toEqual([]);
     expect(service.buildSystemEvidenceBundle(personId, 'cardiovascular')).toMatchObject({
       directFacts: [],
       contextFacts: [{ name: '低密度脂蛋白胆固醇（旧记录候选名）', relation: 'context' }]
@@ -387,7 +439,7 @@ describe('PersonalWorkspaceService', () => {
     });
 
     const event = service.listHealthEvents(personId)[0]!;
-    expect(event.summary).toContain('其中 1 条是本报告引用的历史结果');
+    expect(event.summary).toContain('报告中另有历史对比结果，已与本次检查分开');
     const detail = service.getHealthEventDetail(personId, event.id);
     expect(detail.findings).toEqual([expect.objectContaining({ value: '3.8 mmol/L' })]);
     expect(detail.historicalReferences).toEqual([expect.objectContaining({

@@ -163,7 +163,7 @@ describe('DerivedHealthPipeline', () => {
       },
       expectedFactRevision: service.store.getFactRevision(personId),
       expectedContextRevision: service.store.getClinicalContextRevision(personId),
-      promptVersion: 'derived-v3',
+      promptVersion: 'derived-v4',
       rulesVersion: 'derived-safety-v2',
       modelId: 'test-refresh-model'
     });

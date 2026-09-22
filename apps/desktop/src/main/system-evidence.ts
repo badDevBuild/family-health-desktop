@@ -6,6 +6,7 @@ import {
   SYSTEM_ANALYSIS_PROMPT_VERSION,
   SYSTEM_ANALYSIS_RULES_VERSION
 } from './prompts/index.js';
+import { SYSTEM_KNOWLEDGE_VERSION, knowledgeForSystem } from './system-knowledge.js';
 
 function parseReferenceRange(value: string | null): { low: number | null; high: number | null } {
   if (!value) return { low: null, high: null };
@@ -303,6 +304,7 @@ export function buildSystemEvidenceBundle(
       selectionReason: reason
     }));
   const systemEvents = eventsFor(store, personId, observations, systemId);
+  const knowledge = knowledgeForSystem(systemId);
   const selectedDocumentIds = new Set(selectedObservations.map((observation) => observation.documentId));
   const eventDependencies = store.listReportMetadata(personId)
     .filter((report) => selectedDocumentIds.has(report.documentId))
@@ -345,12 +347,14 @@ export function buildSystemEvidenceBundle(
     })),
     actions: existingActions,
     eventDependencies,
+    knowledge,
     selectorVersions: {
       conceptDictionary: conceptDictionary[0]?.version ?? 'unknown',
       systemRegistry: bodySystemRegistry[0]?.version ?? 'unknown',
       contextSelector: 'context-selector-v2-global-safety-first',
       actionSelector: 'action-selector-v1',
-      analysisWindow: 'all-history-v1'
+      analysisWindow: 'all-history-v1',
+      knowledge: SYSTEM_KNOWLEDGE_VERSION
     },
     promptVersion: SYSTEM_ANALYSIS_PROMPT_VERSION,
     rulesVersion: SYSTEM_ANALYSIS_RULES_VERSION,
@@ -378,7 +382,7 @@ export function buildSystemEvidenceBundle(
     events: systemEvents,
     trends: metricSeries(selected.filter((item) => item.fact.relation === 'direct').map((item) => item.observation), eventIdsByDocument),
     existingActions,
-    knowledge: [],
+    knowledge,
     coverage: {
       selectedObservationIds: selected.map((item) => item.observation.id),
       excludedObservationIds,

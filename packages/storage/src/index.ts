@@ -405,6 +405,9 @@ export interface PublishedDerivedSnapshot {
   personId: string;
   factRevision: number;
   contextRevision: number;
+  promptVersion: string;
+  rulesVersion: string;
+  modelId: string;
   status: 'current' | 'stale' | 'building' | 'unavailable';
   payload: DerivedSnapshotCandidate;
   createdAt: string;
@@ -3960,7 +3963,8 @@ export class WorkspaceStore {
 
   listCurrentDerivedSnapshots(): PublishedDerivedSnapshot[] {
     const rows = this.db.prepare(`
-      SELECT id, person_id, fact_revision, context_revision, status, payload_json, created_at
+      SELECT id, person_id, fact_revision, context_revision, prompt_version, rules_version, model_id,
+             status, payload_json, created_at
       FROM derived_snapshots WHERE status = 'current' ORDER BY created_at, id
     `).all() as Array<Record<string, unknown>>;
     return rows.map((row) => ({
@@ -3968,6 +3972,9 @@ export class WorkspaceStore {
       personId: String(row.person_id),
       factRevision: Number(row.fact_revision),
       contextRevision: Number(row.context_revision),
+      promptVersion: String(row.prompt_version),
+      rulesVersion: String(row.rules_version),
+      modelId: String(row.model_id),
       status: String(row.status) as PublishedDerivedSnapshot['status'],
       payload: JSON.parse(String(row.payload_json)) as DerivedSnapshotCandidate,
       createdAt: String(row.created_at)
@@ -3976,7 +3983,8 @@ export class WorkspaceStore {
 
   listLatestDerivedSnapshots(): PublishedDerivedSnapshot[] {
     const rows = this.db.prepare(`
-      SELECT id, person_id, fact_revision, context_revision, status, payload_json, created_at
+      SELECT id, person_id, fact_revision, context_revision, prompt_version, rules_version, model_id,
+             status, payload_json, created_at
       FROM derived_snapshots
       ORDER BY person_id, created_at DESC, rowid DESC
     `).all() as Array<Record<string, unknown>>;
@@ -3990,6 +3998,9 @@ export class WorkspaceStore {
         personId,
         factRevision: Number(row.fact_revision),
         contextRevision: Number(row.context_revision),
+        promptVersion: String(row.prompt_version),
+        rulesVersion: String(row.rules_version),
+        modelId: String(row.model_id),
         status: String(row.status) as PublishedDerivedSnapshot['status'],
         payload: JSON.parse(String(row.payload_json)) as DerivedSnapshotCandidate,
         createdAt: String(row.created_at)

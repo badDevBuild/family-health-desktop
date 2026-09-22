@@ -63,7 +63,7 @@ afterEach(() => {
 });
 
 describe('App member display editing', () => {
-  it('家庭总览读取成员的真实分析状态和最近一次报告标记', async () => {
+  it('家庭总览只作为成员入口，不用任意一项指标冒充全人结论', async () => {
     const snapshot = createPersonalSnapshot();
     snapshot.persons[0]!.documentCount = 1;
     snapshot.persons[0]!.acceptedFactCount = 3;
@@ -78,25 +78,27 @@ describe('App member display editing', () => {
     installBridge(snapshot);
     render(<App />);
 
-    expect(await screen.findByRole('heading', { name: '报告事实与综合说明已保存' })).toBeTruthy();
-    expect(screen.getByText('最近一次：报告未标记异常')).toBeTruthy();
-    expect(screen.queryByText(/健康解释仍待独立复核/)).toBeNull();
-    expect(screen.queryByText(/报告标记偏高/)).toBeNull();
+    expect(await screen.findByRole('button', { name: /测试成员.*查看健康解读/ })).toBeTruthy();
+    expect(screen.queryByText('最近一次：报告未标记异常')).toBeNull();
+    expect(screen.queryByText(/可比较趋势/)).toBeNull();
   });
 
   it('证据侧栏支持 Escape 关闭并把键盘焦点还给原按钮', async () => {
     render(<App />);
 
+    fireEvent.click(await screen.findByRole('button', { name: '成员档案' }));
     const trigger = await screen.findByRole('button', { name: /心血管/ });
-    trigger.focus();
     fireEvent.click(trigger);
+    const evidenceTrigger = await screen.findByRole('button', { name: /心血管/ });
+    evidenceTrigger.focus();
+    fireEvent.click(evidenceTrigger);
 
     const closeButton = await screen.findByRole('button', { name: '关闭证据侧栏' });
     await waitFor(() => expect(document.activeElement).toBe(closeButton));
     fireEvent.keyDown(closeButton, { key: 'Escape' });
 
     await waitFor(() => expect(screen.queryByLabelText('证据侧栏')).toBeNull());
-    expect(document.activeElement).toBe(trigger);
+    expect(document.activeElement).toBe(evidenceTrigger);
   });
 
   it('reconciles the demo selection with the loaded personal workspace before opening the editor', async () => {

@@ -122,6 +122,8 @@ try {
     systemId: 'cardiovascular',
     inputSignature: cardiovascular.scope.inputSignature,
     headline: '现有记录显示低密度脂蛋白胆固醇连续三次升高，最近一次带有原报告偏高标记。',
+    overview: '三次可比结果显示 LDL-C 逐步升高，最近一次带偏高标记，适合继续跟踪并准备咨询医生。',
+    assessmentStatus: 'attention',
     dataQuality: 'partial',
     keyPoints: [{
       id: 'synthetic-ldl-trend',
@@ -140,7 +142,9 @@ try {
     }],
     conflicts: [],
     dataGaps: [{ text: '缺少更完整的心血管背景资料。', consequence: '目前只呈现报告事实和趋势，不做诊断。' }],
-    discussionPoints: []
+    discussionPoints: [],
+    recommendations: [],
+    clinicallyImportantUnknowns: ['缺少更完整的个人心血管背景。']
   };
   const analysisReview: SystemAnalysisReview = {
     schemaVersion: 1,
@@ -148,7 +152,7 @@ try {
     systemId: 'cardiovascular',
     inputSignature: cardiovascular.scope.inputSignature,
     overallSupported: true,
-    itemReviews: [{ itemId: 'synthetic-ldl-trend', supported: true, safe: true, trendConsistent: true, issue: null }]
+    itemReviews: [{ itemId: 'synthetic-ldl-trend', supported: true, safe: true, trendConsistent: true, useful: true, issue: null }]
   };
   let systemTurn = 0;
   const analysisResult = await new SystemAnalysisPipeline(service.store, {

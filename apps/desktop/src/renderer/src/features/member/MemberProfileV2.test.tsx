@@ -51,9 +51,9 @@ describe('MemberProfileV2 event organization', () => {
     snapshot.workspaceMode = 'personal';
     snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
     const overview: MemberOverviewV2 = {
-      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '核心档案仍可读',
+      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '核心档案仍可读', overview: '核心档案的简要说明。',
       latestClinicalDate: null, acceptedFactCount: 0, eventCount: 0,
-      attentionSystemIds: [], systems: [], recentChanges: [], nextActions: []
+      attentionSystemIds: [], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const getMemberOverview = vi.fn(async () => ({ ok: true as const, data: overview }));
     const listBodySystems = vi.fn(async () => ({ ok: true as const, data: [] }));
@@ -94,9 +94,9 @@ describe('MemberProfileV2 event organization', () => {
     const current = healthEvent('event-current', '2026 年体检', '2026-09-10', ['document-a', 'document-b']);
     const other = healthEvent('event-other', '门诊检验', '2026-09-11', ['document-c']);
     const overview: MemberOverviewV2 = {
-      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '已有检查记录',
+      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '已有检查记录', overview: '已有检查记录的简要说明。',
       latestClinicalDate: '2026-09-11', acceptedFactCount: 3, eventCount: 2,
-      attentionSystemIds: [], systems: [], recentChanges: [], nextActions: []
+      attentionSystemIds: [], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const detail: HealthEventDetailV2 = {
       ...current,
@@ -180,9 +180,9 @@ describe('MemberProfileV2 event organization', () => {
     snapshot.workspaceMode = 'personal';
     snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
     const overview: MemberOverviewV2 = {
-      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '已有检查记录',
+      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '已有检查记录', overview: '已有检查记录的简要说明。',
       latestClinicalDate: '2026-09-11', acceptedFactCount: 1, eventCount: 1,
-      attentionSystemIds: ['cardiovascular'], systems: [], recentChanges: [], nextActions: []
+      attentionSystemIds: ['cardiovascular'], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const plan: LifestylePlanV2 = {
       personId: 'person-1', status: 'current', dataQuality: 'partial', updatedAt: now,
@@ -256,9 +256,9 @@ describe('MemberProfileV2 event organization', () => {
     snapshot.workspaceMode = 'personal';
     snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
     const overview: MemberOverviewV2 = {
-      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '旧记录恢复中',
+      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '旧记录恢复中', overview: '旧记录仍可阅读。',
       latestClinicalDate: '2026-09-11', acceptedFactCount: 1, eventCount: 1,
-      attentionSystemIds: [], systems: [], recentChanges: [], nextActions: []
+      attentionSystemIds: [], systems: [], priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
     };
     const plan: LifestylePlanV2 = {
       personId: 'person-1', status: 'stale', dataQuality: 'partial', updatedAt: now, priorities: [],
