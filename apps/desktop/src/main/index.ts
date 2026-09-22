@@ -7,6 +7,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, No
 import { is } from '@electron-toolkit/utils';
 import {
   accountStateSchema,
+  adoptMemberAssessmentActionInputSchema,
   adoptLifestyleProposalInputSchema,
   aiPreferencesSchema,
   aiSettingsSchema,
@@ -839,6 +840,23 @@ function registerIpc(): void {
       return { ok: true, data: receipt };
     } catch (error) {
       const code = error instanceof Error ? error.message : 'LIFESTYLE_PROPOSAL_ADOPTION_FAILED';
+      return { ok: false, error: { code, messageKey: 'guidance.adopt_failed', retryable: false, correlationId: randomUUID() } };
+    }
+  });
+
+  ipcMain.handle('guidance:adopt-assessment-action', async (event, rawInput: unknown) => {
+    validateSender(event);
+    if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
+      return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
+    }
+    try {
+      const input = adoptMemberAssessmentActionInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const action = personalWorkspace.adoptMemberAssessmentAction(input);
+      emitSnapshotChanged();
+      return { ok: true, data: action, revision: action.userRevision };
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'MEMBER_ASSESSMENT_ACTION_ADOPTION_FAILED';
       return { ok: false, error: { code, messageKey: 'guidance.adopt_failed', retryable: false, correlationId: randomUUID() } };
     }
   });

@@ -643,6 +643,7 @@ export const lifestylePlanV2Schema = z.object({
   adoptedActions: z.array(z.object({
     id: idSchema,
     proposalId: idSchema.nullable(),
+    assessmentDedupeKey: z.string().nullable().optional(),
     title: z.string().min(1),
     userGoal: z.string().min(1),
     selectedStartingOption: z.string().min(1),

@@ -481,6 +481,49 @@ describe('MemberAssessmentPipeline', () => {
     service.close();
   });
 
+  it('成员建议只有本人点击后成为行动，重复点击不重复创建，资料变化后拒绝旧快照', async () => {
+    const { service, personId, built } = await fixture();
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'p02', turnId: 'turn', output: candidateFor(built.request, built.evidencePackage) })
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result.status).toBe('published');
+    expect(service.getLifestylePlan(personId).adoptedActions).toEqual([]);
+    const snapshot = service.getMemberAssessment(personId)!;
+    const input = { personId, snapshotId: snapshot.id, actionId: snapshot.actions[0]!.id };
+    const first = service.adoptMemberAssessmentAction(input);
+    expect(first).toMatchObject({ origin: 'ai_proposed', status: 'planned' });
+    expect(service.adoptMemberAssessmentAction(input).id).toBe(first.id);
+    expect(service.getLifestylePlan(personId).adoptedActions).toMatchObject([{
+      id: first.id, assessmentDedupeKey: snapshot.actions[0]!.dedupeKey
+    }]);
+    expect(service.store.listActionItems(personId).filter((item) => item.id === first.id)).toHaveLength(1);
+    expect(() => service.adoptMemberAssessmentAction({ ...input, actionId: 'not-in-snapshot' })).toThrow('MEMBER_ASSESSMENT_ACTION_NOT_AVAILABLE');
+    service.store.createManualNote({
+      personId, kind: 'free_text', immutableText: '合成补充说明', effectiveDate: '2026-09-22',
+      structuredFields: {}, expectedContextRevision: 0
+    });
+    expect(() => service.adoptMemberAssessmentAction(input)).toThrow('MEMBER_ASSESSMENT_ACTION_STALE');
+    expect(service.store.listActionItems(personId).some((item) => item.id === first.id)).toBe(true);
+    service.close();
+  });
+
+  it('隔离合成评测可显式关闭 P02 联网，输入签名和运行权限保持一致', async () => {
+    const { service, personId } = await fixture();
+    const built = buildMemberAssessmentInput(service.store, personId, {
+      modelId: 'test-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: false
+    });
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        expect(input.allowWebSearch).toBe(false);
+        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+        expect(request.webSearchAllowed).toBe(false);
+        return { threadId: 'offline', turnId: 'offline', output: candidateFor(built.request, built.evidencePackage) };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22', false).process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 1 });
+    service.close();
+  });
+
   it('仅更新已采纳行动的完成进度不会使成员医学输入失效', async () => {
     const { service, personId } = await fixture();
     const action = service.store.createUserAction({
@@ -542,6 +585,10 @@ describe('MemberAssessmentPipeline', () => {
   it('具体引用问题只做一次 P03，不重做全量综合', async () => {
     const { service, personId, built } = await fixture();
     const valid = candidateFor(built.request, built.evidencePackage);
+    const repaired = structuredClone(valid);
+    repaired.overview.summary = '修正引用后，LDL-C 仍高于报告参考上限，下一步整理病史。';
+    repaired.systems[0]!.summary = '已核对的 LDL-C 结果高于参考上限。';
+    repaired.actions[0]!.why = '修正引用后，单次结果仍不足以决定长期管理方向。';
     const wrong = structuredClone(valid);
     wrong.claims[0]!.evidenceIds = ['missing-evidence'];
     let calls = 0;
@@ -550,12 +597,35 @@ describe('MemberAssessmentPipeline', () => {
         calls += 1;
         if (calls === 1) return { threadId: 'p02', turnId: 'first', output: wrong };
         expect(input.prompt).toContain('REPAIR_REQUEST=');
+        expect(input.prompt).toContain('node:action-review');
+        expect(input.prompt).toContain('node:system:cardiovascular');
+        expect(input.prompt).toContain('"overview"');
         expect(input.allowWebSearch).toBe(false);
-        return { threadId: 'p03', turnId: 'second', output: valid };
+        return { threadId: 'p03', turnId: 'second', output: repaired };
       }
     }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
     expect(result).toMatchObject({ status: 'published', callCount: 2 });
     expect(calls).toBe(2);
+    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(snapshot.overview.summary).toBe(repaired.overview.summary);
+    expect(snapshot.systems[0]!.summary).toBe(repaired.systems[0]!.summary);
+    expect(snapshot.actions[0]!.why).toBe(repaired.actions[0]!.why);
+    service.close();
+  });
+
+  it('P03 只放开有明确引用的依赖节点，重复行动键也能定位到两个具体行动', async () => {
+    const { service, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims.push({ ...candidate.claims[0]!, id: 'claim:other', topicKey: 'other' });
+    candidate.actions.push({ ...candidate.actions[0]!, id: 'action:duplicate', claimIds: ['claim:other'] });
+    candidate.questions.push({ id: 'question:related', question: '待核对？', whyItMatters: '影响下一步。',
+      relatedClaimIds: ['claim-ldl'], evidenceIds: candidate.claims[0]!.evidenceIds });
+    expect(new Set(repairTargets(candidate, ['unknown_evidence:claim-ldl:missing']))).toEqual(new Set([
+      'claim-ldl', 'action-review', 'question:related', 'overview', ...candidate.systems.map((system) => system.id)
+    ]));
+    expect(new Set(repairTargets(candidate, ['duplicate_action_key:lipid-risk-context']))).toEqual(new Set([
+      'action-review', 'action:duplicate', 'overview', ...candidate.systems.map((system) => system.id)
+    ]));
     service.close();
   });
 
@@ -751,6 +821,7 @@ describe('MemberAssessmentPipeline', () => {
       ['firstStep', '自行停药即可。', true],
       ['firstStep', '应立即加量。', true],
       ['firstStep', '请勿自行加量，应及时咨询医生。', false],
+      ['firstStep', '请整理目前实际用药，以及是否漏服或自行停药，带给医生核对。', false],
       ['caution', '自行停药有风险，请咨询医生。', false]
     ] as const) {
       const candidate = candidateFor(built.request, built.evidencePackage);
@@ -777,6 +848,8 @@ describe('MemberAssessmentPipeline', () => {
     expect(validateAssessmentCandidate(candidate, input('2024-10-22 诊断：考虑脂肪肝')).issues).toContain('documented_source_not_proven:claim-ldl');
     expect(validateAssessmentCandidate(candidate, input('2024-10-22 诊断：排除脂肪肝')).issues).toContain('documented_source_not_proven:claim-ldl');
     expect(validateAssessmentCandidate(candidate, input('2024-10-22 既往诊断：脂肪肝')).issues).not.toContain('documented_source_not_proven:claim-ldl');
+    expect(validateAssessmentCandidate(candidate, input('2024-10-22 病史记载既往诊断脂肪肝')).issues).not.toContain('documented_source_not_proven:claim-ldl');
+    expect(validateAssessmentCandidate(candidate, input('2024-10-22 既往诊断疑似脂肪肝')).issues).toContain('documented_source_not_proven:claim-ldl');
     candidate.claims[0]!.temporalStatus = 'current';
     expect(validateAssessmentCandidate(candidate, input('2024-10-22 既往诊断：脂肪肝')).issues).toContain('documented_source_not_proven:claim-ldl');
     service.close();

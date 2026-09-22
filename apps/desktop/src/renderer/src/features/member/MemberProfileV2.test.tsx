@@ -2,7 +2,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AdoptLifestyleProposalInput, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, LifestylePlanV2, MemberOverviewV2 } from '@contracts';
+import type { AdoptLifestyleProposalInput, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, LifestylePlanV2, MemberAssessmentSnapshotV3, MemberOverviewV2 } from '@contracts';
 import type { HealthDesktopBridge } from '../../../../preload/index.js';
 import { createDemoSnapshot } from '../../../../../../../packages/test-fixtures/src/index.js';
 import { assessmentKnowledgeStatusLabel, MemberProfileV2, systemAnalysisHeading } from './MemberProfileV2.js';
@@ -38,6 +38,54 @@ afterEach(() => {
 });
 
 describe('MemberProfileV2 event organization', () => {
+  it('新版建议只在本人点击后加入行动，刷新后显示已加入', async () => {
+    const snapshot = createDemoSnapshot() as DashboardSnapshot;
+    snapshot.workspaceMode = 'personal';
+    snapshot.persons = [{ ...snapshot.persons[0]!, id: 'person-1', displayName: '测试成员', relation: '本人' }];
+    const overview: MemberOverviewV2 = {
+      personId: 'person-1', generatedAt: now, dataQuality: 'partial', headline: '已有检查记录', overview: '已有检查记录。',
+      latestClinicalDate: '2026-09-21', acceptedFactCount: 1, unclassifiedFactCount: 0, eventCount: 1,
+      sourceUrgentNotices: [], currentSymptomNotices: [], attentionSystemIds: [], systems: [],
+      priorityIssues: [], importantChanges: [], recentChanges: [], nextActions: []
+    };
+    const assessment = {
+      id: 'assessment-1', personId: 'person-1', systems: [], claims: [], questions: [],
+      actions: [{ id: 'action-1', dedupeKey: 'lipid-followup', kind: 'test_followup', title: '复核血脂',
+        why: '只有一次记录。', firstStep: '整理过去报告。', timing: '下次就诊', reviewPlan: null,
+        caution: null, urgency: 'routine' }]
+    } as unknown as MemberAssessmentSnapshotV3;
+    let adopted = false;
+    const adoptMemberAssessmentAction = vi.fn(async () => { adopted = true; return { ok: true as const, data: { id: 'adopted-1' } }; });
+    window.healthDesktop = {
+      getMemberOverview: async () => ({ ok: true, data: overview }),
+      listBodySystems: async () => ({ ok: true, data: [] }),
+      listHealthEvents: async () => ({ ok: true, data: [] }),
+      getLifestylePlan: async () => ({ ok: true, data: {
+        personId: 'person-1', status: 'unavailable', dataQuality: 'partial', updatedAt: now,
+        priorities: [], proposals: [], adoptedActions: adopted ? [{
+          id: 'adopted-1', proposalId: null, assessmentDedupeKey: 'lipid-followup', title: '复核血脂',
+          userGoal: '复核血脂', selectedStartingOption: '整理过去报告。', plannedTime: '下次就诊',
+          owner: '本人', progressNote: null, status: 'planned', dueDate: null, updatedAt: now
+        }] : []
+      } }),
+      getConceptReview: async () => ({ ok: true, data: { personId: 'person-1', dictionaryVersion: 'test', catalog: [], items: [] } }),
+      getMemberAssessment: async () => ({ ok: true, data: assessment }),
+      adoptMemberAssessmentAction
+    } as unknown as HealthDesktopBridge;
+    render(<MemberProfileV2
+      snapshot={snapshot} person={snapshot.persons[0]!}
+      onSelectPerson={vi.fn()} onOpenEvidence={vi.fn()} onAddPerson={vi.fn()} onEditPerson={vi.fn()}
+      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()}
+      onExcludeDocument={vi.fn()} onReincludeDocument={vi.fn()} onDeleteDocument={vi.fn()} onDeletedDocuments={vi.fn()}
+    />);
+    fireEvent.click(await screen.findByRole('tab', { name: '生活与行动' }));
+    expect(screen.getByRole('button', { name: '加入后续事项' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '加入后续事项' }));
+    await waitFor(() => expect(adoptMemberAssessmentAction).toHaveBeenCalledWith({
+      personId: 'person-1', snapshotId: 'assessment-1', actionId: 'action-1'
+    }));
+    expect(await screen.findByText('已加入后续事项')).toBeTruthy();
+  });
   it('模型给出的网址在页面上不能显示成应用已核验', () => {
     expect(assessmentKnowledgeStatusLabel('model_cited')).toBe('AI 提供的网址；应用尚未核对正文');
     expect(assessmentKnowledgeStatusLabel(undefined)).toBe('AI 提供的网址；应用尚未核对正文');

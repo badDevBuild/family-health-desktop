@@ -2,7 +2,7 @@ import type {
   BodySystemId, HealthClaim, MemberAssessmentCandidateV3, MemberEvidenceRef
 } from '@contracts';
 
-export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v7';
+export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v8';
 
 export interface AssessmentValidationInput {
   personId: string;
@@ -29,10 +29,11 @@ export interface AssessmentValidationResult {
 // 仅识别面向本人直接执行的药物改变；来源事实中的剂量、检验单位及治疗讨论不据字面拒绝。
 const medicationChange = '(?:停药|停用|换药|加量|减量|开始服用|改用|调整剂量)';
 const negatedMedicationChange = new RegExp(`(?:不要|不得|切勿|勿|避免|禁止|不应|无需|不必|停止)[^。；，,]{0,14}(?:自行|擅自)?${medicationChange}`, 'gi');
+const medicationHistoryQuestion = new RegExp(`(?:是否|有无|曾经|过去|之前|历史上)[^。；，,]{0,20}(?:自行|擅自)?${medicationChange}`, 'gi');
 const directMedicationInstruction = new RegExp(`(?:马上|立即|现在|请|应(?:当|该)?|必须|建议你)[^。；，,]{0,24}${medicationChange}|${medicationChange}[^。；，,]{0,12}(?:即可|就行)`, 'i');
 const selfDirectedMedicationChange = new RegExp(`自行[^。；，,]{0,12}${medicationChange}`, 'i');
 const unsourcedProbability = /(?:患病|发病|罹患|诊断|得[^。；，]{0,8}病|患[^。；，]{0,12}风险|癌症风险)[^。；，]{0,24}\d+(?:\.\d+)?\s*%/i;
-const explicitDiagnosis = /(?:明确诊断|临床诊断|病理诊断|出院诊断|诊断[:：]|确诊|诊断意见[:：])/i;
+const explicitDiagnosis = /(?:明确诊断|临床诊断|病理诊断|出院诊断|(?:既往|曾|历史)诊断|诊断[:：]|确诊|诊断意见[:：])/i;
 const negatedOrTentative = /(?:排除|待排|考虑|疑似|可能|家族史|病史自述|未确诊|不能诊断|尚不能诊断)/i;
 const historicalDiagnosis = /(?:既往|既往史|既往诊断|曾诊断|病史)/i;
 
@@ -49,7 +50,7 @@ function hasDirectMedicationChange(action: MemberAssessmentCandidateV3['actions'
   const fields = [action.title, action.why, action.firstStep, action.timing, action.reviewPlan, action.caution]
     .filter((value): value is string => value !== null);
   return fields.some((field, index) => field.split(/[。；，,]/).some((clause) => {
-    const actionable = clause.replace(negatedMedicationChange, '');
+    const actionable = clause.replace(negatedMedicationChange, '').replace(medicationHistoryQuestion, '');
     return directMedicationInstruction.test(actionable)
       || (index === 0 || index === 2) && selfDirectedMedicationChange.test(actionable);
   }));

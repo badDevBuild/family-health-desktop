@@ -260,3 +260,11 @@ export const memberAssessmentSnapshotV3Schema = memberAssessmentCandidateV3Schem
   }).strict())
 }).strict();
 export type MemberAssessmentSnapshotV3 = z.infer<typeof memberAssessmentSnapshotV3Schema>;
+
+/** 只能选择当前已发布快照中的现有行动；标题与内容由主进程从快照读取。 */
+export const adoptMemberAssessmentActionInputSchema = z.object({
+  personId: id,
+  snapshotId: id,
+  actionId: id
+}).strict();
+export type AdoptMemberAssessmentActionInput = z.infer<typeof adoptMemberAssessmentActionInputSchema>;

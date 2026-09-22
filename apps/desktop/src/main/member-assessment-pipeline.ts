@@ -57,9 +57,35 @@ export function repairTargets(candidate: MemberAssessmentCandidateV3, issues: st
   for (const issue of issues) {
     const nodeId = issueOwnerId(issue, nodeIds);
     if (nodeId && targetNode(candidate, nodeId)) ids.add(nodeId);
+    if (issue.startsWith('duplicate_action_key:')) {
+      const key = issue.slice('duplicate_action_key:'.length);
+      for (const action of candidate.actions) if (action.dedupeKey === key) ids.add(action.id);
+    }
     if (issue === 'overview_missing_claims' || issue.startsWith('unknown_claim:overview:')
       || issue.startsWith('unknown_action:overview:')) ids.add('overview');
   }
+  // 一条主张或行动的修正可能改变引用它的可见摘要；只放开有明确 ID 依赖的节点。
+  const affectedClaims = new Set(candidate.claims.filter((claim) => ids.has(claim.id)).map((claim) => claim.id));
+  const affectedKnowledge = new Set(candidate.knowledgeSources.filter((source) => ids.has(source.id)).map((source) => source.id));
+  for (const claim of candidate.claims) {
+    if (claim.knowledgeSourceIds.some((id) => affectedKnowledge.has(id))) {
+      ids.add(claim.id);
+      affectedClaims.add(claim.id);
+    }
+  }
+  for (const action of candidate.actions) {
+    if (action.claimIds.some((id) => affectedClaims.has(id))
+      || action.knowledgeSourceIds.some((id) => affectedKnowledge.has(id))) ids.add(action.id);
+  }
+  for (const question of candidate.questions) {
+    if (question.relatedClaimIds.some((id) => affectedClaims.has(id))) ids.add(question.id);
+  }
+  for (const system of candidate.systems) {
+    if (system.claimIds.some((id) => affectedClaims.has(id))
+      || system.actionIds.some((id) => ids.has(id))) ids.add(system.id);
+  }
+  if (candidate.overview.claimIds.some((id) => affectedClaims.has(id))
+    || candidate.overview.actionIds.some((id) => ids.has(id))) ids.add('overview');
   return [...ids];
 }
 
@@ -126,7 +152,8 @@ export class MemberAssessmentPipeline {
     private readonly transmissionDocumentId?: string,
     private readonly modelId = 'codex-account-default',
     private readonly reasoningEffort = 'medium',
-    private readonly analysisReferenceDate = new Date().toISOString().slice(0, 10)
+    private readonly analysisReferenceDate = new Date().toISOString().slice(0, 10),
+    private readonly webSearchAllowed = true
   ) {}
 
   private async runTurn(stage: string, input: Parameters<StructuredRuntime['runStructuredTurn']>[0]) {
@@ -149,7 +176,7 @@ export class MemberAssessmentPipeline {
   async process(personId: string): Promise<MemberAssessmentPipelineResult> {
     const built = buildMemberAssessmentInput(this.store, personId, {
       modelId: this.modelId, reasoningEffort: this.reasoningEffort,
-      analysisReferenceDate: this.analysisReferenceDate, webSearchAllowed: true
+      analysisReferenceDate: this.analysisReferenceDate, webSearchAllowed: this.webSearchAllowed
     });
     const { request, evidencePackage } = built;
     if (evidencePackage.facts.length === 0 && evidencePackage.personalContext.length === 0) {

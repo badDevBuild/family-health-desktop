@@ -350,6 +350,8 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
   const [conceptBusyId, setConceptBusyId] = useState<string | null>(null);
   const [conceptError, setConceptError] = useState(false);
   const [adoptingProposalId, setAdoptingProposalId] = useState<string | null>(null);
+  const [adoptingAssessmentActionId, setAdoptingAssessmentActionId] = useState<string | null>(null);
+  const [assessmentAdoptionError, setAssessmentAdoptionError] = useState(false);
   const [decidingProposalId, setDecidingProposalId] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
   const [search, setSearch] = useState('');
@@ -559,6 +561,16 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       } : current);
     }).finally(() => setAdoptingProposalId(null));
   };
+  const adoptAssessmentAction = (actionId: string) => {
+    const bridge = window.healthDesktop;
+    if (!assessment || !bridge?.adoptMemberAssessmentAction || adoptingAssessmentActionId) return;
+    setAdoptingAssessmentActionId(actionId);
+    setAssessmentAdoptionError(false);
+    void bridge.adoptMemberAssessmentAction({ personId: person.id, snapshotId: assessment.id, actionId }).then((result) => {
+      if (!result?.ok) { setAssessmentAdoptionError(true); return; }
+      setRefreshToken((value) => value + 1);
+    }).catch(() => setAssessmentAdoptionError(true)).finally(() => setAdoptingAssessmentActionId(null));
+  };
   const decideProposal = (proposalId: string, decision: 'dismiss' | 'restore') => {
     const bridge = window.healthDesktop;
     if (!bridge?.setLifestyleProposalDecision || decidingProposalId) return;
@@ -673,7 +685,15 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
     </div> : <><div className="panel__heading"><div><span className="eyebrow">检查时间线</span><h2>按时间看每次检查</h2></div><StatusBadge tone="neutral">{filteredEvents.length} / {events.length} 次</StatusBadge></div><p className="body-copy">打开某次检查，可以查看当时发现了什么、涉及哪些身体系统，以及对应的原始依据。</p><div className="timeline-filters"><label>事件类型<select value={eventType} onChange={(event) => setEventType(event.target.value as HealthEventV2['type'] | 'all')}><option value="all">全部类型</option><option value="checkup">体检</option><option value="laboratory">检验</option><option value="imaging">影像</option><option value="outpatient">门诊</option><option value="inpatient">住院</option><option value="self_measurement">本人测量</option><option value="manual_note">本人补充</option><option value="other">其他</option></select></label><label>身体系统<select value={eventSystem} onChange={(event) => setEventSystem(event.target.value as BodySystemId | 'all')}><option value="all">全部系统</option>{systems.map((system) => <option key={system.id} value={system.id}>{system.shortName}</option>)}</select></label></div>{filteredEvents.length > 0 ? <div className="timeline-list">{filteredEvents.map((event) => <button key={event.id} onClick={() => chooseEvent(event.id)}><time>{event.time.displayLabel}</time><i /><span><StatusBadge tone={event.metadataStatus === 'unknown' ? 'neutral' : 'success'}>{event.type === 'checkup' ? '体检' : event.type === 'imaging' ? '影像' : event.type === 'laboratory' ? '检验' : '健康事件'}</StatusBadge><strong>{event.title}</strong><small>{event.summary}</small><em>{event.systemIds.length} 个身体系统 · {event.documentIds.length} 份来源文件</em></span><ChevronRight size={18} /></button>)}</div> : <div className="table-empty"><CalendarClock size={24} /><strong>{events.length > 0 ? '没有符合筛选条件的检查' : '还没有检查记录'}</strong><span>{events.length > 0 ? '可以调整检查类型或身体系统。' : '报告处理完成后会按检查时间显示在这里。'}</span></div>}</>}</section>}
     {!loading && tab === 'guidance' && assessment && <div className="guide-grid">
       <section className="panel guide-hero"><span className="eyebrow">生活与行动</span><h2>根据现有资料，先做这些事</h2><p>同一方向已合并为一项建议；建议不会自动变成已采纳计划。</p>
-        {assessment.actions.length > 0 ? <div className="member-proposal-list">{assessment.actions.map((action, index) => <article key={action.id}><div className="panel__heading"><div><span className="eyebrow">第 {index + 1} 项 · {action.kind === 'seek_care' ? '就医准备' : action.kind === 'test_followup' ? '复查' : action.kind === 'treatment_discussion' ? '治疗讨论' : '日常行动'}</span><h3>{action.title}</h3></div><StatusBadge tone={action.urgency === 'urgent' || action.urgency === 'emergency' ? 'warning' : 'info'}>{action.urgency === 'emergency' ? '尽快寻求急救' : action.urgency === 'urgent' ? '及时处理' : action.urgency === 'soon' ? '近期安排' : '按计划进行'}</StatusBadge></div><p>{action.why}</p><dl><div><dt>第一步</dt><dd>{action.firstStep}</dd></div>{action.timing && <div><dt>何时</dt><dd>{action.timing}</dd></div>}{action.reviewPlan && <div><dt>何时回看</dt><dd>{action.reviewPlan}</dd></div>}</dl>{action.caution && <small>{action.caution}</small>}</article>)}</div> : <p className="muted-copy">本轮没有需要新增的统一行动；已有事实和判断仍可在健康总览查看。</p>}
+        {assessment.actions.length > 0 ? <div className="member-proposal-list">{assessment.actions.map((action, index) => {
+          const adopted = plan?.adoptedActions.some((item) => item.assessmentDedupeKey === action.dedupeKey && item.status !== 'dismissed') ?? false;
+          return <article key={action.id}>
+            <div className="panel__heading"><div><span className="eyebrow">第 {index + 1} 项 · {action.kind === 'seek_care' ? '就医准备' : action.kind === 'test_followup' ? '复查' : action.kind === 'treatment_discussion' ? '治疗讨论' : '日常行动'}</span><h3>{action.title}</h3></div><StatusBadge tone={action.urgency === 'urgent' || action.urgency === 'emergency' ? 'warning' : 'info'}>{action.urgency === 'emergency' ? '尽快寻求急救' : action.urgency === 'urgent' ? '及时处理' : action.urgency === 'soon' ? '近期安排' : '按计划进行'}</StatusBadge></div>
+            <p>{action.why}</p><dl><div><dt>第一步</dt><dd>{action.firstStep}</dd></div>{action.timing && <div><dt>何时</dt><dd>{action.timing}</dd></div>}{action.reviewPlan && <div><dt>何时回看</dt><dd>{action.reviewPlan}</dd></div>}</dl>{action.caution && <small>{action.caution}</small>}
+            {adopted ? <p className="muted-copy">已加入后续事项</p> : <button className="secondary-button" onClick={() => adoptAssessmentAction(action.id)} disabled={adoptingAssessmentActionId !== null}>{adoptingAssessmentActionId === action.id ? '正在加入' : '加入后续事项'}</button>}
+          </article>;
+        })}</div> : <p className="muted-copy">本轮没有需要新增的统一行动；已有事实和判断仍可在健康总览查看。</p>}
+        {assessmentAdoptionError && <p role="alert" className="form-error">这项行动暂时没有加入。若资料已更新，请刷新成员档案后重试；原有行动未改变。</p>}
       </section>
       {assessment.questions.length > 0 && <section className="panel"><div className="panel__heading"><h3>会改变判断的关键信息</h3></div><ul>{assessment.questions.map((question) => <li key={question.id}><strong>{question.question}</strong><p>{question.whyItMatters}</p></li>)}</ul></section>}
       <section className="panel"><div className="panel__heading"><h3>已采纳行动</h3><StatusBadge tone="neutral">{plan?.adoptedActions.length ?? 0} 项</StatusBadge></div>{plan?.adoptedActions.length ? plan.adoptedActions.map((action) => <div className="completed-item adopted-action-card" key={action.id}><Check size={16} /><div><strong>{action.title}</strong><span>{action.userGoal}</span><small>{action.selectedStartingOption} · {action.owner}</small>{action.progressNote && <small>备注：{action.progressNote}</small>}</div></div>) : <p className="muted-copy">还没有主动采纳的行动。</p>}</section>

@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import type {
   ActionItem,
+  AdoptMemberAssessmentActionInput,
   ConceptMapping,
   ConceptMappingReceipt,
   CreateManualNoteInput,
@@ -29,6 +30,22 @@ import { BODY_SYSTEM_REGISTRY_VERSION, CONCEPT_DICTIONARY_VERSION, MEMBER_MODEL_
 
 export const WORKSPACE_SCHEMA_VERSION = 35;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
+
+const assessmentActionSourcePrefix = 'assessment-v3:';
+
+function assessmentActionSource(sourceRef: string | null): {
+  snapshotId: string; actionId: string; dedupeKey: string
+} | null {
+  if (!sourceRef?.startsWith(assessmentActionSourcePrefix)) return null;
+  try {
+    const parsed = JSON.parse(sourceRef.slice(assessmentActionSourcePrefix.length)) as Record<string, unknown>;
+    return typeof parsed.snapshotId === 'string' && typeof parsed.actionId === 'string'
+      && typeof parsed.dedupeKey === 'string'
+      ? { snapshotId: parsed.snapshotId, actionId: parsed.actionId, dedupeKey: parsed.dedupeKey } : null;
+  } catch {
+    return null;
+  }
+}
 
 function calendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
   const dates: Array<{ date: string; index: number; length: number }> = [];
@@ -786,7 +803,9 @@ export class WorkspaceStore {
       detail: String(row.detail),
       dueDate: row.due_date === null ? null : String(row.due_date),
       dueText: row.due_text === null ? null : String(row.due_text),
-      evidenceLabel: row.source_ref === null ? null : String(row.source_ref),
+      evidenceLabel: assessmentActionSource(row.source_ref === null ? null : String(row.source_ref))
+        ? '来自本人已采纳的健康解读'
+        : row.source_ref === null ? null : String(row.source_ref),
       userRevision: Number(row.user_revision),
       updatedAt: String(row.updated_at)
     }));
@@ -817,6 +836,63 @@ export class WorkspaceStore {
     });
     transaction();
     return this.listActionItems(input.personId).find((item) => item.id === id)!;
+  }
+
+  listAdoptedMemberAssessmentActions(personId: string): Array<{ action: ActionItem; dedupeKey: string }> {
+    const sources = this.db.prepare(`
+      SELECT id, source_ref FROM action_items WHERE person_id = ? AND origin = 'ai_proposed'
+    `).all(personId) as Array<{ id: string; source_ref: string | null }>;
+    const actions = new Map(this.listActionItems(personId).map((action) => [action.id, action]));
+    return sources.flatMap((row) => {
+      const source = assessmentActionSource(row.source_ref);
+      const action = actions.get(row.id);
+      return source && action ? [{ action, dedupeKey: source.dedupeKey }] : [];
+    });
+  }
+
+  /** 点击采纳才创建行动；事务内重查当前快照、版本和稳定键，防止旧页面或重复点击。 */
+  adoptMemberAssessmentAction(input: AdoptMemberAssessmentActionInput): ActionItem {
+    const timestamp = this.now().toISOString();
+    const actionId = this.db.transaction(() => {
+      const person = this.db.prepare(`SELECT id FROM persons WHERE id = ? AND archived_at IS NULL`).get(input.personId);
+      if (!person) throw new Error('PERSON_NOT_FOUND');
+      const row = this.db.prepare(`
+        SELECT payload_json, fact_revision, context_revision FROM member_assessment_snapshots_v3
+        WHERE id = ? AND person_id = ? AND status = 'current'
+      `).get(input.snapshotId, input.personId) as {
+        payload_json: string; fact_revision: number; context_revision: number
+      } | undefined;
+      if (!row || row.fact_revision !== this.getFactRevision(input.personId)
+        || row.context_revision !== this.getClinicalContextRevision(input.personId)) {
+        throw new Error('MEMBER_ASSESSMENT_ACTION_STALE');
+      }
+      const snapshot = JSON.parse(row.payload_json) as MemberAssessmentSnapshotV3;
+      const proposal = snapshot.actions.find((item) => item.id === input.actionId);
+      if (!proposal || snapshot.heldTargetIds.includes(input.actionId)) throw new Error('MEMBER_ASSESSMENT_ACTION_NOT_AVAILABLE');
+      const existing = this.listAdoptedMemberAssessmentActions(input.personId)
+        .find((item) => item.dedupeKey === proposal.dedupeKey && item.action.status !== 'dismissed');
+      if (existing) return existing.action.id;
+      const id = randomUUID();
+      const detail = [proposal.why, `第一步：${proposal.firstStep}`,
+        proposal.reviewPlan ? `回看：${proposal.reviewPlan}` : null,
+        proposal.caution ? `注意：${proposal.caution}` : null]
+        .filter((part): part is string => Boolean(part)).join('\n');
+      const sourceRef = `${assessmentActionSourcePrefix}${JSON.stringify({
+        snapshotId: input.snapshotId, actionId: input.actionId, dedupeKey: proposal.dedupeKey
+      })}`;
+      this.db.prepare(`
+        INSERT INTO action_items (
+          id, person_id, origin, source_ref, status, title, detail,
+          due_date, due_text, user_revision, updated_at
+        ) VALUES (?, ?, 'ai_proposed', ?, 'planned', ?, ?, NULL, ?, 1, ?)
+      `).run(id, input.personId, sourceRef, proposal.title, detail, proposal.timing, timestamp);
+      this.db.prepare(`
+        INSERT INTO action_events (id, action_id, actor, previous_status, next_status, note, created_at)
+        VALUES (?, ?, 'user', NULL, 'planned', '用户采纳成员健康解读中的行动', ?)
+      `).run(randomUUID(), id, timestamp);
+      return id;
+    })();
+    return this.listActionItems(input.personId).find((item) => item.id === actionId)!;
   }
 
   listLifestyleProposals(personId: string): StoredLifestyleProposal[] {

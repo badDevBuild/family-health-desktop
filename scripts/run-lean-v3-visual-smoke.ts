@@ -7,6 +7,7 @@ import { aiReasoningEffortSchema } from '@contracts';
 import { redactSensitiveLog, spawnCodexAppServer } from '../packages/codex-adapter/src/index.js';
 import { CodexRuntimeManager } from '../apps/desktop/src/main/codex-runtime.js';
 import { DocumentExtractionPipeline } from '../apps/desktop/src/main/processing-pipeline.js';
+import { MemberAssessmentPipeline } from '../apps/desktop/src/main/member-assessment-pipeline.js';
 import { PersonalWorkspaceService } from '../apps/desktop/src/main/workspace-service.js';
 
 /** 只用内存生成的虚构 PNG 验证真实 P01 图像链路，不读取家庭工作区或冒称临床准确率。 */
@@ -47,6 +48,7 @@ if (process.argv.includes('--fixture-only')) {
 }
 
 const modelId = process.argv.find((arg) => arg.startsWith('--model='))?.slice('--model='.length) ?? 'gpt-5.6-sol';
+const fullAssessment = process.argv.includes('--full-assessment');
 const reasoningEffort = aiReasoningEffortSchema.parse(
   process.argv.find((arg) => arg.startsWith('--effort='))?.slice('--effort='.length) ?? 'medium'
 );
@@ -70,12 +72,24 @@ const runtime = new CodexRuntimeManager({ executable, runtimeVersion: null,
     });
     return client;
   } });
-const calls: Array<{ stage: 'P01' | 'P03' | 'extra'; durationMs: number; inputTokens: number | null;
+const calls: Array<{ stage: 'P01' | 'P01_P03' | 'P02' | 'P02_P03' | 'P04'; durationMs: number; inputTokens: number | null;
   outputTokens: number | null; webSearches: number; imageCount: number }> = [];
 const receipt: Record<string, unknown> = {
-  kind: 'P01_IMAGE_ONLY_SYNTHETIC', syntheticOnly: true, modelId, reasoningEffort,
+  kind: fullAssessment ? 'P01_P02_IMAGE_SYNTHETIC' : 'P01_IMAGE_ONLY_SYNTHETIC',
+  syntheticOnly: true, modelId, reasoningEffort,
   webSearchAllowed: false, createdAt: new Date().toISOString(), calls
 };
+
+async function runTrackedTurn(stage: (typeof calls)[number]['stage'], input: {
+  prompt: string; imagePaths?: string[]; outputSchema: Record<string, unknown>;
+  allowWebSearch?: boolean; timeoutMs?: number;
+}) {
+  const turn = await runtime.runStructuredTurn<unknown>({ ...input, aiPreferences: { modelId, reasoningEffort } });
+  calls.push({ stage, durationMs: turn.metrics.durationMs, inputTokens: turn.metrics.inputTokens,
+    outputTokens: turn.metrics.outputTokens, webSearches: turn.metrics.webSearches,
+    imageCount: input.imagePaths?.length ?? 0 });
+  return turn;
+}
 
 try {
   const account = await runtime.refreshAccount();
@@ -91,14 +105,7 @@ try {
   receipt.source = { mediaType: manifest.mediaType, spanKinds: manifest.spans.map((span) => span.spanKind),
     sourceHasTextQuote: manifest.spans.some((span) => span.quote !== null) };
   const pipeline = new DocumentExtractionPipeline(service.store, {
-    runStructuredTurn: async (input) => {
-      const turn = await runtime.runStructuredTurn<unknown>({ ...input, aiPreferences: { modelId, reasoningEffort } });
-      calls.push({ stage: calls.length === 0 ? 'P01' : calls.length === 1 ? 'P03' : 'extra',
-        durationMs: turn.metrics.durationMs, inputTokens: turn.metrics.inputTokens,
-        outputTokens: turn.metrics.outputTokens, webSearches: turn.metrics.webSearches,
-        imageCount: input.imagePaths?.length ?? 0 });
-      return turn;
-    }
+    runStructuredTurn: (input) => runTrackedTurn(calls.length === 0 ? 'P01' : 'P01_P03', input)
   });
   const result = await pipeline.process(documentId);
   const facts = service.store.listAcceptedObservations(personId).map((fact) => ({
@@ -117,6 +124,21 @@ try {
   receipt.expectedValuesFound = expectedValuesFound;
   if (result.status !== 'published' || !Object.values(expectedValuesFound).every(Boolean)
     || calls.some((call) => call.imageCount !== 1 || call.webSearches !== 0)) process.exitCode = 1;
+  if (fullAssessment && result.status === 'published') {
+    const assessment = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: (input) => runTrackedTurn(input.prompt.includes('REVIEW_REQUEST=') ? 'P04'
+        : input.prompt.includes('REPAIR_REQUEST=') ? 'P02_P03' : 'P02', input)
+    }, undefined, undefined, undefined, modelId, reasoningEffort, '2026-09-22', false).process(personId);
+    const published = assessment.status === 'published'
+      ? service.store.listMemberAssessmentSnapshots(personId, true)[0] : null;
+    receipt.assessment = { status: assessment.status, callCount: assessment.callCount,
+      reason: assessment.status === 'rejected' ? assessment.reason : null,
+      headline: published?.overview.headline ?? null,
+      claimCount: published?.claims.length ?? null, actionCount: published?.actions.length ?? null };
+    if (assessment.status !== 'published' || calls.length !== 2
+      || calls[0]?.stage !== 'P01' || calls[1]?.stage !== 'P02'
+      || calls.some((call) => call.webSearches !== 0)) process.exitCode = 1;
+  }
 } catch (error) {
   receipt.errorCode = error instanceof Error ? error.message.split(':')[0] : 'UNKNOWN';
   receipt.runtimeErrors = runtimeErrors.slice(-3);

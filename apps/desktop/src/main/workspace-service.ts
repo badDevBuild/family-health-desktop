@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
-import type { AccountState, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
+import type { AccountState, ActionItem, ActionStatus, AdoptMemberAssessmentActionInput, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
 import { adoptedActionReceiptSchema, bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, lifestyleProposalDecisionReceiptSchema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
 import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, stableHash, type TrendObservationInput } from '@core';
 import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
@@ -875,8 +875,11 @@ export class PersonalWorkspaceService {
     const derived = this.store.listLatestDerivedSnapshots().find((snapshot) => snapshot.personId === personId);
     const storedProposals = this.store.listLifestyleProposals(personId);
     const storedAdoptions = this.store.listActionAdoptions(personId);
+    const assessmentAdoptions = this.store.listAdoptedMemberAssessmentActions(personId);
+    const assessmentAdoptionIds = new Set(assessmentAdoptions.map((item) => item.action.id));
     const useMaterializedPlan = storedProposals.length > 0 || storedAdoptions.length > 0;
-    const legacyActions = useMaterializedPlan ? [] : this.store.listActionItems(personId);
+    const legacyActions = useMaterializedPlan ? [] : this.store.listActionItems(personId)
+      .filter((action) => !assessmentAdoptionIds.has(action.id));
     const proposalSchema = lifestylePlanV2Schema.shape.proposals.element;
     let legacyProjectionUsed = false;
     const legacyProposals = useMaterializedPlan ? [] : (derived?.payload.lifestyleGuidance ?? []).flatMap((guidance) => {
@@ -944,7 +947,8 @@ export class PersonalWorkspaceService {
       personId,
       status: legacyProjectionUsed ? 'stale' : derived?.status ?? 'unavailable',
       dataQuality: derived?.payload.dataQuality ?? (observations.length > 0 ? 'partial' : 'insufficient'),
-      updatedAt: storedProposals[0]?.updatedAt ?? storedAdoptions[0]?.updatedAt ?? derived?.createdAt ?? null,
+      updatedAt: storedProposals[0]?.updatedAt ?? storedAdoptions[0]?.updatedAt
+        ?? assessmentAdoptions[0]?.action.updatedAt ?? derived?.createdAt ?? null,
       priorities: derived?.payload.claims.filter((claim) => claim.level === 'action').slice(0, 3).map((claim) => ({
         id: `priority-${claim.id}`,
         title: claim.title,
@@ -973,7 +977,7 @@ export class PersonalWorkspaceService {
           relatedSystemIds: proposal.relatedSystemIds
         }))
         : legacyProposals,
-      adoptedActions: useMaterializedPlan
+      adoptedActions: [...(useMaterializedPlan
         ? storedAdoptions.map((action) => ({
           id: action.id,
           proposalId: action.proposalId,
@@ -999,7 +1003,12 @@ export class PersonalWorkspaceService {
           status: action.status,
           dueDate: action.dueDate,
           updatedAt: action.updatedAt
-        }))
+        }))), ...assessmentAdoptions.map(({ action, dedupeKey }) => ({
+        id: action.id, proposalId: null, assessmentDedupeKey: dedupeKey,
+        title: action.title, userGoal: action.title, selectedStartingOption: action.detail,
+        plannedTime: action.dueText, owner: '本人', progressNote: null,
+        status: action.status, dueDate: action.dueDate, updatedAt: action.updatedAt
+      }))]
     });
   }
 
@@ -1020,6 +1029,13 @@ export class PersonalWorkspaceService {
       dueDate: action.dueDate,
       updatedAt: action.updatedAt
     });
+  }
+
+  adoptMemberAssessmentAction(input: AdoptMemberAssessmentActionInput): ActionItem {
+    this.requireActivePerson(input.personId);
+    const current = this.getMemberAssessment(input.personId);
+    if (!current || current.id !== input.snapshotId) throw new Error('MEMBER_ASSESSMENT_ACTION_STALE');
+    return this.store.adoptMemberAssessmentAction(input);
   }
 
   setLifestyleProposalDecision(input: SetLifestyleProposalDecisionInput): LifestyleProposalDecisionReceipt {

@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { AccountState, ActionItem, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, AiPreferences, AiSettings, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, CleanupReceipt, ConceptMappingReceipt, ConceptReviewBundle, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, ManualNote, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, Person, ProcessNowInput, ReportMetadataCorrectionReceipt, ResolveReviewInput, RestorePersonInput, Result, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
+import type { AdoptMemberAssessmentActionInput } from '@contracts';
 
 export interface HealthDesktopBridge {
   getBootstrap(): Promise<{
@@ -29,6 +30,7 @@ export interface HealthDesktopBridge {
   getMemberEvidenceBundle(personId: string, evidenceIds: string[]): Promise<Result<MemberEvidenceBundle>>;
   getLifestylePlan(personId: string): Promise<Result<LifestylePlanV2>>;
   adoptLifestyleProposal(input: AdoptLifestyleProposalInput): Promise<Result<AdoptedActionReceipt>>;
+  adoptMemberAssessmentAction(input: AdoptMemberAssessmentActionInput): Promise<Result<ActionItem>>;
   setLifestyleProposalDecision(input: SetLifestyleProposalDecisionInput): Promise<Result<LifestyleProposalDecisionReceipt>>;
   getDiagnosticPreview(): Promise<Result<DiagnosticBundle>>;
   exportDiagnostic(): Promise<Result<DiagnosticExportReceipt | null>>;
@@ -102,6 +104,7 @@ const bridge: HealthDesktopBridge = {
   getMemberEvidenceBundle: (personId, evidenceIds) => ipcRenderer.invoke('evidence:get-bundle', { personId, evidenceIds }),
   getLifestylePlan: (personId) => ipcRenderer.invoke('guidance:get-plan', { personId }),
   adoptLifestyleProposal: (input) => ipcRenderer.invoke('guidance:adopt-proposal', input),
+  adoptMemberAssessmentAction: (input) => ipcRenderer.invoke('guidance:adopt-assessment-action', input),
   setLifestyleProposalDecision: (input) => ipcRenderer.invoke('guidance:set-proposal-decision', input),
   getDiagnosticPreview: () => ipcRenderer.invoke('diagnostics:get-preview'),
   exportDiagnostic: () => ipcRenderer.invoke('diagnostics:export'),
