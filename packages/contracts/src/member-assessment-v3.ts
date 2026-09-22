@@ -190,7 +190,9 @@ export const memberEvidencePackageV3Schema = z.object({
     id,
     sourceId: id,
     applicability: text,
-    requiredCriterionIds: z.array(id).min(1)
+    requiredCriterionIds: z.array(id).min(1),
+    /** 仅由应用的受控标准匹配器产生，模型不能自行增加合格证据。 */
+    verifiedRequirements: z.array(z.object({ criterionId: id, evidenceIds: z.array(id).min(1) }).strict())
   }).strict()),
   partitionResults: z.array(memberAssessmentCandidateV3Schema)
 }).strict();

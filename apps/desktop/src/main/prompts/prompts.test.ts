@@ -3,8 +3,9 @@ import type { ExtractionResult } from '@contracts';
 import {
   ACCEPTANCE_RULES_VERSION,
   DERIVED_PROMPT_VERSION,
-  DERIVED_SAFETY_RULES_VERSION,
   EXTRACTION_PROMPT_VERSION,
+  MEMBER_ASSESSMENT_PROMPT_VERSION,
+  MEMBER_ASSESSMENT_RULES_VERSION,
   buildAdjudicateAbnormalFlagsPrompt,
   buildAdjudicateFactDifferencesPrompt,
   buildAnalyzePrompt,
@@ -41,15 +42,15 @@ function instructionPart(prompt: string): string {
 
 describe('pipeline prompts', () => {
   it('版本号与阶段签名保持一致', () => {
-    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v3');
+    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v4');
     expect(DERIVED_PROMPT_VERSION).toBe('derived-v4');
     expect(promptMetaForStage('extract')).toEqual({
-      promptVersion: 'extract-v3',
+      promptVersion: 'extract-v4',
       rulesVersion: ACCEPTANCE_RULES_VERSION
     });
     expect(promptMetaForStage('analyze')).toEqual({
-      promptVersion: 'derived-v4',
-      rulesVersion: DERIVED_SAFETY_RULES_VERSION
+      promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION,
+      rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION
     });
   });
 

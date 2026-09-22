@@ -113,7 +113,11 @@ export class MemberAssessmentPipeline {
       this.store.assertObservationScopeActive(this.executionGuard, personId, this.store.listAcceptedObservations(personId));
     }
     const current = this.store.listMemberAssessmentSnapshots(personId, true)
-      .find((snapshot) => snapshot.inputSignature === request.inputSignature);
+      .find((snapshot) => snapshot.inputSignature === request.inputSignature
+        && snapshot.promptVersion === MEMBER_ASSESSMENT_PROMPT_VERSION
+        && snapshot.rulesVersion === MEMBER_ASSESSMENT_RULES_VERSION
+        && snapshot.factRevision === built.factRevision
+        && snapshot.contextRevision === built.contextRevision);
     if (current) return { status: 'skipped', reason: 'signature_current', callCount: 0 };
     let calls = 0;
     let lastReceipt: { threadId: string; turnId: string } | null = null;
@@ -197,7 +201,10 @@ export class MemberAssessmentPipeline {
       reviewedTargetIds = targetIds;
       validationMode = 'local_and_focused_review';
       const after = routeFocusedReview(candidate);
-      const newlyHigh = after.targetIds.filter((id) => !targetIds.includes(id));
+      // 同一个依赖节点原本在复核范围内，不代表复核者新写入的高影响内容已被独立审过。
+      const priorReasons = new Set(route.reasons);
+      const newlyHigh = [...new Set(after.reasons.filter((reason) => !priorReasons.has(reason))
+        .map((reason) => reason.slice(reason.indexOf(':') + 1)))];
       if (newlyHigh.length > 0) {
         const holds: ClinicalFocusedReviewV1 = {
           schemaVersion: 1, personId, inputSignature: request.inputSignature,

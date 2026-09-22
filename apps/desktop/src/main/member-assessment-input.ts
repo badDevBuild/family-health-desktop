@@ -3,7 +3,9 @@ import { assessmentRequestV3Schema, memberEvidencePackageV3Schema } from '@contr
 import { bodySystemRegistry, stableHash } from '@core';
 import type { WorkspaceStore } from '@storage';
 import { buildSystemEvidenceBundle } from './system-evidence.js';
-import { MEMBER_ASSESSMENT_PROMPT_VERSION } from './prompts/index.js';
+import { HEALTH_PIPELINE_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, RUNTIME_PROMPT_VERSION } from './prompts/index.js';
+import { ASSESSMENT_VALIDATION_RULES_VERSION } from './assessment-validation.js';
+import { CLINICAL_ROUTER_VERSION } from './clinical-review-router.js';
 
 export const MEMBER_EVIDENCE_SELECTOR_VERSION = 'member-evidence-v3';
 
@@ -110,7 +112,10 @@ export function buildMemberAssessmentInput(
     .filter((issue) => issue.personId === personId)
     .map((issue) => ({ documentId: issue.documentId, reasonCodes: issue.reasonCodes.length ? issue.reasonCodes : [issue.kind] }));
   const existingActions = store.listActionItems(personId).map((action) => ({
-    id: action.id, title: action.title, detail: action.detail, status: action.status,
+    // 进度由本地覆盖层管理；从计划到完成不改变医学输入签名。
+    // 明确“暂不采纳”才是需要尊重的内容偏好。
+    id: action.id, title: action.title, detail: action.detail,
+    status: action.status === 'dismissed' ? 'dismissed' : 'existing',
     systemIds: [...actionSystems.get(action.id) ?? []]
   }));
   const evidencePackage = memberEvidencePackageV3Schema.parse({
@@ -124,8 +129,12 @@ export function buildMemberAssessmentInput(
   const contextRevision = store.getClinicalContextRevision(personId);
   const inputSignature = stableHash({
     personId, selectorVersion: MEMBER_EVIDENCE_SELECTOR_VERSION,
-    promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION, modelId: options.modelId, reasoningEffort: options.reasoningEffort,
-    analysisReferenceDate: options.analysisReferenceDate, factRevision, contextRevision, evidencePackage
+    pipelineVersion: HEALTH_PIPELINE_VERSION, runtimePromptVersion: RUNTIME_PROMPT_VERSION,
+    promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION, rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION,
+    validationRulesVersion: ASSESSMENT_VALIDATION_RULES_VERSION, clinicalRouterVersion: CLINICAL_ROUTER_VERSION,
+    modelId: options.modelId, reasoningEffort: options.reasoningEffort,
+    analysisReferenceDate: options.analysisReferenceDate, webSearchAllowed: options.webSearchAllowed,
+    factRevision, contextRevision, evidencePackage
   });
   const request = assessmentRequestV3Schema.parse({
     personId, inputSignature, mode: 'full', requestedSystemIds,

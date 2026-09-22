@@ -237,7 +237,7 @@ describe('CodexRuntimeManager', () => {
     const turnStart = client.requests.find((request) => request.method === 'turn/start');
     expect(threadStart?.params).toMatchObject({
       config: { web_search: 'live' },
-      developerInstructions: expect.stringContaining('de-identified')
+      developerInstructions: expect.stringContaining('去标识化')
     });
     expect((threadStart?.params as { config?: Record<string, unknown> }).config).not.toHaveProperty('tools');
     expect(turnStart?.params).toMatchObject({ sandboxPolicy: { type: 'readOnly', networkAccess: false } });

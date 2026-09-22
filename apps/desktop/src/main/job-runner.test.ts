@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { DEFAULT_AI_PREFERENCES, type AccountState, type DerivedSafetyReview, type DerivedSnapshotCandidate, type ExtractionResult, type SystemAnalysisCandidate, type SystemAnalysisReview } from '@contracts';
+import type { AccountState, AssessmentRequestV3, ExtractionResult, MemberAssessmentCandidateV3, MemberEvidencePackageV3 } from '@contracts';
 import type { CodexRuntimeManager } from './codex-runtime.js';
 import { ProcessingJobRunner } from './job-runner.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
@@ -14,199 +14,146 @@ afterEach(() => {
 });
 
 describe('ProcessingJobRunner', () => {
-  it.each([
-    { label: '一次性授权任务依次完成事实与派生阶段', rejectSystem: false, expectedStatus: 'succeeded', expectedCalls: 6 },
-    { label: '系统说明未通过时保留事实并标记部分完成', rejectSystem: true, expectedStatus: 'completed_with_issues', expectedCalls: 5 }
-  ])('$label', async ({ rejectSystem, expectedStatus, expectedCalls }) => {
+  const connectedState: AccountState = {
+    status: 'connected', displayLabel: 'fixture@example.test',
+    quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },
+    runtimeVersion: 'fixture-runtime', lastCheckedAt: '2026-09-18T00:00:00Z'
+  };
+
+  function parsePromptValue<T>(prompt: string, key: string, nextKey?: string): T {
+    const content = prompt.split(key + '=')[1]!;
+    return JSON.parse(nextKey ? content.split('\n' + nextKey + '=')[0]! : content) as T;
+  }
+
+  function assessmentFor(request: AssessmentRequestV3, evidence: MemberEvidencePackageV3): MemberAssessmentCandidateV3 {
+    const evidenceId = evidence.facts[0]!.evidenceIds[0]!;
+    return {
+      schemaVersion: 3, personId: request.personId, inputSignature: request.inputSignature,
+      mode: request.mode, requestedSystemIds: request.requestedSystemIds,
+      overview: { id: 'overview', headline: '一项血脂结果需要关注',
+        summary: '这份报告中的 LDL-C 高于随附参考上限；目前不据此宣布疾病。',
+        claimIds: ['claim-ldl'], actionIds: [], limitations: [] },
+      systems: request.requestedSystemIds.map((systemId) => ({
+        id: 'system:' + systemId, systemId, status: 'attention',
+        headline: '血脂结果需关注', summary: 'LDL-C 高于报告参考上限。',
+        claimIds: ['claim-ldl'], actionIds: [], limitations: []
+      })),
+      claims: [{ id: 'claim-ldl', topicKey: 'lipids', systemIds: request.requestedSystemIds,
+        kind: 'interpretation', text: 'LDL-C 4.2 mmol/L，高于报告参考上限。',
+        diseaseName: null, diagnosticStatus: null, temporalStatus: 'current',
+        evidenceIds: [evidenceId], counterEvidenceIds: [], trendIds: [],
+        knowledgeBasis: 'model_general', knowledgeSourceIds: [], criteriaBasis: null,
+        rationale: '报告记载该数值。', materialUncertainty: null, consequenceLevel: 'routine' }],
+      actions: [], questions: [], knowledgeSources: []
+    };
+  }
+
+  it.each([1, 3])('同批 %i 份资料各一次 P01，全部完成后只做一次 P02', async (documentCount) => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-runner-'));
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '测试工作区', () => new Date('2026-09-18T00:00:00Z'));
     const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
-    await service.importFiles([{ path: '/tmp/虚构报告.txt', bytes: Buffer.from('2026-09-17 LDL-C 4.2 mmol/L') }], personId);
-    const documentId = service.getSnapshot(null).inbox[0]!.id;
-    const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
-    const state: AccountState = {
-      status: 'connected', displayLabel: 'fixture@example.test',
-      quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },
-      runtimeVersion: 'fixture-runtime', lastCheckedAt: '2026-09-18T00:00:00Z'
-    };
-    service.processNow({ accountState: state, consentVersion: 1 });
-    const extraction: ExtractionResult = {
-      schemaVersion: 1, documentId, coveredSourceSpanIds: [spanId],
-      subject: { reportedName: null, evidence: [], confidence: 'absent' },
-      candidates: [{
-        localKey: 'ldl-1', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
-        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
-        unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4', reportedAbnormalFlag: 'high',
-        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
-        evidence: [{ sourceSpanId: spanId, quote: '2026-09-17 LDL-C 4.2 mmol/L' }], issues: []
-      }]
-    };
-    let call = 0;
-    let candidate: DerivedSnapshotCandidate | null = null;
+    await service.importFiles(Array.from({ length: documentCount }, (_, index) => ({
+      path: '/tmp/虚构报告-' + index + '.txt',
+      bytes: Buffer.from('2026-09-17 LDL-C 4.' + (index + 2) + ' mmol/L')
+    })), personId);
+    service.processNow({ accountState: connectedState, consentVersion: 1 });
+    let extractionCalls = 0;
+    let assessmentCalls = 0;
     const runtime = {
-      getState: () => state,
-      runStructuredTurn: async (input: { prompt: string }) => {
-        call += 1;
-        if (call <= 2) return { threadId: 'extract-thread', turnId: `extract-${call}`, output: extraction };
-        const observationId = service.store.listAcceptedObservations(personId)[0]!.id;
-        if (call === 3) {
-          candidate = {
-            schemaVersion: 1, personId, factRevision: 1, dataQuality: 'partial',
-            claims: [{
-              id: 'claim-1', organId: 'cardiovascular', level: 'action', title: '咨询血脂记录',
-              explanation: '原报告记录 LDL-C 4.2 mmol/L；建议就此咨询医生。',
-              evidenceObservationIds: [observationId], boundaryNote: '这不是诊断。'
-            }],
-            lifestyleGuidance: []
+      getState: () => connectedState,
+      runStructuredTurn: async (input: { prompt: string; allowWebSearch?: boolean }) => {
+        if (input.prompt.includes('SOURCE_PACKAGE=')) {
+          extractionCalls += 1;
+          expect(input.allowWebSearch).toBe(false);
+          const source = parsePromptValue<{ documentId: string; spans: Array<{ sourceSpanId: string; quote: string }> }>(input.prompt, 'SOURCE_PACKAGE');
+          const span = source.spans[0]!;
+          const value = span.quote.match(/LDL-C ([\d.]+)/)![1]!;
+          const extraction: ExtractionResult = {
+            schemaVersion: 1, documentId: source.documentId, coveredSourceSpanIds: source.spans.map((item) => item.sourceSpanId),
+            subject: { reportedName: null, evidence: [], confidence: 'absent' },
+            candidates: [{
+              localKey: 'ldl', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
+              value: { kind: 'numeric', rawText: value, decimal: value, comparator: 'eq' },
+              unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+              specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
+              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: []
+            }]
           };
-          return { threadId: 'derived-thread', turnId: 'derived-1', output: candidate };
+          return { threadId: 'extract', turnId: 'extract-' + extractionCalls, output: extraction };
         }
-        if (call === 4) {
-          const review: DerivedSafetyReview = {
-            schemaVersion: 1, personId, factRevision: 1, overallSafe: true,
-            claimReviews: [{ claimId: candidate!.claims[0]!.id, supported: true, safe: true, issue: null }],
-            guidanceReviews: []
-          };
-          return { threadId: 'derived-thread', turnId: 'derived-2', output: review };
-        }
-        const bundle = service.buildSystemEvidenceBundle(personId, 'cardiovascular', DEFAULT_AI_PREFERENCES.modelId);
-        if (call === 5 || (rejectSystem && call === 6)) {
-          const citedEvidenceId = input.prompt.match(/evidence-[^"\\]+-primary/)?.[0]
-            ?? bundle.directFacts[0]!.evidence.id;
-          const systemCandidate: SystemAnalysisCandidate = {
-            schemaVersion: 2,
-            personId,
-            systemId: 'cardiovascular',
-            inputSignature: bundle.scope.inputSignature,
-            headline: '这份记录中的 LDL-C 带有原报告偏高标记。',
-            overview: 'LDL-C 带有原报告偏高标记；目前只有一次结果，不能判断长期变化。',
-            assessmentStatus: 'attention',
-            dataQuality: 'partial',
-            keyPoints: [{
-              id: 'point-ldl',
-              kind: 'fact_summary',
-              text: 'LDL-C 4.2 mmol/L，高于该报告参考上限 3.4。',
-              evidenceIds: [rejectSystem && call === 5 ? 'missing-fact-evidence' : citedEvidenceId],
-              limitations: [],
-              trendFactIds: []
-            }],
-            topicSections: [{ topicId: 'lipids', title: '血脂', claimIds: ['point-ldl'], seriesIds: [], findingIds: [] }],
-            conflicts: [],
-            dataGaps: [{ text: '只有一次结果。', consequence: '不能判断趋势。' }],
-            discussionPoints: [],
-            recommendations: [],
-            clinicallyImportantUnknowns: ['目前只有一次结果。']
-          };
-          return { threadId: 'system-thread', turnId: 'system-1', output: systemCandidate };
-        }
-        const review: SystemAnalysisReview = {
-          schemaVersion: 1, personId,
-          systemId: 'cardiovascular',
-          inputSignature: bundle.scope.inputSignature,
-          overallSupported: true,
-          itemReviews: [{ itemId: 'point-ldl', supported: true, safe: true, trendConsistent: true, useful: true, issue: null }]
-        };
-        return { threadId: 'system-thread', turnId: 'system-2', output: review };
+        assessmentCalls += 1;
+        expect(input.prompt).toContain('ASSESSMENT_REQUEST=');
+        const request = parsePromptValue<AssessmentRequestV3>(input.prompt, 'ASSESSMENT_REQUEST', 'MEMBER_EVIDENCE_PACKAGE');
+        const evidence = parsePromptValue<MemberEvidencePackageV3>(input.prompt, 'MEMBER_EVIDENCE_PACKAGE');
+        return { threadId: 'assess', turnId: 'assess-1', output: assessmentFor(request, evidence) };
       }
     } as unknown as CodexRuntimeManager;
-    const runner = new ProcessingJobRunner(runtime);
-    await runner.runAvailableJobs(service.store);
-    expect(call).toBe(expectedCalls);
+    await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
+    expect(extractionCalls).toBe(documentCount);
+    expect(assessmentCalls).toBe(1);
     expect(service.store.listStoredJobs()[0]).toMatchObject({
-      status: expectedStatus,
-      stage: 'publish',
-      completedUnits: 1,
-      systemOutcomes: expect.arrayContaining([
-        expect.objectContaining({ systemId: 'cardiovascular', status: rejectSystem ? 'rejected' : 'published' }),
-        expect.objectContaining({ systemId: 'endocrine_metabolic', status: 'skipped_no_data' }),
-        expect.objectContaining({ systemId: 'renal_urinary', status: 'skipped_no_data' })
-      ])
+      status: 'succeeded', stage: 'publish', completedUnits: documentCount
     });
-    expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);
-    expect(service.store.listSystemAnalysisSnapshots(personId, true)).toHaveLength(rejectSystem ? 0 : 1);
-    expect(service.getSnapshot(state).persons[0]).toMatchObject({ derivedStatus: 'current', acceptedFactCount: 1 });
-    expect(service.getSnapshot(state).inbox[0]).toMatchObject({ sentToAi: true, aiTransmissionStatus: 'completed' });
-    if (rejectSystem) {
-      const jobId = service.store.listStoredJobs()[0]!.id;
-      service.store.retryFailedJob(jobId);
-      await runner.runAvailableJobs(service.store);
-      expect(call).toBe(7);
-      expect(service.store.listStoredJobs()[0]).toMatchObject({
-        status: 'succeeded',
-        systemOutcomes: expect.arrayContaining([
-          expect.objectContaining({ systemId: 'cardiovascular', status: 'published' }),
-          expect.objectContaining({ systemId: 'endocrine_metabolic', status: 'skipped_no_data' })
-        ])
-      });
-      expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
-      expect(service.store.listCurrentDerivedSnapshots()).toHaveLength(1);
-      expect(service.store.listSystemAnalysisSnapshots(personId, true)).toHaveLength(1);
-    }
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(documentCount);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)).toHaveLength(1);
     service.close();
   });
 
-  it('一份资料需要核对时仍继续处理同批其余资料', async () => {
+  it('身份冲突只隔离该资料，其他资料仍提取并参与一次成员综合', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-runner-partial-review-'));
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '测试工作区', () => new Date('2026-09-18T00:00:00Z'));
     const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
     await service.importFiles([
-      { path: '/tmp/虚构待核对报告一.txt', bytes: Buffer.from('报告一 2026-09-17 LDL-C 4.2 mmol/L') },
-      { path: '/tmp/虚构清晰报告二.txt', bytes: Buffer.from('报告二 2026-09-17 LDL-C 4.2 mmol/L') }
+      { path: '/tmp/虚构待核对报告一.txt', bytes: Buffer.from('姓名：另一人 2026-09-17 LDL-C 4.1 mmol/L') },
+      { path: '/tmp/虚构清晰报告二.txt', bytes: Buffer.from('2026-09-17 LDL-C 4.2 mmol/L') }
     ], personId);
-    const state: AccountState = {
-      status: 'connected', displayLabel: 'fixture@example.test',
-      quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },
-      runtimeVersion: 'fixture-runtime', lastCheckedAt: '2026-09-18T00:00:00Z'
-    };
-    service.processNow({ accountState: state, consentVersion: 1 });
-    const job = service.store.listStoredJobs()[0]!;
-    const [reviewDocumentId, clearDocumentId] = job.documentIds;
-    const reviewSpanId = service.store.getDocumentExtractionBundle(reviewDocumentId!).manifest.spans[0]!.id;
-    const clearSpanId = service.store.getDocumentExtractionBundle(clearDocumentId!).manifest.spans[0]!.id;
-    const needsReviewOutput: ExtractionResult = {
-      schemaVersion: 1,
-      documentId: reviewDocumentId!,
-      subject: { reportedName: null, evidence: [], confidence: 'absent' },
-      coveredSourceSpanIds: [],
-      candidates: []
-    };
-    const clearOutput: ExtractionResult = {
-      schemaVersion: 1,
-      documentId: clearDocumentId!,
-      subject: { reportedName: null, evidence: [], confidence: 'absent' },
-      coveredSourceSpanIds: [clearSpanId],
-      candidates: [{
-        localKey: 'ldl-clear', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
-        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
-        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
-        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
-        evidence: [{ sourceSpanId: clearSpanId, quote: '2026-09-17 LDL-C 4.2 mmol/L' }], issues: []
-      }]
-    };
-    let call = 0;
+    service.processNow({ accountState: connectedState, consentVersion: 1 });
+    const documentIds = service.store.listStoredJobs()[0]!.documentIds;
+    const conflictDocumentId = documentIds.find((id) => service.store.getDocumentExtractionBundle(id).manifest.spans
+      .some((span) => span.quote?.includes('姓名：另一人')))!;
+    const clearDocumentId = documentIds.find((id) => id !== conflictDocumentId)!;
+    let extractionCalls = 0;
+    let assessmentCalls = 0;
     const runtime = {
-      getState: () => state,
-      runStructuredTurn: async () => {
-        call += 1;
-        return call <= 2
-          ? { threadId: 'review-thread', turnId: 'review-turn', output: needsReviewOutput }
-          : { threadId: 'clear-thread', turnId: `clear-${call}`, output: clearOutput };
+      getState: () => connectedState,
+      runStructuredTurn: async (input: { prompt: string }) => {
+        if (input.prompt.includes('SOURCE_PACKAGE=')) {
+          extractionCalls += 1;
+          const source = parsePromptValue<{ documentId: string; spans: Array<{ sourceSpanId: string; quote: string }> }>(input.prompt, 'SOURCE_PACKAGE');
+          const span = source.spans[0]!;
+          const conflict = source.documentId === conflictDocumentId;
+          const output: ExtractionResult = {
+            schemaVersion: 1, documentId: source.documentId, coveredSourceSpanIds: source.spans.map((item) => item.sourceSpanId),
+            subject: conflict
+              ? { reportedName: '另一人', evidence: [{ sourceSpanId: span.sourceSpanId, quote: '姓名：另一人' }], confidence: 'explicit' }
+              : { reportedName: null, evidence: [], confidence: 'absent' },
+            candidates: [{
+              localKey: 'ldl', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
+              value: { kind: 'numeric', rawText: conflict ? '4.1' : '4.2', decimal: conflict ? '4.1' : '4.2', comparator: 'eq' },
+              unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+              specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
+              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: []
+            }]
+          };
+          return { threadId: 'extract', turnId: 'extract-' + extractionCalls, output };
+        }
+        assessmentCalls += 1;
+        const request = parsePromptValue<AssessmentRequestV3>(input.prompt, 'ASSESSMENT_REQUEST', 'MEMBER_EVIDENCE_PACKAGE');
+        const evidence = parsePromptValue<MemberEvidencePackageV3>(input.prompt, 'MEMBER_EVIDENCE_PACKAGE');
+        expect(evidence.facts).toHaveLength(1);
+        return { threadId: 'assess', turnId: 'assess-1', output: assessmentFor(request, evidence) };
       }
     } as unknown as CodexRuntimeManager;
-
     await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
-
-    expect(call).toBe(4);
+    expect(extractionCalls).toBe(2);
+    expect(assessmentCalls).toBe(1);
     expect(service.store.listStoredJobs()[0]).toMatchObject({ status: 'waiting_user', completedUnits: 2, totalUnits: 2 });
-    expect(service.store.listOpenExtractionReviewIssues()).toEqual([
-      expect.objectContaining({ documentId: reviewDocumentId, kind: 'coverage_gap', reasonCodes: ['EXTRACTION_COVERAGE_INCOMPLETE'] })
-    ]);
+    expect(service.store.isDocumentCommitted(conflictDocumentId!)).toBe(false);
     expect(service.store.isDocumentCommitted(clearDocumentId!)).toBe(true);
-    expect(service.store.isDocumentCommitted(reviewDocumentId!)).toBe(false);
-    expect(service.store.getFactRevision(personId)).toBe(1);
-    expect(reviewSpanId).toBeTruthy();
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)).toHaveLength(1);
     service.close();
   });
 

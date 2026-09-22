@@ -1,6 +1,8 @@
 import type {
-  BodySystemId, MemberAssessmentCandidateV3, MemberEvidenceRef
+  BodySystemId, HealthClaim, MemberAssessmentCandidateV3, MemberEvidenceRef
 } from '@contracts';
+
+export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v3';
 
 export interface AssessmentValidationInput {
   personId: string;
@@ -15,6 +17,7 @@ export interface AssessmentValidationInput {
     sourceId: string;
     applicability: string;
     requiredCriterionIds: string[];
+    verifiedRequirements: Array<{ criterionId: string; evidenceIds: string[] }>;
   }>;
 }
 
@@ -25,14 +28,18 @@ export interface AssessmentValidationResult {
 
 // 仅识别面向本人直接执行的药物改变；来源事实中的剂量、检验单位及治疗讨论不据字面拒绝。
 const directMedicationInstruction = /(?:自行|马上|立即|现在|请|应当|必须|建议你)[^。；，]{0,24}(?:停药|停用|换药|加量|减量|开始服用|改用|调整剂量)|(?:停药|停用|换药|加量|减量)[^。；，]{0,12}(?:即可|就行)/i;
-const unsourcedProbability = /(?:患病|发病|罹患|诊断|得[^。；，]{0,8}病)[^。；，]{0,20}\d+(?:\.\d+)?\s*%/i;
+const unsourcedProbability = /(?:患病|发病|罹患|诊断|得[^。；，]{0,8}病|患[^。；，]{0,12}风险|癌症风险)[^。；，]{0,24}\d+(?:\.\d+)?\s*%/i;
 const explicitDiagnosis = /(?:明确诊断|临床诊断|病理诊断|出院诊断|诊断[:：]|确诊|诊断意见[:：])/i;
-const negatedOrTentative = /(?:排除|待排|考虑|疑似|可能|既往|家族史|病史自述|未确诊|不能诊断|尚不能诊断)/i;
+const negatedOrTentative = /(?:排除|待排|考虑|疑似|可能|家族史|病史自述|未确诊|不能诊断|尚不能诊断)/i;
+const historicalDiagnosis = /(?:既往|既往史|既往诊断|曾诊断|病史)/i;
 
-function hasOwnDocumentedDiagnosis(evidence: MemberEvidenceRef, diseaseName: string): boolean {
+function hasOwnDocumentedDiagnosis(evidence: MemberEvidenceRef, diseaseName: string, temporalStatus: HealthClaim['temporalStatus']): boolean {
   const quote = evidence.quote ?? '';
   if (!['observation', 'clinical_finding', 'source_span'].includes(evidence.kind)) return false;
-  return quote.includes(diseaseName) && explicitDiagnosis.test(quote) && !negatedOrTentative.test(quote);
+  const relevantClauses = quote.split(/[。；;\n]/).filter((clause) => clause.includes(diseaseName));
+  return relevantClauses.some((clause) => explicitDiagnosis.test(clause)
+    && !negatedOrTentative.test(clause)
+    && (!historicalDiagnosis.test(clause) || temporalStatus === 'historical'));
 }
 
 export function validateAssessmentCandidate(
@@ -79,10 +86,12 @@ export function validateAssessmentCandidate(
   };
   validateClaims('overview', candidate.overview.claimIds);
   validateActions('overview', candidate.overview.actionIds);
+  if (unsourcedProbability.test(`${candidate.overview.headline} ${candidate.overview.summary}`)) issues.push('unsourced_probability:overview');
   for (const system of candidate.systems) {
     validateClaims(system.id, system.claimIds);
     validateActions(system.id, system.actionIds);
     if (system.claimIds.length === 0 && system.status !== 'insufficient') issues.push(`unsupported_system_status:${system.id}`);
+    if (unsourcedProbability.test(`${system.headline} ${system.summary}`)) issues.push(`unsourced_probability:${system.id}`);
   }
   if (candidate.overview.claimIds.length === 0 && candidate.claims.length > 0) issues.push('overview_missing_claims');
 
@@ -100,17 +109,23 @@ export function validateAssessmentCandidate(
     if (claim.diagnosticStatus === 'documented') {
       if (!claim.evidenceIds.some((id) => {
         const source = evidence.get(id);
-        return source && hasOwnDocumentedDiagnosis(source, claim.diseaseName!);
+        return source && hasOwnDocumentedDiagnosis(source, claim.diseaseName!, claim.temporalStatus);
       })) issues.push(`documented_source_not_proven:${claim.id}`);
     }
     if (claim.diagnosticStatus === 'criteria_met') {
       const criteria = claim.criteriaBasis;
       const supplied = input.criteriaSets.find((set) => set.id === criteria?.criteriaSetId);
       if (!criteria || !supplied || criteria.sourceId !== supplied.sourceId
+        || criteria.applicability !== supplied.applicability
+        || !input.catalogKnowledgeIds.includes(supplied.sourceId)
         || supplied.requiredCriterionIds.length === 0
         || !supplied.requiredCriterionIds.every((id) => criteria.requirements.some((requirement) => (
           requirement.criterionId === id && requirement.status === 'met'
-          && requirement.evidenceIds.length > 0 && requirement.evidenceIds.every((evidenceId) => evidence.has(evidenceId))
+          && requirement.evidenceIds.length > 0 && requirement.evidenceIds.every((evidenceId) => (
+            evidence.has(evidenceId)
+            && supplied.verifiedRequirements.some((verified) => verified.criterionId === id
+              && verified.evidenceIds.includes(evidenceId))
+          ))
         )))) {
         issues.push(`criteria_not_proven:${claim.id}`);
       }
@@ -132,9 +147,10 @@ export function validateAssessmentCandidate(
     if (action.evidenceIds.length === 0) issues.push(`action_personal_evidence_required:${action.id}`);
     if (dedupeKeys.has(action.dedupeKey)) issues.push(`duplicate_action_key:${action.dedupeKey}`);
     dedupeKeys.add(action.dedupeKey);
-    if (action.kind !== 'treatment_discussion' && directMedicationInstruction.test(`${action.title} ${action.firstStep}`)) {
+    if (directMedicationInstruction.test(`${action.title} ${action.why} ${action.firstStep} ${action.timing ?? ''} ${action.reviewPlan ?? ''} ${action.caution ?? ''}`)) {
       issues.push(`direct_medication_change:${action.id}`);
     }
+    if (unsourcedProbability.test(`${action.title} ${action.why} ${action.firstStep}`)) issues.push(`unsourced_probability:${action.id}`);
     if (action.urgency === 'emergency') focusedReviewReasons.push(`emergency_action:${action.id}`);
   }
   for (const question of candidate.questions) {

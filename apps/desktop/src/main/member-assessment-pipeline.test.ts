@@ -1,11 +1,15 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { AssessmentRequestV3, ClinicalFocusedReviewV1, ExtractionResult, MemberAssessmentCandidateV3, MemberEvidencePackageV3 } from '@contracts';
+import type { AccountState, AssessmentRequestV3, ClinicalFocusedReviewV1, ExtractionResult, MemberAssessmentCandidateV3, MemberEvidencePackageV3 } from '@contracts';
+import type { CodexRuntimeManager } from './codex-runtime.js';
+import { ProcessingJobRunner } from './job-runner.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { MemberAssessmentPipeline } from './member-assessment-pipeline.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
+import { validateAssessmentCandidate } from './assessment-validation.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
 
 const roots: string[] = [];
@@ -103,6 +107,59 @@ describe('MemberAssessmentPipeline', () => {
     service.close();
   });
 
+  it('仅更新已采纳行动的完成进度不会使成员医学输入失效', async () => {
+    const { service, personId } = await fixture();
+    const action = service.store.createUserAction({
+      personId, title: '整理既往报告', detail: '下次就诊携带', dueDate: null, dueText: null
+    });
+    const options = { modelId: 'test-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: true };
+    const before = buildMemberAssessmentInput(service.store, personId, options);
+    service.store.updateActionStatus({ actionId: action.id, status: 'completed', expectedRevision: action.userRevision });
+    const after = buildMemberAssessmentInput(service.store, personId, options);
+    expect(after.request.inputSignature).toBe(before.request.inputSignature);
+    expect(after.evidencePackage.existingActions[0]!.status).toBe('existing');
+    service.close();
+  });
+
+  it('旧版综合过期时只重做 P02，已接纳报告事实不重新提取', async () => {
+    const { service, personId, built } = await fixture();
+    await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'original', turnId: 'original', output: candidateFor(built.request, built.evidencePackage) })
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    const original = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    const oldSignature = 'f'.repeat(64);
+    const database = new Database(service.store.databasePath);
+    database.prepare(`UPDATE member_assessment_snapshots_v3 SET input_signature = ?, prompt_version = ?,
+      payload_json = json_set(payload_json, '$.inputSignature', ?, '$.promptVersion', ?) WHERE id = ?`)
+      .run(oldSignature, 'member-assessment-v2', oldSignature, 'member-assessment-v2', original.id);
+    database.close();
+    const state: AccountState = { status: 'connected', displayLabel: 'fixture@example.test',
+      quota: { status: 'available', primaryUsedPercent: 10, secondaryUsedPercent: null, resetsAt: null },
+      runtimeVersion: 'fixture', lastCheckedAt: '2026-09-22T00:00:00Z' };
+    service.processNow({ accountState: state, consentVersion: 1 });
+    expect(service.store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze' });
+    const factRevision = service.store.getFactRevision(personId);
+    let calls = 0;
+    const runtime = {
+      getState: () => state,
+      runStructuredTurn: async (input: { prompt: string }) => {
+        calls += 1;
+        expect(input.prompt).toContain('ASSESSMENT_REQUEST=');
+        expect(input.prompt).not.toContain('SOURCE_PACKAGE=');
+        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        return { threadId: 'refresh', turnId: 'refresh', output: candidateFor(request, evidence) };
+      }
+    } as unknown as CodexRuntimeManager;
+    await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
+    expect(calls).toBe(1);
+    expect(service.store.getFactRevision(personId)).toBe(factRevision);
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)).toHaveLength(1);
+    expect(service.store.listMemberAssessmentSnapshots(personId, false)).toHaveLength(2);
+    service.close();
+  });
+
   it('具体引用问题只做一次 P03，不重做全量综合', async () => {
     const { service, personId, built } = await fixture();
     const valid = candidateFor(built.request, built.evidencePackage);
@@ -153,6 +210,168 @@ describe('MemberAssessmentPipeline', () => {
     expect(published.overview.headline).toBe('部分健康判断仍需核实');
     expect(published.actions).toEqual([]);
     expect(published.heldTargetIds).toContain('claim-ldl');
+    service.close();
+  });
+
+  it('治疗讨论也不能夹带让本人直接停药的指令，概率不能藏在总览', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.actions[0] = { ...candidate.actions[0]!, kind: 'treatment_discussion', firstStep: '请现在停药。' };
+    candidate.overview.summary = '你患癌症风险约 73%。';
+    const result = validateAssessmentCandidate(candidate, {
+      personId, inputSignature: built.request.inputSignature, mode: built.request.mode,
+      requestedSystemIds: built.request.requestedSystemIds,
+      evidenceCatalog: built.evidencePackage.evidenceCatalog,
+      trendIds: built.evidencePackage.trends.map((item) => item.id),
+      catalogKnowledgeIds: built.evidencePackage.knowledge.map((item) => item.id),
+      criteriaSets: built.evidencePackage.criteriaSets
+    });
+    expect(result.issues).toContain('direct_medication_change:action-review');
+    expect(result.issues).toContain('unsourced_probability:overview');
+    service.close();
+  });
+
+  it('明确报告诊断可为 documented；考虑和既往语句不能升级成当前确诊', async () => {
+    const { service, personId, built } = await fixture();
+    const evidenceId = built.evidencePackage.facts[0]!.evidenceIds[0]!;
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims[0] = { ...candidate.claims[0]!, kind: 'diagnostic_assessment', diseaseName: '脂肪肝',
+      diagnosticStatus: 'documented', text: '2024 年报告明确诊断为脂肪肝。', temporalStatus: 'historical' };
+    const input = (quote: string) => ({
+      personId, inputSignature: built.request.inputSignature, mode: built.request.mode,
+      requestedSystemIds: built.request.requestedSystemIds,
+      evidenceCatalog: built.evidencePackage.evidenceCatalog.map((item) => item.id === evidenceId ? { ...item, quote } : item),
+      trendIds: [], catalogKnowledgeIds: [], criteriaSets: []
+    });
+    expect(validateAssessmentCandidate(candidate, input('2024-10-22 诊断：脂肪肝')).issues).not.toContain('documented_source_not_proven:claim-ldl');
+    expect(validateAssessmentCandidate(candidate, input('2024-10-22 诊断：考虑脂肪肝')).issues).toContain('documented_source_not_proven:claim-ldl');
+    expect(validateAssessmentCandidate(candidate, input('2024-10-22 诊断：排除脂肪肝')).issues).toContain('documented_source_not_proven:claim-ldl');
+    expect(validateAssessmentCandidate(candidate, input('2024-10-22 既往诊断：脂肪肝')).issues).not.toContain('documented_source_not_proven:claim-ldl');
+    candidate.claims[0]!.temporalStatus = 'current';
+    expect(validateAssessmentCandidate(candidate, input('2024-10-22 既往诊断：脂肪肝')).issues).toContain('documented_source_not_proven:claim-ldl');
+    service.close();
+  });
+
+  it('符合标准必须逐项命中应用核验的证据，不能靠模型自报 met', async () => {
+    const { service, personId, built } = await fixture();
+    const firstEvidence = built.evidencePackage.facts[0]!.evidenceIds[0]!;
+    const secondEvidence = 'evidence-independent-confirmation';
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims[0] = { ...candidate.claims[0]!, kind: 'diagnostic_assessment', diseaseName: '合成疾病X',
+      diagnosticStatus: 'criteria_met', text: '现有资料符合合成疾病X的标准。',
+      knowledgeBasis: 'catalog', knowledgeSourceIds: ['controlled-criteria'], evidenceIds: [firstEvidence, secondEvidence],
+      criteriaBasis: { criteriaSetId: 'synthetic-criteria', sourceId: 'controlled-criteria', applicability: '合成测试适用范围',
+        requirements: [
+          { criterionId: 'first-result', status: 'met', evidenceIds: [firstEvidence] },
+          { criterionId: 'independent-confirmation', status: 'met', evidenceIds: [secondEvidence] }
+        ] } };
+    const base = {
+      personId, inputSignature: built.request.inputSignature, mode: built.request.mode,
+      requestedSystemIds: built.request.requestedSystemIds,
+      evidenceCatalog: [...built.evidencePackage.evidenceCatalog, {
+        ...built.evidencePackage.evidenceCatalog[0]!, id: secondEvidence, quote: '独立复测结果'
+      }], trendIds: [], catalogKnowledgeIds: ['controlled-criteria']
+    };
+    const completeSet = { id: 'synthetic-criteria', sourceId: 'controlled-criteria', applicability: '合成测试适用范围',
+      requiredCriterionIds: ['first-result', 'independent-confirmation'],
+      verifiedRequirements: [
+        { criterionId: 'first-result', evidenceIds: [firstEvidence] },
+        { criterionId: 'independent-confirmation', evidenceIds: [secondEvidence] }
+      ] };
+    expect(validateAssessmentCandidate(candidate, { ...base, criteriaSets: [completeSet] }).issues).not.toContain('criteria_not_proven:claim-ldl');
+    expect(validateAssessmentCandidate(candidate, { ...base, criteriaSets: [{
+      ...completeSet, verifiedRequirements: completeSet.verifiedRequirements.slice(0, 1)
+    }] }).issues).toContain('criteria_not_proven:claim-ldl');
+    service.close();
+  });
+
+  it('P04 替换关联行动时引入紧急行动，不再次调用模型而隔离新风险', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims[0]!.consequenceLevel = 'high';
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => {
+        calls += 1;
+        if (calls === 1) return { threadId: 'p02', turnId: 'first', output: candidate };
+        const targets = ['claim-ldl', 'action-review', 'overview', ...built.request.requestedSystemIds.map((id) => `system:${id}`)];
+        const review: ClinicalFocusedReviewV1 = {
+          schemaVersion: 1, personId, inputSignature: built.request.inputSignature,
+          results: targets.map((targetId) => targetId === 'action-review'
+            ? { targetId, verdict: 'replace', reason: '合成测试替换', replacement: {
+              nodeType: 'action', value: { ...candidate.actions[0]!, urgency: 'emergency', title: '立即急诊就医' }
+            } }
+            : { targetId, verdict: 'pass', reason: '无需改动', replacement: null })
+        };
+        return { threadId: 'p04', turnId: 'second', output: review };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    expect(calls).toBe(2);
+    const published = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(published.heldTargetIds).toContain('action-review');
+    expect(published.actions).toEqual([]);
+    expect(published.overview.actionIds).toEqual([]);
+    service.close();
+  });
+
+  it('高影响主张被 hold 后，保留另一条可用解释但不残留原状态和问题', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims[0]!.consequenceLevel = 'high';
+    candidate.claims.push({ ...candidate.claims[0]!, id: 'claim-other', text: '原报告记载 LDL-C 4.2 mmol/L。', consequenceLevel: 'routine' });
+    candidate.overview.claimIds.push('claim-other');
+    for (const system of candidate.systems) system.claimIds.push('claim-other');
+    candidate.questions.push({ id: 'question-dependent', question: '是否需要立即处理这个高风险？',
+      whyItMatters: '与被隔离主张相关', relatedClaimIds: ['claim-ldl'],
+      evidenceIds: [built.evidencePackage.facts[0]!.evidenceIds[0]!] });
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => {
+        calls += 1;
+        if (calls === 1) return { threadId: 'p02', turnId: 'first', output: candidate };
+        const targets = ['claim-ldl', 'action-review', 'overview', ...built.request.requestedSystemIds.map((id) => `system:${id}`)];
+        const review: ClinicalFocusedReviewV1 = { schemaVersion: 1, personId, inputSignature: built.request.inputSignature,
+          results: targets.map((targetId) => ({ targetId, verdict: targetId === 'claim-ldl' ? 'hold' : 'pass',
+            reason: '合成测试中只隔离一条主张', replacement: null })) };
+        return { threadId: 'p04', turnId: 'second', output: review };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    const published = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(published.claims.map((item) => item.id)).toEqual(['claim-other']);
+    expect(published.systems.every((system) => system.status === 'monitor')).toBe(true);
+    expect(published.questions).toEqual([]);
+    expect(published.actions).toEqual([]);
+    service.close();
+  });
+
+  it('两条高影响主张共享来源和行动时只做一次 P04，并覆盖共同依赖', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.claims[0]!.consequenceLevel = 'high';
+    candidate.claims.push({ ...candidate.claims[0]!, id: 'claim-second', text: '另一条待重点复核的高影响判断。' });
+    candidate.overview.claimIds.push('claim-second');
+    candidate.actions[0]!.claimIds.push('claim-second');
+    for (const system of candidate.systems) system.claimIds.push('claim-second');
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async (input) => {
+        calls += 1;
+        if (calls === 1) return { threadId: 'p02', turnId: 'first', output: candidate };
+        expect(input.prompt).toContain('claim-ldl');
+        expect(input.prompt).toContain('claim-second');
+        const targets = ['claim-ldl', 'claim-second', 'action-review', 'overview',
+          ...built.request.requestedSystemIds.map((id) => `system:${id}`)];
+        const review: ClinicalFocusedReviewV1 = { schemaVersion: 1, personId, inputSignature: built.request.inputSignature,
+          results: targets.map((targetId) => ({ targetId, verdict: 'pass', reason: '合成测试中已检查', replacement: null })) };
+        return { threadId: 'p04', turnId: 'second', output: review };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    expect(calls).toBe(2);
+    const published = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    expect(published.reviewedTargetIds).toEqual(expect.arrayContaining(['claim-ldl', 'claim-second', 'action-review', 'overview']));
     service.close();
   });
 });

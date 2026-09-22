@@ -8,6 +8,8 @@ export {
   promptMetaForStage,
   MEMBER_ASSESSMENT_PROMPT_VERSION,
   MEMBER_ASSESSMENT_RULES_VERSION,
+  HEALTH_PIPELINE_VERSION,
+  RUNTIME_PROMPT_VERSION,
   renderPrompt
 } from './shared.js';
 export {

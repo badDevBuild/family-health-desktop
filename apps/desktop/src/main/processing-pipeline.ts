@@ -371,7 +371,12 @@ function expandAbbreviatedEvidenceQuotes(
 
 function normalizeCandidates(candidates: ObservationCandidate[], sourceSpans: SourceSpan[]): ObservationCandidate[] {
   return strengthenUnambiguousClinicalDateEvidence(
-    expandAbbreviatedEvidenceQuotes(normalizeBloodPressureCandidates(candidates.map(normalizeModelEntities), sourceSpans), sourceSpans),
+    expandAbbreviatedEvidenceQuotes(normalizeBloodPressureCandidates(candidates
+      .filter((candidate) => !(candidate.value.kind === 'unknown'
+        && candidate.value.rawText === null
+        && candidate.issues.length === 0
+        && /空白|未填写|未填|空栏|未记录/.test(candidate.value.reason)))
+      .map(normalizeModelEntities), sourceSpans), sourceSpans),
     sourceSpans
   );
 }
@@ -1110,7 +1115,10 @@ export class DocumentExtractionPipeline {
         let missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
         let failures = candidateValidationFailures(extracted, bundle);
         if (missing.length > 0 || failures.length > 0 || !evidenceIsConfinedToChunk(extracted, expectedSpanIds)) {
-          const targetKeys = new Set(failures.map((failure) => failure.localKey));
+          const expected = new Set(expectedSpanIds);
+          const outsideKeys = extracted.candidates.filter((candidate) => candidate.evidence.some((ref) => !expected.has(ref.sourceSpanId)))
+            .map((candidate) => candidate.localKey);
+          const targetKeys = new Set([...failures.map((failure) => failure.localKey), ...outsideKeys]);
           const repairRequest = {
             stage: 'extraction',
             targets: [...targetKeys, ...missing],
@@ -1122,7 +1130,9 @@ export class DocumentExtractionPipeline {
             issues: [
               ...failures.flatMap((failure) => failure.reasons.map((reason) => failure.localKey + ':' + reason)),
               ...missing.map((id) => 'uncovered_source_span:' + id),
-              ...(!evidenceIsConfinedToChunk(extracted, expectedSpanIds) ? ['evidence_outside_chunk'] : [])
+              ...outsideKeys.map((key) => `evidence_outside_chunk:${key}`),
+              ...(extracted.subject.evidence.some((ref) => !expected.has(ref.sourceSpanId)) ? ['subject_evidence_outside_chunk'] : []),
+              ...(reportMetadataEvidence(extracted.reportMetadata).some((ref) => !expected.has(ref.sourceSpanId)) ? ['metadata_evidence_outside_chunk'] : [])
             ],
             originalCandidateHash: stableHash(extracted)
           };
@@ -1156,16 +1166,24 @@ export class DocumentExtractionPipeline {
           missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
           failures = candidateValidationFailures(extracted, bundle);
         }
-        const failedKeys = new Set(failures.map((failure) => failure.localKey));
+        const expected = new Set(expectedSpanIds);
+        if (extracted.subject.evidence.some((ref) => !expected.has(ref.sourceSpanId))) {
+          return this.needsReview(documentId, 'field_conflict', expectedSpanIds,
+            'SUBJECT_EVIDENCE_OUTSIDE_CHUNK', lastReceipt.threadId, lastReceipt.turnId);
+        }
+        const outOfChunk = extracted.candidates.filter((candidate) => candidate.evidence.some((ref) => !expected.has(ref.sourceSpanId)));
+        const failedKeys = new Set([...failures.map((failure) => failure.localKey), ...outOfChunk.map((candidate) => candidate.localKey)]);
         acceptedCandidates.push(...extracted.candidates.filter((candidate) => !failedKeys.has(candidate.localKey)));
         for (const failure of failures) {
           const candidate = extracted.candidates.find((item) => item.localKey === failure.localKey);
           if (candidate) unresolved.push({ candidate, reasons: failure.reasons });
         }
+        unresolved.push(...outOfChunk.map((candidate) => ({ candidate, reasons: ['EVIDENCE_OUTSIDE_CHUNK'] })));
         uncoveredSpanIds.push(...missing);
         coveredSourceSpanIds.push(...extracted.coveredSourceSpanIds.filter((id) => expectedSpanIds.includes(id)));
         subjects.push(extracted.subject);
-        metadata.push(extracted.reportMetadata);
+        metadata.push(reportMetadataEvidence(extracted.reportMetadata).every((ref) => expected.has(ref.sourceSpanId))
+          ? extracted.reportMetadata : null);
         if (temporaryRoot) rmSync(join(temporaryRoot, chunkDirectory), { recursive: true, force: true });
       }
     } finally {

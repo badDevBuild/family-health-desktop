@@ -79,7 +79,8 @@ export function applyFocusedReview(
     byId.set(result.targetId, { type: original.type, value: result.replacement.value });
   }
   const heldClaims = new Set(candidate.claims.filter((item) => held.has(item.id)).map((item) => item.id));
-  const heldActions = new Set(candidate.actions.filter((item) => held.has(item.id) || item.claimIds.some((id) => heldClaims.has(id))).map((item) => item.id));
+  const heldActions = new Set(candidate.actions.filter((item) => held.has(item.id)
+    || (byId.get(item.id)!.value as HealthAction).claimIds.some((id) => heldClaims.has(id))).map((item) => item.id));
   for (const id of heldActions) held.add(id);
   const claims = candidate.claims.filter((item) => !heldClaims.has(item.id)).map((item) => byId.get(item.id)!.value as HealthClaim);
   const actions = candidate.actions.filter((item) => !heldActions.has(item.id)).map((item) => byId.get(item.id)!.value as HealthAction);
@@ -90,7 +91,8 @@ export function applyFocusedReview(
     const dependent = held.has(item.id) || node.claimIds.length !== claimIds.length || node.actionIds.length !== actionIds.length;
     return dependent ? {
       ...node, claimIds, actionIds,
-      status: claimIds.length === 0 ? 'insufficient' as const : node.status,
+      // 原状态可能只由被隔离的高影响主张支撑，不能沿用“需关注”或“本范围无提示”。
+      status: claimIds.length === 0 ? 'insufficient' as const : 'monitor' as const,
       headline: claimIds.length === 0 ? '这部分判断仍需核实' : '部分判断仍需核实',
       summary: '已核实的资料仍可查看；本系统有重要判断暂未纳入本次解读。',
       limitations: [...node.limitations, '部分判断因证据不足暂未发布。']
@@ -107,9 +109,10 @@ export function applyFocusedReview(
     actionIds: originalOverview.actionIds.filter((id) => !heldActions.has(id)),
     limitations: [...originalOverview.limitations, '部分判断因证据不足暂未发布。']
   } : originalOverview;
-  const questions = candidate.questions.filter((item) => !held.has(item.id)).map((item) => {
+  const questions = candidate.questions.filter((item) => !held.has(item.id)
+    && !(byId.get(item.id)!.value as QuestionNode).relatedClaimIds.some((id) => heldClaims.has(id))).map((item) => {
     const node = byId.get(item.id)!.value as QuestionNode;
-    return { ...node, relatedClaimIds: node.relatedClaimIds.filter((id) => !heldClaims.has(id)) };
+    return node;
   });
   return { candidate: { ...candidate, overview, systems, claims, actions, questions }, heldTargetIds: [...held] };
 }
