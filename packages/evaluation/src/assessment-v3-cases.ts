@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { AssessmentRequestV3, BodySystemId, MemberEvidencePackageV3 } from '@contracts';
 
 /** 只用于评测的虚构资料；不是医学金标准，也不包含家庭成员的真实档案。 */
-export const ASSESSMENT_V3_CASESET_VERSION = 'assessment-v3-synthetic-2026-09-22-v2';
+export const ASSESSMENT_V3_CASESET_VERSION = 'assessment-v3-synthetic-2026-09-22-v3';
 
 type SourceQuality = 'clear_text' | 'mixed_layout' | 'image_unclear' | 'conflicting_sources';
 type HistorySpan = 'single_event' | 'multi_year';
@@ -81,7 +81,7 @@ const seeds: CaseSeed[] = [
     facts: [{ name: 'LDL-C', value: '4.2', unit: 'mmol/L', range: '0–3.4', flag: 'high', systemIds: cv }],
     reviewQuestions: ['是否说明高于这份报告的参考上限，同时不凭单次数值宣称已确诊？', '下一步是否具体而不过度处方？'], clinicianReferenceRequired: false },
   { id: 'A002', split: 'development', title: '报告明确记载脂肪肝', sourceQuality: 'clear_text', historySpan: 'single_event', riskTheme: 'diagnostic_boundary', specialContext: 'none',
-    facts: [{ name: '肝脏超声结论', value: '诊断：脂肪肝', kind: 'text', systemIds: hb, quote: '2025-06-10 肝脏超声 诊断：脂肪肝。' }],
+    facts: [{ name: '肝脏超声结论', value: '诊断：脂肪肝', kind: 'text', date: '2025-06-10', systemIds: hb, quote: '2025-06-10 肝脏超声 诊断：脂肪肝。' }],
     reviewQuestions: ['是否保留来源已有病名、报告日期与 documented 标签？', '是否避免把旧报告表述成今天的新诊断？'], clinicianReferenceRequired: true },
   { id: 'A003', split: 'development', title: '报告写考虑而非确诊', sourceQuality: 'mixed_layout', historySpan: 'single_event', riskTheme: 'diagnostic_boundary', specialContext: 'none',
     facts: [{ name: '甲状腺超声小结', value: '弥漫性回声改变，考虑甲状腺炎', kind: 'text', systemIds: em, quote: '甲状腺弥漫性回声改变，考虑甲状腺炎，请结合实验室检查。' }],
@@ -143,7 +143,7 @@ const seeds: CaseSeed[] = [
     reviewQuestions: ['若引用需要复测的标准，是否避免把单次值写成 criteria_met？', '是否仍给出有用的下一步核实方式？'], clinicianReferenceRequired: true },
   { id: 'A020', split: 'development', title: '来源明确的诊断不要求模型重新证明', sourceQuality: 'clear_text', historySpan: 'single_event', riskTheme: 'diagnostic_boundary', specialContext: 'none',
     facts: [
-      { name: '胃镜诊断', value: '诊断：慢性胃炎', kind: 'text', systemIds: ['digestive'], quote: '2025-08-01 胃镜 诊断：慢性胃炎。' },
+      { name: '胃镜诊断', value: '诊断：慢性胃炎', kind: 'text', date: '2025-08-01', systemIds: ['digestive'], quote: '2025-08-01 胃镜 诊断：慢性胃炎。' },
       { name: '幽门螺杆菌', value: '阴性', kind: 'qualitative', systemIds: ['digestive'] }
     ], reviewQuestions: ['是否把来源已诊断与另一项阴性结果分别说明？', '是否不要求用户再次确认病名？'], clinicianReferenceRequired: true },
   { id: 'A021', split: 'development', title: '跨系统问题复用同一行动', sourceQuality: 'clear_text', historySpan: 'single_event', riskTheme: 'routine', specialContext: 'none',
@@ -249,6 +249,17 @@ export function validateAssessmentV3SyntheticCases(cases: AssessmentV3SyntheticC
     || cases.some((item) => !item.synthetic || item.reviewQuestions.length === 0
       || item.request.personId !== item.evidencePackage.identity.personId)) {
     throw new Error('ASSESSMENT_CASESET_INVALID');
+  }
+  for (const item of cases) {
+    const evidenceById = new Map(item.evidencePackage.evidenceCatalog.map((evidence) => [evidence.id, evidence]));
+    for (const fact of item.evidencePackage.facts) {
+      for (const evidenceId of fact.evidenceIds) {
+        const leadingSourceDate = evidenceById.get(evidenceId)?.quote?.match(/^\s*(20\d{2}-\d{2}-\d{2})\b/)?.[1];
+        if (leadingSourceDate && leadingSourceDate !== fact.clinicalDate) {
+          throw new Error(`ASSESSMENT_CASESET_SOURCE_DATE_CONFLICT:${item.id}:${fact.observationId}`);
+        }
+      }
+    }
   }
   for (const dimension of ['sourceQuality', 'historySpan', 'riskTheme', 'specialContext'] as const) {
     const seen = new Set(cases.map((item) => item.dimensions[dimension]));

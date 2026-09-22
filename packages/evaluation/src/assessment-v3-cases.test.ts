@@ -52,6 +52,17 @@ describe('V3 成员综合固定纯合成评测包', () => {
       .toThrow('ASSESSMENT_CASESET_DIMENSION_MISSING:sourceQuality');
   });
 
+  it('原文开头的检查日期不得与结构化临床日期冲突', () => {
+    const cases = createAssessmentV3SyntheticCases();
+    const fattyLiver = cases.find((item) => item.id === 'A002')!;
+    const gastritis = cases.find((item) => item.id === 'A020')!;
+    expect(fattyLiver.evidencePackage.facts[0]?.clinicalDate).toBe('2025-06-10');
+    expect(gastritis.evidencePackage.facts[0]?.clinicalDate).toBe('2025-08-01');
+    fattyLiver.evidencePackage.facts[0]!.clinicalDate = '2025-09-21';
+    expect(() => validateAssessmentV3SyntheticCases(cases))
+      .toThrow('ASSESSMENT_CASESET_SOURCE_DATE_CONFLICT:A002:A002-observation-1');
+  });
+
   it('两次物化结果一致，并明确临床质量仍为 NOT_RUN', () => {
     const first = mkdtempSync(join(tmpdir(), 'assessment-v3-cases-a-'));
     const second = mkdtempSync(join(tmpdir(), 'assessment-v3-cases-b-'));
