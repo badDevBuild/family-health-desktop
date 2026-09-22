@@ -7,13 +7,14 @@ import { HEALTH_PIPELINE_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSES
 import { ASSESSMENT_VALIDATION_RULES_VERSION } from './assessment-validation.js';
 import { CLINICAL_ROUTER_VERSION } from './clinical-review-router.js';
 
-export const MEMBER_EVIDENCE_SELECTOR_VERSION = 'member-evidence-v6';
+export const MEMBER_EVIDENCE_SELECTOR_VERSION = 'member-evidence-v7';
 
 export interface BuiltMemberAssessmentInput {
   request: AssessmentRequestV3;
   evidencePackage: MemberEvidencePackageV3;
   factRevision: number;
   contextRevision: number;
+  reviewScopeSignature: string;
 }
 
 /** 全部聚合在本机完成；系统视角只选择输入，不产生额外模型调用。 */
@@ -171,6 +172,7 @@ export function buildMemberAssessmentInput(
   const dates = facts.map((item) => item.clinicalDate).filter((value): value is string => value !== null).sort();
   const factRevision = store.getFactRevision(personId);
   const contextRevision = store.getClinicalContextRevision(personId);
+  const reviewScopeSignature = store.getOpenReviewScopeSignature(personId);
   const inputSignature = stableHash({
     personId, selectorVersion: MEMBER_EVIDENCE_SELECTOR_VERSION,
     pipelineVersion: HEALTH_PIPELINE_VERSION, runtimePromptVersion: RUNTIME_PROMPT_VERSION,
@@ -178,7 +180,7 @@ export function buildMemberAssessmentInput(
     validationRulesVersion: ASSESSMENT_VALIDATION_RULES_VERSION, clinicalRouterVersion: CLINICAL_ROUTER_VERSION,
     modelId: options.modelId, reasoningEffort: options.reasoningEffort,
     analysisReferenceDate: options.analysisReferenceDate, webSearchAllowed: options.webSearchAllowed,
-    factRevision, contextRevision, evidencePackage
+    factRevision, contextRevision, reviewScopeSignature, evidencePackage
   });
   const request = assessmentRequestV3Schema.parse({
     personId, inputSignature, mode: 'full', requestedSystemIds,
@@ -186,5 +188,5 @@ export function buildMemberAssessmentInput(
     clinicalFrom: dates[0] ?? null, clinicalAsOf: dates.at(-1) ?? null,
     webSearchAllowed: options.webSearchAllowed
   });
-  return { request, evidencePackage, factRevision, contextRevision };
+  return { request, evidencePackage, factRevision, contextRevision, reviewScopeSignature };
 }

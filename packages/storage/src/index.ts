@@ -2064,6 +2064,17 @@ export class WorkspaceStore {
     });
   }
 
+  /** 待核对范围变化不一定增加事实版本；用独立签名阻止旧综合继续冒充当前结论。 */
+  getOpenReviewScopeSignature(personId: string): string {
+    const rows = this.db.prepare(`
+      SELECT ri.id FROM review_issues ri
+      JOIN documents d ON ri.field_ref = 'document:' || d.id
+      WHERE d.person_id = ? AND ri.resolution_status = 'open'
+      ORDER BY ri.id
+    `).all(personId) as Array<{ id: string }>;
+    return createHash('sha256').update(JSON.stringify(rows.map((row) => row.id))).digest('hex');
+  }
+
   retryExtractionReview(input: { issueId: string; documentId: string }): void {
     const transaction = this.db.transaction(() => {
       const issue = this.db.prepare(`
@@ -4143,6 +4154,12 @@ export class WorkspaceStore {
     }));
   }
 
+  hasMemberAssessmentHistory(personId: string): boolean {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM member_assessment_snapshots_v3 WHERE person_id = ? LIMIT 1
+    `).get(personId));
+  }
+
   publishMemberAssessmentSnapshot(input: {
     snapshot: Omit<MemberAssessmentSnapshotV3, 'id' | 'status' | 'generatedAt'>;
     executionGuard?: JobExecutionGuard;
@@ -4152,6 +4169,9 @@ export class WorkspaceStore {
       if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard);
       if (this.getFactRevision(snapshot.personId) !== snapshot.factRevision) throw new Error('MEMBER_ASSESSMENT_FACT_REVISION_CONFLICT');
       if (this.getClinicalContextRevision(snapshot.personId) !== snapshot.contextRevision) throw new Error('MEMBER_ASSESSMENT_CONTEXT_REVISION_CONFLICT');
+      if (this.getOpenReviewScopeSignature(snapshot.personId) !== snapshot.reviewScopeSignature) {
+        throw new Error('MEMBER_ASSESSMENT_REVIEW_SCOPE_CONFLICT');
+      }
       const observations = this.listAcceptedObservations(snapshot.personId);
       if (input.executionGuard) this.assertObservationScopeActive(input.executionGuard, snapshot.personId, observations);
       const currentObservationIds = new Set(observations.map((item) => item.id));

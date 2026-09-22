@@ -237,6 +237,7 @@ export const memberAssessmentSnapshotV3Schema = memberAssessmentCandidateV3Schem
   generatedAt: z.string().datetime({ offset: true }),
   factRevision: z.number().int().nonnegative(),
   contextRevision: z.number().int().nonnegative(),
+  reviewScopeSignature: signature,
   promptVersion: id,
   rulesVersion: id,
   modelId: id,

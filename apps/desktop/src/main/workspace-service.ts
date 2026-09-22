@@ -286,7 +286,11 @@ export class PersonalWorkspaceService {
 
   private memberObservations(personId: string): AcceptedObservationSummary[] {
     this.requireActivePerson(personId);
-    return this.store.listAcceptedObservations(personId);
+    const conflictedDocumentIds = new Set(this.store.listOpenExtractionReviewIssues()
+      .filter((issue) => issue.personId === personId && issue.kind === 'person_conflict')
+      .map((issue) => issue.documentId));
+    return this.store.listAcceptedObservations(personId)
+      .filter((observation) => !conflictedDocumentIds.has(observation.documentId));
   }
 
   getMemberAssessment(personId: string): MemberAssessmentSnapshotV3 | null {
@@ -295,7 +299,8 @@ export class PersonalWorkspaceService {
     if (!snapshot || snapshot.promptVersion !== MEMBER_ASSESSMENT_PROMPT_VERSION
       || snapshot.rulesVersion !== MEMBER_ASSESSMENT_RULES_VERSION
       || snapshot.factRevision !== this.store.getFactRevision(personId)
-      || snapshot.contextRevision !== this.store.getClinicalContextRevision(personId)) return null;
+      || snapshot.contextRevision !== this.store.getClinicalContextRevision(personId)
+      || snapshot.reviewScopeSignature !== this.store.getOpenReviewScopeSignature(personId)) return null;
     const parsed = memberAssessmentSnapshotV3Schema.safeParse(snapshot);
     return parsed.success ? parsed.data : null;
   }
@@ -344,6 +349,8 @@ export class PersonalWorkspaceService {
   }
 
   private currentSystemAnalysis(personId: string, systemId: BodySystemId, observations: AcceptedObservationSummary[]): SystemAnalysisSnapshot | null {
+    // 一旦采用 V3，旧系统结论只能作为历史存储，不能在 V3 因待核对范围变化失效时回退冒充当前结果。
+    if (this.store.hasMemberAssessmentHistory(personId)) return null;
     const allSystemSnapshots = this.store.listSystemAnalysisSnapshots(personId, false)
       .filter((item) => item.systemId === systemId);
     const systemSnapshot = allSystemSnapshots.find((item) => item.status === 'current')
@@ -1329,7 +1336,8 @@ export class PersonalWorkspaceService {
         if (current?.promptVersion === MEMBER_ASSESSMENT_PROMPT_VERSION
           && current.rulesVersion === MEMBER_ASSESSMENT_RULES_VERSION
           && current.factRevision === this.store.getFactRevision(person.id)
-          && current.contextRevision === this.store.getClinicalContextRevision(person.id)) continue;
+          && current.contextRevision === this.store.getClinicalContextRevision(person.id)
+          && current.reviewScopeSignature === this.store.getOpenReviewScopeSignature(person.id)) continue;
         byPerson.set(person.id, { documentIds: [sourceDocumentId], stage: 'analyze' });
       }
     }
@@ -1347,6 +1355,7 @@ export class PersonalWorkspaceService {
         documentIds: [...group.documentIds].sort(),
         factRevision: this.store.getFactRevision(personId),
         contextRevision: this.store.getClinicalContextRevision(personId),
+        reviewScopeSignature: this.store.getOpenReviewScopeSignature(personId),
         ...promptMetaForStage(group.stage)
       })
     }));
@@ -1483,10 +1492,19 @@ export class PersonalWorkspaceService {
     const processingDocumentIds = this.store.listProcessingDocumentIds();
     // 主快照只承载每位成员最近的展示窗口；精确总数由 SQL 聚合读取，完整事实由成员级查询按需打开。
     // 这样家庭总览不会把全家数万条明细一次性传给 renderer。
+    const conflictedDocumentIds = new Set(this.store.listOpenExtractionReviewIssues()
+      .filter((issue) => issue.kind === 'person_conflict').map((issue) => issue.documentId));
     const acceptedObservations = this.store.listAcceptedObservations(undefined, { limitPerPerson: 500 })
-      .filter((observation) => activePersonIds.has(observation.personId));
-    const derivedByPerson = new Map(this.store.listCurrentDerivedSnapshots().map((snapshot) => [snapshot.personId, snapshot]));
-    const latestDerivedByPerson = new Map(this.store.listLatestDerivedSnapshots().map((snapshot) => [snapshot.personId, snapshot]));
+      .filter((observation) => activePersonIds.has(observation.personId)
+        && !conflictedDocumentIds.has(observation.documentId));
+    const v3HistoryPersonIds = new Set(storedPersons.filter((person) => this.store.hasMemberAssessmentHistory(person.id))
+      .map((person) => person.id));
+    const derivedByPerson = new Map(this.store.listCurrentDerivedSnapshots()
+      .filter((snapshot) => !v3HistoryPersonIds.has(snapshot.personId))
+      .map((snapshot) => [snapshot.personId, snapshot]));
+    const latestDerivedByPerson = new Map(this.store.listLatestDerivedSnapshots()
+      .filter((snapshot) => !v3HistoryPersonIds.has(snapshot.personId))
+      .map((snapshot) => [snapshot.personId, snapshot]));
     const allActions = this.store.listActionItems();
     const persons = storedPersons.filter((person) => person.archivedAt === null).map((person) => {
       const documentCount = counts.get(person.id) ?? 0;
@@ -1520,7 +1538,8 @@ export class PersonalWorkspaceService {
           ? `最近处理已保存 ${stats.acceptedFactCount} 条报告事实；健康解释仍需单独生成和复核`
           : processingCount > 0 ? '资料已安全保存在本机，请到处理中心查看进度或恢复失败任务'
             : documentCount > 0 ? '资料已安全保存在本机，尚未形成健康结论' : '可以先添加一份体检或门诊资料'),
-        derivedStatus: assessment ? 'current' as const : derived?.status ?? 'unavailable' as const,
+        derivedStatus: assessment ? 'current' as const : v3HistoryPersonIds.has(person.id)
+          ? 'stale' as const : derived?.status ?? 'unavailable' as const,
         assessmentSummary: assessment?.overview.summary ?? (derived?.status === 'current' ? derived.payload.claims[0]?.explanation ?? null : null),
         dataRevision: stableHash({
           factRevision: this.store.getFactRevision(person.id),

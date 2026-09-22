@@ -12,6 +12,7 @@ import { buildMemberAssessmentInput } from './member-assessment-input.js';
 import { buildMemberAggregatePackage, buildMemberSystemPartitions, splitMemberPartition } from './member-assessment-partition.js';
 import { validateAssessmentCandidate } from './assessment-validation.js';
 import { buildAssessmentKnowledgeVerifications, canonicalizeAssessmentKnowledge } from './assessment-knowledge.js';
+import { buildMemberSummaryData } from './export-service.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
 
 const roots: string[] = [];
@@ -142,6 +143,40 @@ function candidateFor(request: AssessmentRequestV3, source: MemberEvidencePackag
 }
 
 describe('MemberAssessmentPipeline', () => {
+  it('待核对范围变化即使事实版本不变，也使旧综合失效并拒绝迟到发布', async () => {
+    const { service, personId, documentId } = await fixture();
+    const runtime = {
+      runStructuredTurn: async (input: { prompt: string }) => {
+        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+        const source = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        return { threadId: 'p02', turnId: 'turn', output: candidateFor(request, source) };
+      }
+    };
+    await expect(new MemberAssessmentPipeline(service.store, runtime,
+      undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId))
+      .resolves.toMatchObject({ status: 'published', callCount: 1 });
+    const prior = service.getMemberAssessment(personId)!;
+    const factRevision = service.store.getFactRevision(personId);
+    const scopeBefore = service.store.getOpenReviewScopeSignature(personId);
+    service.store.saveExtractionReviewIssue({
+      documentId, kind: 'coverage_gap', severity: 'warning', preserveDocumentStatus: true,
+      evidenceRefs: [], reasonCodes: ['SYNTHETIC_UNRESOLVED_SPAN']
+    });
+    expect(service.store.getFactRevision(personId)).toBe(factRevision);
+    expect(service.store.getOpenReviewScopeSignature(personId)).not.toBe(scopeBefore);
+    expect(service.getMemberAssessment(personId)).toBeNull();
+    expect(() => service.store.publishMemberAssessmentSnapshot({ snapshot: prior }))
+      .toThrow('MEMBER_ASSESSMENT_REVIEW_SCOPE_CONFLICT');
+    expect(service.processNow()).toMatchObject({ idempotent: false });
+    await expect(new MemberAssessmentPipeline(service.store, runtime,
+      undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId))
+      .resolves.toMatchObject({ status: 'published', callCount: 1 });
+    const refreshed = service.getMemberAssessment(personId)!;
+    expect(refreshed.id).not.toBe(prior.id);
+    expect(refreshed.reviewScopeSignature).toBe(service.store.getOpenReviewScopeSignature(personId));
+    service.close();
+  });
+
   it('通用“诊断”项目仅在原文明确支持检查部位时归入相应身体系统', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-generic-diagnosis-'));
     roots.push(root);
@@ -218,6 +253,7 @@ describe('MemberAssessmentPipeline', () => {
 
   it('身份冲突资料只告知综合存在归属缺口，不发送可能属于另一成员的项目名', async () => {
     const { service, personId, documentId } = await fixture();
+    const previouslyAccepted = service.store.listAcceptedObservations(personId)[0]!;
     const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
     service.store.saveExtractionReviewIssue({
       documentId, kind: 'person_conflict', severity: 'warning', preserveDocumentStatus: true,
@@ -241,6 +277,15 @@ describe('MemberAssessmentPipeline', () => {
     expect(built.request.requestedSystemIds).toEqual([]);
     expect(JSON.stringify(built.evidencePackage)).not.toContain('2026-09-21 LDL-C 4.2');
     expect(JSON.stringify(built.evidencePackage)).not.toContain('其他成员敏感项目');
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.getMemberOverview(personId).acceptedFactCount).toBe(0);
+    expect(service.listHealthEvents(personId)).toEqual([]);
+    expect(service.getSnapshot(null).trends).toEqual([]);
+    expect(buildMemberSummaryData(service.getSnapshot(null), {
+      personId, dateFrom: null, dateTo: null
+    }).observations).toEqual([]);
+    expect(service.getMemberEvidenceBundle(personId, [previouslyAccepted.id]).missingIds)
+      .toEqual([previouslyAccepted.id]);
     service.close();
   });
 
@@ -781,6 +826,17 @@ describe('MemberAssessmentPipeline', () => {
       runStructuredTurn: async () => { throw new Error('SHOULD_NOT_REPROCESS'); }
     }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId))
       .toMatchObject({ status: 'skipped', reason: 'signature_current', callCount: 0 });
+    restarted.store.saveExtractionReviewIssue({
+      documentId, kind: 'coverage_gap', severity: 'warning', preserveDocumentStatus: true,
+      evidenceRefs: [], reasonCodes: ['SYNTHETIC_NEW_SCOPE']
+    });
+    expect(restarted.getMemberAssessment(personId)).toBeNull();
+    const staleHome = restarted.getSnapshot(null);
+    expect(staleHome.persons.find((person) => person.id === personId)).toMatchObject({
+      derivedStatus: 'stale', assessmentSummary: null
+    });
+    expect(staleHome.guidance).toEqual([]);
+    expect(restarted.getMemberOverview(personId).headline).toBe('报告内容已保存，健康解读正在准备。');
     restarted.close();
   });
 

@@ -240,8 +240,12 @@ export function buildSystemEvidenceBundle(
   const person = store.listPersons().find((item) => item.id === personId && item.archivedAt === null);
   if (!person) throw new Error('PERSON_NOT_FOUND');
   if (!bodySystemRegistry.some((system) => system.id === systemId)) throw new Error('BODY_SYSTEM_NOT_FOUND');
+  const conflictedDocumentIds = new Set(store.listOpenExtractionReviewIssues()
+    .filter((issue) => issue.personId === personId && issue.kind === 'person_conflict')
+    .map((issue) => issue.documentId));
   const observations = store.listAcceptedObservations(personId)
-    .filter((observation) => !options.excludedDocumentIds?.has(observation.documentId));
+    .filter((observation) => !conflictedDocumentIds.has(observation.documentId)
+      && !options.excludedDocumentIds?.has(observation.documentId));
   const eventIdsByDocument = new Map(store.listReportMetadata(personId).map((item) => [item.documentId, item.eventId]));
   const selected: Array<{ observation: AcceptedObservationSummary; fact: SystemEvidenceFact }> = [];
   const unclassifiedObservationIds: string[] = [];

@@ -434,6 +434,7 @@ export class MemberAssessmentPipeline {
     const snapshot: Omit<MemberAssessmentSnapshotV3, 'id' | 'status' | 'generatedAt'> = {
       ...publishCandidate,
       factRevision: built.factRevision, contextRevision: built.contextRevision,
+      reviewScopeSignature: built.reviewScopeSignature,
       promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION, rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION,
       modelId: this.modelId, reasoningEffort: this.reasoningEffort, validationMode,
       reviewedTargetIds, heldTargetIds,

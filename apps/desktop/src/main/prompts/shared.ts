@@ -29,7 +29,7 @@ export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v2';
 export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v2';
 export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v6';
 /** 本地校验规则变化必须使旧成员快照过期，避免旧结果被误当成新规则产物。 */
-export const MEMBER_ASSESSMENT_RULES_VERSION = `lean-health-v3.8+${ASSESSMENT_VALIDATION_RULES_VERSION}`;
+export const MEMBER_ASSESSMENT_RULES_VERSION = `lean-health-v3.9+${ASSESSMENT_VALIDATION_RULES_VERSION}`;
 export const HEALTH_PIPELINE_VERSION = 'lean-health-v3';
 export const RUNTIME_PROMPT_VERSION = 'health-runtime-v3';
 
