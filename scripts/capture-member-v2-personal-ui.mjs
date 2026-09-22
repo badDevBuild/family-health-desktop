@@ -142,6 +142,22 @@ async function auditCurrentPage(name) {
   return audit;
 }
 
+async function auditAssessmentActionLayout() {
+  return evaluate(`(() => {
+    const card = document.querySelector('.assessment-action-card');
+    const title = card?.querySelector('.panel__heading h3');
+    if (!card || !title) return null;
+    const cardRect = card.getBoundingClientRect();
+    const titleRect = title.getBoundingClientRect();
+    return {
+      cardWidth: Math.round(cardRect.width),
+      titleWidth: Math.round(titleRect.width),
+      titleHeight: Math.round(titleRect.height),
+      readable: titleRect.width >= 180 && titleRect.height < 150
+    };
+  })()`);
+}
+
 await client.send('Page.reload', { ignoreCache: true });
 await waitFor(`document.querySelector('.app-shell') !== null`);
 await setViewport(1440, 900, 1);
@@ -159,9 +175,11 @@ const desktopTabs = [
   ['生活与行动', '06-guidance'],
   ['原始资料', '07-sources']
 ];
+let desktopAssessmentActionLayout = null;
 for (const [label, name] of desktopTabs) {
   await clickButton(label, true);
   if (label === '身体与指标') await selectSystem(systemLabel);
+  if (label === '生活与行动') desktopAssessmentActionLayout = await auditAssessmentActionLayout();
   await screenshot(name);
 }
 
@@ -210,12 +228,20 @@ if (sourceOpened) {
 
 await setViewport(720, 450, 2);
 const compactAudits = [];
+let compactAssessmentActionLayout = null;
+let compactActionScreenshot = false;
 for (const [label, name] of desktopTabs) {
   await clickButton(label, true);
   if (label === '身体与指标') await selectSystem(systemLabel);
+  if (label === '生活与行动') compactAssessmentActionLayout = await auditAssessmentActionLayout();
   const compactName = `${name}-200-percent`;
   await screenshot(compactName);
   compactAudits.push(await auditCurrentPage(compactName));
+  if (label === '生活与行动' && compactAssessmentActionLayout) {
+    await evaluate(`document.querySelector('.assessment-action-card')?.scrollIntoView({ block: 'center' })`);
+    await screenshot('06-guidance-action-200-percent');
+    compactActionScreenshot = true;
+  }
 }
 
 await setViewport(1440, 900, 1);
@@ -307,7 +333,14 @@ const result = {
   detailCoverage: { metricOpened, eventOpened, sourceOpened },
   desktopScreenshots: desktopTabs.length + Number(metricOpened) + Number(eventOpened) + Number(sourceOpened),
   compactScreenshots: desktopTabs.length,
+  compactActionScreenshot,
   compactAudits,
+  assessmentActionLayout: {
+    desktop: desktopAssessmentActionLayout,
+    compact: compactAssessmentActionLayout,
+    readable: [desktopAssessmentActionLayout, compactAssessmentActionLayout]
+      .filter(Boolean).every((layout) => layout.readable)
+  },
   allCompactPagesWithoutHorizontalOverflow: compactAudits.every((item) => !item.horizontalOverflow),
   keyboardJourney,
   adoptionJourney,
@@ -316,3 +349,4 @@ const result = {
 await writeFile(resolve(outputDirectory, 'audit.json'), `${JSON.stringify(result, null, 2)}\n`);
 client.close();
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+if (!result.assessmentActionLayout.readable) process.exitCode = 1;

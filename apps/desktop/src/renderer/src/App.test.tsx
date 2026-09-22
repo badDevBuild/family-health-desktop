@@ -253,6 +253,9 @@ describe('App member display editing', () => {
     render(<App />);
 
     fireEvent.click(await screen.findByRole('button', { name: '处理中心' }));
+    expect(screen.getByText('每块提取一次')).toBeTruthy();
+    expect(screen.getByText('成员综合一次')).toBeTruthy();
+    expect(screen.queryByText('独立核对')).toBeNull();
     expect(screen.queryByRole('heading', { name: '正在处理与需要关注' })).toBeNull();
     expect(screen.getByRole('heading', { name: '最近记录' })).toBeTruthy();
     expect(screen.getByText('旧处理任务')).toBeTruthy();
@@ -643,6 +646,7 @@ describe('App member display editing', () => {
     fireEvent.click(await screen.findByRole('button', { name: '设置' }));
     fireEvent.click(await screen.findByRole('button', { name: /AI 模型/ }));
     expect(await screen.findByRole('dialog', { name: '模型与推理强度' })).toBeTruthy();
+    expect(screen.getByText(/高影响医学判断才重点复核/)).toBeTruthy();
     expect((screen.getByLabelText('模型') as HTMLSelectElement).value).toBe('gpt-5.6-sol');
     expect((screen.getByLabelText('推理强度') as HTMLSelectElement).value).toBe('medium');
     fireEvent.change(screen.getByLabelText('模型'), { target: { value: 'gpt-5.6-terra' } });

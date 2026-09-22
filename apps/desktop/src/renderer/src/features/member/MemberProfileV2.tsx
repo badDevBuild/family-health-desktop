@@ -687,7 +687,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
       <section className="panel guide-hero"><span className="eyebrow">生活与行动</span><h2>根据现有资料，先做这些事</h2><p>同一方向已合并为一项建议；建议不会自动变成已采纳计划。</p>
         {assessment.actions.length > 0 ? <div className="member-proposal-list">{assessment.actions.map((action, index) => {
           const adopted = plan?.adoptedActions.some((item) => item.assessmentDedupeKey === action.dedupeKey && item.status !== 'dismissed') ?? false;
-          return <article key={action.id}>
+          return <article className="assessment-action-card" key={action.id}>
             <div className="panel__heading"><div><span className="eyebrow">第 {index + 1} 项 · {action.kind === 'seek_care' ? '就医准备' : action.kind === 'test_followup' ? '复查' : action.kind === 'treatment_discussion' ? '治疗讨论' : '日常行动'}</span><h3>{action.title}</h3></div><StatusBadge tone={action.urgency === 'urgent' || action.urgency === 'emergency' ? 'warning' : 'info'}>{action.urgency === 'emergency' ? '尽快寻求急救' : action.urgency === 'urgent' ? '及时处理' : action.urgency === 'soon' ? '近期安排' : '按计划进行'}</StatusBadge></div>
             <p>{action.why}</p><dl><div><dt>第一步</dt><dd>{action.firstStep}</dd></div>{action.timing && <div><dt>何时</dt><dd>{action.timing}</dd></div>}{action.reviewPlan && <div><dt>何时回看</dt><dd>{action.reviewPlan}</dd></div>}</dl>{action.caution && <small>{action.caution}</small>}
             {adopted ? <p className="muted-copy">已加入后续事项</p> : <button className="secondary-button" onClick={() => adoptAssessmentAction(action.id)} disabled={adoptingAssessmentActionId !== null}>{adoptingAssessmentActionId === action.id ? '正在加入' : '加入后续事项'}</button>}

@@ -80,6 +80,7 @@ describe('MemberProfileV2 event organization', () => {
     />);
     fireEvent.click(await screen.findByRole('tab', { name: '生活与行动' }));
     expect(screen.getByRole('button', { name: '加入后续事项' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '加入后续事项' }).closest('.assessment-action-card')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '加入后续事项' }));
     await waitFor(() => expect(adoptMemberAssessmentAction).toHaveBeenCalledWith({
       personId: 'person-1', snapshotId: 'assessment-1', actionId: 'action-1'

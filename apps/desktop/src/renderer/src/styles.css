@@ -712,6 +712,16 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 }
 .member-proposal-list { display: grid; gap: 12px; margin-top: 16px; }
 .member-proposal-list > article { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; padding: 15px; border: 1px solid var(--warm-200); border-radius: 15px; background: #fff; }
+.member-proposal-list > article.assessment-action-card { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 18px; }
+.assessment-action-card .panel__heading { align-items: flex-start; flex-wrap: wrap; }
+.assessment-action-card .panel__heading > div { min-width: 0; flex: 1 1 240px; }
+.assessment-action-card .panel__heading h3 { margin-top: 4px; font-size: 18px; line-height: 1.45; overflow-wrap: anywhere; }
+.member-proposal-list > article.assessment-action-card > p { margin: 0; font-size: 16px; line-height: 1.65; }
+.assessment-action-card dl { display: grid; gap: 10px; margin: 0; }
+.assessment-action-card dl > div { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 12px; padding: 10px 12px; border-radius: 10px; background: var(--warm-50); }
+.assessment-action-card dt { color: var(--warm-600); font-size: 14px; font-weight: 700; }
+.assessment-action-card dd { min-width: 0; margin: 0; font-size: 16px; line-height: 1.6; overflow-wrap: anywhere; }
+.assessment-action-card > small { color: var(--warm-600); font-size: 14px; line-height: 1.6; }
 .member-proposal-list > article.is-muted { opacity: .72; background: var(--warm-50); }
 .member-proposal-list__index { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 10px; color: var(--primary-dark); background: var(--primary-light); font-weight: 750; }
 .member-proposal-list h3 { margin: 0; font-size: 17px; }
@@ -809,6 +819,10 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
   .app-shell.has-evidence .workspace-switcher > span:not(.avatar),
   .app-shell.has-evidence .workspace-switcher svg { display: none; }
   .app-shell.has-evidence .side-nav__item { grid-template-columns: 1fr; justify-items: center; padding: 0; }
+}
+
+@media (max-width: 1100px) {
+  .guide-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 900px) {
