@@ -125,7 +125,15 @@ export const assessmentRequestV3Schema = z.object({
   analysisReferenceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   clinicalFrom: z.string().nullable(),
   clinicalAsOf: z.string().nullable(),
-  webSearchAllowed: z.boolean()
+  webSearchAllowed: z.boolean(),
+  partitionScope: z.object({
+    basis: z.enum(['system', 'document', 'clinical_date', 'fact_group']),
+    label: text,
+    selectedFactCount: z.number().int().nonnegative(),
+    totalAcceptedFactCount: z.number().int().nonnegative(),
+    primaryObservationIds: z.array(id),
+    contextObservationIds: z.array(id)
+  }).strict().optional()
 }).strict();
 export type AssessmentRequestV3 = z.infer<typeof assessmentRequestV3Schema>;
 
@@ -234,6 +242,12 @@ export const memberAssessmentSnapshotV3Schema = memberAssessmentCandidateV3Schem
   heldTargetIds: z.array(id),
   limitations: z.array(text),
   evidenceCatalog: z.array(memberEvidenceRefSchema),
+  /** 应用记录的执行路径；不由模型回填。 */
+  processingPlan: z.object({
+    strategy: z.enum(['full', 'partitioned']),
+    trigger: z.enum(['none', 'runtime_context_window_exceeded']),
+    partitionCount: z.number().int().nonnegative()
+  }).strict(),
   /** 仅由应用写入；模型给出 URL 不构成已核验来源。 */
   knowledgeVerifications: z.array(z.object({
     sourceId: id,

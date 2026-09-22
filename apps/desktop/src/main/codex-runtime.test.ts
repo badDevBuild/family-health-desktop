@@ -223,6 +223,22 @@ describe('CodexRuntimeManager', () => {
     manager.shutdown();
   });
 
+  it('把运行时真实上下文超限作为可识别错误，不与普通模型失败混淆', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    client.turnCompletion = {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'failed', items: [],
+        error: { error: { codexErrorInfo: 'ContextWindowExceeded', message: 'input too large' } } }
+    };
+    await manager.start();
+    await expect(manager.runStructuredTurn({
+      prompt: '合成超大输入', aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false }
+    })).rejects.toThrow('CODEX_CONTEXT_WINDOW_EXCEEDED');
+    manager.shutdown();
+  });
+
   it('派生分析只开启内置实时 Web Search，命令网络仍保持关闭', async () => {
     const { manager, client } = setup();
     client.authenticated = true;

@@ -90,6 +90,10 @@ function turnFailureCode(notification: TurnCompleted): string {
   const detail = recordValue(outer?.error) ?? outer;
   const serviceCode = typeof detail?.code === 'string' ? detail.code : null;
   const message = typeof detail?.message === 'string' ? detail.message : '';
+  const codexErrorInfo = typeof detail?.codexErrorInfo === 'string' ? detail.codexErrorInfo : '';
+  if (/contextwindowexceeded/i.test(codexErrorInfo) || /context.window.exceeded/i.test(message)) {
+    return 'CODEX_CONTEXT_WINDOW_EXCEEDED';
+  }
   if (serviceCode === 'invalid_json_schema' || message.includes('Invalid schema for response_format')) {
     return 'CODEX_OUTPUT_SCHEMA_INVALID';
   }

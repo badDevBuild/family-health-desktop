@@ -85,7 +85,7 @@ knowledgeSources：仅列实际使用来源；无法验证的记忆不编URL。�
 
 ## 执行模式
 mode=full：完成本轮所有请求系统和跨系统总览。
-mode=partition：只完成指定系统分区；不得称为全身结论。
+mode=partition：只完成本轮 partitionScope 指定的事实子集和系统分区。primaryObservationIds 是本分区主事实；contextObservationIds 仅供跨系统背景与反证，不要把它们误当本系统检查项目或新增事实。可能还有同系统其他资料尚未送入本轮，不得称为全身或本系统的完整结论，不得推断未提供的事实不存在。
 mode=aggregate：基于分区结果、其个人依据和关键反证完成总览与去重，不重新提取报告，不凭空新增事实；仍输出同一候选契约。`;
 
 const P03 = `## 任务
