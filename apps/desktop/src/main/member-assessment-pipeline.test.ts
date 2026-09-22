@@ -142,14 +142,151 @@ function candidateFor(request: AssessmentRequestV3, source: MemberEvidencePackag
 }
 
 describe('MemberAssessmentPipeline', () => {
+  it('通用“诊断”项目仅在原文明确支持检查部位时归入相应身体系统', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-generic-diagnosis-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
+    const sourceText = '2025-06-10 肝脏彩超小结：诊断：脂肪肝。';
+    await service.importFiles([{ path: '/tmp/合成肝脏彩超.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const extracted: ExtractionResult = {
+      schemaVersion: 1, documentId, coveredSourceSpanIds: [span.id],
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      candidates: [{
+        localKey: 'diagnosis', originalName: '诊断', standardNameCandidate: null,
+        value: { kind: 'text', rawText: '脂肪肝' }, unitRaw: null, referenceRangeRaw: null,
+        reportedAbnormalFlag: null, specimen: null, method: '彩超', bodySite: '肝脏',
+        clinicalDate: '2025-06-10', evidence: [{ sourceSpanId: span.id, quote: sourceText }], issues: []
+      }]
+    };
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'p01', turnId: 'first', output: extracted })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    const built = buildMemberAssessmentInput(service.store, personId, {
+      modelId: 'test-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: false
+    });
+    expect(built.request.requestedSystemIds).toContain('hepatobiliary');
+    expect(built.evidencePackage.facts[0]?.systemIds).toContain('hepatobiliary');
+    service.close();
+  });
+
+  it('局部读不清时接纳清楚的 TSH，并把未解析的超声项目及影响送入综合', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-partial-scope-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
+    const sourceText = '2025-06-10 TSH 6.8 mIU/L；甲状腺超声结论无法辨认';
+    await service.importFiles([{ path: '/tmp/合成局部模糊.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const extracted: ExtractionResult = {
+      schemaVersion: 1, documentId, coveredSourceSpanIds: [span.id],
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      candidates: [{
+        localKey: 'tsh', originalName: 'TSH', standardNameCandidate: 'TSH',
+        value: { kind: 'numeric', rawText: '6.8', decimal: '6.8', comparator: 'eq' },
+        unitRaw: 'mIU/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: '甲状腺', clinicalDate: '2025-06-10',
+        evidence: [{ sourceSpanId: span.id, quote: sourceText }], issues: []
+      }, {
+        localKey: 'ultrasound-unreadable', originalName: '甲状腺超声', standardNameCandidate: null,
+        value: { kind: 'unknown', rawText: null, reason: '超声结论无法辨认' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: '超声', bodySite: '甲状腺', clinicalDate: '2025-06-10',
+        evidence: [{ sourceSpanId: span.id, quote: sourceText }],
+        issues: [{ code: 'unreadable_result', message: '结论无法辨认' }]
+      }]
+    };
+    let calls = 0;
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'extract', turnId: `turn-${++calls}`, output: extracted })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(calls).toBe(2);
+    const built = buildMemberAssessmentInput(service.store, personId, {
+      modelId: 'test-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: false
+    });
+    expect(built.evidencePackage.facts.map((fact) => fact.originalName)).toEqual(['TSH']);
+    expect(built.evidencePackage.unresolvedScope).toEqual([expect.objectContaining({
+      documentId, affectedItemNames: ['甲状腺超声'],
+      reasonCodes: expect.arrayContaining(['value_unknown']),
+      potentialImpact: expect.stringContaining('不能把未解析的项目当成正常')
+    })]);
+    service.close();
+  });
+
+  it('身份冲突资料只告知综合存在归属缺口，不发送可能属于另一成员的项目名', async () => {
+    const { service, personId, documentId } = await fixture();
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    service.store.saveExtractionReviewIssue({
+      documentId, kind: 'person_conflict', severity: 'warning', preserveDocumentStatus: true,
+      evidenceRefs: [span.id], reasonCodes: ['PERSON_IDENTITY_NOT_CONFIRMED'],
+      candidateOptions: [{
+        localKey: 'other-member', originalName: '其他成员敏感项目', standardNameCandidate: null,
+        value: { kind: 'text', rawText: '不应外发' }, unitRaw: null, referenceRangeRaw: null,
+        reportedAbnormalFlag: null, specimen: null, method: null, bodySite: null,
+        clinicalDate: null, evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+      }]
+    });
+    const built = buildMemberAssessmentInput(service.store, personId, {
+      modelId: 'test-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: false
+    });
+    expect(built.evidencePackage.unresolvedScope).toEqual([expect.objectContaining({
+      documentId, reasonCodes: ['PERSON_IDENTITY_NOT_CONFIRMED'], affectedItemNames: [],
+      potentialImpact: expect.stringContaining('成员归属未确认')
+    })]);
+    expect(built.evidencePackage.facts).toEqual([]);
+    expect(built.evidencePackage.trends).toEqual([]);
+    expect(built.request.requestedSystemIds).toEqual([]);
+    expect(JSON.stringify(built.evidencePackage)).not.toContain('2026-09-21 LDL-C 4.2');
+    expect(JSON.stringify(built.evidencePackage)).not.toContain('其他成员敏感项目');
+    service.close();
+  });
+
+  it('旧库空值观测仍保留在数据库，但综合输入只取有结果事实并记录缺口', async () => {
+    const { service, personId } = await fixture();
+    await service.importFiles([{ path: '/tmp/合成旧版空值.txt', bytes: Buffer.from('甲状腺超声：结论无法辨认') }], personId);
+    const documentId = service.getSnapshot(null).inbox.find((item) => item.displayName === '合成旧版空值.txt')!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const acceptanceId = service.store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'health-acceptance-v3',
+      inputSignature: 'synthetic-legacy-unknown', outputHash: 'synthetic-legacy-unknown',
+      reviewRef: null, decision: 'accept_with_warnings'
+    });
+    service.store.publishFacts({
+      personId, documentId, documentCommitKey: 'e'.repeat(64),
+      expectedRevision: service.store.getFactRevision(personId), changeSetHash: 'f'.repeat(64),
+      summary: '合成旧规则空值观测', observations: [{
+        conceptKey: '甲状腺超声', originalName: '甲状腺超声', modelStandardNameCandidate: null,
+        rawText: '', valueKind: 'unknown', decimalValue: null, qualifier: null, unit: null,
+        referenceRange: null, clinicalDate: null, abnormalFlag: 'unknown', documentId,
+        sourceSpanId: span.id, acceptanceId, specimen: null, method: '超声', bodySite: '甲状腺',
+        evidence: [{ sourceSpanId: span.id, quote: span.quote }]
+      }]
+    });
+    const built = buildMemberAssessmentInput(service.store, personId, {
+      modelId: 'test-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: false
+    });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(2);
+    expect(built.evidencePackage.facts).toHaveLength(1);
+    expect(built.evidencePackage.facts[0]?.originalName).toBe('LDL-C');
+    expect(built.evidencePackage.unresolvedScope).toEqual([expect.objectContaining({
+      documentId, reasonCodes: ['LEGACY_VALUE_UNKNOWN'], affectedItemNames: ['甲状腺超声'],
+      potentialImpact: expect.stringContaining('不能据此判断该检查正常')
+    })]);
+    service.close();
+  });
+
   it('事实已接纳但尚未归入系统时仍一次 P02 发布成员总览，不猜系统或重提取', async () => {
     const { service, personId, built } = await fixtureUnclassified();
     expect(built.evidencePackage.facts).toHaveLength(1);
     expect(built.evidencePackage.facts[0]?.systemIds).toEqual([]);
     expect(built.request.requestedSystemIds).toEqual([]);
-    expect(built.evidencePackage.unresolvedScope).toEqual([{
-      documentId: built.evidencePackage.facts[0]!.documentId, reasonCodes: ['FACT_SYSTEM_UNMAPPED']
-    }]);
+    expect(built.evidencePackage.unresolvedScope).toEqual([expect.objectContaining({
+      documentId: built.evidencePackage.facts[0]!.documentId, reasonCodes: ['FACT_SYSTEM_UNMAPPED'],
+      affectedItemNames: ['合成未归类检查']
+    })]);
     const candidate = candidateFor(built.request, built.evidencePackage);
     candidate.overview = { ...candidate.overview, headline: '已保存一条检查记录，尚待归类',
       summary: '报告记录了合成未归类检查的原文结果；目前不猜测它属于哪个身体系统。',
@@ -877,6 +1014,32 @@ describe('MemberAssessmentPipeline', () => {
     expect(buildAssessmentKnowledgeVerifications(normalized, evidencePackage)[0]).toMatchObject({
       sourceId: 'controlled-source', status: 'catalog_curated', checkedAt: '2026-09-01', toolReceiptId: null
     });
+    service.close();
+  });
+
+  it('目录来源网址唯一且完全一致时，纠正临时 ID 并同步引用而不多发 P03', async () => {
+    const { service, personId, built } = await fixture();
+    const entry = built.evidencePackage.knowledge.find((item) => item.id === 'knowledge-physical-activity-tailoring')!;
+    expect(entry).toBeDefined();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.knowledgeSources.push({
+      id: 'knowledge-source-physical-activity-tailoring', title: '模型转述标题', organization: '模型转述机构',
+      url: entry.sourceUrl, origin: 'catalog', supports: '模型自称的更宽范围'
+    });
+    candidate.actions[0]!.knowledgeSourceIds = ['knowledge-source-physical-activity-tailoring'];
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => { calls += 1; return { threadId: 'p02', turnId: 'first', output: candidate }; }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 1 });
+    expect(calls).toBe(1);
+    const snapshot = service.getMemberAssessment(personId)!;
+    expect(snapshot.actions[0]?.knowledgeSourceIds).toEqual([entry.id]);
+    expect(snapshot.knowledgeSources[0]).toMatchObject({
+      id: entry.id, title: entry.title, organization: entry.sourceOrganization,
+      url: entry.sourceUrl, supports: entry.supportedScope
+    });
+    expect(snapshot.knowledgeVerifications[0]).toMatchObject({ sourceId: entry.id, status: 'catalog_curated' });
     service.close();
   });
 

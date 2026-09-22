@@ -92,6 +92,21 @@ describe('格式和证据预处理', () => {
     expect(manifest.spans[1]?.lineStart).toBe(2);
   });
 
+  it('TXT 空白行不生成虚假的来源单元，但保留实际原文行号', () => {
+    const base = {
+      sourceObjectId: 'source-blank', documentId: 'doc-blank', sha256: 'd'.repeat(64),
+      displayName: '虚构空行.txt', createdAt: '2026-09-22T00:00:00Z'
+    };
+    const manifest = buildTextManifest({ ...base, text: '检查日期：2025-06-10\n\n诊断：脂肪肝。\n   \n' });
+    expect(manifest.normalizerVersion).toBe('txt-v2');
+    expect(manifest.totalUnits).toBe(2);
+    expect(manifest.coveredUnitIndexes).toEqual([0, 1]);
+    expect(manifest.spans.map((span) => [span.lineStart, span.quote])).toEqual([
+      [1, '检查日期：2025-06-10'], [3, '诊断：脂肪肝。']
+    ]);
+    expect(() => buildTextManifest({ ...base, text: '\n   \n' })).toThrow('TEXT_HAS_NO_CONTENT');
+  });
+
   it('TXT 规范化后超过单片段或片段数量预算时拒绝', () => {
     const base = {
       sourceObjectId: 'source-limit', documentId: 'doc-limit', sha256: 'c'.repeat(64),

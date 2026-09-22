@@ -219,7 +219,7 @@ export class MemberAssessmentPipeline {
       scopePackage: MemberEvidencePackageV3
     ): Promise<{ candidate: MemberAssessmentCandidateV3 | null; heldTargetIds: string[]; reason: string | null }> => {
       const validationInput = validationInputFor(scopeRequest, scopePackage);
-      let candidate = normalizeAssessmentStructuralFields(original);
+      let candidate = canonicalizeAssessmentKnowledge(normalizeAssessmentStructuralFields(original), scopePackage);
       let validation = validateAssessmentCandidate(candidate, validationInput);
       let heldTargetIds: string[] = [];
       if (validation.issues.length === 0) return { candidate, heldTargetIds, reason: null };
@@ -240,7 +240,9 @@ export class MemberAssessmentPipeline {
         outputSchema: candidateOutputSchema, allowWebSearch: false
       });
       const repairParsed = memberAssessmentCandidateV3Schema.safeParse(repaired.output);
-      const repairedCandidate = repairParsed.success ? normalizeAssessmentStructuralFields(repairParsed.data) : null;
+      const repairedCandidate = repairParsed.success
+        ? canonicalizeAssessmentKnowledge(normalizeAssessmentStructuralFields(repairParsed.data), scopePackage)
+        : null;
       if (!repairedCandidate || !repairChangedOnlyAllowed(candidate, repairedCandidate, targetIds)) {
         const isolated = isolateInvalidNodes(candidate, validation.issues);
         if (!isolated) return { candidate: null, heldTargetIds, reason: 'assessment_repair_outside_scope' };

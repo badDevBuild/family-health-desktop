@@ -52,6 +52,18 @@ describe('自动接纳规则', () => {
       .toEqual({ decision: 'accept', warnings: [] });
   });
 
+  it('空值未知候选只算未解决来源，不能接纳为健康事实', () => {
+    const unknown: ObservationCandidate = {
+      ...candidate,
+      originalName: '模糊来源单元',
+      value: { kind: 'unknown', rawText: null, reason: '文字或图像无法辨认' },
+      evidence: [{ sourceSpanId: 'span-2', quote: null }],
+      issues: [{ code: 'SOURCE_CONTENT_MISSING', message: '合成来源无结果' }]
+    };
+    expect(evaluateObservationCandidate(unknown, manifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['value_unknown'] });
+  });
+
   it('数值必须和对应指标出现在同一证据行，不能借用邻项数字', () => {
     const rowManifest: SourceManifest = {
       ...manifest,

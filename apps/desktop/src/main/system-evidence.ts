@@ -60,7 +60,13 @@ function linksFor(observation: AcceptedObservationSummary) {
   if (observation.originalNameStatus === 'legacy_missing') {
     return linkLegacyCandidateToSystems(observation.mapping, observation.modelStandardNameCandidate);
   }
-  return linkConceptToSystems(mappingFor(observation));
+  const namedLinks = linkConceptToSystems(mappingFor(observation));
+  if (namedLinks.length > 0) return namedLinks;
+  // “诊断/小结”本身不是器官名；仅当原文确实写出提取到的检查部位时才按部位归类。
+  const site = observation.bodySite?.trim();
+  if (!site || !/^(?:诊断|结论|小结|检查结论|影像结论|超声小结)$/.test(observation.originalName.trim())
+    || !observation.evidence.some((reference) => reference.quote?.includes(site))) return namedLinks;
+  return linkTextToSystems(site).map((systemId) => ({ systemId, relation: 'direct' as const }));
 }
 
 function displayNameFor(observation: AcceptedObservationSummary): string {
@@ -229,17 +235,25 @@ export function buildSystemEvidenceBundle(
   store: WorkspaceStore,
   personId: string,
   systemId: BodySystemId,
-  options: { modelId?: string; analysisWindow?: 'all_history' } = {}
+  options: { modelId?: string; analysisWindow?: 'all_history'; excludedDocumentIds?: ReadonlySet<string> } = {}
 ): SystemEvidenceBundle {
   const person = store.listPersons().find((item) => item.id === personId && item.archivedAt === null);
   if (!person) throw new Error('PERSON_NOT_FOUND');
   if (!bodySystemRegistry.some((system) => system.id === systemId)) throw new Error('BODY_SYSTEM_NOT_FOUND');
-  const observations = store.listAcceptedObservations(personId);
+  const observations = store.listAcceptedObservations(personId)
+    .filter((observation) => !options.excludedDocumentIds?.has(observation.documentId));
   const eventIdsByDocument = new Map(store.listReportMetadata(personId).map((item) => [item.documentId, item.eventId]));
   const selected: Array<{ observation: AcceptedObservationSummary; fact: SystemEvidenceFact }> = [];
   const unclassifiedObservationIds: string[] = [];
   const excludedObservationIds: string[] = [];
+  const unusableObservationIds: string[] = [];
   for (const observation of observations) {
+    // 旧规则可能把 unknown/空结果作为观测保存；它既不能成为系统事实，也不能生成空趋势点。
+    if (observation.valueKind === 'unknown' || observation.rawText.trim().length === 0) {
+      if (linksFor(observation).some((item) => item.systemId === systemId)) unusableObservationIds.push(observation.id);
+      else excludedObservationIds.push(observation.id);
+      continue;
+    }
     const mapping = mappingFor(observation);
     const link = linksFor(observation).find((item) => item.systemId === systemId);
     if (!link) {
@@ -303,7 +317,7 @@ export function buildSystemEvidenceBundle(
       relatedSystemIds: systemIds,
       selectionReason: reason
     }));
-  const systemEvents = eventsFor(store, personId, observations, systemId);
+  const systemEvents = eventsFor(store, personId, selectedObservations, systemId);
   const knowledge = knowledgeForSystem(systemId);
   const selectedDocumentIds = new Set(selectedObservations.map((observation) => observation.documentId));
   const eventDependencies = store.listReportMetadata(personId)
@@ -338,6 +352,7 @@ export function buildSystemEvidenceBundle(
       clinicalDate: item.observation.clinicalDate,
       abnormalFlag: item.observation.abnormalFlag
     })),
+    unusableObservationIds,
     notes: selectedNotes.map(({ note }) => ({
       id: note.id,
       revision: note.revision,
@@ -354,6 +369,7 @@ export function buildSystemEvidenceBundle(
       contextSelector: 'context-selector-v2-global-safety-first',
       actionSelector: 'action-selector-v1',
       analysisWindow: 'all-history-v1',
+      sourceFactFilter: 'nonempty-result-v1',
       knowledge: SYSTEM_KNOWLEDGE_VERSION
     },
     promptVersion: SYSTEM_ANALYSIS_PROMPT_VERSION,
@@ -385,7 +401,7 @@ export function buildSystemEvidenceBundle(
     knowledge,
     coverage: {
       selectedObservationIds: selected.map((item) => item.observation.id),
-      excludedObservationIds,
+      excludedObservationIds: [...excludedObservationIds, ...unusableObservationIds],
       unclassifiedObservationIds,
       selectedContextIds: selectedNotes.map((selection) => selection.note.id),
       excludedContextIds: noteSelections.filter((selection) => !selection.systemIds.includes(systemId)).map((selection) => selection.note.id),
@@ -393,6 +409,7 @@ export function buildSystemEvidenceBundle(
       excludedActionIds: actionSelections.filter((selection) => !selection.systemIds.includes(systemId)).map((selection) => selection.action.id),
       incompleteReasons: [
         ...(unclassifiedObservationIds.length > 0 ? [`${unclassifiedObservationIds.length} 条事实尚未完成概念映射。`] : []),
+        ...(unusableObservationIds.length > 0 ? [`${unusableObservationIds.length} 条旧记录没有可用结果，未纳入系统分析。`] : []),
         ...(selected.length === 0 ? ['此身体系统尚无可归集事实。'] : [])
       ]
     }

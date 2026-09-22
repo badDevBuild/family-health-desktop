@@ -11,11 +11,28 @@ import { DocumentExtractionPipeline } from '../apps/desktop/src/main/processing-
 import { PersonalWorkspaceService } from '../apps/desktop/src/main/workspace-service.js';
 
 /** 固定哈希的纯合成文本；用当前正式管道实跑 P01＋P02，不读取家庭工作区。 */
-const expectedFixtureSha256 = '174709df569fb8d696db9174d2774aa5d5925fb5383ead28a8646f9151507028';
-const fixturePath = resolve('packages/evaluation/fixtures/full-chain-ldl.txt');
+const fixtures = {
+  'clear-ldl': {
+    filename: 'full-chain-ldl.txt',
+    sha256: '174709df569fb8d696db9174d2774aa5d5925fb5383ead28a8646f9151507028'
+  },
+  'documented-fatty-liver': {
+    filename: 'full-chain-documented-fatty-liver.txt',
+    sha256: '29dbe99346a57936b891ba7870bd6aaff910b659a3cd5fa3eaf79509a9c1c106'
+  },
+  'partial-thyroid': {
+    filename: 'full-chain-partial-thyroid.txt',
+    sha256: 'ab0655c2c318b9d415ed893c57d3e93bfd509d1131f01db2e96d80b418c9fd80'
+  }
+} as const;
+const requestedCase = process.argv.find((arg) => arg.startsWith('--case='))?.slice('--case='.length) ?? 'clear-ldl';
+if (!(requestedCase in fixtures)) throw new Error('UNKNOWN_SYNTHETIC_CASE');
+const caseId = requestedCase as keyof typeof fixtures;
+const fixture = fixtures[caseId];
+const fixturePath = resolve('packages/evaluation/fixtures', fixture.filename);
 const fixtureBytes = readFileSync(fixturePath);
 const fixtureSha256 = createHash('sha256').update(fixtureBytes).digest('hex');
-if (fixtureSha256 !== expectedFixtureSha256) throw new Error('SYNTHETIC_FIXTURE_HASH_MISMATCH');
+if (fixtureSha256 !== fixture.sha256) throw new Error('SYNTHETIC_FIXTURE_HASH_MISMATCH');
 const modelId = process.argv.find((arg) => arg.startsWith('--model='))?.slice('--model='.length) ?? 'gpt-5.6-sol';
 const reasoningEffort = aiReasoningEffortSchema.parse(
   process.argv.find((arg) => arg.startsWith('--effort='))?.slice('--effort='.length) ?? 'medium'
@@ -40,7 +57,7 @@ const calls: Array<{ phase: string; index: number; requestedWebSearch: boolean; 
   durationMs: number; inputTokens: number | null; outputTokens: number | null; webSearches: number;
   status: 'completed' | 'failed'; errorCode: string | null }> = [];
 const receipt: Record<string, unknown> = {
-  kind: 'LEAN_V3_FULL_CHAIN_SYNTHETIC', syntheticOnly: true,
+  kind: 'LEAN_V3_FULL_CHAIN_SYNTHETIC', syntheticOnly: true, caseId,
   fixtureSha256, modelId, reasoningEffort, webSearchAllowed: false,
   createdAt: new Date().toISOString(), calls
 };
@@ -79,7 +96,7 @@ try {
   const account = await runtime.refreshAccount();
   if (account.status !== 'connected') throw new Error('CODEX_AUTH_REQUIRED');
   const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
-  const imported = await service.importFiles([{ path: '/tmp/纯合成血脂报告.txt', bytes: fixtureBytes }], personId);
+  const imported = await service.importFiles([{ path: `/tmp/纯合成报告-${caseId}.txt`, bytes: fixtureBytes }], personId);
   if (imported.rejected.length > 0) throw new Error('SYNTHETIC_IMPORT_REJECTED');
   const documentId = service.getSnapshot(null).inbox[0]?.id;
   if (!documentId) throw new Error('SYNTHETIC_DOCUMENT_MISSING');

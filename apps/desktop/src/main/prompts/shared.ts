@@ -19,7 +19,7 @@ export const EXTRACTION_PROMPT_VERSION = 'extract-v4';
 export const DERIVED_PROMPT_VERSION = 'derived-v4';
 
 /** 本地事实接纳规则版本，与 health-core 的 evaluateObservationCandidate 对齐。 */
-export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v3';
+export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v4';
 
 /** 派生安全规则版本，与 derived-pipeline 本地拦截对齐。 */
 export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
@@ -27,9 +27,9 @@ export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
 /** 成员档案 v2 的系统级综合与独立复核版本。 */
 export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v2';
 export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v2';
-export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v5';
+export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v6';
 /** 本地校验规则变化必须使旧成员快照过期，避免旧结果被误当成新规则产物。 */
-export const MEMBER_ASSESSMENT_RULES_VERSION = `lean-health-v3.7+${ASSESSMENT_VALIDATION_RULES_VERSION}`;
+export const MEMBER_ASSESSMENT_RULES_VERSION = `lean-health-v3.8+${ASSESSMENT_VALIDATION_RULES_VERSION}`;
 export const HEALTH_PIPELINE_VERSION = 'lean-health-v3';
 export const RUNTIME_PROMPT_VERSION = 'health-runtime-v3';
 

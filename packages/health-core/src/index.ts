@@ -291,6 +291,11 @@ export function evaluateObservationCandidate(
     return { decision: 'reject', reasons: ['evidence_mismatch'] };
   }
 
+  // 未知值是覆盖缺口，不是已知的个人健康事实；不能写成空值观测后交给综合分析。
+  if (candidate.value.kind === 'unknown') {
+    return { decision: 'reject', reasons: ['value_unknown'] };
+  }
+
   const contentProblems = evidenceContentProblems(candidate, manifest);
   if (contentProblems.length > 0) {
     return { decision: 'reject', reasons: contentProblems };
@@ -309,7 +314,6 @@ export function evaluateObservationCandidate(
   const warnings: string[] = [];
   if (candidate.referenceRangeRaw === null) warnings.push('reference_range_not_provided');
   if (candidate.unitRaw === null && candidate.value.kind === 'numeric') warnings.push('unit_not_provided');
-  if (candidate.value.kind === 'unknown') warnings.push('value_unknown');
 
   return warnings.length === 0
     ? { decision: 'accept', warnings }

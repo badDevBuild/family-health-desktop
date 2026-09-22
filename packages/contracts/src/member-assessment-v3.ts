@@ -175,7 +175,11 @@ export const memberEvidencePackageV3Schema = z.object({
     evidenceId: id,
     sourceKind: z.literal('user_reported')
   }).strict()),
-  unresolvedScope: z.array(z.object({ documentId: id, reasonCodes: z.array(z.string()) }).strict()),
+  unresolvedScope: z.array(z.object({
+    documentId: id, reasonCodes: z.array(z.string()),
+    affectedItemNames: z.array(z.string().min(1)).optional(),
+    potentialImpact: z.string().min(1).optional()
+  }).strict()),
   existingActions: z.array(z.object({
     id,
     title: text,

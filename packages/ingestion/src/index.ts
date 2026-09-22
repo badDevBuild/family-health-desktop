@@ -327,17 +327,20 @@ export function buildTextManifest(input: {
   text: string;
   createdAt: string;
 }): SourceManifest {
-  const lines = input.text.split(/\r?\n/);
-  assertNormalizedTextBudget(lines);
-  const spans: SourceSpan[] = lines.map((line, index) => ({
+  const lines = input.text.split(/\r?\n/)
+    .map((line, index) => ({ line, sourceLine: index + 1 }))
+    .filter(({ line }) => line.trim().length > 0);
+  if (lines.length === 0) throw new Error('TEXT_HAS_NO_CONTENT');
+  assertNormalizedTextBudget(lines.map(({ line }) => line));
+  const spans: SourceSpan[] = lines.map(({ line, sourceLine }) => ({
     id: randomUUID(),
     documentId: input.documentId,
     spanKind: 'line',
     page: null,
     blockId: null,
-    lineStart: index + 1,
-    lineEnd: index + 1,
-    quote: line || null,
+    lineStart: sourceLine,
+    lineEnd: sourceLine,
+    quote: line,
     readability: 'clear'
   }));
   return {
@@ -346,10 +349,10 @@ export function buildTextManifest(input: {
     sha256: input.sha256,
     mediaType: 'text/plain',
     originalDisplayName: basename(input.displayName),
-    totalUnits: Math.max(lines.length, 1),
-    coveredUnitIndexes: Array.from({ length: Math.max(lines.length, 1) }, (_, index) => index),
+    totalUnits: lines.length,
+    coveredUnitIndexes: Array.from({ length: lines.length }, (_, index) => index),
     spans,
-    normalizerVersion: 'txt-v1',
+    normalizerVersion: 'txt-v2',
     conversionWarnings: [],
     createdAt: input.createdAt
   };
