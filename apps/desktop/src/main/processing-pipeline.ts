@@ -16,7 +16,8 @@ import { evaluateObservationCandidate, stableHash } from '@core';
 import { buildPdfManifest, INGESTION_LIMITS, renderDocxImagesToFiles, renderHeicImagesToPngs, renderPdfPagesToPngs } from '@ingestion';
 import type { JobExecutionGuard, WorkspaceStore } from '@storage';
 import {
-  ACCEPTANCE_RULES_VERSION
+  ACCEPTANCE_RULES_VERSION,
+  EXTRACTION_PROMPT_VERSION
 } from './prompts/index.js';
 import { buildP01Prompt, buildP03Prompt } from './prompts/lean.js';
 
@@ -1009,8 +1010,52 @@ export class DocumentExtractionPipeline {
     const uncoveredSpanIds: string[] = [];
     let lastReceipt: { threadId: string; turnId: string } | null = null;
     let temporaryRoot: string | null = null;
+    const absorbChunk = (extracted: ExtractionResult, expectedSpanIds: string[]): boolean => {
+      const expected = new Set(expectedSpanIds);
+      if (extracted.subject.evidence.some((ref) => !expected.has(ref.sourceSpanId))) return false;
+      const failures = candidateValidationFailures(extracted, bundle);
+      const missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
+      const outOfChunk = extracted.candidates.filter((candidate) => candidate.evidence.some((ref) => !expected.has(ref.sourceSpanId)));
+      const failedKeys = new Set([...failures.map((failure) => failure.localKey), ...outOfChunk.map((candidate) => candidate.localKey)]);
+      acceptedCandidates.push(...extracted.candidates.filter((candidate) => !failedKeys.has(candidate.localKey)));
+      for (const failure of failures) {
+        const candidate = extracted.candidates.find((item) => item.localKey === failure.localKey);
+        if (candidate) unresolved.push({ candidate, reasons: failure.reasons });
+      }
+      unresolved.push(...outOfChunk.map((candidate) => ({ candidate, reasons: ['EVIDENCE_OUTSIDE_CHUNK'] })));
+      uncoveredSpanIds.push(...missing);
+      coveredSourceSpanIds.push(...extracted.coveredSourceSpanIds.filter((id) => expected.has(id)));
+      subjects.push(extracted.subject);
+      metadata.push(reportMetadataEvidence(extracted.reportMetadata).every((ref) => expected.has(ref.sourceSpanId))
+        ? extracted.reportMetadata : null);
+      return true;
+    };
     try {
       for (const [chunkIndex, spans] of chunks.entries()) {
+        const expectedSpanIds = spans.map((span) => span.id);
+        const checkpointSignature = stableHash({
+          documentId, sourceSha256: bundle.manifest.sha256,
+          normalizerVersion: bundle.manifest.normalizerVersion,
+          promptVersion: EXTRACTION_PROMPT_VERSION,
+          rulesVersion: ACCEPTANCE_RULES_VERSION,
+          chunkIndex,
+          spans: spans.map((span) => ({ id: span.id, quote: span.quote, readability: span.readability }))
+        });
+        const checkpoint = this.executionGuard
+          ? this.store.getExtractionChunkCheckpoint(this.executionGuard, documentId, checkpointSignature)
+          : null;
+        if (checkpoint) {
+          const parsedCheckpoint = extractionResultSchema.safeParse(checkpoint.output);
+          if (!parsedCheckpoint.success || parsedCheckpoint.data.documentId !== documentId
+            || !subjectIsConsistent(parsedCheckpoint.data, bundle)
+            || !evidenceIsConfinedToChunk(parsedCheckpoint.data, expectedSpanIds)
+            || !absorbChunk(parsedCheckpoint.data, expectedSpanIds)) {
+            throw new Error('EXTRACTION_CHUNK_CHECKPOINT_INVALID');
+          }
+          lastReceipt = { threadId: checkpoint.threadId, turnId: checkpoint.turnId };
+          extractionTurnIds.push(checkpoint.extractionTurnId);
+          continue;
+        }
         const imagePaths: string[] = [];
         const imageMappings: ImageMapping[] = [];
         const chunkDirectory = 'chunk-' + (chunkIndex + 1);
@@ -1087,7 +1132,6 @@ export class DocumentExtractionPipeline {
         if (Buffer.byteLength(sourcePackage, 'utf8') > INGESTION_LIMITS.maxSourcePackageBytes) {
           throw new Error('SOURCE_PACKAGE_LIMIT_EXCEEDED');
         }
-        const expectedSpanIds = spans.map((span) => span.id);
         const generated = await this.runTurn(documentId, 'extract', {
           prompt: buildP01Prompt({
             personId: bundle.personId, displayName: bundle.personDisplayName,
@@ -1096,6 +1140,7 @@ export class DocumentExtractionPipeline {
           imagePaths, outputSchema, allowWebSearch: false, timeoutMs: 600_000
         });
         lastReceipt = { threadId: generated.threadId, turnId: generated.turnId };
+        let effectiveReceipt = lastReceipt;
         extractionTurnIds.push(generated.turnId);
         const parsed = extractionResultSchema.safeParse(generated.output);
         if (!parsed.success || parsed.data.documentId !== documentId) {
@@ -1112,8 +1157,8 @@ export class DocumentExtractionPipeline {
             extracted.subject.evidence.map((item) => item.sourceSpanId), 'PERSON_IDENTITY_NOT_CONFIRMED',
             generated.threadId, generated.turnId, undefined, reportedName ?? undefined);
         }
-        let missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
-        let failures = candidateValidationFailures(extracted, bundle);
+        const missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
+        const failures = candidateValidationFailures(extracted, bundle);
         if (missing.length > 0 || failures.length > 0 || !evidenceIsConfinedToChunk(extracted, expectedSpanIds)) {
           const expected = new Set(expectedSpanIds);
           const outsideKeys = extracted.candidates.filter((candidate) => candidate.evidence.some((ref) => !expected.has(ref.sourceSpanId)))
@@ -1161,29 +1206,25 @@ export class DocumentExtractionPipeline {
               })
               && [...newByKey].every(([key, candidate]) => oldByKey.has(key)
                 || missing.some((id) => candidate.evidence.some((ref) => ref.sourceSpanId === id)));
-            if (preserved) extracted = repaired;
+            if (preserved) {
+              extracted = repaired;
+              effectiveReceipt = { threadId: repairedTurn.threadId, turnId: repairedTurn.turnId };
+            }
           }
-          missing = expectedSpanIds.filter((id) => !extracted.coveredSourceSpanIds.includes(id));
-          failures = candidateValidationFailures(extracted, bundle);
         }
-        const expected = new Set(expectedSpanIds);
-        if (extracted.subject.evidence.some((ref) => !expected.has(ref.sourceSpanId))) {
+        lastReceipt = effectiveReceipt;
+        if (!absorbChunk(extracted, expectedSpanIds)) {
           return this.needsReview(documentId, 'field_conflict', expectedSpanIds,
             'SUBJECT_EVIDENCE_OUTSIDE_CHUNK', lastReceipt.threadId, lastReceipt.turnId);
         }
-        const outOfChunk = extracted.candidates.filter((candidate) => candidate.evidence.some((ref) => !expected.has(ref.sourceSpanId)));
-        const failedKeys = new Set([...failures.map((failure) => failure.localKey), ...outOfChunk.map((candidate) => candidate.localKey)]);
-        acceptedCandidates.push(...extracted.candidates.filter((candidate) => !failedKeys.has(candidate.localKey)));
-        for (const failure of failures) {
-          const candidate = extracted.candidates.find((item) => item.localKey === failure.localKey);
-          if (candidate) unresolved.push({ candidate, reasons: failure.reasons });
+        if (this.executionGuard) {
+          this.store.saveExtractionChunkCheckpoint({
+            guard: this.executionGuard, documentId, signature: checkpointSignature,
+            chunkIndex, output: extracted,
+            threadId: effectiveReceipt.threadId, turnId: effectiveReceipt.turnId,
+            extractionTurnId: generated.turnId
+          });
         }
-        unresolved.push(...outOfChunk.map((candidate) => ({ candidate, reasons: ['EVIDENCE_OUTSIDE_CHUNK'] })));
-        uncoveredSpanIds.push(...missing);
-        coveredSourceSpanIds.push(...extracted.coveredSourceSpanIds.filter((id) => expectedSpanIds.includes(id)));
-        subjects.push(extracted.subject);
-        metadata.push(reportMetadataEvidence(extracted.reportMetadata).every((ref) => expected.has(ref.sourceSpanId))
-          ? extracted.reportMetadata : null);
         if (temporaryRoot) rmSync(join(temporaryRoot, chunkDirectory), { recursive: true, force: true });
       }
     } finally {
@@ -1253,6 +1294,8 @@ export class DocumentExtractionPipeline {
         ])]
       });
     }
+    // 整份事实已提交后不再需要带原文的块级恢复记录；失败重试仍保留未提交块。
+    if (this.executionGuard) this.store.clearExtractionChunkCheckpoints(this.executionGuard, documentId);
     return { status: 'published', documentId, revision: publication.revision, candidateCount: accepted.length,
       threadId: lastReceipt.threadId, turnId: lastReceipt.turnId };
   }

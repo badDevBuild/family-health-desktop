@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
+import { memberAssessmentSnapshotV3Schema } from '@contracts';
 import type {
   ActionItem,
   AdoptMemberAssessmentActionInput,
@@ -241,6 +242,17 @@ export interface JobExecutionGuard {
   attemptId: string;
   consentId: string;
   accountFingerprint: string;
+}
+
+interface ExtractionChunkCheckpoint {
+  consentId: string;
+  documentId: string;
+  signature: string;
+  chunkIndex: number;
+  output: unknown;
+  threadId: string;
+  turnId: string;
+  extractionTurnId: string;
 }
 
 export interface DocumentConversionInput {
@@ -626,6 +638,7 @@ export class WorkspaceStore {
         `).run(input.personId, nextContextRevision, JSON.stringify({ operation: 'birth_year_changed', birthYear: input.birthYear }), changedAt);
         this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
         this.db.prepare(`UPDATE system_analysis_snapshots_v2 SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+        this.invalidateMemberAssessmentSnapshots(input.personId);
       }
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
@@ -667,6 +680,14 @@ export class WorkspaceStore {
         UPDATE jobs SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
         WHERE person_id = ? AND status IN ('queued', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait', 'failed')
       `).run(archivedAt, input.personId);
+      const archivedJobs = this.db.prepare(`SELECT id FROM jobs WHERE person_id = ?`)
+        .all(input.personId) as Array<{ id: string }>;
+      for (const job of archivedJobs) {
+        try { this.scrubExtractionChunksFromJob(job.id); } catch {
+          // 损坏的任务记录不能阻止成员归档与授权撤回。
+        }
+      }
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       this.db.prepare(`
         UPDATE documents SET status = 'ignored', excluded_from_analysis = 1
         WHERE person_id = ? AND status IN ('queued', 'needs_review', 'blocked')
@@ -773,6 +794,7 @@ export class WorkspaceStore {
       `).run(next, input.personId, actual);
       if (update.changes !== 1) throw new RevisionConflictError(actual, this.getPersonRevision(input.personId, 'clinical_context_revision'));
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       if (affectedSystemIds.length > 0) {
         this.db.prepare(`
           UPDATE system_analysis_snapshots_v2 SET status = 'stale'
@@ -867,6 +889,9 @@ export class WorkspaceStore {
         throw new Error('MEMBER_ASSESSMENT_ACTION_STALE');
       }
       const snapshot = JSON.parse(row.payload_json) as MemberAssessmentSnapshotV3;
+      if (snapshot.reviewScopeSignature !== this.getOpenReviewScopeSignature(input.personId)) {
+        throw new Error('MEMBER_ASSESSMENT_ACTION_STALE');
+      }
       const proposal = snapshot.actions.find((item) => item.id === input.actionId);
       if (!proposal || snapshot.heldTargetIds.includes(input.actionId)) throw new Error('MEMBER_ASSESSMENT_ACTION_NOT_AVAILABLE');
       const existing = this.listAdoptedMemberAssessmentActions(input.personId)
@@ -1188,6 +1213,7 @@ export class WorkspaceStore {
       `).run(next, personId, actual);
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(personId);
       this.db.prepare(`UPDATE system_analysis_snapshots_v2 SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(personId);
+      this.invalidateMemberAssessmentSnapshots(personId);
       return next;
     });
     return transaction();
@@ -1585,6 +1611,7 @@ export class WorkspaceStore {
         `).run(document.person_id);
         this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(document.person_id);
         this.invalidateSystemSnapshots(document.person_id, affectedSystemIds);
+        this.invalidateMemberAssessmentSnapshots(document.person_id);
       }
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
@@ -1664,6 +1691,9 @@ export class WorkspaceStore {
     const deletedAt = this.now().toISOString();
     try {
       const transaction = this.db.transaction(() => {
+        const jobsWithCheckpoints = this.db.prepare(`SELECT id FROM jobs WHERE checkpoint_json IS NOT NULL`)
+          .all() as Array<{ id: string }>;
+        for (const job of jobsWithCheckpoints) this.scrubExtractionChunksFromJob(job.id, input.documentId);
         const spanRows = this.db.prepare(`SELECT id FROM source_spans WHERE document_id = ?`).all(input.documentId) as Array<{ id: string }>;
         const spanIds = spanRows.map((row) => row.id);
         const observationRows = spanIds.length === 0 ? [] : this.db.prepare(`
@@ -1685,6 +1715,16 @@ export class WorkspaceStore {
         `).all(...reportIds) as Array<{ event_id: string }>;
 
         if (document.person_id) {
+          // 成员级综合可能引用这份资料；当前工作区无法安全地只删单份引用，故清除该成员整代 V3 正文及其采纳行动。
+          const assessmentActions = this.db.prepare(`
+            SELECT id FROM action_items
+            WHERE person_id = ? AND origin = 'ai_proposed' AND source_ref LIKE ?
+          `).all(document.person_id, `${assessmentActionSourcePrefix}%`) as Array<{ id: string }>;
+          for (const action of assessmentActions) {
+            this.db.prepare(`DELETE FROM action_events WHERE action_id = ?`).run(action.id);
+            this.db.prepare(`DELETE FROM action_items WHERE id = ?`).run(action.id);
+          }
+          this.db.prepare(`DELETE FROM member_assessment_snapshots_v3 WHERE person_id = ?`).run(document.person_id);
           const snapshotRows = this.db.prepare(`SELECT id FROM derived_snapshots WHERE person_id = ?`).all(document.person_id) as Array<{ id: string }>;
           for (const snapshot of snapshotRows) this.db.prepare(`DELETE FROM snapshot_evidence WHERE snapshot_id = ?`).run(snapshot.id);
           this.db.prepare(`DELETE FROM derived_snapshots WHERE person_id = ?`).run(document.person_id);
@@ -2019,6 +2059,9 @@ export class WorkspaceStore {
       if (!input.preserveDocumentStatus) {
         this.db.prepare(`UPDATE documents SET status = 'needs_review' WHERE id = ?`).run(input.documentId);
       }
+      const document = this.db.prepare(`SELECT person_id FROM documents WHERE id = ?`)
+        .get(input.documentId) as { person_id: string | null } | undefined;
+      if (document?.person_id) this.invalidateMemberAssessmentSnapshots(document.person_id);
     });
     transaction();
     return id;
@@ -2115,6 +2158,9 @@ export class WorkspaceStore {
         WHERE id = ?
       `).run(input.issueId);
       this.db.prepare(`UPDATE documents SET status = 'queued' WHERE id = ?`).run(input.documentId);
+      const reviewDocument = this.db.prepare(`SELECT person_id FROM documents WHERE id = ?`)
+        .get(input.documentId) as { person_id: string | null } | undefined;
+      if (reviewDocument?.person_id) this.invalidateMemberAssessmentSnapshots(reviewDocument.person_id);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'review_issue.requeued', ?, '核对事项已关闭，资料按当前规则重新核对', ?)
@@ -2132,6 +2178,9 @@ export class WorkspaceStore {
         WHERE id = ? AND field_ref = 'document:' || ? AND resolution_status = 'open' AND kind = 'field_conflict'
       `).run(issueId, documentId);
       if (result.changes !== 1) throw new Error('REVIEW_ISSUE_NOT_OPEN');
+      const reviewDocument = this.db.prepare(`SELECT person_id FROM documents WHERE id = ?`)
+        .get(documentId) as { person_id: string | null } | undefined;
+      if (reviewDocument?.person_id) this.invalidateMemberAssessmentSnapshots(reviewDocument.person_id);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'review_issue.corrected', ?, '用户核对原始依据后修正并接纳事实', ?)
@@ -2150,6 +2199,7 @@ export class WorkspaceStore {
         WHERE id = ? AND person_id IS NULL AND status = 'needs_review'
       `).run(personId, documentId);
       if (updated.changes !== 1) throw new Error('DOCUMENT_ASSIGNMENT_CONFLICT');
+      this.invalidateMemberAssessmentSnapshots(personId);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'document.person_assigned', ?, '用户确认资料所属成员，已进入待处理队列', ?)
@@ -2194,6 +2244,7 @@ export class WorkspaceStore {
             payload_json = json_set(payload_json, '$.identityConfirmed', json('true'))
         WHERE id = ?
       `).run(input.issueId);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'review_issue.identity_confirmed', ?, '用户确认报告姓名与当前成员为同一人，任务重新进入核对队列', ?)
@@ -2236,6 +2287,9 @@ export class WorkspaceStore {
         UPDATE review_issues SET resolution_status = 'resolved', resolution_revision = 1
         WHERE id = ? AND resolution_status = 'open'
       `).run(input.issueId);
+      const reviewDocument = this.db.prepare(`SELECT person_id FROM documents WHERE id = ?`)
+        .get(input.documentId) as { person_id: string | null } | undefined;
+      if (reviewDocument?.person_id) this.invalidateMemberAssessmentSnapshots(reviewDocument.person_id);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'review_issue.resolved', ?, ?, ?)
@@ -2429,7 +2483,7 @@ export class WorkspaceStore {
       if (!binding) throw new Error('INBOX_BINDING_NOT_FOUND');
       const timestamp = this.now().toISOString();
       this.db.prepare(`UPDATE inbox_bindings SET enabled = 0 WHERE id = ?`).run(bindingId);
-      if (binding.consent_id) this.db.prepare(`UPDATE consents SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`).run(timestamp, binding.consent_id);
+      if (binding.consent_id) this.revokeConsent(binding.consent_id);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'inbox_binding.disabled', ?, '已停止目录监控并撤回对应处理授权', ?)
@@ -2451,6 +2505,13 @@ export class WorkspaceStore {
         UPDATE jobs SET status = 'waiting_auth', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
         WHERE status IN ('queued', 'waiting_quota', 'retry_wait')
       `).run(timestamp);
+      const jobs = this.db.prepare(`SELECT id FROM jobs WHERE checkpoint_json IS NOT NULL`)
+        .all() as Array<{ id: string }>;
+      for (const job of jobs) {
+        try { this.scrubExtractionChunksFromJob(job.id); } catch {
+          // 损坏的任务记录不能阻止用户撤回全部授权；活动执行仍会被授权门禁阻断。
+        }
+      }
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'account.logged_out', NULL, 'Codex 已退出；本机档案保留，待发送任务与 AI 授权已暂停', ?)
@@ -2490,6 +2551,13 @@ export class WorkspaceStore {
         SET status = 'waiting_auth', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
         WHERE status IN ('queued', 'running', 'waiting_quota', 'retry_wait')
       `).run(timestamp);
+      const checkpointJobs = this.db.prepare(`SELECT id FROM jobs WHERE checkpoint_json IS NOT NULL`)
+        .all() as Array<{ id: string }>;
+      for (const job of checkpointJobs) {
+        try { this.scrubExtractionChunksFromJob(job.id); } catch {
+          // 恢复设备时，即使个别旧检查点损坏，也必须先撤回授权与目录绑定。
+        }
+      }
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'backup.restore_machine_state_sanitized', NULL, '恢复后已清除设备路径并暂停目录授权、AI 授权与自动任务', ?)
@@ -2727,8 +2795,17 @@ export class WorkspaceStore {
   }
 
   revokeConsent(consentId: string): void {
-    this.db.prepare(`UPDATE consents SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`)
-      .run(this.now().toISOString(), consentId);
+    this.db.transaction(() => {
+      this.db.prepare(`UPDATE consents SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`)
+        .run(this.now().toISOString(), consentId);
+      const rows = this.db.prepare(`SELECT id, checkpoint_json FROM jobs WHERE checkpoint_json IS NOT NULL`)
+        .all() as Array<{ id: string; checkpoint_json: string }>;
+      for (const row of rows) {
+        let checkpoint: { consentId?: string };
+        try { checkpoint = JSON.parse(row.checkpoint_json) as { consentId?: string }; } catch { continue; }
+        if (checkpoint.consentId === consentId) this.scrubExtractionChunksFromJob(row.id);
+      }
+    })();
   }
 
   revokeUnreferencedManualProcessingConsents(): number {
@@ -2905,6 +2982,7 @@ export class WorkspaceStore {
           this.now().toISOString(),
           jobId
         );
+        this.scrubExtractionChunksFromJob(jobId);
         return { running: true, alreadyTerminal: false };
       }
       this.db.prepare(`
@@ -2912,6 +2990,7 @@ export class WorkspaceStore {
         SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
         WHERE id = ?
       `).run(this.now().toISOString(), jobId);
+      this.scrubExtractionChunksFromJob(jobId);
       return { running: false, alreadyTerminal: false };
     });
     return transaction();
@@ -2949,6 +3028,94 @@ export class WorkspaceStore {
     if (checkpoint.consentId !== guard.consentId || row.revoked_at !== null) throw new Error('CONSENT_REVOKED');
     if (row.account_fingerprint !== guard.accountFingerprint) throw new Error('ACCOUNT_FINGERPRINT_MISMATCH');
     if (documentId && !checkpoint.documentIds?.includes(documentId)) throw new Error('DOCUMENT_OUTSIDE_CONSENT_SCOPE');
+  }
+
+  /** 仅当前有效执行可读取；签名绑定原文件、证据片段与规则版本，授权 ID 改变则不可复用。 */
+  getExtractionChunkCheckpoint(
+    guard: JobExecutionGuard,
+    documentId: string,
+    signature: string
+  ): Pick<ExtractionChunkCheckpoint, 'output' | 'threadId' | 'turnId' | 'extractionTurnId'> | null {
+    return this.db.transaction(() => {
+      this.assertJobExecutionActive(guard, documentId);
+      const row = this.db.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ?`)
+        .get(guard.jobId) as { checkpoint_json: string | null };
+      const checkpoint = row.checkpoint_json ? JSON.parse(row.checkpoint_json) as {
+        extractionChunks?: Record<string, Record<string, ExtractionChunkCheckpoint>>;
+      } : {};
+      const saved = checkpoint.extractionChunks?.[documentId]?.[signature];
+      return saved?.consentId === guard.consentId && saved.documentId === documentId
+        && saved.signature === signature
+        ? { output: saved.output, threadId: saved.threadId, turnId: saved.turnId, extractionTurnId: saved.extractionTurnId }
+        : null;
+    })();
+  }
+
+  saveExtractionChunkCheckpoint(input: {
+    guard: JobExecutionGuard;
+    documentId: string;
+    signature: string;
+    chunkIndex: number;
+    output: unknown;
+    threadId: string;
+    turnId: string;
+    extractionTurnId: string;
+  }): void {
+    this.db.transaction(() => {
+      this.assertJobExecutionActive(input.guard, input.documentId);
+      const row = this.db.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ? AND status = 'running'`)
+        .get(input.guard.jobId) as { checkpoint_json: string | null } | undefined;
+      if (!row) throw new Error('JOB_EXECUTION_INACTIVE');
+      const checkpoint = row.checkpoint_json ? JSON.parse(row.checkpoint_json) as Record<string, unknown> : {};
+      const chunks = (checkpoint.extractionChunks ?? {}) as Record<string, Record<string, ExtractionChunkCheckpoint>>;
+      const byDocument = chunks[input.documentId] ?? {};
+      byDocument[input.signature] = {
+        consentId: input.guard.consentId, documentId: input.documentId,
+        signature: input.signature, chunkIndex: input.chunkIndex,
+        output: input.output, threadId: input.threadId, turnId: input.turnId,
+        extractionTurnId: input.extractionTurnId
+      };
+      chunks[input.documentId] = byDocument;
+      const updated = this.db.prepare(`UPDATE jobs SET checkpoint_json = ?, updated_at = ? WHERE id = ? AND status = 'running'`)
+        .run(JSON.stringify({ ...checkpoint, extractionChunks: chunks }), this.now().toISOString(), input.guard.jobId);
+      if (updated.changes !== 1) throw new Error('JOB_EXECUTION_INACTIVE');
+    })();
+  }
+
+  clearExtractionChunkCheckpoints(guard: JobExecutionGuard, documentId: string): void {
+    this.db.transaction(() => {
+      this.assertJobExecutionActive(guard, documentId);
+      const row = this.db.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ? AND status = 'running'`)
+        .get(guard.jobId) as { checkpoint_json: string | null } | undefined;
+      if (!row?.checkpoint_json) return;
+      const checkpoint = JSON.parse(row.checkpoint_json) as Record<string, unknown>;
+      const chunks = (checkpoint.extractionChunks ?? {}) as Record<string, Record<string, ExtractionChunkCheckpoint>>;
+      if (!chunks[documentId]) return;
+      delete chunks[documentId];
+      if (Object.keys(chunks).length === 0) delete checkpoint.extractionChunks;
+      else checkpoint.extractionChunks = chunks;
+      const updated = this.db.prepare(`UPDATE jobs SET checkpoint_json = ?, updated_at = ? WHERE id = ? AND status = 'running'`)
+        .run(JSON.stringify(checkpoint), this.now().toISOString(), guard.jobId);
+      if (updated.changes !== 1) throw new Error('JOB_EXECUTION_INACTIVE');
+    })();
+  }
+
+  /** 取消、撤权或删除时仅清理原文缓存，保留任务进度和授权收据。 */
+  private scrubExtractionChunksFromJob(jobId: string, documentId?: string): void {
+    const row = this.db.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ?`)
+      .get(jobId) as { checkpoint_json: string | null } | undefined;
+    if (!row?.checkpoint_json) return;
+    const checkpoint = JSON.parse(row.checkpoint_json) as Record<string, unknown>;
+    if (!checkpoint.extractionChunks || typeof checkpoint.extractionChunks !== 'object') return;
+    if (documentId === undefined) delete checkpoint.extractionChunks;
+    else {
+      const chunks = checkpoint.extractionChunks as Record<string, unknown>;
+      if (!(documentId in chunks)) return;
+      delete chunks[documentId];
+      if (Object.keys(chunks).length === 0) delete checkpoint.extractionChunks;
+    }
+    this.db.prepare(`UPDATE jobs SET checkpoint_json = ?, updated_at = ? WHERE id = ?`)
+      .run(JSON.stringify(checkpoint), this.now().toISOString(), jobId);
   }
 
   assertObservationScopeActive(
@@ -3131,11 +3298,16 @@ export class WorkspaceStore {
   }
 
   finishJob(jobId: string, status: 'succeeded' | 'completed_with_issues' | 'failed' | 'waiting_auth' | 'waiting_quota' | 'waiting_user' | 'cancelled'): void {
-    const result = this.db.prepare(`
-      UPDATE jobs SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-      WHERE id = ? AND status = 'running'
-    `).run(status, this.now().toISOString(), jobId);
-    if (result.changes !== 1) throw new Error('JOB_NOT_RUNNING');
+    this.db.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE jobs SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'running'
+      `).run(status, this.now().toISOString(), jobId);
+      if (result.changes !== 1) throw new Error('JOB_NOT_RUNNING');
+      if (status === 'succeeded' || status === 'completed_with_issues' || status === 'cancelled') {
+        this.scrubExtractionChunksFromJob(jobId);
+      }
+    })();
   }
 
   startJobAttempt(jobId: string, runtimeVersion: string | null, model: string | null = null, reasoningEffort: string | null = null): string {
@@ -3260,6 +3432,12 @@ export class WorkspaceStore {
     return row?.fact_revision ?? 0;
   }
 
+  /** 事实、成员上下文或待核对范围变化时，旧综合与变化本身必须在同一事务失效。 */
+  private invalidateMemberAssessmentSnapshots(personId: string): void {
+    this.db.prepare(`UPDATE member_assessment_snapshots_v3 SET status = 'stale' WHERE person_id = ? AND status = 'current'`)
+      .run(personId);
+  }
+
   setObservationConceptMapping(input: {
     personId: string;
     observationId: string;
@@ -3329,6 +3507,7 @@ export class WorkspaceStore {
         `).run(input.personId, ...invalidatedSystemIds);
       }
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'concept_mapping_corrected', ?, '用户修正了指标概念映射；原始事实保持不变。', ?)
@@ -3401,6 +3580,7 @@ export class WorkspaceStore {
         `).run(input.personId, ...invalidatedSystemIds);
       }
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'concept_mapping_undone', ?, '用户撤销了上一次指标概念修正；原始事实保持不变。', ?)
@@ -3674,6 +3854,7 @@ export class WorkspaceStore {
       `).run(input.personId);
       this.invalidateSystemSnapshots(input.personId, affectedSystemIds);
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'report_metadata_corrected', ?, '用户修正了报告标题、机构、科室或临床日期；原始提取记录保持不变。', ?)
@@ -3736,6 +3917,7 @@ export class WorkspaceStore {
       `).run(input.personId);
       this.invalidateSystemSnapshots(input.personId, affectedSystemIds);
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       this.db.prepare(`
         INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
         VALUES (?, 'report_metadata_correction_undone', ?, '用户撤销了上一次报告元数据修正；原始提取记录保持不变。', ?)
@@ -3815,6 +3997,7 @@ export class WorkspaceStore {
     `).run(personId);
     this.invalidateSystemSnapshots(personId, this.systemIdsForReports(reportIds));
     this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(personId);
+    this.invalidateMemberAssessmentSnapshots(personId);
     return this.getFactRevision(personId);
   }
 
@@ -4140,18 +4323,21 @@ export class WorkspaceStore {
 
   listMemberAssessmentSnapshots(personId?: string, currentOnly = false): MemberAssessmentSnapshotV3[] {
     const rows = this.db.prepare(`
-      SELECT id, payload_json, status, created_at FROM member_assessment_snapshots_v3
+      SELECT id, person_id, fact_revision, context_revision, payload_json, status, created_at
+      FROM member_assessment_snapshots_v3
       WHERE (? IS NULL OR person_id = ?) AND (? = 0 OR status = 'current')
       ORDER BY created_at DESC, rowid DESC
     `).all(personId ?? null, personId ?? null, currentOnly ? 1 : 0) as Array<{
-      id: string; payload_json: string; status: 'current' | 'stale'; created_at: string
+      id: string; person_id: string; fact_revision: number; context_revision: number;
+      payload_json: string; status: 'current' | 'stale'; created_at: string
     }>;
-    return rows.map((row) => ({
-      ...(JSON.parse(row.payload_json) as MemberAssessmentSnapshotV3),
-      id: row.id,
-      status: row.status,
-      generatedAt: row.created_at
-    }));
+    return rows.flatMap((row) => {
+      const snapshot = JSON.parse(row.payload_json) as MemberAssessmentSnapshotV3;
+      if (currentOnly && (row.fact_revision !== this.getFactRevision(row.person_id)
+        || row.context_revision !== this.getClinicalContextRevision(row.person_id)
+        || snapshot.reviewScopeSignature !== this.getOpenReviewScopeSignature(row.person_id))) return [];
+      return [{ ...snapshot, id: row.id, status: row.status, generatedAt: row.created_at }];
+    });
   }
 
   hasMemberAssessmentHistory(personId: string): boolean {
@@ -4167,6 +4353,40 @@ export class WorkspaceStore {
     const { snapshot } = input;
     const transaction = this.db.transaction(() => {
       if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard);
+      // 写库边界重新检查完整契约与节点关系；不能只信任上游 TypeScript 类型或模型字段。
+      const candidateId = randomUUID();
+      const candidateTimestamp = this.now().toISOString();
+      if (!memberAssessmentSnapshotV3Schema.safeParse({ ...snapshot,
+        id: candidateId, status: 'current', generatedAt: candidateTimestamp }).success) {
+        throw new Error('MEMBER_ASSESSMENT_SCHEMA_INVALID');
+      }
+      const claimIds = new Set(snapshot.claims.map((claim) => claim.id));
+      const actionIds = new Set(snapshot.actions.map((action) => action.id));
+      const systemIds = new Set(snapshot.systems.map((system) => system.id));
+      const questionIds = new Set(snapshot.questions.map((question) => question.id));
+      const evidenceIds = new Set(snapshot.evidenceCatalog.map((evidence) => evidence.id));
+      const knowledgeIds = new Set(snapshot.knowledgeSources.map((source) => source.id));
+      const liveNodeIds = ['overview', ...claimIds, ...actionIds, ...systemIds, ...questionIds];
+      if (new Set(liveNodeIds).size !== liveNodeIds.length
+        || evidenceIds.size !== snapshot.evidenceCatalog.length
+        || knowledgeIds.size !== snapshot.knowledgeSources.length
+        || snapshot.heldTargetIds.some((id) => liveNodeIds.includes(id))) {
+        throw new Error('MEMBER_ASSESSMENT_HELD_OR_DUPLICATE_NODE');
+      }
+      const referencesValid = snapshot.overview.claimIds.every((id) => claimIds.has(id))
+        && snapshot.overview.actionIds.every((id) => actionIds.has(id))
+        && snapshot.systems.every((system) => system.id === `system:${system.systemId}`
+          && system.claimIds.every((id) => claimIds.has(id))
+          && system.actionIds.every((id) => actionIds.has(id)))
+        && snapshot.actions.every((action) => action.claimIds.every((id) => claimIds.has(id)))
+        && snapshot.questions.every((question) => question.relatedClaimIds.every((id) => claimIds.has(id)))
+        && snapshot.claims.every((claim) => [...claim.evidenceIds, ...claim.counterEvidenceIds,
+          ...(claim.criteriaBasis?.requirements.flatMap((requirement) => requirement.evidenceIds) ?? [])]
+          .every((id) => evidenceIds.has(id)) && claim.knowledgeSourceIds.every((id) => knowledgeIds.has(id)))
+        && snapshot.actions.every((action) => action.evidenceIds.every((id) => evidenceIds.has(id))
+          && action.knowledgeSourceIds.every((id) => knowledgeIds.has(id)))
+        && snapshot.questions.every((question) => question.evidenceIds.every((id) => evidenceIds.has(id)));
+      if (!referencesValid) throw new Error('MEMBER_ASSESSMENT_REFERENCE_INVALID');
       if (this.getFactRevision(snapshot.personId) !== snapshot.factRevision) throw new Error('MEMBER_ASSESSMENT_FACT_REVISION_CONFLICT');
       if (this.getClinicalContextRevision(snapshot.personId) !== snapshot.contextRevision) throw new Error('MEMBER_ASSESSMENT_CONTEXT_REVISION_CONFLICT');
       if (this.getOpenReviewScopeSignature(snapshot.personId) !== snapshot.reviewScopeSignature) {
@@ -4558,6 +4778,7 @@ export class WorkspaceStore {
         ON CONFLICT(person_id) DO UPDATE SET fact_revision = excluded.fact_revision
       `).run(input.personId, nextRevision);
       this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(input.personId);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
       const staleSystemSnapshot = this.db.prepare(`
         UPDATE system_analysis_snapshots_v2 SET status = 'stale'
         WHERE person_id = ? AND system_id = ? AND status = 'current'

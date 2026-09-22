@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
+import type { MemberAssessmentSnapshotV3 } from '@contracts';
 import { RevisionConflictError, WorkspaceStore } from './index.js';
 
 const directories: string[] = [];
@@ -28,6 +29,40 @@ function createSchemaV2Database(directory: string): void {
     PRAGMA user_version = 2;
   `);
   database.close();
+}
+
+function syntheticAssessmentSnapshot(
+  store: WorkspaceStore,
+  personId: string,
+  marker: string
+): Omit<MemberAssessmentSnapshotV3, 'id' | 'status' | 'generatedAt'> {
+  return {
+    schemaVersion: 3,
+    personId,
+    inputSignature: createHash('sha256').update(marker).digest('hex'),
+    mode: 'full',
+    requestedSystemIds: [],
+    overview: {
+      id: 'overview', headline: `合成综合 ${marker}`, summary: `合成内容 ${marker}`,
+      claimIds: [], actionIds: ['action-followup'], limitations: []
+    },
+    systems: [], claims: [],
+    actions: [{
+      id: 'action-followup', dedupeKey: `followup-${marker}`, systemIds: [], claimIds: [],
+      kind: 'test_followup', title: `合成行动 ${marker}`, why: `合成原因 ${marker}`,
+      firstStep: '核对原始资料', timing: null, timingBasis: 'none', reviewPlan: null,
+      caution: null, urgency: 'routine', evidenceIds: [], knowledgeSourceIds: []
+    }],
+    questions: [], knowledgeSources: [],
+    factRevision: store.getFactRevision(personId),
+    contextRevision: store.getClinicalContextRevision(personId),
+    reviewScopeSignature: store.getOpenReviewScopeSignature(personId),
+    promptVersion: 'test-p02', rulesVersion: 'test-rules', modelId: 'test-model',
+    reasoningEffort: 'medium', validationMode: 'local_only',
+    reviewedTargetIds: [], heldTargetIds: [], limitations: [], evidenceCatalog: [],
+    processingPlan: { strategy: 'full', trigger: 'none', partitionCount: 0, partitionHeldTargetCount: 0 },
+    knowledgeVerifications: []
+  };
 }
 
 afterEach(() => {
@@ -1831,6 +1866,206 @@ describe('WorkspaceStore', () => {
     expect(store.listImportedDocuments()).toEqual([expect.objectContaining({ id: document.documentId, status: 'queued' })]);
     expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
     expect(store.getFactRevision(person.id)).toBe(2);
+    store.close();
+  });
+
+  it('V3 综合随上下文、待核对范围和事实版本变化同事务失效', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('合成资料'), mediaType: 'text/plain', displayName: '合成.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+
+    store.publishMemberAssessmentSnapshot({ snapshot: syntheticAssessmentSnapshot(store, person.id, 'context') });
+    expect(store.listMemberAssessmentSnapshots(person.id, true)).toHaveLength(1);
+    store.updateClinicalContext(person.id, { synthetic: 'new-context' }, 0);
+    expect(store.listMemberAssessmentSnapshots(person.id, true)).toEqual([]);
+    expect(store.listMemberAssessmentSnapshots(person.id)[0]?.status).toBe('stale');
+
+    store.publishMemberAssessmentSnapshot({ snapshot: syntheticAssessmentSnapshot(store, person.id, 'review') });
+    const current = store.listMemberAssessmentSnapshots(person.id, true)[0]!;
+    const factRevision = store.getFactRevision(person.id);
+    store.saveExtractionReviewIssue({
+      documentId: document.documentId, kind: 'coverage_gap', severity: 'warning',
+      preserveDocumentStatus: true, evidenceRefs: [], reasonCodes: ['SYNTHETIC_GAP']
+    });
+    expect(store.getFactRevision(person.id)).toBe(factRevision);
+    expect(store.listMemberAssessmentSnapshots(person.id, true)).toEqual([]);
+    expect(() => store.adoptMemberAssessmentAction({
+      personId: person.id, snapshotId: current.id, actionId: 'action-followup'
+    })).toThrow('MEMBER_ASSESSMENT_ACTION_STALE');
+
+    store.publishMemberAssessmentSnapshot({ snapshot: syntheticAssessmentSnapshot(store, person.id, 'fact') });
+    expect(store.listMemberAssessmentSnapshots(person.id, true)).toHaveLength(1);
+    store.setDocumentIncluded({ documentId: document.documentId, included: false });
+    expect(store.listMemberAssessmentSnapshots(person.id, true)).toEqual([]);
+    expect(store.listMemberAssessmentSnapshots(person.id).every((snapshot) => snapshot.status === 'stale')).toBe(true);
+    store.close();
+  });
+
+  it('currentOnly 再核对实际版本，拒绝错误标记为 current 的旧综合', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    store.publishMemberAssessmentSnapshot({ snapshot: syntheticAssessmentSnapshot(store, person.id, 'legacy-current') });
+    const database = new Database(store.databasePath);
+    database.prepare(`INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)`).run(person.id);
+    database.close();
+    expect(store.listMemberAssessmentSnapshots(person.id)[0]?.status).toBe('current');
+    expect(store.listMemberAssessmentSnapshots(person.id, true)).toEqual([]);
+    store.close();
+  });
+
+  it('V3 写库边界拒绝坏 schema、悬空引用和仍在正文中的 held 节点', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const base = syntheticAssessmentSnapshot(store, person.id, 'write-gate');
+    expect(() => store.publishMemberAssessmentSnapshot({ snapshot: {
+      ...base, schemaVersion: 4
+    } as unknown as typeof base })).toThrow('MEMBER_ASSESSMENT_SCHEMA_INVALID');
+    expect(() => store.publishMemberAssessmentSnapshot({ snapshot: {
+      ...base, overview: { ...base.overview, actionIds: ['missing-action'] }
+    } })).toThrow('MEMBER_ASSESSMENT_REFERENCE_INVALID');
+    expect(() => store.publishMemberAssessmentSnapshot({ snapshot: {
+      ...base, heldTargetIds: ['action-followup']
+    } })).toThrow('MEMBER_ASSESSMENT_HELD_OR_DUPLICATE_NODE');
+    expect(() => store.publishMemberAssessmentSnapshot({ snapshot: {
+      ...base, actions: [{ ...base.actions[0]!, evidenceIds: ['missing-evidence'] }]
+    } })).toThrow('MEMBER_ASSESSMENT_REFERENCE_INVALID');
+    expect(store.listMemberAssessmentSnapshots(person.id)).toEqual([]);
+    store.close();
+  });
+
+  it('分块提取检查点可跨失败重启复用，但签名或授权改变后不得复用', () => {
+    const store = makeStore();
+    const rootDirectory = store.rootDirectory;
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('纯合成分块资料'), mediaType: 'text/plain', displayName: '合成.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const accountFingerprint = 'synthetic-account';
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint, version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'chunk-restart-test' }]
+    });
+    const job = store.claimNextQueuedJob('synthetic-runner', accountFingerprint)!;
+    const attemptId = store.startJobAttempt(job.id, 'synthetic-runtime');
+    const guard = { jobId: job.id, attemptId, consentId, accountFingerprint };
+    const signature = createHash('sha256').update('source+span+prompt+rules').digest('hex');
+    store.saveExtractionChunkCheckpoint({
+      guard, documentId: document.documentId, signature, chunkIndex: 0,
+      output: { synthetic: 'SYNTHETIC_CHUNK_BODY' }, threadId: 'thread-1',
+      turnId: 'turn-1', extractionTurnId: 'turn-1'
+    });
+    expect(store.getExtractionChunkCheckpoint(guard, document.documentId, signature)).toMatchObject({
+      output: { synthetic: 'SYNTHETIC_CHUNK_BODY' }, extractionTurnId: 'turn-1'
+    });
+    store.finishJobAttempt({ attemptId, status: 'failed' });
+    store.finishJob(job.id, 'failed');
+    store.close();
+
+    const restored = new WorkspaceStore({ rootDirectory, now: () => new Date('2026-09-18T00:00:00Z') });
+    restored.retryFailedJob(job.id);
+    expect(restored.claimNextQueuedJob('synthetic-retry', accountFingerprint)?.id).toBe(job.id);
+    const retryAttemptId = restored.startJobAttempt(job.id, 'synthetic-runtime');
+    const retryGuard = { ...guard, attemptId: retryAttemptId };
+    expect(restored.getExtractionChunkCheckpoint(retryGuard, document.documentId, signature)?.output)
+      .toEqual({ synthetic: 'SYNTHETIC_CHUNK_BODY' });
+    expect(restored.getExtractionChunkCheckpoint(retryGuard, document.documentId, '0'.repeat(64))).toBeNull();
+    restored.finishJobAttempt({ attemptId: retryAttemptId, status: 'failed' });
+    restored.finishJob(job.id, 'failed');
+
+    const newConsentId = restored.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint, version: 2
+    });
+    const database = new Database(restored.databasePath);
+    database.prepare(`UPDATE jobs SET checkpoint_json = json_set(checkpoint_json, '$.consentId', ?) WHERE id = ?`)
+      .run(newConsentId, job.id);
+    database.close();
+    restored.retryFailedJob(job.id);
+    expect(restored.claimNextQueuedJob('synthetic-new-consent', accountFingerprint)?.id).toBe(job.id);
+    const newAttemptId = restored.startJobAttempt(job.id, 'synthetic-runtime');
+    const newGuard = { jobId: job.id, attemptId: newAttemptId, consentId: newConsentId, accountFingerprint };
+    expect(restored.getExtractionChunkCheckpoint(newGuard, document.documentId, signature)).toBeNull();
+    restored.clearExtractionChunkCheckpoints(newGuard, document.documentId);
+    expect(restored.getExtractionChunkCheckpoint(newGuard, document.documentId, signature)).toBeNull();
+    restored.saveExtractionChunkCheckpoint({
+      guard: newGuard, documentId: document.documentId, signature, chunkIndex: 0,
+      output: { synthetic: 'NEW_CONSENT_CHUNK_BODY' }, threadId: 'thread-2',
+      turnId: 'turn-2', extractionTurnId: 'turn-2'
+    });
+    restored.revokeConsent(newConsentId);
+    expect(() => restored.getExtractionChunkCheckpoint(newGuard, document.documentId, signature))
+      .toThrow('CONSENT_REVOKED');
+    const revokedDatabase = new Database(restored.databasePath, { readonly: true });
+    const revokedCheckpoint = revokedDatabase.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ?`)
+      .get(job.id) as { checkpoint_json: string };
+    expect(revokedCheckpoint.checkpoint_json).not.toContain('NEW_CONSENT_CHUNK_BODY');
+    revokedDatabase.close();
+    restored.finishJobAttempt({ attemptId: newAttemptId, status: 'cancelled' });
+    restored.finishJob(job.id, 'cancelled');
+    restored.close();
+  });
+
+  it('永久删除报告会清除失败任务检查点中的该报告分块原文', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('纯合成待删除资料'), mediaType: 'text/plain', displayName: '待删除.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const accountFingerprint = 'synthetic-account';
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint, version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'chunk-delete-test' }]
+    });
+    const job = store.claimNextQueuedJob('synthetic-runner', accountFingerprint)!;
+    const attemptId = store.startJobAttempt(job.id, 'synthetic-runtime');
+    store.saveExtractionChunkCheckpoint({
+      guard: { jobId: job.id, attemptId, consentId, accountFingerprint },
+      documentId: document.documentId, signature: '1'.repeat(64), chunkIndex: 0,
+      output: { synthetic: 'SYNTHETIC_SENSITIVE_CHUNK' }, threadId: 'thread-1',
+      turnId: 'turn-1', extractionTurnId: 'turn-1'
+    });
+    store.finishJobAttempt({ attemptId, status: 'failed' });
+    store.finishJob(job.id, 'failed');
+    store.deleteDocument({ documentId: document.documentId, retainedByRecoveryPoint: false });
+    const database = new Database(store.databasePath, { readonly: true });
+    const checkpoint = database.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ?`)
+      .get(job.id) as { checkpoint_json: string };
+    expect(checkpoint.checkpoint_json).toContain(document.documentId);
+    expect(checkpoint.checkpoint_json).not.toContain('SYNTHETIC_SENSITIVE_CHUNK');
+    expect(checkpoint.checkpoint_json).not.toContain('extractionChunks');
+    database.close();
+    store.close();
+  });
+
+  it('永久删除一份资料时清除该成员全部 V3 正文和从 V3 采纳的行动，但保留本人事项', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const source = store.putSourceObject({ bytes: Buffer.from('合成报告中不应残留的正文'), mediaType: 'text/plain', displayName: '待删除.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const published = store.publishMemberAssessmentSnapshot({ snapshot: syntheticAssessmentSnapshot(store, person.id, 'sensitive-body') });
+    const adopted = store.adoptMemberAssessmentAction({
+      personId: person.id, snapshotId: published.snapshotId, actionId: 'action-followup'
+    });
+    const personal = store.createUserAction({
+      personId: person.id, title: '本人独立事项', detail: '这段由本人写入', dueDate: null, dueText: null
+    });
+    expect(store.listMemberAssessmentSnapshots(person.id)).toHaveLength(1);
+    expect(store.listActionItems(person.id).map((item) => item.id)).toContain(adopted.id);
+
+    store.deleteDocument({ documentId: document.documentId, retainedByRecoveryPoint: false });
+    expect(store.listMemberAssessmentSnapshots(person.id)).toEqual([]);
+    expect(store.listActionItems(person.id)).toEqual([expect.objectContaining({ id: personal.id, title: '本人独立事项' })]);
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM member_assessment_snapshots_v3 WHERE person_id = ?`).get(person.id))
+      .toEqual({ count: 0 });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM action_items WHERE id = ?`).get(adopted.id)).toEqual({ count: 0 });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM action_events WHERE action_id = ?`).get(adopted.id)).toEqual({ count: 0 });
+    database.close();
+    expect(store.integrityCheck()).toBe('ok');
     store.close();
   });
 

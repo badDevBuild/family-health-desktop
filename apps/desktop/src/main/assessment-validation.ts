@@ -2,7 +2,7 @@ import type {
   BodySystemId, HealthClaim, MemberAssessmentCandidateV3, MemberEvidenceRef
 } from '@contracts';
 
-export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v8';
+export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v10';
 
 export interface AssessmentValidationInput {
   personId: string;
@@ -36,17 +36,42 @@ const unsourcedProbability = /(?:患病|发病|罹患|诊断|得[^。；，]{0,8
 const explicitDiagnosis = /(?:明确诊断|临床诊断|病理诊断|出院诊断|(?:既往|曾|历史)诊断|诊断[:：]|确诊|诊断意见[:：])/i;
 const negatedOrTentative = /(?:排除|待排|考虑|疑似|可能|家族史|病史自述|未确诊|不能诊断|尚不能诊断)/i;
 const historicalDiagnosis = /(?:既往|既往史|既往诊断|曾诊断|病史)/i;
+const otherPersonSubject = /(?:家族史|父亲|母亲|祖父|祖母|外祖父|外祖母|兄弟|姐妹|子女|配偶|亲属)/i;
+const selfSubject = /(?:本人|患者|受检者|自己)/i;
+const highConsequenceDisease = /(?:恶性肿瘤|恶性淋巴瘤|癌症|癌变|[\p{Script=Han}]{1,8}癌|心肌梗死|急性冠脉综合征|主动脉夹层|肺栓塞|脑卒中|脑梗死|脑出血|败血症|脓毒症|急性肾衰|急性肾损伤|肝衰竭|器官衰竭)/giu;
+const highConsequenceAssertion = /(?:(?:尚?不能|无法|不)排除|待排|高度怀疑|怀疑|疑似|可能|考虑|提示|确诊|诊断|患有|罹患|发现|检出)/i;
+const directlyNegatedDisease = /(?:已排除|明确排除|未见|无|不支持|未确诊|不能确诊|尚不能确诊)\s*$/i;
+const directlyNegatedCancerMention = /(?:已排除|明确排除|未见|无|不支持|未确诊|不能确诊|尚不能确诊)\s*[\p{Script=Han}]{0,4}$/u;
+
+/** 只识别针对本人的高后果主张，不把家族史、明确排除或单纯提及病名当作判断。 */
+export function hasHighConsequenceAssertion(text: string): boolean {
+  return text.split(/[。；;，,！？!?\n]/).some((clause) => {
+    for (const match of clause.matchAll(highConsequenceDisease)) {
+      const before = clause.slice(Math.max(0, match.index - 24), match.index);
+      const after = clause.slice(match.index + match[0].length, match.index + match[0].length + 12);
+      // 通用“X癌”匹配可能吞进前置汉字，如“高度怀疑肺癌”；判断语气时保留这段前文。
+      const mentionLead = before + (match[0].endsWith('癌') ? match[0].slice(0, -1) : '');
+      if (otherPersonSubject.test(mentionLead) && !selfSubject.test(mentionLead)) continue;
+      if ((directlyNegatedDisease.test(before) || match[0].endsWith('癌') && directlyNegatedCancerMention.test(mentionLead))
+        && !/(?:不能|尚不能|无法)排除\s*$/i.test(before)) continue;
+      if (highConsequenceAssertion.test(mentionLead) || highConsequenceAssertion.test(after)) return true;
+    }
+    return false;
+  });
+}
 
 function hasOwnDocumentedDiagnosis(evidence: MemberEvidenceRef, diseaseName: string, temporalStatus: HealthClaim['temporalStatus']): boolean {
   const quote = evidence.quote ?? '';
   if (!['observation', 'clinical_finding', 'source_span'].includes(evidence.kind)) return false;
-  const relevantClauses = quote.split(/[。；;\n]/).filter((clause) => clause.includes(diseaseName));
+  const relevantClauses = quote.split(/[。；;，,\n]/).filter((clause) => clause.includes(diseaseName));
   return relevantClauses.some((clause) => explicitDiagnosis.test(clause)
+    && !(otherPersonSubject.test(clause.slice(0, clause.indexOf(diseaseName)))
+      && !selfSubject.test(clause.slice(0, clause.indexOf(diseaseName))))
     && !negatedOrTentative.test(clause)
     && (!historicalDiagnosis.test(clause) || temporalStatus === 'historical'));
 }
 
-function hasDirectMedicationChange(action: MemberAssessmentCandidateV3['actions'][number]): boolean {
+export function hasDirectMedicationChange(action: MemberAssessmentCandidateV3['actions'][number]): boolean {
   const fields = [action.title, action.why, action.firstStep, action.timing, action.reviewPlan, action.caution]
     .filter((value): value is string => value !== null);
   return fields.some((field, index) => field.split(/[。；，,]/).some((clause) => {
@@ -111,11 +136,20 @@ export function validateAssessmentCandidate(
   validateClaims('overview', candidate.overview.claimIds);
   validateActions('overview', candidate.overview.actionIds);
   if (unsourcedProbability.test(`${candidate.overview.headline} ${candidate.overview.summary}`)) issues.push('unsourced_probability:overview');
+  const supportedHighImpact = (text: string, claimIds: string[]) => !hasHighConsequenceAssertion(text)
+    || candidate.claims.some((claim) => claimIds.includes(claim.id) && claim.diagnosticStatus !== null
+      && claim.diseaseName !== null && text.includes(claim.diseaseName));
+  if (!supportedHighImpact(`${candidate.overview.headline} ${candidate.overview.summary}`, candidate.overview.claimIds)) {
+    issues.push('unsupported_high_impact_text:overview');
+  }
   for (const system of candidate.systems) {
     validateClaims(system.id, system.claimIds);
     validateActions(system.id, system.actionIds);
     if (system.claimIds.length === 0 && system.status !== 'insufficient') issues.push(`unsupported_system_status:${system.id}`);
     if (unsourcedProbability.test(`${system.headline} ${system.summary}`)) issues.push(`unsourced_probability:${system.id}`);
+    if (!supportedHighImpact(`${system.headline} ${system.summary}`, system.claimIds)) {
+      issues.push(`unsupported_high_impact_text:${system.id}`);
+    }
   }
   if (candidate.overview.claimIds.length === 0 && candidate.claims.length > 0) issues.push('overview_missing_claims');
 
@@ -127,6 +161,7 @@ export function validateAssessmentCandidate(
     if (claim.evidenceIds.length === 0) issues.push(`personal_evidence_required:${claim.id}`);
     if (claim.diagnosticStatus === null) {
       if (claim.diseaseName !== null || claim.criteriaBasis !== null) issues.push(`diagnostic_fields_without_status:${claim.id}`);
+      if (hasHighConsequenceAssertion(claim.text)) issues.push(`high_impact_claim_untyped:${claim.id}`);
     } else if (!claim.diseaseName || claim.kind !== 'diagnostic_assessment') {
       issues.push(`diagnostic_fields_incomplete:${claim.id}`);
     }

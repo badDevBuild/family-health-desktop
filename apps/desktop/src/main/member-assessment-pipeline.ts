@@ -115,7 +115,7 @@ function isolatableTargets(candidate: MemberAssessmentCandidateV3, issues: strin
   const allowed = new Set([
     'unknown_evidence', 'unknown_trend', 'unknown_knowledge', 'personal_evidence_required',
     'personal_diagnostic_evidence_required', 'documented_source_not_proven',
-    'criteria_not_proven', 'criteria_wrong_status', 'diagnostic_fields_without_status',
+    'criteria_not_proven', 'criteria_wrong_status', 'diagnostic_fields_without_status', 'high_impact_claim_untyped',
     'diagnostic_fields_incomplete', 'claim_system_outside_scope', 'action_system_outside_scope',
     'action_personal_evidence_required', 'direct_medication_change', 'unsourced_probability',
     'unknown_claim'
@@ -183,9 +183,21 @@ export class MemberAssessmentPipeline {
       return { status: 'skipped', reason: 'no_accepted_facts', callCount: 0 };
     }
     // 已接纳但尚未归入身体系统的事实仍可产生成员总览，不强行猜测器官归属。
-    if (this.executionGuard) {
-      this.store.assertObservationScopeActive(this.executionGuard, personId, this.store.listAcceptedObservations(personId));
-    }
+    const assertInputStillAuthorized = () => {
+      if (this.store.getFactRevision(personId) !== built.factRevision) throw new Error('MEMBER_ASSESSMENT_FACT_REVISION_CONFLICT');
+      if (this.store.getClinicalContextRevision(personId) !== built.contextRevision) throw new Error('MEMBER_ASSESSMENT_CONTEXT_REVISION_CONFLICT');
+      if (this.store.getOpenReviewScopeSignature(personId) !== built.reviewScopeSignature) {
+        throw new Error('MEMBER_ASSESSMENT_REVIEW_SCOPE_CONFLICT');
+      }
+      const current = new Map(this.store.listAcceptedObservations(personId)
+        .map((observation) => [observation.id, observation.documentId]));
+      const sentFacts = built.evidencePackage.facts.map((fact) => ({ id: fact.observationId, documentId: fact.documentId }));
+      if (sentFacts.some((fact) => current.get(fact.id) !== fact.documentId)) {
+        throw new Error('MEMBER_ASSESSMENT_EVIDENCE_MISMATCH');
+      }
+      if (this.executionGuard) this.store.assertObservationScopeActive(this.executionGuard, personId, sentFacts);
+    };
+    assertInputStillAuthorized();
     const current = this.store.listMemberAssessmentSnapshots(personId, true)
       .find((snapshot) => snapshot.inputSignature === request.inputSignature
         && snapshot.promptVersion === MEMBER_ASSESSMENT_PROMPT_VERSION
@@ -200,6 +212,8 @@ export class MemberAssessmentPipeline {
       turnId: lastReceipt?.turnId ?? null, callCount: calls
     });
     const runCountedTurn = async (stage: string, input: Parameters<StructuredRuntime['runStructuredTurn']>[0]) => {
+      // 构包后的事实/授权可能被撤销；每次真正发送前以原始发送范围重查，而非以当前列表替代旧包。
+      assertInputStillAuthorized();
       calls += 1; // 失败的原始尝试也是真实请求，不能在分区模式中藏掉。
       const result = await this.runTurn(stage, input);
       lastReceipt = result;
@@ -398,6 +412,7 @@ export class MemberAssessmentPipeline {
       });
       const reviewParsed = clinicalFocusedReviewV1Schema.safeParse(reviewed.output);
       if (!reviewParsed.success) return reject('focused_review_schema_invalid');
+      const originalTargetHashes = new Map(targetIds.map((id) => [id, stableHash(targetNode(candidate, id))]));
       let applied: ReturnType<typeof applyFocusedReview>;
       try { applied = applyFocusedReview(candidate, reviewParsed.data, targetIds); }
       catch (error) { return reject(error instanceof Error ? error.message : 'focused_review_invalid'); }
@@ -416,8 +431,12 @@ export class MemberAssessmentPipeline {
       const after = routeFocusedReview(candidate);
       // 同一个依赖节点原本在复核范围内，不代表复核者新写入的高影响内容已被独立审过。
       const priorReasons = new Set(route.reasons);
-      const newlyHigh = [...new Set(after.reasons.filter((reason) => !priorReasons.has(reason))
-        .map((reason) => reason.slice(reason.indexOf(':') + 1)))];
+      const replacedHighImpact = reviewParsed.data.results.filter((result) => result.verdict === 'replace'
+        && after.reasons.some((reason) => reason.endsWith(`:${result.targetId}`))
+        && originalTargetHashes.get(result.targetId) !== stableHash(targetNode(candidate, result.targetId)))
+        .map((result) => result.targetId);
+      const newlyHigh = [...new Set([...after.reasons.filter((reason) => !priorReasons.has(reason))
+        .map((reason) => reason.slice(reason.indexOf(':') + 1)), ...replacedHighImpact])];
       if (newlyHigh.length > 0) {
         const holds: ClinicalFocusedReviewV1 = {
           schemaVersion: 1, personId, inputSignature: request.inputSignature,

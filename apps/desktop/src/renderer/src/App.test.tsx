@@ -133,6 +133,8 @@ describe('App member display editing', () => {
     fireEvent.click(await screen.findByRole('button', { name: '删除本机档案' }));
 
     expect(await screen.findByRole('dialog', { name: '删除这份本机档案？' })).toBeTruthy();
+    expect(screen.getByText(/该成员全部旧版 AI 综合及由它采纳的后续事项/)).toBeTruthy();
+    expect(screen.getByText(/你自己创建的事项保留/)).toBeTruthy();
     const confirm = screen.getByRole('button', { name: '确认删除' });
     expect(confirm.hasAttribute('disabled')).toBe(true);
     const acknowledgements = screen.getAllByRole('checkbox');

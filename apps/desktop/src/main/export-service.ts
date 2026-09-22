@@ -1,4 +1,4 @@
-import type { DashboardSnapshot, ExportMemberSummaryInput } from '@contracts';
+import type { DashboardSnapshot, ExportMemberSummaryInput, MemberAssessmentSnapshotV3 } from '@contracts';
 
 export interface MemberSummaryData {
   schemaVersion: 1;
@@ -37,6 +37,15 @@ export interface MemberSummaryData {
     dueDate: string | null;
     dueText: string | null;
   }>;
+  suggestedActions: Array<{
+    title: string;
+    why: string;
+    firstStep: string;
+    timing: string | null;
+    reviewPlan: string | null;
+    caution: string | null;
+    kind: MemberAssessmentSnapshotV3['actions'][number]['kind'];
+  }>;
   lifestyleGuidance: Array<{
     title: string;
     detail: string;
@@ -56,10 +65,15 @@ function dateInRange(date: string | null, from: string | null, to: string | null
 export function buildMemberSummaryData(
   snapshot: DashboardSnapshot,
   input: Pick<ExportMemberSummaryInput, 'personId' | 'dateFrom' | 'dateTo'>,
-  exportedAt = new Date().toISOString()
+  exportedAt = new Date().toISOString(),
+  memberAssessment: MemberAssessmentSnapshotV3 | null = null
 ): MemberSummaryData {
   const person = snapshot.persons.find((item) => item.id === input.personId);
   if (!person) throw new Error('PERSON_NOT_FOUND');
+  // V3 是全历史综合，不把它塞进只导出某一日期区间的文件中。
+  const fullHistoryExport = input.dateFrom === null && input.dateTo === null;
+  const currentAssessment = fullHistoryExport && person.derivedStatus === 'current'
+    && memberAssessment?.personId === person.id ? memberAssessment : null;
   const observations = snapshot.trends
     .filter((series) => series.personId === person.id)
     .flatMap((series) => series.points
@@ -89,6 +103,7 @@ export function buildMemberSummaryData(
   ];
   if ((input.dateFrom || input.dateTo) && unknownDateCount > 0) warnings.push(`有 ${unknownDateCount} 条日期未知的本人补充未纳入所选日期范围。`);
   if (person.derivedStatus === 'stale') warnings.push('成员背景或事实已变化，旧的 AI 派生说明已标记为待更新，本摘要未使用旧说明。');
+  if (!fullHistoryExport) warnings.push('按日期筛选仅限制报告指标与本人补充；跨期综合及建议未纳入。后续事项和资料清单仍按成员列出。');
   return {
     schemaVersion: 1,
     exportedAt,
@@ -101,8 +116,9 @@ export function buildMemberSummaryData(
     },
     dateRange: { from: input.dateFrom, to: input.dateTo },
     assessment: {
-      status: person.derivedStatus,
-      summary: person.derivedStatus === 'current' ? person.assessmentSummary : null
+      status: fullHistoryExport ? person.derivedStatus : 'unavailable',
+      summary: fullHistoryExport && person.derivedStatus === 'current'
+        ? currentAssessment?.overview.summary ?? person.assessmentSummary : null
     },
     observations,
     userReportedNotes: notes,
@@ -114,7 +130,18 @@ export function buildMemberSummaryData(
       dueDate: item.dueDate,
       dueText: item.dueText
     })),
-    lifestyleGuidance: snapshot.guidance.filter((item) => item.personId === person.id).map((item) => ({
+    suggestedActions: currentAssessment?.actions.map((action) => ({
+      title: action.title,
+      why: action.why,
+      firstStep: action.firstStep,
+      timing: action.timing,
+      reviewPlan: action.reviewPlan,
+      caution: action.caution,
+      kind: action.kind
+    })) ?? [],
+    // V3 发布后不再把旧派生建议混入同一份导出；已采纳行动仍从 actionItems 单独列出。
+    lifestyleGuidance: (fullHistoryExport && person.derivedStatus === 'current' && !currentAssessment
+      ? snapshot.guidance : []).filter((item) => item.personId === person.id).map((item) => ({
       title: item.title,
       detail: item.detail,
       consultProfessional: item.consultProfessional
@@ -152,6 +179,7 @@ export function renderMemberSummaryHtml(summary: MemberSummaryData): string {
   const rows = summary.observations.map((item) => `<tr><td>${escapeHtml(item.date)}</td><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.value)} ${escapeHtml(item.unit)}</td><td>${escapeHtml(item.sourceLabel)}</td></tr>`).join('');
   const notes = summary.userReportedNotes.map((item) => `<article><span class="pill blue">${escapeHtml(noteLabels[item.kind] ?? item.kind)} · 本人补充</span><h3>${escapeHtml(item.date ?? '日期未知')}</h3><p>${escapeHtml(item.text)}</p></article>`).join('');
   const actions = summary.actionItems.map((item) => `<li><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(actionOriginLabels[item.origin] ?? item.origin)} · ${escapeHtml(item.status)} · ${escapeHtml(item.dueDate ?? item.dueText ?? '无固定日期')}</span><p>${escapeHtml(item.detail)}</p></li>`).join('');
+  const suggestedActions = summary.suggestedActions.map((item) => `<li><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.why)}</p><p>第一步：${escapeHtml(item.firstStep)}</p>${item.timing ? `<p>何时：${escapeHtml(item.timing)}</p>` : ''}${item.reviewPlan ? `<p>回看：${escapeHtml(item.reviewPlan)}</p>` : ''}${item.caution ? `<p>注意：${escapeHtml(item.caution)}</p>` : ''}</li>`).join('');
   const guidance = summary.lifestyleGuidance.map((item) => `<li><strong>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.detail)}</p>${item.consultProfessional ? '<span>建议与专业人员确认</span>' : ''}</li>`).join('');
   const sources = summary.sourceDocuments.map((item) => `<li>${escapeHtml(item.displayName)} <span>${escapeHtml(item.format)} · ${escapeHtml(item.status)}</span></li>`).join('');
   const warnings = summary.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('');
@@ -162,6 +190,7 @@ export function renderMemberSummaryHtml(summary: MemberSummaryData): string {
   <section><h2>有日期的报告指标</h2>${rows ? `<table><thead><tr><th>日期</th><th>项目</th><th>原始显示值</th><th>来源</th></tr></thead><tbody>${rows}</tbody></table>` : '<p>所选范围内没有可列出的带日期数值记录。</p>'}</section>
   <section><h2>本人补充</h2>${notes || '<p>所选范围内没有本人补充资料。</p>'}</section>
   <section><h2>后续事项</h2>${actions ? `<ul>${actions}</ul>` : '<p>没有已保存的后续事项。</p>'}</section>
+  <section><h2>新版综合建议</h2><p>以下建议来自当前成员综合，尚未自动加入本人的后续事项。</p>${suggestedActions ? `<ul>${suggestedActions}</ul>` : '<p>当前没有可导出的新版综合建议。</p>'}</section>
   <section><h2>生活指南</h2>${guidance ? `<ul>${guidance}</ul>` : '<p>当前没有已发布的生活指南。</p>'}</section>
   <section><h2>资料清单</h2><p>只列名称和处理状态，不附原始报告。</p>${sources ? `<ul>${sources}</ul>` : '<p>没有已导入资料。</p>'}</section>
   <section class="warning"><h2>重要边界</h2><ul>${warnings}</ul></section><p class="footer">导出时间：${escapeHtml(summary.exportedAt)} · 格式版本：${summary.schemaVersion}</p></body></html>`;

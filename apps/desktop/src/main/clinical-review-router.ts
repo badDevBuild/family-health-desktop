@@ -2,8 +2,9 @@ import type {
   ClinicalFocusedReviewV1, HealthAction, HealthClaim, MemberAssessmentCandidateV3,
   OverviewNode, QuestionNode, SystemNode
 } from '@contracts';
+import { hasDirectMedicationChange, hasHighConsequenceAssertion } from './assessment-validation.js';
 
-export const CLINICAL_ROUTER_VERSION = 'clinical-router-v2';
+export const CLINICAL_ROUTER_VERSION = 'clinical-router-v3';
 
 const highConsequenceDisease = /(?:恶性肿瘤|恶性淋巴瘤|癌症|癌变|[\p{Script=Han}]{1,8}癌|心肌梗死|急性冠脉综合征|主动脉夹层|肺栓塞|脑卒中|脑梗死|脑出血|败血症|脓毒症|急性肾衰|急性肾损伤|肝衰竭|器官衰竭)/iu;
 const directlyNegatedDisease = /(?:已排除|明确排除|未见|无|不支持|未确诊|不能确诊|尚不能确诊)\s*$/i;
@@ -37,9 +38,11 @@ export function routeFocusedReview(candidate: MemberAssessmentCandidateV3): Focu
   const targets = new Set<string>();
   const reasons: string[] = [];
   for (const claim of candidate.claims) {
-    const novel = claim.diagnosticStatus !== 'documented' && claim.kind === 'diagnostic_assessment';
-    const highConsequence = novel && highConsequenceDisease.test(`${claim.diseaseName ?? ''} ${claim.text}`)
-      && (claim.diagnosticStatus !== 'undetermined' || !onlyDirectlyNegatedDiseaseMentions(claim));
+    const novel = claim.diagnosticStatus !== 'documented';
+    const highConsequence = novel && (claim.kind === 'diagnostic_assessment' && claim.diagnosticStatus !== null
+      && highConsequenceDisease.test(`${claim.diseaseName ?? ''} ${claim.text}`)
+      && (claim.diagnosticStatus !== 'undetermined' || !onlyDirectlyNegatedDiseaseMentions(claim))
+      || hasHighConsequenceAssertion(claim.text));
     if (claim.consequenceLevel !== 'high' && !highConsequence) continue;
     targets.add(claim.id);
     reasons.push(highConsequence ? `high_consequence_disease:${claim.id}` : `reported_high_consequence:${claim.id}`);
@@ -48,12 +51,22 @@ export function routeFocusedReview(candidate: MemberAssessmentCandidateV3): Focu
     if (candidate.overview.claimIds.includes(claim.id)) targets.add('overview');
   }
   for (const action of candidate.actions) {
-    if (action.urgency === 'emergency' || action.kind === 'treatment_discussion' && /(?:停药|加量|减量|换药)/.test(action.firstStep)) {
+    if (action.urgency === 'emergency' || hasDirectMedicationChange(action)
+      || hasHighConsequenceAssertion(`${action.title} ${action.why} ${action.firstStep} ${action.reviewPlan ?? ''}`)) {
       targets.add(action.id);
       reasons.push(`high_impact_action:${action.id}`);
       for (const system of candidate.systems.filter((item) => item.actionIds.includes(action.id))) targets.add(system.id);
       if (candidate.overview.actionIds.includes(action.id)) targets.add('overview');
     }
+  }
+  if (hasHighConsequenceAssertion(`${candidate.overview.headline} ${candidate.overview.summary}`)) {
+    targets.add('overview');
+    reasons.push('high_consequence_statement:overview');
+  }
+  for (const system of candidate.systems) {
+    if (!hasHighConsequenceAssertion(`${system.headline} ${system.summary}`)) continue;
+    targets.add(system.id);
+    reasons.push(`high_consequence_statement:${system.id}`);
   }
   return { targetIds: [...targets], reasons: [...new Set(reasons)] };
 }

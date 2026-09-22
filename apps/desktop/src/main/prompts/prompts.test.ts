@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
-import { buildP01Prompt } from './lean.js';
+import { buildP01Prompt, buildP02Prompt, buildP04Prompt } from './lean.js';
 import {
   ACCEPTANCE_RULES_VERSION,
   DERIVED_PROMPT_VERSION,
@@ -59,6 +59,18 @@ describe('pipeline prompts', () => {
     const prompt = buildP01Prompt({ displayName: '合成成员' }, { spans: [{ quote: '此图仅用于软件测试' }] });
     expect(prompt).toContain('软件测试声明等非临床说明不是个人健康事实');
     expect(prompt).toContain('不要为了覆盖而把它们建成“报告说明”候选');
+  });
+
+  it('V3 综合明确使用授权全历史，药物讨论标签不能豁免直接指令', () => {
+    expect(MEMBER_ASSESSMENT_PROMPT_VERSION).toBe('member-assessment-v8');
+    const prompt = buildP02Prompt({ newDocumentIds: ['doc-new'] }, { facts: [] });
+    expect(prompt).toContain('不能只看 newDocumentIds');
+    expect(prompt).toContain('不能用上次分析摘要代替历史事实');
+    expect(prompt).toContain('既往诊断可以同时使用两者');
+    expect(prompt).toContain('treatment_discussion');
+    expect(prompt).toContain('直接开始、停止或调整处方药');
+    const focusedReview = buildP04Prompt({ targets: [] }, {}, {});
+    expect(focusedReview).toContain('action.type=treatment_discussion');
   });
 
   it('提取提示词把数据块放在说明之后，并锁定关键硬规则', () => {

@@ -1466,7 +1466,7 @@ function registerIpc(): void {
     try {
       const input = exportMemberSummaryInputSchema.parse(rawInput);
       const snapshot = personalWorkspace.getSnapshot(currentAccountState());
-      const summary = buildMemberSummaryData(snapshot, input);
+      const summary = buildMemberSummaryData(snapshot, input, undefined, personalWorkspace.getMemberAssessment(input.personId));
       const safeMemberName = [...summary.member.displayName]
         .map((character) => character.charCodeAt(0) < 32 ? '_' : character)
         .join('')

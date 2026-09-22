@@ -139,6 +139,184 @@ describe('ProcessingJobRunner', () => {
     service.close();
   });
 
+  it('ABC 已完成后重启加入 D：只提取 D，P02 读取全历史、授权范围与现有行动，排除后不再发送旧事实', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-runner-history-'));
+    roots.push(root);
+    const timeline = [
+      ['A', '2023-06-10', '4.1'], ['B', '2024-06-10', '4.2'],
+      ['C', '2025-06-10', '4.3'], ['D', '2026-06-10', '4.4']
+    ] as const;
+    const runtimeFor = (requests: Array<{ stage: 'P01' | 'P02'; documentId?: string;
+      evidence?: MemberEvidencePackageV3; request?: AssessmentRequestV3 }>) => ({
+      getState: () => connectedState,
+      runStructuredTurn: async (input: { prompt: string; allowWebSearch?: boolean; outputSchema: Record<string, unknown> }) => {
+        if (input.prompt.includes('\nSOURCE_PACKAGE=')) {
+          expect(input.allowWebSearch).toBe(false);
+          expect(input.outputSchema.properties).toHaveProperty('documentId');
+          const source = parsePromptValue<{ documentId: string; spans: Array<{ sourceSpanId: string; quote: string }> }>(
+            input.prompt, 'SOURCE_PACKAGE');
+          const span = source.spans[0]!;
+          const clinicalDate = span.quote.match(/\d{4}-\d{2}-\d{2}/)![0]!;
+          const value = span.quote.match(/LDL-C ([\d.]+)/)![1]!;
+          requests.push({ stage: 'P01', documentId: source.documentId });
+          return { threadId: 'extract', turnId: `extract-${requests.length}`, output: {
+            schemaVersion: 1, documentId: source.documentId,
+            coveredSourceSpanIds: source.spans.map((item) => item.sourceSpanId),
+            subject: { reportedName: null, evidence: [], confidence: 'absent' },
+            candidates: [{
+              localKey: 'ldl', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
+              value: { kind: 'numeric', rawText: value, decimal: value, comparator: 'eq' },
+              unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+              specimen: null, method: null, bodySite: null, clinicalDate,
+              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: []
+            }]
+          } satisfies ExtractionResult };
+        }
+        expect(input.prompt).toContain('\nASSESSMENT_REQUEST=');
+        expect(input.outputSchema.properties).toHaveProperty('inputSignature');
+        const request = parsePromptValue<AssessmentRequestV3>(input.prompt, 'ASSESSMENT_REQUEST', 'MEMBER_EVIDENCE_PACKAGE');
+        const evidence = parsePromptValue<MemberEvidencePackageV3>(input.prompt, 'MEMBER_EVIDENCE_PACKAGE');
+        requests.push({ stage: 'P02', request, evidence });
+        return { threadId: 'assess', turnId: `assess-${requests.length}`, output: assessmentFor(request, evidence) };
+      }
+    } as unknown as CodexRuntimeManager);
+
+    const first = new PersonalWorkspaceService(root, '合成历史工作区', () => new Date('2026-09-22T00:00:00Z'));
+    const personId = first.ensurePrimaryMember({ displayName: '合成本人', relation: '本人' });
+    await first.importFiles(timeline.slice(0, 3).map(([label, date, value]) => ({
+      path: `/tmp/合成报告-${label}.txt`, bytes: Buffer.from(`${date} LDL-C ${value} mmol/L`)
+    })), personId);
+    first.processNow({ accountState: connectedState, consentVersion: 1 });
+    const firstRequests: Parameters<typeof runtimeFor>[0] = [];
+    await new ProcessingJobRunner(runtimeFor(firstRequests)).runAvailableJobs(first.store);
+    expect(first.store.listStoredJobs()[0]).toMatchObject({ status: 'succeeded' });
+    expect(firstRequests.map((item) => item.stage)).toEqual(['P01', 'P01', 'P01', 'P02']);
+    const historical = first.store.listAcceptedObservations(personId);
+    expect(historical.map((item) => item.rawText)).toEqual(['4.1', '4.2', '4.3']);
+    const action = first.createAction({ personId, title: '保留既有行动', detail: '本人已完成', dueDate: null, dueText: null });
+    first.updateActionStatus({ actionId: action.id, status: 'completed', expectedRevision: action.userRevision });
+    first.close();
+
+    const reopened = new PersonalWorkspaceService(root, '合成历史工作区', () => new Date('2026-09-22T00:00:00Z'));
+    const otherPersonId = reopened.createMember({ displayName: '隔离成员', relation: '家人', birthYear: null });
+    reopened.createManualNote({ personId: otherPersonId, kind: 'history',
+      immutableText: '其他成员独有的合成病史', effectiveDate: '2026-09-22', structuredFields: {}, expectedContextRevision: 0 });
+    const [label, date, value] = timeline[3];
+    await reopened.importFiles([{ path: `/tmp/合成报告-${label}.txt`,
+      bytes: Buffer.from(`${date} LDL-C ${value} mmol/L`) }], personId);
+    const documentD = reopened.getSnapshot(null).inbox.find((item) => item.displayName === '合成报告-D.txt')!.id;
+    reopened.processNow({ accountState: connectedState, consentVersion: 1, documentIds: [documentD] });
+    const dJob = reopened.store.listStoredJobs().find((job) => job.documentIds.includes(documentD))!;
+    const consentDb = new Database(reopened.store.databasePath, { readonly: true });
+    const dConsent = JSON.parse((consentDb.prepare(`
+      SELECT c.scope_json FROM jobs j
+      JOIN consents c ON c.id = json_extract(j.checkpoint_json, '$.consentId')
+      WHERE j.id = ?
+    `).get(dJob.id) as { scope_json: string }).scope_json) as {
+      documentIds: string[]; historicalObservationIds: string[]; personIds: string[]
+    };
+    consentDb.close();
+    expect(dConsent.documentIds).toEqual([documentD]);
+    expect(dConsent.historicalObservationIds.sort()).toEqual(historical.map((item) => item.id).sort());
+    expect(dConsent.personIds).toEqual([personId]);
+    const nextRequests: Parameters<typeof runtimeFor>[0] = [];
+    await new ProcessingJobRunner(runtimeFor(nextRequests)).runAvailableJobs(reopened.store);
+    expect(nextRequests.map((item) => item.stage)).toEqual(['P01', 'P02']);
+    expect(nextRequests[0]?.documentId).toBe(documentD);
+    const fullEvidence = nextRequests[1]!.evidence!;
+    expect(fullEvidence.facts.map((fact) => fact.rawValue)).toEqual(['4.1', '4.2', '4.3', '4.4']);
+    expect(fullEvidence.facts.map((fact) => fact.observationId).slice(0, 3)).toEqual(historical.map((item) => item.id));
+    expect(fullEvidence.trends.length).toBeGreaterThan(0);
+    expect(JSON.stringify(fullEvidence.trends)).toContain('2023-06-10');
+    expect(JSON.stringify(fullEvidence.trends)).toContain('2026-06-10');
+    expect(JSON.stringify(fullEvidence)).not.toContain('其他成员独有的合成病史');
+    expect(fullEvidence.existingActions).toEqual([expect.objectContaining({ id: action.id, title: '保留既有行动' })]);
+    expect(reopened.store.listActionItems(personId)).toContainEqual(expect.objectContaining({ id: action.id, status: 'completed' }));
+    expect(recordedTurnUsage(reopened.store.databasePath).attemptedTurnRequests)
+      .toEqual({ P01: 1, P02: 1, P03: 0, P04: 0, other: 0 });
+
+    const excludedId = historical[1]!.documentId;
+    reopened.setDocumentIncluded({ documentId: excludedId, included: false, confirmedExclusion: true });
+    reopened.processNow({ accountState: connectedState, consentVersion: 1 });
+    const refreshRequests: Parameters<typeof runtimeFor>[0] = [];
+    await new ProcessingJobRunner(runtimeFor(refreshRequests)).runAvailableJobs(reopened.store);
+    expect(refreshRequests.map((item) => item.stage)).toEqual(['P02']);
+    expect(refreshRequests[0]!.evidence!.facts.map((fact) => fact.rawValue)).toEqual(['4.1', '4.3', '4.4']);
+    expect(JSON.stringify(refreshRequests[0]!.evidence)).not.toContain('4.2');
+    expect(reopened.store.listActionItems(personId)).toContainEqual(expect.objectContaining({ id: action.id, status: 'completed' }));
+    reopened.close();
+  });
+
+  it('多块提取在第二块失败后重启重试，只重发未完成块', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-runner-resume-chunk-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '合成多块工作区', () => new Date('2026-09-22T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '合成本人', relation: '本人' });
+    const lines = Array.from({ length: 41 }, (_, index) =>
+      `2026-09-21 LDL-C ${index === 40 ? '4.4' : '4.1'} mmol/L 第 ${index + 1} 行`);
+    await service.importFiles([{ path: '/tmp/合成多块报告.txt', bytes: Buffer.from(lines.join('\n')) }], personId);
+    service.processNow({ accountState: connectedState, consentVersion: 1 });
+    const jobId = service.store.listStoredJobs()[0]!.id;
+    const firstChunks: number[] = [];
+    const extractionFor = (source: { documentId: string; spans: Array<{ sourceSpanId: string; quote: string }> }): ExtractionResult => {
+      const span = source.spans[0]!;
+      const value = span.quote.match(/LDL-C ([\d.]+)/)![1]!;
+      return {
+        schemaVersion: 1, documentId: source.documentId,
+        coveredSourceSpanIds: source.spans.map((item) => item.sourceSpanId),
+        subject: { reportedName: null, evidence: [], confidence: 'absent' },
+        candidates: [{ localKey: 'ldl', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
+          value: { kind: 'numeric', rawText: value, decimal: value, comparator: 'eq' },
+          unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+          specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-21',
+          evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: [] }]
+      };
+    };
+    const failingRuntime = {
+      getState: () => connectedState,
+      runStructuredTurn: async (input: { prompt: string }) => {
+        const source = parsePromptValue<{ documentId: string; spans: Array<{ sourceSpanId: string; quote: string }> }>(
+          input.prompt, 'SOURCE_PACKAGE');
+        firstChunks.push(source.spans.length);
+        if (firstChunks.length === 2) throw new Error('SYNTHETIC_TRANSIENT_FAILURE');
+        return { threadId: 'extract', turnId: 'extract-first-chunk', output: extractionFor(source) };
+      }
+    } as unknown as CodexRuntimeManager;
+    await new ProcessingJobRunner(failingRuntime).runAvailableJobs(service.store);
+    expect(firstChunks).toEqual([40, 1]);
+    expect(service.store.listStoredJobs()[0]).toMatchObject({ status: 'failed' });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([]);
+    service.close();
+
+    const reopened = new PersonalWorkspaceService(root, '合成多块工作区', () => new Date('2026-09-22T00:00:00Z'));
+    reopened.store.retryFailedJob(jobId);
+    const retryChunks: number[] = [];
+    let assessmentCalls = 0;
+    const retryRuntime = {
+      getState: () => connectedState,
+      runStructuredTurn: async (input: { prompt: string }) => {
+        if (input.prompt.includes('\nSOURCE_PACKAGE=')) {
+          const source = parsePromptValue<{ documentId: string; spans: Array<{ sourceSpanId: string; quote: string }> }>(
+            input.prompt, 'SOURCE_PACKAGE');
+          retryChunks.push(source.spans.length);
+          return { threadId: 'extract-retry', turnId: 'extract-second-chunk', output: extractionFor(source) };
+        }
+        assessmentCalls += 1;
+        const request = parsePromptValue<AssessmentRequestV3>(input.prompt, 'ASSESSMENT_REQUEST', 'MEMBER_EVIDENCE_PACKAGE');
+        const evidence = parsePromptValue<MemberEvidencePackageV3>(input.prompt, 'MEMBER_EVIDENCE_PACKAGE');
+        return { threadId: 'assess', turnId: 'assess-retry', output: assessmentFor(request, evidence) };
+      }
+    } as unknown as CodexRuntimeManager;
+    await new ProcessingJobRunner(retryRuntime).runAvailableJobs(reopened.store);
+    expect(retryChunks).toEqual([1]);
+    expect(assessmentCalls).toBe(1);
+    expect(reopened.store.listStoredJobs()[0]).toMatchObject({ status: 'succeeded' });
+    expect(reopened.store.listAcceptedObservations(personId).map((item) => item.rawText).sort()).toEqual(['4.1', '4.4']);
+    expect(recordedTurnUsage(reopened.store.databasePath).attemptedTurnRequests)
+      .toEqual({ P01: 1, P02: 1, P03: 0, P04: 0, other: 0 });
+    reopened.close();
+  });
+
   it('身份冲突只隔离该资料，其他资料仍提取并参与一次成员综合', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-runner-partial-review-'));
     roots.push(root);

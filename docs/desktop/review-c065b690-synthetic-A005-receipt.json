@@ -1,0 +1,20 @@
+{
+  "kind": "P02_ONLY_SYNTHETIC",
+  "caseId": "A005",
+  "createdAt": "2026-09-22T15:47:17.780Z",
+  "modelId": "gpt-5.6-sol",
+  "reasoningEffort": "medium",
+  "promptVersion": "member-assessment-v8",
+  "validationRulesVersion": "assessment-validation-v9",
+  "routerVersion": "clinical-router-v3",
+  "webSearchAllowed": false,
+  "webSearches": 0,
+  "schemaValid": true,
+  "localValidationIssueCount": 0,
+  "focusedReviewTargetCount": 0,
+  "durationMs": 69006,
+  "inputTokens": 17785,
+  "outputTokens": 1960,
+  "resultSummary": "合成资料中的既往高血压诊断与当前血压控制情况未知被分开表述",
+  "limits": "单次合成 P02，未运行对应 P01、正式安装包或独立医学专业审核"
+}
