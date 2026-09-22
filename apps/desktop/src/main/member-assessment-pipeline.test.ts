@@ -507,6 +507,40 @@ describe('MemberAssessmentPipeline', () => {
     service.close();
   });
 
+  it('新增本人资料并重新综合后保留已采纳行动的进度且不重复创建', async () => {
+    const { service, personId, built } = await fixture();
+    const runtime = {
+      runStructuredTurn: async (input: { prompt: string }) => {
+        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+        const source = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        return { threadId: 'p02', turnId: 'turn', output: candidateFor(request, source) };
+      }
+    };
+    const firstResult = await new MemberAssessmentPipeline(service.store, runtime,
+      undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(firstResult).toMatchObject({ status: 'published', callCount: 1 });
+    const firstSnapshot = service.getMemberAssessment(personId)!;
+    expect(firstSnapshot.inputSignature).toBe(built.request.inputSignature);
+    const adopted = service.adoptMemberAssessmentAction({
+      personId, snapshotId: firstSnapshot.id, actionId: firstSnapshot.actions[0]!.id
+    });
+    service.store.updateActionStatus({ actionId: adopted.id, status: 'completed', expectedRevision: adopted.userRevision });
+    service.store.createManualNote({
+      personId, kind: 'free_text', immutableText: '合成补充说明', effectiveDate: '2026-09-22',
+      structuredFields: {}, expectedContextRevision: 0
+    });
+    const secondResult = await new MemberAssessmentPipeline(service.store, runtime,
+      undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(secondResult).toMatchObject({ status: 'published', callCount: 1 });
+    const secondSnapshot = service.getMemberAssessment(personId)!;
+    expect(secondSnapshot.id).not.toBe(firstSnapshot.id);
+    expect(service.getLifestylePlan(personId).adoptedActions).toMatchObject([{
+      id: adopted.id, assessmentDedupeKey: secondSnapshot.actions[0]!.dedupeKey, status: 'completed'
+    }]);
+    expect(service.store.listActionItems(personId).filter((item) => item.id === adopted.id)).toHaveLength(1);
+    service.close();
+  });
+
   it('隔离合成评测可显式关闭 P02 联网，输入签名和运行权限保持一致', async () => {
     const { service, personId } = await fixture();
     const built = buildMemberAssessmentInput(service.store, personId, {
