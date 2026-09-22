@@ -26,7 +26,7 @@ import type {
   UndoHealthEventRelationInput,
   UpdateReportMetadataInput
 } from '@contracts';
-import { BODY_SYSTEM_REGISTRY_VERSION, CONCEPT_DICTIONARY_VERSION, MEMBER_MODEL_VERSION, bodySystemRegistry, conceptDictionary, linkConceptToSystems, mapConcept, selectContextSystems } from '@core';
+import { BODY_SYSTEM_REGISTRY_VERSION, CONCEPT_DICTIONARY_VERSION, MEMBER_MODEL_VERSION, bodySystemRegistry, conceptDictionary, linkConceptToSystems, mapConcept, sameAdoptedActionScope, selectContextSystems } from '@core';
 
 export const WORKSPACE_SCHEMA_VERSION = 35;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
@@ -872,6 +872,13 @@ export class WorkspaceStore {
       const existing = this.listAdoptedMemberAssessmentActions(input.personId)
         .find((item) => item.dedupeKey === proposal.dedupeKey && item.action.status !== 'dismissed');
       if (existing) return existing.action.id;
+      const legacyProposalIds = new Set(this.listLifestyleProposals(input.personId)
+        .filter((item) => sameAdoptedActionScope(item, proposal))
+        .map((item) => item.id));
+      const legacyAdoption = this.listActionAdoptions(input.personId).find((item) => (
+        item.proposalId !== null && legacyProposalIds.has(item.proposalId) && item.status !== 'dismissed'
+      ));
+      if (legacyAdoption) return legacyAdoption.id;
       const id = randomUUID();
       const detail = [proposal.why, `第一步：${proposal.firstStep}`,
         proposal.reviewPlan ? `回看：${proposal.reviewPlan}` : null,

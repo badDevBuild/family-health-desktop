@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { ObservationCandidate, SourceManifest } from '@contracts';
 
 export * from './member-v2.js';
+export * from './member-action-match.js';
 
 export type AcceptanceOutcome =
   | { decision: 'accept'; warnings: string[] }

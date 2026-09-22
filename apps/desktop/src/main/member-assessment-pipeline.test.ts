@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { AccountState, AssessmentRequestV3, ClinicalFocusedReviewV1, ExtractionResult, MemberAssessmentCandidateV3, MemberEvidencePackageV3 } from '@contracts';
+import type { AccountState, AssessmentRequestV3, ClinicalFocusedReviewV1, DerivedSnapshotCandidate, ExtractionResult, MemberAssessmentCandidateV3, MemberEvidencePackageV3 } from '@contracts';
 import type { CodexRuntimeManager } from './codex-runtime.js';
 import { ProcessingJobRunner } from './job-runner.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
@@ -539,6 +539,112 @@ describe('MemberAssessmentPipeline', () => {
     }]);
     expect(service.store.listActionItems(personId).filter((item) => item.id === adopted.id)).toHaveLength(1);
     service.close();
+  });
+
+  it('旧版快照与用户修改共存时升级为 V3，重启后仍保留事实、修正和已完成事项', async () => {
+    const { service, personId, documentId } = await fixture();
+    const root = service.store.rootDirectory;
+    const report = service.store.listReportMetadata(personId)[0]!;
+    service.updateReportMetadata({
+      personId, reportId: report.reportId, expectedRevision: report.metadataRevision,
+      title: '本人核对后的合成血脂报告', organization: null, department: null,
+      clinicalTime: { value: '2026-09-21', precision: 'day' }, reason: '合成升级测试：保留手工修正'
+    });
+    const note = service.createManualNote({
+      personId, kind: 'free_text', immutableText: '本人补充：尚未复测血脂。',
+      effectiveDate: '2026-09-22', structuredFields: {}, expectedContextRevision: 0
+    });
+    const action = service.createAction({
+      personId, title: '带报告复核', detail: '本人已完成的旧版事项', dueDate: null, dueText: null
+    });
+    service.updateActionStatus({ actionId: action.id, status: 'completed', expectedRevision: action.userRevision });
+    const fact = service.store.listAcceptedObservations(personId)[0]!;
+    const factRevision = service.store.getFactRevision(personId);
+    const sourceHash = service.store.getDocumentSourceHash(documentId);
+    const legacyCandidate: DerivedSnapshotCandidate = {
+      schemaVersion: 1, personId, factRevision, dataQuality: 'partial', claims: [],
+      lifestyleGuidance: [{
+        id: 'old-guidance', dedupeKey: 'lipid-risk-context', category: 'review', title: '旧版生活建议',
+        detail: '带上报告讨论复查安排。', goal: '确定复查安排',
+        rationale: '已有一项带来源的检查结果。', steps: ['整理报告'],
+        startingOptions: ['先整理资料'], scheduleSuggestion: null,
+        trackingSuggestion: '记录是否完成', constraints: [], uncertainties: [],
+        generalKnowledgeEvidence: [], sourceKind: 'ai_proposed', relatedSystemIds: ['cardiovascular'],
+        evidenceObservationIds: [fact.id], consultProfessional: false
+      }]
+    };
+    const legacySnapshot = service.store.publishDerivedSnapshot({
+      candidate: legacyCandidate, expectedFactRevision: factRevision,
+      expectedContextRevision: service.store.getClinicalContextRevision(personId),
+      promptVersion: 'derived-v1', rulesVersion: 'derived-safety-v1', modelId: 'legacy-model'
+    });
+    const legacyProposal = service.store.listLifestyleProposals(personId)[0]!;
+    const adopted = service.adoptLifestyleProposal({
+      personId, proposalId: legacyProposal.id, userGoal: '带上报告讨论复查安排',
+      selectedStartingOption: '先整理资料', plannedTime: '下次就诊时', owner: '本人',
+      progressNote: '已整理旧报告', dueDate: null
+    });
+    service.updateActionStatus({ actionId: adopted.id, status: 'completed', expectedRevision: 1 });
+    expect(service.getLifestylePlan(personId).proposals).toEqual([
+      expect.objectContaining({ id: legacyProposal.id, title: '旧版生活建议', status: 'adopted' })
+    ]);
+    service.close();
+
+    const reopened = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(reopened.store, {
+      runStructuredTurn: async (input) => {
+        calls += 1;
+        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        expect(evidence.facts.some((item) => item.observationId === fact.id)).toBe(true);
+        expect(evidence.personalContext.some((item) => item.id === note.id)).toBe(true);
+        return { threadId: 'v3-upgrade', turnId: 'v3-upgrade', output: candidateFor(request, evidence) };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 1 });
+    expect(calls).toBe(1);
+    const assessment = reopened.getMemberAssessment(personId)!;
+    expect(assessment.overview.headline).toBe('这次血脂检查有一项需要关注');
+    expect(reopened.getLifestylePlan(personId).adoptedActions).toContainEqual(
+      expect.objectContaining({ id: adopted.id, assessmentDedupeKey: assessment.actions[0]!.dedupeKey })
+    );
+    expect(reopened.adoptMemberAssessmentAction({
+      personId, snapshotId: assessment.id, actionId: assessment.actions[0]!.id
+    }).id).toBe(adopted.id);
+    expect(reopened.store.listActionItems(personId).filter((item) => item.origin === 'ai_proposed')).toHaveLength(1);
+    expect(reopened.store.getFactRevision(personId)).toBe(factRevision);
+    expect(reopened.store.getDocumentSourceHash(documentId)).toBe(sourceHash);
+    expect(reopened.store.listAcceptedObservations(personId)).toMatchObject([{
+      id: fact.id, rawText: '4.2', documentId
+    }]);
+    expect(reopened.store.listReportMetadata(personId)[0]).toMatchObject({ title: '本人核对后的合成血脂报告' });
+    expect(reopened.store.listManualNotes(personId)).toContainEqual(expect.objectContaining({ id: note.id }));
+    expect(reopened.store.listActionItems(personId)).toContainEqual(expect.objectContaining({ id: action.id, status: 'completed' }));
+    expect(reopened.store.listActionAdoptions(personId)).toEqual([
+      expect.objectContaining({ id: adopted.id, proposalId: legacyProposal.id, status: 'completed' })
+    ]);
+    expect(reopened.getLifestylePlan(personId).adoptedActions).toContainEqual(
+      expect.objectContaining({ id: adopted.id, status: 'completed' })
+    );
+    const persisted = new Database(reopened.store.databasePath, { readonly: true });
+    expect(persisted.prepare('SELECT payload_json FROM derived_snapshots WHERE id = ?').get(legacySnapshot.snapshotId))
+      .toEqual({ payload_json: JSON.stringify(legacyCandidate) });
+    persisted.close();
+    reopened.close();
+
+    const restarted = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
+    expect(restarted.getMemberAssessment(personId)?.overview.headline).toBe('这次血脂检查有一项需要关注');
+    expect(restarted.store.getDocumentSourceHash(documentId)).toBe(sourceHash);
+    expect(restarted.store.listActionItems(personId)).toContainEqual(expect.objectContaining({ id: action.id, status: 'completed' }));
+    expect(restarted.store.listActionAdoptions(personId)).toEqual([
+      expect.objectContaining({ id: adopted.id, status: 'completed' })
+    ]);
+    expect(await new MemberAssessmentPipeline(restarted.store, {
+      runStructuredTurn: async () => { throw new Error('SHOULD_NOT_REPROCESS'); }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId))
+      .toMatchObject({ status: 'skipped', reason: 'signature_current', callCount: 0 });
+    restarted.close();
   });
 
   it('隔离合成评测可显式关闭 P02 联网，输入签名和运行权限保持一致', async () => {

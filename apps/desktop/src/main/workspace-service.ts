@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import type { AccountState, ActionItem, ActionStatus, AdoptMemberAssessmentActionInput, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
 import { adoptedActionReceiptSchema, bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, lifestyleProposalDecisionReceiptSchema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
-import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, stableHash, type TrendObservationInput } from '@core';
+import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, sameAdoptedActionScope, stableHash, type TrendObservationInput } from '@core';
 import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
 import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
@@ -876,6 +876,12 @@ export class PersonalWorkspaceService {
     const storedProposals = this.store.listLifestyleProposals(personId);
     const storedAdoptions = this.store.listActionAdoptions(personId);
     const assessmentAdoptions = this.store.listAdoptedMemberAssessmentActions(personId);
+    const currentActions = this.getMemberAssessment(personId)?.actions ?? [];
+    const legacyAssessmentKeys = new Map(storedProposals.flatMap((proposal) => {
+      if (proposal.status !== 'adopted') return [];
+      const matched = currentActions.find((action) => sameAdoptedActionScope(proposal, action));
+      return matched ? [[proposal.id, matched.dedupeKey] as const] : [];
+    }));
     const assessmentAdoptionIds = new Set(assessmentAdoptions.map((item) => item.action.id));
     const useMaterializedPlan = storedProposals.length > 0 || storedAdoptions.length > 0;
     const legacyActions = useMaterializedPlan ? [] : this.store.listActionItems(personId)
@@ -981,6 +987,8 @@ export class PersonalWorkspaceService {
         ? storedAdoptions.map((action) => ({
           id: action.id,
           proposalId: action.proposalId,
+          assessmentDedupeKey: action.proposalId === null ? null
+            : legacyAssessmentKeys.get(action.proposalId) ?? null,
           title: action.title,
           userGoal: action.userGoal,
           selectedStartingOption: action.selectedStartingOption,
