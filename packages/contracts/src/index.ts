@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { actionStatusSchema } from './action-status.js';
 
 export * from './member-v2.js';
+export * from './member-assessment-v3.js';
 export * from './action-status.js';
 
 export const idSchema = z.string().min(1).max(120);

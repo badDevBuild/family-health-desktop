@@ -9,6 +9,7 @@ import type {
   CreateManualNoteInput,
   DerivedSnapshotCandidate,
   ManualNote,
+  MemberAssessmentSnapshotV3,
   HealthEventRelationReceipt,
   MergeHealthEventsInput,
   ObservationCandidate,
@@ -26,7 +27,7 @@ import type {
 } from '@contracts';
 import { BODY_SYSTEM_REGISTRY_VERSION, CONCEPT_DICTIONARY_VERSION, MEMBER_MODEL_VERSION, bodySystemRegistry, conceptDictionary, linkConceptToSystems, mapConcept, selectContextSystems } from '@core';
 
-export const WORKSPACE_SCHEMA_VERSION = 34;
+export const WORKSPACE_SCHEMA_VERSION = 35;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 function calendarDateMatchesInText(text: string): Array<{ date: string; index: number; length: number }> {
@@ -4027,6 +4028,61 @@ export class WorkspaceStore {
     });
   }
 
+  listMemberAssessmentSnapshots(personId?: string, currentOnly = false): MemberAssessmentSnapshotV3[] {
+    const rows = this.db.prepare(`
+      SELECT id, payload_json, status, created_at FROM member_assessment_snapshots_v3
+      WHERE (? IS NULL OR person_id = ?) AND (? = 0 OR status = 'current')
+      ORDER BY created_at DESC, rowid DESC
+    `).all(personId ?? null, personId ?? null, currentOnly ? 1 : 0) as Array<{
+      id: string; payload_json: string; status: 'current' | 'stale'; created_at: string
+    }>;
+    return rows.map((row) => ({
+      ...(JSON.parse(row.payload_json) as MemberAssessmentSnapshotV3),
+      id: row.id,
+      status: row.status,
+      generatedAt: row.created_at
+    }));
+  }
+
+  publishMemberAssessmentSnapshot(input: {
+    snapshot: Omit<MemberAssessmentSnapshotV3, 'id' | 'status' | 'generatedAt'>;
+    executionGuard?: JobExecutionGuard;
+  }): { snapshotId: string; idempotent: boolean } {
+    const { snapshot } = input;
+    const transaction = this.db.transaction(() => {
+      if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard);
+      if (this.getFactRevision(snapshot.personId) !== snapshot.factRevision) throw new Error('MEMBER_ASSESSMENT_FACT_REVISION_CONFLICT');
+      if (this.getClinicalContextRevision(snapshot.personId) !== snapshot.contextRevision) throw new Error('MEMBER_ASSESSMENT_CONTEXT_REVISION_CONFLICT');
+      const observations = this.listAcceptedObservations(snapshot.personId);
+      if (input.executionGuard) this.assertObservationScopeActive(input.executionGuard, snapshot.personId, observations);
+      const currentObservationIds = new Set(observations.map((item) => item.id));
+      const evidenceObservationIds = snapshot.evidenceCatalog
+        .map((item) => item.observationId).filter((id): id is string => id !== null);
+      if (evidenceObservationIds.some((id) => !currentObservationIds.has(id))) throw new Error('MEMBER_ASSESSMENT_EVIDENCE_MISMATCH');
+      const existing = this.db.prepare(`
+        SELECT id FROM member_assessment_snapshots_v3
+        WHERE person_id = ? AND input_signature = ? AND status = 'current' LIMIT 1
+      `).get(snapshot.personId, snapshot.inputSignature) as { id: string } | undefined;
+      if (existing) return { snapshotId: existing.id, idempotent: true };
+      const snapshotId = randomUUID();
+      const timestamp = this.now().toISOString();
+      this.db.prepare(`UPDATE member_assessment_snapshots_v3 SET status = 'stale' WHERE person_id = ? AND status = 'current'`)
+        .run(snapshot.personId);
+      this.db.prepare(`
+        INSERT INTO member_assessment_snapshots_v3 (
+          id, person_id, input_signature, fact_revision, context_revision,
+          prompt_version, rules_version, model_id, reasoning_effort, validation_mode,
+          payload_json, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)
+      `).run(snapshotId, snapshot.personId, snapshot.inputSignature, snapshot.factRevision,
+        snapshot.contextRevision, snapshot.promptVersion, snapshot.rulesVersion,
+        snapshot.modelId, snapshot.reasoningEffort, snapshot.validationMode,
+        JSON.stringify(snapshot), timestamp);
+      return { snapshotId, idempotent: false };
+    });
+    return transaction();
+  }
+
   publishSystemAnalysisSnapshot(input: {
     snapshot: Omit<SystemAnalysisSnapshot, 'id' | 'status' | 'generatedAt'>;
     evidenceBundle: SystemEvidenceBundle;
@@ -5996,6 +6052,25 @@ export class WorkspaceStore {
         current = 34;
       }
 
+      if (current === 34) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS member_assessment_snapshots_v3 (
+            id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
+            input_signature TEXT NOT NULL, fact_revision INTEGER NOT NULL,
+            context_revision INTEGER NOT NULL, prompt_version TEXT NOT NULL,
+            rules_version TEXT NOT NULL, model_id TEXT NOT NULL,
+            reasoning_effort TEXT NOT NULL, validation_mode TEXT NOT NULL,
+            payload_json TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS idx_member_assessment_current_v3
+            ON member_assessment_snapshots_v3(person_id, status, created_at);
+          UPDATE workspaces SET schema_version = 35;
+          PRAGMA user_version = 35;
+        `);
+        current = 35;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -6109,6 +6184,17 @@ export class WorkspaceStore {
         model_id TEXT NOT NULL, coverage_json TEXT NOT NULL, payload_json TEXT NOT NULL,
         status TEXT NOT NULL, created_at TEXT NOT NULL
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS member_assessment_snapshots_v3 (
+        id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES persons(id),
+        input_signature TEXT NOT NULL, fact_revision INTEGER NOT NULL,
+        context_revision INTEGER NOT NULL, prompt_version TEXT NOT NULL,
+        rules_version TEXT NOT NULL, model_id TEXT NOT NULL,
+        reasoning_effort TEXT NOT NULL, validation_mode TEXT NOT NULL,
+        payload_json TEXT NOT NULL, status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS idx_member_assessment_current_v3
+        ON member_assessment_snapshots_v3(person_id, status, created_at);
       CREATE TABLE IF NOT EXISTS snapshot_evidence (
         snapshot_id TEXT NOT NULL REFERENCES derived_snapshots(id), claim_id TEXT NOT NULL,
         observation_revision_id TEXT, source_span_id TEXT,
@@ -6325,7 +6411,7 @@ export class WorkspaceStore {
         ON concept_mapping_corrections(observation_id) WHERE active = 1;
       CREATE INDEX IF NOT EXISTS idx_concept_mapping_corrections_history
         ON concept_mapping_corrections(observation_id, created_at, id);
-      PRAGMA user_version = 34;
+      PRAGMA user_version = 35;
       `);
 
       this.seedMemberModelV2();

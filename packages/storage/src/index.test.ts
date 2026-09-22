@@ -80,7 +80,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -95,10 +95,10 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('schema v34 建立成员档案注册表、版本化派生表与可撤销纠错表', () => {
+  it('schema v35 建立成员档案注册表、版本化派生表与可撤销纠错表', () => {
     const store = makeStore();
     const database = new Database(store.databasePath, { readonly: true });
-    expect(database.pragma('user_version', { simple: true })).toBe(34);
+    expect(database.pragma('user_version', { simple: true })).toBe(35);
     const tables = new Set((database.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>).map((row) => row.name));
     for (const table of [
       'body_system_registry',
@@ -108,6 +108,7 @@ describe('WorkspaceStore', () => {
       'health_events_v2',
       'report_records',
       'system_analysis_snapshots_v2',
+      'member_assessment_snapshots_v3',
       'lifestyle_proposals_v2',
       'action_adoptions_v2',
       'derivation_dependencies',
@@ -175,7 +176,7 @@ describe('WorkspaceStore', () => {
     ]);
     const migrated = new Database(upgraded.databasePath, { readonly: true });
     expect(migrated.prepare(`SELECT original_name FROM observations`).get()).toEqual({ original_name: null });
-    expect(migrated.pragma('user_version', { simple: true })).toBe(34);
+    expect(migrated.pragma('user_version', { simple: true })).toBe(35);
     migrated.close();
     upgraded.close();
   });
@@ -802,7 +803,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -858,7 +859,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -914,7 +915,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -970,7 +971,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1026,7 +1027,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1082,7 +1083,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1138,7 +1139,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1194,7 +1195,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1251,7 +1252,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1308,7 +1309,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1365,7 +1366,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1421,7 +1422,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1465,7 +1466,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1504,7 +1505,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1549,7 +1550,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1594,7 +1595,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
@@ -1649,7 +1650,7 @@ describe('WorkspaceStore', () => {
     ]));
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0, totalUnits: 2 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     const checkpoint = JSON.parse((upgraded.prepare('SELECT checkpoint_json FROM jobs WHERE id = ?').get(job.id) as { checkpoint_json: string }).checkpoint_json) as { documentIds: string[] };
     expect(checkpoint.documentIds).toEqual(documentIds);
     upgraded.close();
@@ -1707,7 +1708,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toContainEqual({ id: document.documentId, personId: person.id });
     expect(store.listStoredJobs()[0]).toMatchObject({ id: job.id, status: 'queued', stage: 'extract', completedUnits: 0 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(34);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
     upgraded.close();
     store.close();
   });
