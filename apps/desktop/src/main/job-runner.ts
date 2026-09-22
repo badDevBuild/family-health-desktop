@@ -59,14 +59,45 @@ export class ProcessingJobRunner extends EventEmitter {
         // 每个任务领取时冻结模型设置，避免用户在处理中修改设置导致同一任务混用模型。
         const aiPreferences = structuredClone(this.getAiPreferences());
         const attemptId = store.startJobAttempt(job.id, account.runtimeVersion, aiPreferences.modelId, aiPreferences.reasoningEffort);
-        const turnUsage = { attemptedTurnRequests: emptyTurnCounts(), completedTurnResponses: emptyTurnCounts() };
+        const attemptStartedAtMs = Date.now();
+        const turnUsage = {
+          attemptedTurnRequests: emptyTurnCounts(), completedTurnResponses: emptyTurnCounts(),
+          failedTurnRequests: emptyTurnCounts(), timedOutTurnRequests: emptyTurnCounts(),
+          completedTurnDurationMs: emptyTurnCounts(), observedTurnMetrics: 0,
+          webToolActions: { searches: 0, pageOpens: 0, pageFinds: 0, other: 0 },
+          observedTokenUsage: 0,
+          inputTokens: null as number | null, outputTokens: null as number | null,
+          cachedInputTokens: null as number | null,
+          firstUsableFactMs: null as number | null, attemptDurationMs: 0
+        };
         const jobRuntime = {
           runStructuredTurn: async <T>(input: Omit<Parameters<CodexRuntimeManager['runStructuredTurn']>[0], 'aiPreferences'>) => {
             const stage = classifyLeanTurn(input.prompt);
             turnUsage.attemptedTurnRequests[stage] += 1;
-            const result = await this.runtime.runStructuredTurn<T>({ ...input, aiPreferences });
-            turnUsage.completedTurnResponses[stage] += 1;
-            return result;
+            try {
+              const result = await this.runtime.runStructuredTurn<T>({ ...input, aiPreferences });
+              turnUsage.completedTurnResponses[stage] += 1;
+              if (result.metrics) {
+                turnUsage.observedTurnMetrics += 1;
+                turnUsage.completedTurnDurationMs[stage] += result.metrics.durationMs;
+                turnUsage.webToolActions.searches += result.metrics.webSearches;
+                turnUsage.webToolActions.pageOpens += result.metrics.webPageOpens;
+                turnUsage.webToolActions.pageFinds += result.metrics.webPageFinds;
+                turnUsage.webToolActions.other += result.metrics.webSearchOtherActions;
+                if (Number.isFinite(result.metrics.inputTokens) && Number.isFinite(result.metrics.outputTokens)
+                  && Number.isFinite(result.metrics.cachedInputTokens)) {
+                  turnUsage.observedTokenUsage += 1;
+                  turnUsage.inputTokens = (turnUsage.inputTokens ?? 0) + (result.metrics.inputTokens ?? 0);
+                  turnUsage.outputTokens = (turnUsage.outputTokens ?? 0) + (result.metrics.outputTokens ?? 0);
+                  turnUsage.cachedInputTokens = (turnUsage.cachedInputTokens ?? 0) + (result.metrics.cachedInputTokens ?? 0);
+                }
+              }
+              return result;
+            } catch (error) {
+              turnUsage.failedTurnRequests[stage] += 1;
+              if (error instanceof Error && error.message === 'CODEX_TURN_TIMEOUT') turnUsage.timedOutTurnRequests[stage] += 1;
+              throw error;
+            }
           }
         };
         const executionGuard = {
@@ -99,6 +130,9 @@ export class ProcessingJobRunner extends EventEmitter {
                 continue;
               }
               const result = await pipeline.process(documentId);
+              if (turnUsage.firstUsableFactMs === null && result.status === 'published' && result.candidateCount > 0) {
+                turnUsage.firstUsableFactMs = Math.max(0, Date.now() - attemptStartedAtMs);
+              }
               if (result.threadId && result.turnId) lastReceipt = { threadId: result.threadId, turnId: result.turnId };
               completedUnits += 1;
               store.updateJobProgress(job.id, completedUnits);
@@ -127,6 +161,10 @@ export class ProcessingJobRunner extends EventEmitter {
           const finalStatus = needsReview ? 'waiting_user' : hasAssessmentRejection ? 'completed_with_issues' : 'succeeded';
           if (!needsReview) store.updateJobStage(job.id, 'publish');
           store.finishJob(job.id, finalStatus);
+          turnUsage.attemptDurationMs = Math.max(0, Date.now() - attemptStartedAtMs);
+          if (turnUsage.observedTokenUsage !== Object.values(turnUsage.completedTurnResponses).reduce((a, b) => a + b, 0)) {
+            turnUsage.inputTokens = turnUsage.outputTokens = turnUsage.cachedInputTokens = null;
+          }
           store.finishJobAttempt({ attemptId, status: finalStatus, ...lastReceipt, usage: turnUsage });
           this.emit('terminal', { jobId: job.id, status: finalStatus });
         } catch (error) {
@@ -142,6 +180,10 @@ export class ProcessingJobRunner extends EventEmitter {
               ? 'waiting_quota'
               : 'failed';
           store.finishJob(job.id, status);
+          turnUsage.attemptDurationMs = Math.max(0, Date.now() - attemptStartedAtMs);
+          if (turnUsage.observedTokenUsage !== Object.values(turnUsage.completedTurnResponses).reduce((a, b) => a + b, 0)) {
+            turnUsage.inputTokens = turnUsage.outputTokens = turnUsage.cachedInputTokens = null;
+          }
           store.finishJobAttempt({ attemptId, status, errorCode: code, usage: turnUsage });
           this.emit('terminal', { jobId: job.id, status });
         }

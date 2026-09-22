@@ -48,6 +48,7 @@ interface TurnItem {
   type: string;
   text?: string;
   phase?: string | null;
+  action?: { type?: string } | null;
 }
 
 interface TurnCompleted {
@@ -72,6 +73,38 @@ interface CompletedTurnCapture {
   notification: TurnCompleted;
   completedMessages: TurnItem[];
   streamedMessages: TurnItem[];
+  completedWebSearchItems: TurnItem[];
+  tokenUsage: { inputTokens: number; outputTokens: number; cachedInputTokens: number } | null;
+}
+
+export interface TurnMetrics {
+  durationMs: number;
+  webSearches: number;
+  webPageOpens: number;
+  webPageFinds: number;
+  webSearchOtherActions: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedInputTokens: number | null;
+}
+
+function webSearchMetrics(capture: CompletedTurnCapture): Pick<TurnMetrics,
+  'webSearches' | 'webPageOpens' | 'webPageFinds' | 'webSearchOtherActions'> {
+  // 完成通知和 item/completed 可能重复携带同一工具条目，只按 ID 计一次。
+  const items = new Map<string, TurnItem>();
+  for (const item of [...capture.notification.turn.items, ...capture.completedWebSearchItems]) {
+    if (item.type === 'webSearch' && item.id) items.set(item.id, item);
+  }
+  const result = { webSearches: 0, webPageOpens: 0, webPageFinds: 0, webSearchOtherActions: 0 };
+  for (const item of items.values()) {
+    switch (item.action?.type) {
+      case 'search': result.webSearches += 1; break;
+      case 'openPage': result.webPageOpens += 1; break;
+      case 'findInPage': result.webPageFinds += 1; break;
+      default: result.webSearchOtherActions += 1;
+    }
+  }
+  return result;
 }
 
 function latestAgentMessage(items: TurnItem[]): TurnItem | undefined {
@@ -281,7 +314,8 @@ export class CodexRuntimeManager extends EventEmitter {
     aiPreferences: AiPreferences;
     allowWebSearch?: boolean;
     timeoutMs?: number;
-  }): Promise<{ threadId: string; turnId: string; output: T }> {
+  }): Promise<{ threadId: string; turnId: string; output: T; metrics: TurnMetrics }> {
+    const startedAtMs = Date.now();
     await this.start();
     if (!this.client) throw new Error('CODEX_RUNTIME_UNAVAILABLE');
     if (this.state.status !== 'connected') throw new Error('CODEX_AUTH_REQUIRED');
@@ -324,7 +358,17 @@ export class CodexRuntimeManager extends EventEmitter {
         ?? latestAgentMessage(notification.turn.items)
         ?? latestAgentMessage(capture.streamedMessages);
       if (!message?.text) throw new Error('CODEX_STRUCTURED_OUTPUT_MISSING');
-      return { threadId: notification.threadId, turnId: notification.turn.id, output: JSON.parse(message.text) as T };
+      return {
+        threadId: notification.threadId, turnId: notification.turn.id,
+        output: JSON.parse(message.text) as T,
+        metrics: {
+          durationMs: Math.max(0, Date.now() - startedAtMs),
+          ...webSearchMetrics(capture),
+          inputTokens: capture.tokenUsage?.inputTokens ?? null,
+          outputTokens: capture.tokenUsage?.outputTokens ?? null,
+          cachedInputTokens: capture.tokenUsage?.cachedInputTokens ?? null
+        }
+      };
     } finally {
       this.activeTurn = null;
     }
@@ -379,6 +423,8 @@ export class CodexRuntimeManager extends EventEmitter {
     let rejectPromise!: (error: Error) => void;
     let cleanupExternal: () => void = () => undefined;
     const completedMessages = new Map<string, Map<string, TurnItem>>();
+    const completedWebSearchItems = new Map<string, Map<string, TurnItem>>();
+    const tokenUsageByTurn = new Map<string, CompletedTurnCapture['tokenUsage']>();
     const streamedMessageText = new Map<string, Map<string, string>>();
     const streamedMessagePhase = new Map<string, Map<string, string | null>>();
     const streamedMessageOrder = new Map<string, string[]>();
@@ -399,7 +445,9 @@ export class CodexRuntimeManager extends EventEmitter {
         const text = textByItem?.get(itemId);
         return text ? [{ id: itemId, type: 'agentMessage', phase: phaseByItem?.get(itemId) ?? null, text }] : [];
       });
-      return { notification, completedMessages: completed, streamedMessages: streamed };
+      return { notification, completedMessages: completed, streamedMessages: streamed,
+        completedWebSearchItems: [...(completedWebSearchItems.get(turnId)?.values() ?? [])],
+        tokenUsage: tokenUsageByTurn.get(turnId) ?? null };
     };
     const promise = new Promise<CompletedTurnCapture>((resolve, reject) => {
       resolvePromise = resolve;
@@ -417,7 +465,14 @@ export class CodexRuntimeManager extends EventEmitter {
         rememberMessageOrder(notification.turnId, notification.item.id);
       };
       const onItemCompleted = (notification: ItemLifecycleNotification) => {
-        if (notification.threadId !== threadId || notification.item.type !== 'agentMessage' || !notification.item.id) return;
+        if (notification.threadId !== threadId || !notification.item.id) return;
+        if (notification.item.type === 'webSearch') {
+          const items = completedWebSearchItems.get(notification.turnId) ?? new Map<string, TurnItem>();
+          items.set(notification.item.id, notification.item);
+          completedWebSearchItems.set(notification.turnId, items);
+          return;
+        }
+        if (notification.item.type !== 'agentMessage') return;
         const messages = completedMessages.get(notification.turnId) ?? new Map<string, TurnItem>();
         messages.set(notification.item.id, notification.item);
         completedMessages.set(notification.turnId, messages);
@@ -432,6 +487,20 @@ export class CodexRuntimeManager extends EventEmitter {
         messages.set(notification.itemId, `${messages.get(notification.itemId) ?? ''}${notification.delta}`);
         streamedMessageText.set(notification.turnId, messages);
         rememberMessageOrder(notification.turnId, notification.itemId);
+      };
+      const onTokenUsageUpdated = (notification: {
+        threadId: string; turnId: string;
+        tokenUsage?: { total?: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number } };
+      }) => {
+        if (notification.threadId !== threadId) return;
+        // 每次调用新建 thread；total 含本轮搜索前后所有模型响应，last 只含最后一次响应。
+        const total = notification.tokenUsage?.total;
+        if (!total || !Number.isFinite(total.inputTokens) || !Number.isFinite(total.outputTokens)
+          || !Number.isFinite(total.cachedInputTokens) || total.inputTokens! < 0
+          || total.outputTokens! < 0 || total.cachedInputTokens! < 0) return;
+        tokenUsageByTurn.set(notification.turnId, {
+          inputTokens: total.inputTokens!, outputTokens: total.outputTokens!, cachedInputTokens: total.cachedInputTokens!
+        });
       };
       const onCompleted = (notification: TurnCompleted) => {
         if (notification.threadId !== threadId) return;
@@ -455,6 +524,7 @@ export class CodexRuntimeManager extends EventEmitter {
         client.off('item/started', onItemStarted);
         client.off('item/completed', onItemCompleted);
         client.off('item/agentMessage/delta', onAgentMessageDelta);
+        client.off('thread/tokenUsage/updated', onTokenUsageUpdated);
         client.off('processExit', onExit);
       };
       cleanupExternal = cleanup;
@@ -462,6 +532,7 @@ export class CodexRuntimeManager extends EventEmitter {
       client.on('item/started', onItemStarted);
       client.on('item/completed', onItemCompleted);
       client.on('item/agentMessage/delta', onAgentMessageDelta);
+      client.on('thread/tokenUsage/updated', onTokenUsageUpdated);
       client.on('processExit', onExit);
     });
     return {

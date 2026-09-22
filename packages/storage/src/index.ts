@@ -3064,6 +3064,17 @@ export class WorkspaceStore {
     usage?: {
       attemptedTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
       completedTurnResponses: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      failedTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      timedOutTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      completedTurnDurationMs: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      observedTurnMetrics: number;
+      observedTokenUsage: number;
+      webToolActions: { searches: number; pageOpens: number; pageFinds: number; other: number };
+      inputTokens: number | null;
+      outputTokens: number | null;
+      cachedInputTokens: number | null;
+      firstUsableFactMs: number | null;
+      attemptDurationMs: number;
     };
   }): void {
     const result = this.db.prepare(`

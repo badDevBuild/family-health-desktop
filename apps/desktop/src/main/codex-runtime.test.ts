@@ -260,6 +260,34 @@ describe('CodexRuntimeManager', () => {
     manager.shutdown();
   });
 
+  it('只记录去标识化的 Web Search 动作计数，完成事件重复时不重复计数', async () => {
+    const { manager, client } = setup();
+    client.authenticated = true;
+    const searchItem = { id: 'web-1', type: 'webSearch', action: { type: 'search', query: '虚构敏感查询词' } };
+    const openItem = { id: 'web-2', type: 'webSearch', action: { type: 'openPage', url: 'https://example.test/private' } };
+    client.turnNotifications = [
+      { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: searchItem } },
+      { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: openItem } },
+      { method: 'thread/tokenUsage/updated', params: { threadId: 'thread-1', turnId: 'turn-1',
+        tokenUsage: { total: { inputTokens: 120, outputTokens: 35, cachedInputTokens: 40 },
+          last: { inputTokens: 20, outputTokens: 5, cachedInputTokens: 10 } } } },
+      { method: 'turn/completed', params: { threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', error: null,
+          items: [searchItem, openItem, { type: 'agentMessage', phase: 'final_answer', text: '{"ok":true}' }] } } }
+    ];
+    await manager.start();
+    const result = await manager.runStructuredTurn<{ ok: boolean }>({
+      prompt: '仅使用虚构资料', aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      allowWebSearch: true,
+      outputSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false }
+    });
+    expect(result.metrics).toMatchObject({ webSearches: 1, webPageOpens: 1, webPageFinds: 0,
+      webSearchOtherActions: 0, inputTokens: 120, outputTokens: 35, cachedInputTokens: 40 });
+    expect(JSON.stringify(result.metrics)).not.toContain('虚构敏感查询词');
+    expect(JSON.stringify(result.metrics)).not.toContain('example.test/private');
+    manager.shutdown();
+  });
+
   it('从当前 Codex 账户读取支持图像的模型与推理强度', async () => {
     const { manager } = setup();
     await expect(manager.listModels()).resolves.toEqual([{

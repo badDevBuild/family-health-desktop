@@ -18,6 +18,17 @@ function recordedTurnUsage(databasePath: string) {
     return JSON.parse(row.usage_json!) as {
       attemptedTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
       completedTurnResponses: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      failedTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      timedOutTurnRequests: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      completedTurnDurationMs: Record<'P01' | 'P02' | 'P03' | 'P04' | 'other', number>;
+      observedTurnMetrics: number;
+      observedTokenUsage: number;
+      webToolActions: { searches: number; pageOpens: number; pageFinds: number; other: number };
+      inputTokens: number | null;
+      outputTokens: number | null;
+      cachedInputTokens: number | null;
+      firstUsableFactMs: number | null;
+      attemptDurationMs: number;
     };
   } finally { database.close(); }
 }
@@ -93,13 +104,17 @@ describe('ProcessingJobRunner', () => {
               evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: []
             }]
           };
-          return { threadId: 'extract', turnId: 'extract-' + extractionCalls, output: extraction };
+          return { threadId: 'extract', turnId: 'extract-' + extractionCalls, output: extraction,
+            metrics: { durationMs: 10, webSearches: 0, webPageOpens: 0, webPageFinds: 0,
+              webSearchOtherActions: 0, inputTokens: 10, outputTokens: 20, cachedInputTokens: 0 } };
         }
         assessmentCalls += 1;
         expect(input.prompt).toContain('ASSESSMENT_REQUEST=');
         const request = parsePromptValue<AssessmentRequestV3>(input.prompt, 'ASSESSMENT_REQUEST', 'MEMBER_EVIDENCE_PACKAGE');
         const evidence = parsePromptValue<MemberEvidencePackageV3>(input.prompt, 'MEMBER_EVIDENCE_PACKAGE');
-        return { threadId: 'assess', turnId: 'assess-1', output: assessmentFor(request, evidence) };
+        return { threadId: 'assess', turnId: 'assess-1', output: assessmentFor(request, evidence),
+          metrics: { durationMs: 20, webSearches: 2, webPageOpens: 1, webPageFinds: 0,
+            webSearchOtherActions: 0, inputTokens: 40, outputTokens: 50, cachedInputTokens: 15 } };
       }
     } as unknown as CodexRuntimeManager;
     await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
@@ -110,10 +125,17 @@ describe('ProcessingJobRunner', () => {
     });
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(documentCount);
     expect(service.store.listMemberAssessmentSnapshots(personId, true)).toHaveLength(1);
-    expect(recordedTurnUsage(service.store.databasePath)).toEqual({
+    expect(recordedTurnUsage(service.store.databasePath)).toMatchObject({
       attemptedTurnRequests: { P01: documentCount, P02: 1, P03: 0, P04: 0, other: 0 },
-      completedTurnResponses: { P01: documentCount, P02: 1, P03: 0, P04: 0, other: 0 }
+      completedTurnResponses: { P01: documentCount, P02: 1, P03: 0, P04: 0, other: 0 },
+      completedTurnDurationMs: { P01: documentCount * 10, P02: 20, P03: 0, P04: 0, other: 0 },
+      observedTurnMetrics: documentCount + 1,
+      observedTokenUsage: documentCount + 1,
+      webToolActions: { searches: 2, pageOpens: 1, pageFinds: 0, other: 0 },
+      inputTokens: documentCount * 10 + 40, outputTokens: documentCount * 20 + 50,
+      cachedInputTokens: 15
     });
+    expect(recordedTurnUsage(service.store.databasePath).firstUsableFactMs).toBeGreaterThanOrEqual(0);
     service.close();
   });
 
@@ -205,9 +227,11 @@ describe('ProcessingJobRunner', () => {
     await running;
     expect(service.store.listStoredJobs()[0]).toMatchObject({ id: jobId, status: 'cancelled', completedUnits: 0 });
     expect(service.store.listAcceptedObservations(personId)).toEqual([]);
-    expect(recordedTurnUsage(service.store.databasePath)).toEqual({
+    expect(recordedTurnUsage(service.store.databasePath)).toMatchObject({
       attemptedTurnRequests: { P01: 1, P02: 0, P03: 0, P04: 0, other: 0 },
-      completedTurnResponses: { P01: 0, P02: 0, P03: 0, P04: 0, other: 0 }
+      completedTurnResponses: { P01: 0, P02: 0, P03: 0, P04: 0, other: 0 },
+      failedTurnRequests: { P01: 1, P02: 0, P03: 0, P04: 0, other: 0 },
+      firstUsableFactMs: null
     });
     service.close();
   });
