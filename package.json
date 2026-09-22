@@ -33,6 +33,7 @@
     "gold:materialize": "node --experimental-strip-types scripts/materialize-synthetic-gold.ts",
     "assessment:materialize": "node --experimental-strip-types scripts/materialize-assessment-v3-cases.ts",
     "eval:lean-v3:synthetic": "tsx --tsconfig tsconfig.node.json scripts/run-lean-v3-synthetic-eval.ts",
+    "eval:lean-v3:revalidate": "tsx --tsconfig tsconfig.node.json scripts/revalidate-lean-v3-synthetic-eval.ts",
     "eval:lean-v3:visual": "tsx --tsconfig tsconfig.node.json scripts/run-lean-v3-visual-smoke.ts",
     "scan:release": "node scripts/scan-release-artifact.mjs",
     "scan:public": "node scripts/scan-public-repository.mjs",

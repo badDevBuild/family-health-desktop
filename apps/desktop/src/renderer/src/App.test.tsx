@@ -588,10 +588,15 @@ describe('App member display editing', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: '选中 选中的报告.txt' }));
     fireEvent.click(screen.getByRole('button', { name: /处理选中项/ }));
     expect(await screen.findByText(/1 份选中的已归属资料/)).toBeTruthy();
+    expect(screen.getByText(/无法在发送前逐条检查搜索词/)).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: /我确认本次接收方/ }));
     fireEvent.click(screen.getByRole('button', { name: '授权并开始' }));
 
     await waitFor(() => expect(processNow).toHaveBeenCalledWith({ consentVersion: 1, confirmedDataRecipient: 'OpenAI/Codex', documentIds: ['ready-1'] }));
+    fireEvent.click(screen.getByRole('button', { name: '设置' }));
+    fireEvent.click(await screen.findByRole('button', { name: /数据与隐私/ }));
+    expect(await screen.findByRole('dialog', { name: '哪些留在本机，哪些会发送' })).toBeTruthy();
+    expect(screen.getByText(/查询词目前无法由应用在发送前逐条拦截/)).toBeTruthy();
   });
 
   it('persists display preferences and applies the accessibility classes immediately', async () => {
