@@ -56,4 +56,17 @@ describe('Codex RPC framing', () => {
   it('日志脱敏认证信息', () => {
     expect(redactSensitiveLog('Authorization: Bearer abc.def.ghi')).not.toContain('abc.def.ghi');
   });
+
+  it('App Server 的 error 重连通知不会触发 Node 未处理异常', async () => {
+    const harness = createHarness();
+    const notifications: unknown[] = [];
+    const serverErrors: unknown[] = [];
+    harness.client.on('notification', (value) => notifications.push(value));
+    harness.client.on('serverError', (value) => serverErrors.push(value));
+    const payload = { error: { message: 'Reconnecting... 2/5' }, willRetry: true };
+    harness.fromServer.write(`${JSON.stringify({ method: 'error', params: payload })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(notifications).toEqual([{ method: 'error', params: payload }]);
+    expect(serverErrors).toEqual([payload]);
+  });
 });

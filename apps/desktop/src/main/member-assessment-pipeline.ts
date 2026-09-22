@@ -6,7 +6,7 @@ import {
 } from '@contracts';
 import { stableHash } from '@core';
 import type { JobExecutionGuard, WorkspaceStore } from '@storage';
-import { validateAssessmentCandidate } from './assessment-validation.js';
+import { normalizeAssessmentStructuralFields, validateAssessmentCandidate } from './assessment-validation.js';
 import { applyFocusedReview, routeFocusedReview } from './clinical-review-router.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
 import { buildMemberAggregatePackage, buildMemberSystemPartitions, splitMemberPartition } from './member-assessment-partition.js';
@@ -180,7 +180,7 @@ export class MemberAssessmentPipeline {
       scopePackage: MemberEvidencePackageV3
     ): Promise<{ candidate: MemberAssessmentCandidateV3 | null; heldTargetIds: string[]; reason: string | null }> => {
       const validationInput = validationInputFor(scopeRequest, scopePackage);
-      let candidate = original;
+      let candidate = normalizeAssessmentStructuralFields(original);
       let validation = validateAssessmentCandidate(candidate, validationInput);
       let heldTargetIds: string[] = [];
       if (validation.issues.length === 0) return { candidate, heldTargetIds, reason: null };
@@ -201,13 +201,14 @@ export class MemberAssessmentPipeline {
         outputSchema: candidateOutputSchema, allowWebSearch: false
       });
       const repairParsed = memberAssessmentCandidateV3Schema.safeParse(repaired.output);
-      if (!repairParsed.success || !repairChangedOnlyAllowed(candidate, repairParsed.data, targetIds)) {
+      const repairedCandidate = repairParsed.success ? normalizeAssessmentStructuralFields(repairParsed.data) : null;
+      if (!repairedCandidate || !repairChangedOnlyAllowed(candidate, repairedCandidate, targetIds)) {
         const isolated = isolateInvalidNodes(candidate, validation.issues);
         if (!isolated) return { candidate: null, heldTargetIds, reason: 'assessment_repair_outside_scope' };
         candidate = isolated.candidate;
         heldTargetIds = isolated.heldTargetIds;
       } else {
-        candidate = repairParsed.data;
+        candidate = repairedCandidate;
       }
       validation = validateAssessmentCandidate(candidate, validationInput);
       if (validation.issues.length > 0) {

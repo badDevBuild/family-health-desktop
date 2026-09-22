@@ -2,7 +2,7 @@ import type {
   BodySystemId, HealthClaim, MemberAssessmentCandidateV3, MemberEvidenceRef
 } from '@contracts';
 
-export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v4';
+export const ASSESSMENT_VALIDATION_RULES_VERSION = 'assessment-validation-v6';
 
 export interface AssessmentValidationInput {
   personId: string;
@@ -27,7 +27,10 @@ export interface AssessmentValidationResult {
 }
 
 // 仅识别面向本人直接执行的药物改变；来源事实中的剂量、检验单位及治疗讨论不据字面拒绝。
-const directMedicationInstruction = /(?:自行|马上|立即|现在|请|应当|必须|建议你)[^。；，]{0,24}(?:停药|停用|换药|加量|减量|开始服用|改用|调整剂量)|(?:停药|停用|换药|加量|减量)[^。；，]{0,12}(?:即可|就行)/i;
+const medicationChange = '(?:停药|停用|换药|加量|减量|开始服用|改用|调整剂量)';
+const negatedMedicationChange = new RegExp(`(?:不要|不得|切勿|勿|避免|禁止|不应|无需|不必|停止)[^。；，,]{0,14}(?:自行|擅自)?${medicationChange}`, 'gi');
+const directMedicationInstruction = new RegExp(`(?:马上|立即|现在|请|应(?:当|该)?|必须|建议你)[^。；，,]{0,24}${medicationChange}|${medicationChange}[^。；，,]{0,12}(?:即可|就行)`, 'i');
+const selfDirectedMedicationChange = new RegExp(`自行[^。；，,]{0,12}${medicationChange}`, 'i');
 const unsourcedProbability = /(?:患病|发病|罹患|诊断|得[^。；，]{0,8}病|患[^。；，]{0,12}风险|癌症风险)[^。；，]{0,24}\d+(?:\.\d+)?\s*%/i;
 const explicitDiagnosis = /(?:明确诊断|临床诊断|病理诊断|出院诊断|诊断[:：]|确诊|诊断意见[:：])/i;
 const negatedOrTentative = /(?:排除|待排|考虑|疑似|可能|家族史|病史自述|未确诊|不能诊断|尚不能诊断)/i;
@@ -40,6 +43,26 @@ function hasOwnDocumentedDiagnosis(evidence: MemberEvidenceRef, diseaseName: str
   return relevantClauses.some((clause) => explicitDiagnosis.test(clause)
     && !negatedOrTentative.test(clause)
     && (!historicalDiagnosis.test(clause) || temporalStatus === 'historical'));
+}
+
+function hasDirectMedicationChange(action: MemberAssessmentCandidateV3['actions'][number]): boolean {
+  const fields = [action.title, action.why, action.firstStep, action.timing, action.reviewPlan, action.caution]
+    .filter((value): value is string => value !== null);
+  return fields.some((field, index) => field.split(/[。；，,]/).some((clause) => {
+    const actionable = clause.replace(negatedMedicationChange, '');
+    return directMedicationInstruction.test(actionable)
+      || (index === 0 || index === 2) && selfDirectedMedicationChange.test(actionable);
+  }));
+}
+
+/** 仅归一化可由同一候选字段确定的结构信息，不推断病名、证据或医学确定性。 */
+export function normalizeAssessmentStructuralFields(candidate: MemberAssessmentCandidateV3): MemberAssessmentCandidateV3 {
+  return {
+    ...candidate,
+    systems: candidate.systems.map((system) => ({ ...system, id: `system:${system.systemId}` })),
+    claims: candidate.claims.map((claim) => claim.diagnosticStatus !== null && claim.diseaseName !== null
+      && claim.kind === 'interpretation' ? { ...claim, kind: 'diagnostic_assessment' } : claim)
+  };
 }
 
 export function validateAssessmentCandidate(
@@ -147,7 +170,7 @@ export function validateAssessmentCandidate(
     if (action.evidenceIds.length === 0) issues.push(`action_personal_evidence_required:${action.id}`);
     if (dedupeKeys.has(action.dedupeKey)) issues.push(`duplicate_action_key:${action.dedupeKey}`);
     dedupeKeys.add(action.dedupeKey);
-    if (directMedicationInstruction.test(`${action.title} ${action.why} ${action.firstStep} ${action.timing ?? ''} ${action.reviewPlan ?? ''} ${action.caution ?? ''}`)) {
+    if (hasDirectMedicationChange(action)) {
       issues.push(`direct_medication_change:${action.id}`);
     }
     if (unsourcedProbability.test(`${action.title} ${action.why} ${action.firstStep}`)) issues.push(`unsourced_probability:${action.id}`);

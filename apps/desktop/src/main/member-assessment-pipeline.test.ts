@@ -114,6 +114,26 @@ function candidateFor(request: AssessmentRequestV3, source: MemberEvidencePackag
 }
 
 describe('MemberAssessmentPipeline', () => {
+  it('真实模型的系统 ID 与 undetermined 类型可本地归一化，正常路径仍只需一次 P02', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.systems[0]!.id = `system-${candidate.systems[0]!.systemId}`;
+    candidate.claims[0] = { ...candidate.claims[0]!, kind: 'interpretation',
+      diseaseName: '血脂异常的具体病因', diagnosticStatus: 'undetermined',
+      text: '目前不能仅凭一次 LDL-C 结果判断血脂异常的具体病因。' };
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => { calls += 1; return { threadId: 'p02', turnId: 'turn', output: candidate }; }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 1 });
+    expect(calls).toBe(1);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]?.systems[0]?.id)
+      .toBe(`system:${candidate.systems[0]!.systemId}`);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]?.claims[0]?.kind)
+      .toBe('diagnostic_assessment');
+    service.close();
+  });
+
   it('分区覆盖每条选入事实，共享线索复用原 ID，聚合保留分区结果与原子依据', async () => {
     const { service, built } = await fixtureTwoSystems();
     const source = structuredClone(built.evidencePackage);
@@ -606,6 +626,46 @@ describe('MemberAssessmentPipeline', () => {
     });
     expect(result.issues).toContain('direct_medication_change:action-review');
     expect(result.issues).toContain('unsourced_probability:overview');
+    service.close();
+  });
+
+  it('禁止自行加量的安全提醒不是让本人加量的指令', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.actions[0] = { ...candidate.actions[0]!, caution: '若活动时胸痛，应停止自行加量并尽快就医评估。' };
+    const result = validateAssessmentCandidate(candidate, {
+      personId, inputSignature: built.request.inputSignature, mode: built.request.mode,
+      requestedSystemIds: built.request.requestedSystemIds,
+      evidenceCatalog: built.evidencePackage.evidenceCatalog,
+      trendIds: built.evidencePackage.trends.map((item) => item.id),
+      catalogKnowledgeIds: built.evidencePackage.knowledge.map((item) => item.id),
+      criteriaSets: built.evidencePackage.criteriaSets
+    });
+    expect(result.issues).not.toContain('direct_medication_change:action-review');
+    service.close();
+  });
+
+  it('药物变更门禁区分直接指令和否定式安全提醒', async () => {
+    const { service, personId, built } = await fixture();
+    const input = {
+      personId, inputSignature: built.request.inputSignature, mode: built.request.mode,
+      requestedSystemIds: built.request.requestedSystemIds,
+      evidenceCatalog: built.evidencePackage.evidenceCatalog,
+      trendIds: built.evidencePackage.trends.map((item) => item.id),
+      catalogKnowledgeIds: built.evidencePackage.knowledge.map((item) => item.id),
+      criteriaSets: built.evidencePackage.criteriaSets
+    };
+    for (const [field, wording, blocked] of [
+      ['firstStep', '自行停药即可。', true],
+      ['firstStep', '应立即加量。', true],
+      ['firstStep', '请勿自行加量，应及时咨询医生。', false],
+      ['caution', '自行停药有风险，请咨询医生。', false]
+    ] as const) {
+      const candidate = candidateFor(built.request, built.evidencePackage);
+      candidate.actions[0] = { ...candidate.actions[0]!, [field]: wording };
+      const result = validateAssessmentCandidate(candidate, input);
+      expect(result.issues.includes('direct_medication_change:action-review'), wording).toBe(blocked);
+    }
     service.close();
   });
 

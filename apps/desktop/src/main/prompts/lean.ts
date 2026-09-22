@@ -76,8 +76,10 @@ criteria_met 必须填 criteriaBasis。优先使用输入里完整、适用的 c
 ## 输出组织
 遵守 MemberAssessmentCandidateV3。
 claims：保存实际的事实、趋势和医学判断；每条个人结论绑定个人 evidenceIds，rationale 只写简短可见依据，不输出内部推理。反证通过 counterEvidenceIds 保留。systemIds 可有多个，但同一主张只建一次。
+当 diagnosticStatus 和 diseaseName 不为空时，claim.kind 必须是 diagnostic_assessment；包括“目前不能确定该疾病/并发症是否存在”的 undetermined 判断。普通非疾病解释才用 interpretation。
 overview：先说整体主线和最值得处理的方向；不是复制第一条系统结论。headline、summary 和所有医学表述由 claimIds 支持，行动通过 actionIds 引用。
 systems：按输入 requestedSystemIds 输出，区分需关注、跟踪、本范围未提示问题和资料不足。headline/summary 不比其依据的疾病判断更肯定。不为无资料系统编写模板诊断。
+每个 systems 节点的 id 必须是 system: 加上该节点的 systemId，例如 systemId=cardiovascular 时 id=system:cardiovascular。该 ID 是应用保留键，不是可自由命名的标题。
 actions：保存可执行建议，填写目的、第一步、timing及timingBasis、回看方式、必要注意事项、证据和关联claimIds。
 questions：只列会实质改变判断或行动的重要未知，通常0—3项；不是全部未检查项目清单，不要求用户逐条回答后才给现有分析。
 knowledgeSources：仅列实际使用来源；无法验证的记忆不编URL。内部标识、处理状态和版本不出现在面向家人的正文。

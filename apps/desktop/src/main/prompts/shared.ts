@@ -25,7 +25,7 @@ export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
 /** 成员档案 v2 的系统级综合与独立复核版本。 */
 export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v2';
 export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v2';
-export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v3';
+export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v4';
 export const MEMBER_ASSESSMENT_RULES_VERSION = 'lean-health-v3.5';
 export const HEALTH_PIPELINE_VERSION = 'lean-health-v3';
 export const RUNTIME_PROMPT_VERSION = 'health-runtime-v3';

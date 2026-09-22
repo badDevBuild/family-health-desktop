@@ -159,7 +159,8 @@ export class CodexRpcClient extends EventEmitter {
 
     if (typeof message.method === 'string') {
       this.emit('notification', { method: message.method, params: message.params });
-      this.emit(message.method, message.params);
+      // App Server 的 `error` 是普通通知；Node EventEmitter 会把同名事件当作未捕获异常。
+      this.emit(message.method === 'error' ? 'serverError' : message.method, message.params);
       return;
     }
 
@@ -183,11 +184,13 @@ export function spawnCodexAppServer(options: {
   codexHome: string;
   cwd: string;
   inheritedPath?: string;
+  /** 仅供使用已有用户配置的合成评测；正式应用始终使用严格配置。 */
+  strictConfig?: boolean;
 }): { client: CodexRpcClient; process: ChildProcessWithoutNullStreams } {
   const child = spawn(options.executable, [
     'app-server',
     '--stdio',
-    '--strict-config',
+    ...(options.strictConfig === false ? [] : ['--strict-config']),
     '-c', 'web_search="disabled"',
     '--disable', 'shell_tool',
     '--disable', 'unified_exec',
