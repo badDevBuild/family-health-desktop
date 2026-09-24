@@ -479,6 +479,19 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .review-resolution-scroll { min-height: 0; display: grid; gap: 14px; overflow: auto; overscroll-behavior: contain; padding: 2px 5px 2px 1px; }
 .review-resolution-intro { margin: -3px 0 2px; color: var(--warm-600); font-size: 16px; line-height: 1.6; }
 .review-resolution-dialog > .dialog-actions { margin-top: 0; padding-top: 12px; border-top: 1px solid var(--warm-200); background: var(--warm-50); }
+.identity-resolution-options { display: grid; gap: 10px; }
+.identity-resolution-option { width: 100%; min-height: 76px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 13px; padding: 12px 14px; border: 1px solid var(--warm-200); border-radius: 14px; color: var(--warm-900); background: #fff; text-align: left; cursor: pointer; }
+.identity-resolution-option:hover, .identity-resolution-option.is-active { border-color: rgba(59, 155, 111, .55); background: #fcfdfc; }
+.identity-resolution-option > svg { color: var(--primary); }
+.identity-resolution-option strong, .identity-resolution-option small { display: block; }
+.identity-resolution-option strong { font-size: 16px; line-height: 1.45; }
+.identity-resolution-option small { margin-top: 4px; color: var(--warm-600); font-size: 16px; line-height: 1.55; }
+.review-resolution-dialog .identity-resolution-select { display: grid; gap: 8px; color: var(--warm-700); font-size: 16px; font-weight: 700; }
+.review-resolution-dialog .identity-resolution-select select { min-height: 44px; font-size: 16px; }
+.identity-resolution-empty { display: grid; gap: 10px; }
+.identity-resolution-empty > .secondary-button { justify-self: start; }
+.review-resolution-dialog .identity-archive-confirm { min-height: 44px; display: flex; align-items: center; gap: 10px; color: var(--warm-800); font-size: 16px; font-weight: 650; line-height: 1.5; }
+.review-resolution-dialog .identity-archive-confirm input { width: 20px; height: 20px; flex: 0 0 auto; padding: 0; accent-color: var(--primary); }
 .review-difference-list { margin-top: 0; }
 .review-difference-fields { align-items: flex-start !important; padding-bottom: 4px; color: var(--warm-600); font-size: 13px; line-height: 1.5; }
 .review-difference-fields strong { flex: 0 0 auto; color: var(--warning); }

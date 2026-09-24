@@ -923,16 +923,19 @@ function ReviewDifferenceEditor({ candidate, fields, included, onIncludedChange,
   </div>;
 }
 
-function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResolve }: {
+function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResolve, onCreateMember }: {
   review: ReviewIssue;
   snapshot: DashboardSnapshot;
   onClose(): void;
   onEvidence(): void;
   onResolve(input: ResolveReviewInput): Promise<boolean>;
+  onCreateMember(): void;
 }) {
   const [personId, setPersonId] = useState(snapshot.persons[0]?.id ?? '');
   const [busy, setBusy] = useState(false);
   const [candidates, setCandidates] = useState(review.candidateOptions);
+  const [identityResolution, setIdentityResolution] = useState<'confirm_identity' | 'reassign_person' | 'archive_only' | null>(null);
+  const [archiveConfirmed, setArchiveConfirmed] = useState(false);
   const [excludedLocalKeys, setExcludedLocalKeys] = useState<Set<string>>(() => new Set(
     review.candidateDiffs.filter((difference) => difference.fields.includes('issues')).map((difference) => difference.localKey)
   ));
@@ -941,6 +944,10 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const targetPerson = isIdentityConfirmation
     ? snapshot.persons.find((person) => person.id === review.personId) ?? null
     : null;
+  const otherPeople = isIdentityConfirmation
+    ? snapshot.persons.filter((person) => person.id !== review.personId)
+    : [];
+  const [reassignPersonId, setReassignPersonId] = useState('');
   const isDerived = review.kind === 'derived_safety';
   const isFieldConflict = review.kind === 'field_conflict';
   const isLegacyFieldReview = review.severity === 'blocking'
@@ -971,7 +978,10 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   };
   const canSubmit = !busy
     && (!isAssignment || Boolean(personId))
-    && (!isIdentityConfirmation || Boolean(targetPerson))
+    && (!isIdentityConfirmation || (Boolean(targetPerson)
+      && (identityResolution === 'confirm_identity'
+        || (identityResolution === 'reassign_person' && Boolean(reassignPersonId))
+        || (identityResolution === 'archive_only' && archiveConfirmed))))
     && (!isFieldConflict || isLegacyFieldReview || canRetryModelReview || canCorrect);
 
   async function submitResolution() {
@@ -980,7 +990,11 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
       const resolution: ResolveReviewInput = isAssignment
         ? { action: 'assign_person', documentId: review.documentId, personId }
         : isIdentityConfirmation && targetPerson
-          ? { action: 'confirm_identity', issueId: review.id, documentId: review.documentId, personId: targetPerson.id }
+          ? identityResolution === 'reassign_person'
+            ? { action: 'reassign_person', issueId: review.id, documentId: review.documentId, personId: reassignPersonId }
+            : identityResolution === 'archive_only'
+              ? { action: 'archive_only', issueId: review.id, documentId: review.documentId }
+              : { action: 'confirm_identity', issueId: review.id, documentId: review.documentId, personId: targetPerson.id }
           : isLegacyFieldReview || canRetryModelReview
             ? { action: 'retry_review', issueId: review.id, documentId: review.documentId }
           : canCorrect
@@ -1013,9 +1027,36 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
             <>
               <dl className="identity-confirmation">
                 <div><dt>报告姓名</dt><dd>{review.reportedName}</dd></div>
-                <div><dt>将归入</dt><dd>{targetPerson.displayName}{targetPerson.relation ? ` · ${targetPerson.relation}` : ''}</dd></div>
+                <div><dt>当前归属</dt><dd>{targetPerson.displayName}{targetPerson.relation ? ` · ${targetPerson.relation}` : ''}</dd></div>
               </dl>
-              <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。</p></div></div>
+              <div className="identity-resolution-options" role="group" aria-label="选择这份报告的处理方式">
+                <button type="button" className={`identity-resolution-option${identityResolution === 'confirm_identity' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'confirm_identity'} onClick={() => { setIdentityResolution('confirm_identity'); setArchiveConfirmed(false); }}>
+                  <ShieldCheck size={21} /><span><strong>是同一人</strong><small>报告姓名与当前成员指的是同一个人。系统会重新核对后再保存事实。</small></span>{identityResolution === 'confirm_identity' && <Check size={20} />}
+                </button>
+                <button type="button" className={`identity-resolution-option${identityResolution === 'reassign_person' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'reassign_person'} onClick={() => { setIdentityResolution('reassign_person'); setReassignPersonId(''); setArchiveConfirmed(false); }}>
+                  <UsersRound size={21} /><span><strong>属于另一位成员</strong><small>{otherPeople.length > 0 ? '从其他现有成员中选择正确归属。' : '目前没有其他可选成员，需要先创建成员。'}</small></span>{identityResolution === 'reassign_person' && <Check size={20} />}
+                </button>
+                <button type="button" className={`identity-resolution-option${identityResolution === 'archive_only' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'archive_only'} onClick={() => setIdentityResolution('archive_only')}>
+                  <Archive size={21} /><span><strong>不纳入任何成员</strong><small>保留本机原始资料，但阻止后续入库和成员分析。</small></span>{identityResolution === 'archive_only' && <Check size={20} />}
+                </button>
+              </div>
+              {identityResolution === 'confirm_identity' && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。</p></div></div>}
+              {identityResolution === 'reassign_person' && (otherPeople.length > 0 ? <>
+                <label className="identity-resolution-select">选择另一位成员
+                  <select aria-label="选择另一位成员" value={reassignPersonId} onChange={(event) => setReassignPersonId(event.target.value)}>
+                    <option value="" disabled>请选择成员</option>
+                    {otherPeople.map((person) => <option key={person.id} value={person.id}>{person.displayName}{person.relation ? ` · ${person.relation}` : ''}</option>)}
+                  </select>
+                </label>
+                <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>改归后不会自动继续发送</strong><p>资料会进入所选成员的待处理队列。你需要针对这位成员重新确认接收方、用途和资料范围，再开始处理。</p></div></div>
+              </> : <div className="identity-resolution-empty">
+                <div className="info-callout compact"><UsersRound size={18} /><div><strong>请先创建正确的家庭成员</strong><p>应用不会根据报告姓名暗中创建成员。创建完成后，再回来把这份资料改归给对方。</p></div></div>
+                <button type="button" className="secondary-button" onClick={onCreateMember}><Plus size={17} /> 先创建成员</button>
+              </div>)}
+              {identityResolution === 'archive_only' && <>
+                <div className="info-callout compact"><Archive size={18} /><div><strong>这份资料不会进入任何成员档案</strong><p>后续不会入库或参与分析；此前已经授权并发送给模型的处理审计仍会保留，不能通过这个操作撤回。</p></div></div>
+                <label className="identity-archive-confirm"><input type="checkbox" checked={archiveConfirmed} onChange={(event) => setArchiveConfirmed(event.target.checked)} /> 我确认不把这份资料纳入任何成员</label>
+              </>}
             </>
           ) : isLegacyFieldReview ? (
             <div className="info-callout compact"><RefreshCw size={18} /><div><strong>不需要逐项检查这 {candidates.length} 项内容</strong><p>旧版把标本、日期或证据摘录的写法差异也当成冲突。点击重新核对后，系统会用新规则再处理；只有数值、项目、单位等核心事实真正不一致时才会再次询问你。</p></div></div>
@@ -1050,7 +1091,12 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
           <button className="secondary-button" onClick={onClose}>稍后处理</button>
           <button className="primary-button" disabled={!canSubmit} onClick={() => void submitResolution()}>
             {busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}
-            {isAssignment ? '确认归属' : isIdentityConfirmation ? '确认是同一人' : isLegacyFieldReview ? '按新规则重新核对' : canRetryEvidenceBindingReview ? '让模型重新核对' : canRetryAbnormalFlagReview ? '让模型重新判断' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}
+            {isAssignment ? '确认归属' : isIdentityConfirmation
+              ? identityResolution === 'confirm_identity' ? '确认是同一人'
+                : identityResolution === 'reassign_person' ? '确认改归成员'
+                  : identityResolution === 'archive_only' ? '确认不纳入'
+                    : '请选择处理方式'
+              : isLegacyFieldReview ? '按新规则重新核对' : canRetryEvidenceBindingReview ? '让模型重新核对' : canRetryAbnormalFlagReview ? '让模型重新判断' : canCorrect ? '保存修正并纳入' : isDerived ? '保留事实，不发布说明' : '仅归档这份资料'}
           </button>
         </div>
       </section>
@@ -1570,8 +1616,9 @@ export default function App() {
     setToast(input.action === 'assign_person'
       ? '成员归属已确认，资料已进入待处理队列。'
       : input.action === 'confirm_identity' ? '身份关系已确认，任务将从事实提取重新核对并继续。'
+      : input.action === 'reassign_person' ? '已改归到另一位成员；请针对新成员重新授权后，再开始处理。'
       : input.action === 'retry_review' ? '报告正在按新规则重新核对；只有仍无法判断时才会再次询问你。'
-      : input.action === 'archive_only' ? '资料已仅归档，不会进入分析。'
+      : input.action === 'archive_only' ? '资料已归档，不会进入任何成员档案或后续分析；已有的模型处理审计仍会保留。'
       : input.action === 'accept_correction' ? '修正后的事实已保存，并保留原始证据链。'
       : '报告事实已保留，本次未通过复核的说明不会发布。');
     return true;
@@ -2053,7 +2100,7 @@ export default function App() {
       }} onNotice={setToast} />}
       {aboutDialogOpen && <AboutDialog snapshot={snapshot} onClose={() => setAboutDialogOpen(false)} onNotice={setToast} />}
       {jobDetail && <JobDetailDialog job={jobDetail} onClose={() => setJobDetail(null)} />}
-      {reviewDialog && <ReviewResolutionDialog review={reviewDialog} snapshot={snapshot} onClose={() => setReviewDialog(null)} onEvidence={() => void handleOpenEvidence(snapshot.workspaceMode === 'demo'
+      {reviewDialog && <ReviewResolutionDialog review={reviewDialog} snapshot={snapshot} onClose={() => setReviewDialog(null)} onCreateMember={() => { setReviewDialog(null); setMemberDialogOpen(true); }} onEvidence={() => void handleOpenEvidence(snapshot.workspaceMode === 'demo'
         ? { title: reviewDialog.title, label: '门诊报告.docx · 标题块', quote: '姓名：林×（信息不完整）', meta: '文件夹归属与正文身份不能唯一匹配；确认前不会写入成员档案。' }
         : { title: reviewDialog.title, label: '本机导入资料', quote: '正在读取受控来源片段…', meta: reviewDialog.description, sourceSpanId: reviewDialog.evidenceRefs[0] ?? null, documentId: reviewDialog.documentId })} onResolve={handleResolveReview} />}
       {toast && <div className="toast" role="status">{toast}</div>}

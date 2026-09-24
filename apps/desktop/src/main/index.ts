@@ -1016,6 +1016,8 @@ function registerIpc(): void {
         personalWorkspace.store.assignDocumentPerson(input.documentId, input.personId);
       } else if (input.action === 'confirm_identity') {
         personalWorkspace.store.confirmDocumentIdentity(input);
+      } else if (input.action === 'reassign_person') {
+        personalWorkspace.store.reassignDocumentPerson(input);
       } else if (input.action === 'accept_correction') {
         personalWorkspace.acceptCorrectedFacts(input);
       } else if (input.action === 'retry_review') {

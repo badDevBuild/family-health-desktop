@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { localDateSchema, reportMetadataCandidateSchema } from './index.js';
+import { localDateSchema, reportMetadataCandidateSchema, resolveReviewInputSchema } from './index.js';
 import { clinicalTimeSchema } from './member-v2.js';
 
 describe('本地日期契约', () => {
@@ -50,5 +50,19 @@ describe('成员时间线日期精度契约', () => {
     expect(clinicalTimeSchema.safeParse({ ...base, value: '2024-06-08', precision: 'day' }).success).toBe(true);
     expect(clinicalTimeSchema.safeParse({ ...base, value: '2024-01-01', precision: 'year' }).success).toBe(false);
     expect(clinicalTimeSchema.safeParse({ ...base, value: null, precision: 'day' }).success).toBe(false);
+  });
+});
+
+describe('核对操作契约', () => {
+  it('改归其他成员必须同时绑定事项、资料和目标成员', () => {
+    expect(resolveReviewInputSchema.safeParse({
+      action: 'reassign_person', issueId: 'issue-1', documentId: 'document-1', personId: 'person-2'
+    }).success).toBe(true);
+    expect(resolveReviewInputSchema.safeParse({
+      action: 'reassign_person', issueId: 'issue-1', documentId: 'document-1'
+    }).success).toBe(false);
+    expect(resolveReviewInputSchema.safeParse({
+      action: 'reassign_person', issueId: 'issue-1', documentId: 'document-1', personId: 'person-2', reuseConsent: true
+    }).success).toBe(false);
   });
 });

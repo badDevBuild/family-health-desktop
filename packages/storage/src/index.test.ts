@@ -720,6 +720,580 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('身份冲突可原子改归其他成员，旧批次只重建剩余资料且不复用授权', () => {
+    const store = makeStore();
+    const originalPerson = store.createPerson({ displayName: '原成员', relation: '本人' });
+    const targetPerson = store.createPerson({ displayName: '目标成员', relation: '家人' });
+    const remainingSource = store.putSourceObject({
+      bytes: Buffer.from('纯合成已完成资料'), mediaType: 'text/plain', displayName: '已完成.txt'
+    });
+    const conflictSource = store.putSourceObject({
+      bytes: Buffer.from('姓名：目标成员'), mediaType: 'text/plain', displayName: '待改归.txt'
+    });
+    const remainingDocument = store.registerImportedDocument({
+      sourceObjectId: remainingSource.id, personId: originalPerson.id
+    });
+    const conflictDocument = store.registerImportedDocument({
+      sourceObjectId: conflictSource.id, personId: originalPerson.id
+    });
+    store.setDocumentStatus(remainingDocument.documentId, 'completed');
+    const accountFingerprint = 'identity-reassign-account';
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [remainingDocument.documentId, conflictDocument.documentId],
+      personIds: [originalPerson.id], accountFingerprint, version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{
+        personId: originalPerson.id,
+        documentIds: [remainingDocument.documentId, conflictDocument.documentId],
+        inputSignature: 'identity-reassign-job'
+      }]
+    });
+    const job = store.claimNextQueuedJob('identity-runner', accountFingerprint)!;
+    const attemptId = store.startJobAttempt(job.id, 'synthetic-runtime');
+    store.saveExtractionChunkCheckpoint({
+      guard: { jobId: job.id, attemptId, consentId, accountFingerprint },
+      documentId: conflictDocument.documentId, signature: '9'.repeat(64), chunkIndex: 0,
+      output: { synthetic: 'OLD_CONSENT_CHUNK_MUST_BE_REMOVED' },
+      threadId: 'identity-thread', turnId: 'identity-turn', extractionTurnId: 'identity-turn'
+    });
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: conflictDocument.documentId, jobId: job.id,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [],
+      reportedName: '目标成员', reasonCodes: ['PERSON_NAME_CONFLICT']
+    });
+    store.updateJobStage(job.id, 'analyze');
+    store.finishJobAttempt({ attemptId, status: 'waiting_user' });
+    store.finishJob(job.id, 'waiting_user');
+
+    store.publishMemberAssessmentSnapshot({
+      snapshot: syntheticAssessmentSnapshot(store, originalPerson.id, 'old-person-before-reassign')
+    });
+    store.publishMemberAssessmentSnapshot({
+      snapshot: syntheticAssessmentSnapshot(store, targetPerson.id, 'target-person-before-reassign')
+    });
+
+    store.reassignDocumentPerson({
+      issueId, documentId: conflictDocument.documentId, personId: targetPerson.id
+    });
+
+    expect(store.listImportedDocuments()).toContainEqual(expect.objectContaining({
+      id: conflictDocument.documentId, personId: targetPerson.id, status: 'queued'
+    }));
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listMemberAssessmentSnapshots(originalPerson.id, true)).toEqual([]);
+    expect(store.listMemberAssessmentSnapshots(targetPerson.id, true)).toEqual([]);
+    expect(store.listReadyDocuments()).toContainEqual({
+      id: conflictDocument.documentId, personId: targetPerson.id
+    });
+    expect(store.listProcessingDocumentIds().has(conflictDocument.documentId)).toBe(false);
+
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.prepare(`
+      SELECT person_id, person_assignment_basis, confirmed_reported_name
+      FROM documents WHERE id = ?
+    `).get(conflictDocument.documentId)).toEqual({
+      person_id: targetPerson.id,
+      person_assignment_basis: 'identity_confirmed',
+      confirmed_reported_name: '目标成员'
+    });
+    const checkpoint = database.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ?`).get(job.id) as { checkpoint_json: string };
+    expect(JSON.parse(checkpoint.checkpoint_json)).toMatchObject({
+      documentIds: [remainingDocument.documentId], completedUnits: 1
+    });
+    expect(checkpoint.checkpoint_json).not.toContain(conflictDocument.documentId);
+    expect(checkpoint.checkpoint_json).not.toContain('OLD_CONSENT_CHUNK_MUST_BE_REMOVED');
+    expect(database.prepare(`SELECT event_type FROM audit_events WHERE entity_id = ?`).get(issueId)).toEqual({
+      event_type: 'review_issue.identity_reassigned'
+    });
+    database.close();
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'analyze', completedUnits: 1, totalUnits: 1 });
+    expect(store.claimNextQueuedJob('identity-resume', accountFingerprint)).toMatchObject({
+      id: job.id, personId: originalPerson.id, documentIds: [remainingDocument.documentId], consentId, stage: 'analyze'
+    });
+    const unauthorizedTargetBatch = store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:01:00Z', initialStatus: 'queued', consentId,
+      groups: [{
+        personId: targetPerson.id,
+        documentIds: [conflictDocument.documentId],
+        inputSignature: 'target-must-reauthorize'
+      }]
+    });
+    expect(store.claimNextQueuedJob('identity-old-consent-target', accountFingerprint)).toBeNull();
+    const authorizationDatabase = new Database(store.databasePath, { readonly: true });
+    expect(authorizationDatabase.prepare(`SELECT status FROM jobs WHERE id = ?`)
+      .get(unauthorizedTargetBatch.jobIds[0])).toEqual({ status: 'waiting_user' });
+    authorizationDatabase.close();
+
+    // 同一原文后续从旧成员目录扫描时，人工确认的归属不得被覆盖或重建冲突。
+    expect(store.registerImportedDocument({
+      sourceObjectId: conflictSource.id, personId: originalPerson.id, assignmentBasis: 'folder_binding'
+    })).toEqual({ documentId: conflictDocument.documentId, status: 'duplicate', duplicate: true });
+    store.close();
+  });
+
+  it('运行中批次和非阻断事项都不得改归', () => {
+    const store = makeStore();
+    const originalPerson = store.createPerson({ displayName: '原成员' });
+    const targetPerson = store.createPerson({ displayName: '目标成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('纯合成身份冲突'), mediaType: 'text/plain', displayName: '冲突.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: originalPerson.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [originalPerson.id],
+      accountFingerprint: 'identity-running-account', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: originalPerson.id, documentIds: [document.documentId], inputSignature: 'identity-running-job' }]
+    });
+    const job = store.claimNextQueuedJob('identity-running', 'identity-running-account')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId, jobId: job.id,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [], reportedName: '目标成员'
+    });
+    expect(() => store.reassignDocumentPerson({
+      issueId, documentId: document.documentId, personId: targetPerson.id
+    })).toThrow('DOCUMENT_HAS_RUNNING_JOB');
+    expect(store.listImportedDocuments()).toContainEqual(expect.objectContaining({
+      id: document.documentId, personId: originalPerson.id, status: 'needs_review'
+    }));
+    expect(store.listOpenExtractionReviewIssues()).toHaveLength(1);
+
+    store.finishJob(job.id, 'cancelled');
+    store.resolveReviewIssue({ issueId, documentId: document.documentId, action: 'archive_only' });
+    const warningIssue = store.saveExtractionReviewIssue({
+      documentId: document.documentId, kind: 'person_conflict', severity: 'warning',
+      evidenceRefs: [], reportedName: '目标成员'
+    });
+    expect(() => store.reassignDocumentPerson({
+      issueId: warningIssue, documentId: document.documentId, personId: targetPerson.id
+    })).toThrow('REVIEW_ISSUE_NOT_OPEN');
+    store.close();
+  });
+
+  it('旧成员授权不能领取已改归文档的旧成员任务', () => {
+    const store = makeStore();
+    const originalPerson = store.createPerson({ displayName: '原成员' });
+    const targetPerson = store.createPerson({ displayName: '目标成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('姓名：目标成员'), mediaType: 'text/plain', displayName: '待改归.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: originalPerson.id });
+    const oldConsentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [originalPerson.id],
+      accountFingerprint: 'old-person-account', version: 1
+    });
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId, kind: 'person_conflict', severity: 'blocking',
+      evidenceRefs: [], reportedName: '目标成员'
+    });
+    store.reassignDocumentPerson({
+      issueId, documentId: document.documentId, personId: targetPerson.id
+    });
+
+    const staleBatch = store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId: oldConsentId,
+      groups: [{
+        personId: originalPerson.id,
+        documentIds: [document.documentId],
+        inputSignature: 'stale-old-person-job'
+      }]
+    });
+
+    expect(store.claimNextQueuedJob('stale-old-person-runner', 'old-person-account')).toBeNull();
+    expect(store.listStoredJobs()).toContainEqual(expect.objectContaining({
+      id: staleBatch.jobIds[0], status: 'waiting_user'
+    }));
+    expect(store.listReadyDocuments()).toContainEqual({
+      id: document.documentId, personId: targetPerson.id
+    });
+    store.close();
+  });
+
+  it('改归资料会清理可重试的部分完成任务，重试只带剩余资料', () => {
+    const store = makeStore();
+    const originalPerson = store.createPerson({ displayName: '原成员' });
+    const targetPerson = store.createPerson({ displayName: '目标成员' });
+    const remainingSource = store.putSourceObject({
+      bytes: Buffer.from('保留资料'), mediaType: 'text/plain', displayName: '保留.txt'
+    });
+    const conflictSource = store.putSourceObject({
+      bytes: Buffer.from('姓名：目标成员'), mediaType: 'text/plain', displayName: '冲突.txt'
+    });
+    const remainingDocument = store.registerImportedDocument({
+      sourceObjectId: remainingSource.id, personId: originalPerson.id
+    });
+    const conflictDocument = store.registerImportedDocument({
+      sourceObjectId: conflictSource.id, personId: originalPerson.id
+    });
+    store.setDocumentStatus(remainingDocument.documentId, 'completed');
+    const accountFingerprint = 'reassign-completed-issues-account';
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [remainingDocument.documentId, conflictDocument.documentId],
+      personIds: [originalPerson.id], accountFingerprint, version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{
+        personId: originalPerson.id,
+        documentIds: [remainingDocument.documentId, conflictDocument.documentId],
+        inputSignature: 'reassign-completed-issues-job'
+      }]
+    });
+    const job = store.claimNextQueuedJob('reassign-completed-issues-runner', accountFingerprint)!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: conflictDocument.documentId, jobId: job.id,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [], reportedName: '目标成员'
+    });
+    store.updateJobProgress(job.id, 2);
+    store.finishJob(job.id, 'completed_with_issues');
+
+    const legacyDatabase = new Database(store.databasePath);
+    const legacyRow = legacyDatabase.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ?`)
+      .get(job.id) as { checkpoint_json: string };
+    const legacyCheckpoint = JSON.parse(legacyRow.checkpoint_json) as Record<string, unknown>;
+    legacyDatabase.prepare(`UPDATE jobs SET checkpoint_json = ? WHERE id = ?`).run(JSON.stringify({
+      ...legacyCheckpoint,
+      extractionChunks: {
+        [conflictDocument.documentId]: { stale: { output: 'MUST_BE_REMOVED' } }
+      },
+      systemOutcomes: [{ systemId: 'cardiovascular', status: 'held' }]
+    }), job.id);
+    legacyDatabase.close();
+
+    store.reassignDocumentPerson({
+      issueId, documentId: conflictDocument.documentId, personId: targetPerson.id
+    });
+
+    const cleanedDatabase = new Database(store.databasePath, { readonly: true });
+    const cleanedRow = cleanedDatabase.prepare(`SELECT status, checkpoint_json FROM jobs WHERE id = ?`)
+      .get(job.id) as { status: string; checkpoint_json: string };
+    cleanedDatabase.close();
+    expect(cleanedRow.status).toBe('completed_with_issues');
+    expect(JSON.parse(cleanedRow.checkpoint_json)).toMatchObject({
+      documentIds: [remainingDocument.documentId], completedUnits: 1
+    });
+    expect(cleanedRow.checkpoint_json).not.toContain(conflictDocument.documentId);
+    expect(cleanedRow.checkpoint_json).not.toContain('MUST_BE_REMOVED');
+    expect(cleanedRow.checkpoint_json).not.toContain('systemOutcomes');
+
+    store.retryFailedJob(job.id);
+    expect(store.claimNextQueuedJob('reassign-retry', accountFingerprint)).toMatchObject({
+      id: job.id,
+      stage: 'system_analysis',
+      documentIds: [remainingDocument.documentId]
+    });
+    store.close();
+  });
+
+  it('已提交资料、已有观测和已归档目标成员都不得改归，失败时不改文档或事项', () => {
+    const store = makeStore();
+    const originalPerson = store.createPerson({ displayName: '原成员' });
+    const targetPerson = store.createPerson({ displayName: '目标成员' });
+    const archivedTarget = store.createPerson({ displayName: '已归档目标' });
+
+    const committedSource = store.putSourceObject({
+      bytes: Buffer.from('纯合成已提交资料'), mediaType: 'text/plain', displayName: '已提交.txt'
+    });
+    const committedDocument = store.registerImportedDocument({
+      sourceObjectId: committedSource.id, personId: originalPerson.id
+    });
+    store.publishFacts({
+      personId: originalPerson.id,
+      documentId: committedDocument.documentId,
+      documentCommitKey: '7'.repeat(64), expectedRevision: 0,
+      changeSetHash: '8'.repeat(64), summary: '合成已提交资料', observations: []
+    });
+    const committedIssue = store.saveExtractionReviewIssue({
+      documentId: committedDocument.documentId,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [], reportedName: '目标成员'
+    });
+    expect(() => store.reassignDocumentPerson({
+      issueId: committedIssue, documentId: committedDocument.documentId, personId: targetPerson.id
+    })).toThrow('DOCUMENT_ALREADY_COMMITTED');
+
+    const observationSource = store.putSourceObject({
+      bytes: Buffer.from('纯合成已有观测资料'), mediaType: 'text/plain', displayName: '已有观测.txt'
+    });
+    const observationDocument = store.registerImportedDocument({
+      sourceObjectId: observationSource.id, personId: originalPerson.id
+    });
+    store.saveSourceManifest({
+      id: 'identity-observation-manifest', sourceObjectId: observationSource.id,
+      sha256: observationSource.sha256, mediaType: 'text/plain', originalDisplayName: '已有观测.txt',
+      totalUnits: 1, coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [],
+      createdAt: '2026-09-18T00:00:00.000Z',
+      spans: [{
+        id: 'identity-observation-span', documentId: observationDocument.documentId,
+        spanKind: 'line', page: null, blockId: null, lineStart: 1, lineEnd: 1,
+        quote: '收缩压 107 mmHg', readability: 'clear'
+      }]
+    });
+    const acceptanceId = store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'identity-observation-input',
+      outputHash: 'identity-observation-output', reviewRef: null, decision: 'accept'
+    });
+    store.publishFacts({
+      personId: originalPerson.id, documentId: observationDocument.documentId,
+      documentCommitKey: '9'.repeat(64), expectedRevision: store.getFactRevision(originalPerson.id),
+      changeSetHash: 'a'.repeat(64), summary: '合成观测',
+      observations: [{
+        conceptKey: '收缩压', rawText: '107', valueKind: 'numeric', decimalValue: '107',
+        qualifier: 'eq', unit: 'mmHg', referenceRange: null, clinicalDate: '2026-09-18',
+        abnormalFlag: 'unknown', documentId: observationDocument.documentId,
+        sourceSpanId: 'identity-observation-span', acceptanceId,
+        specimen: null, method: null, bodySite: null,
+        evidence: [{ sourceSpanId: 'identity-observation-span', quote: '收缩压 107 mmHg' }]
+      }]
+    });
+    const observationDatabase = new Database(store.databasePath);
+    observationDatabase.prepare(`DELETE FROM document_commits WHERE document_id = ?`).run(observationDocument.documentId);
+    observationDatabase.close();
+    const observationIssue = store.saveExtractionReviewIssue({
+      documentId: observationDocument.documentId,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [], reportedName: '目标成员'
+    });
+    expect(() => store.reassignDocumentPerson({
+      issueId: observationIssue, documentId: observationDocument.documentId, personId: targetPerson.id
+    })).toThrow('DOCUMENT_HAS_OBSERVATIONS');
+
+    const archivedSource = store.putSourceObject({
+      bytes: Buffer.from('纯合成待改归资料'), mediaType: 'text/plain', displayName: '待改归.txt'
+    });
+    const archivedDocument = store.registerImportedDocument({
+      sourceObjectId: archivedSource.id, personId: originalPerson.id
+    });
+    const archivedIssue = store.saveExtractionReviewIssue({
+      documentId: archivedDocument.documentId,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [], reportedName: '已归档目标'
+    });
+    store.archivePerson({ personId: archivedTarget.id, expectedDisplayRevision: archivedTarget.displayRevision });
+    expect(() => store.reassignDocumentPerson({
+      issueId: archivedIssue, documentId: archivedDocument.documentId, personId: archivedTarget.id
+    })).toThrow('PERSON_NOT_FOUND');
+
+    expect(store.listImportedDocuments()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: committedDocument.documentId, personId: originalPerson.id, status: 'needs_review'
+      }),
+      expect.objectContaining({
+        id: archivedDocument.documentId, personId: originalPerson.id, status: 'needs_review'
+      }),
+      expect.objectContaining({
+        id: observationDocument.documentId, personId: originalPerson.id, status: 'needs_review'
+      })
+    ]));
+    expect(store.listOpenExtractionReviewIssues().map((issue) => issue.id)).toEqual(expect.arrayContaining([
+      committedIssue, observationIssue, archivedIssue
+    ]));
+    store.close();
+  });
+
+  it('身份冲突资料仅归档后脱离成员，旧成员只用剩余资料重建综合', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const remainingSource = store.putSourceObject({
+      bytes: Buffer.from('纯合成保留资料'), mediaType: 'text/plain', displayName: '保留.txt'
+    });
+    const archivedSource = store.putSourceObject({
+      bytes: Buffer.from('纯合成归档资料'), mediaType: 'text/plain', displayName: '归档.txt'
+    });
+    const remainingDocument = store.registerImportedDocument({
+      sourceObjectId: remainingSource.id, personId: person.id
+    });
+    const archivedDocument = store.registerImportedDocument({
+      sourceObjectId: archivedSource.id, personId: person.id
+    });
+    store.setDocumentStatus(remainingDocument.documentId, 'completed');
+    store.publishFacts({
+      personId: person.id,
+      documentId: archivedDocument.documentId,
+      documentCommitKey: 'd'.repeat(64), expectedRevision: 0,
+      changeSetHash: 'e'.repeat(64), summary: '合成归档前投影', observations: []
+    });
+    expect(store.listPersonDocumentCounts().get(person.id)).toBe(2);
+    expect(store.listReportMetadata(person.id)).toHaveLength(1);
+
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [remainingDocument.documentId, archivedDocument.documentId], personIds: [person.id],
+      accountFingerprint: 'archive-analyze-account', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{
+        personId: person.id,
+        documentIds: [remainingDocument.documentId, archivedDocument.documentId],
+        inputSignature: 'archive-analyze-job'
+      }]
+    });
+    const job = store.claimNextQueuedJob('archive-analyze', 'archive-analyze-account')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: archivedDocument.documentId, jobId: job.id,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [],
+      preserveDocumentStatus: true, reportedName: '其他姓名'
+    });
+    store.updateJobStage(job.id, 'analyze');
+    store.finishJob(job.id, 'waiting_user');
+    store.publishMemberAssessmentSnapshot({
+      snapshot: syntheticAssessmentSnapshot(store, person.id, 'before-identity-archive')
+    });
+
+    store.resolveReviewIssue({
+      issueId, documentId: archivedDocument.documentId, action: 'archive_only'
+    });
+
+    expect(store.listStoredJobs()[0]).toMatchObject({
+      status: 'queued', stage: 'analyze', completedUnits: 1, totalUnits: 1
+    });
+    expect(store.claimNextQueuedJob('archive-resume', 'archive-analyze-account')).toMatchObject({
+      id: job.id, stage: 'analyze', documentIds: [remainingDocument.documentId]
+    });
+    expect(store.listPersonDocumentCounts().get(person.id)).toBe(1);
+    expect(store.listReportMetadata(person.id)).toEqual([]);
+    expect(store.listMemberAssessmentSnapshots(person.id, true)).toEqual([]);
+    expect(store.listImportedDocuments()).toContainEqual(expect.objectContaining({
+      id: archivedDocument.documentId,
+      personId: null,
+      personLabel: null,
+      status: 'ignored'
+    }));
+    expect(store.listReadyDocuments()).not.toContainEqual(expect.objectContaining({
+      id: archivedDocument.documentId
+    }));
+
+    const database = new Database(store.databasePath, { readonly: true });
+    expect(database.prepare(`
+      SELECT person_id, status, excluded_from_analysis FROM documents WHERE id = ?
+    `).get(archivedDocument.documentId)).toEqual({
+      person_id: null, status: 'ignored', excluded_from_analysis: 1
+    });
+    expect(database.prepare(`SELECT COUNT(*) AS count FROM source_objects WHERE id = ?`)
+      .get(archivedSource.id)).toEqual({ count: 1 });
+    expect(database.prepare(`SELECT resolution_status FROM review_issues WHERE id = ?`)
+      .get(issueId)).toEqual({ resolution_status: 'resolved' });
+    expect(database.prepare(`SELECT event_type FROM audit_events WHERE entity_id = ? ORDER BY created_at DESC LIMIT 1`)
+      .get(issueId)).toEqual({ event_type: 'review_issue.resolved' });
+    database.close();
+
+    // 原文仍在本地存档，但同一来源再次扫描不得重建成员资料。
+    expect(store.registerImportedDocument({
+      sourceObjectId: archivedSource.id, personId: person.id, assignmentBasis: 'folder_binding'
+    })).toEqual({ documentId: archivedDocument.documentId, status: 'duplicate', duplicate: true });
+    store.close();
+  });
+
+  it('身份冲突资料归档后批次无剩余资料时安全取消任务', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('唯一的身份冲突资料'), mediaType: 'text/plain', displayName: '唯一资料.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id],
+      accountFingerprint: 'archive-only-account', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'archive-only-job' }]
+    });
+    const job = store.claimNextQueuedJob('archive-only-runner', 'archive-only-account')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId, jobId: job.id,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [], reportedName: '其他姓名'
+    });
+    store.finishJob(job.id, 'waiting_user');
+
+    store.resolveReviewIssue({ issueId, documentId: document.documentId, action: 'archive_only' });
+
+    expect(store.listStoredJobs()).toContainEqual(expect.objectContaining({
+      id: job.id, status: 'cancelled', documentIds: [], completedUnits: 0
+    }));
+    expect(store.claimNextQueuedJob('must-not-resume', 'archive-only-account')).toBeNull();
+    expect(store.listImportedDocuments()).toContainEqual(expect.objectContaining({
+      id: document.documentId, personId: null, status: 'ignored'
+    }));
+    store.close();
+  });
+
+  it('归档资料会清理可重试的部分完成任务，重试不再带无归属资料', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const remainingSource = store.putSourceObject({
+      bytes: Buffer.from('保留资料'), mediaType: 'text/plain', displayName: '保留.txt'
+    });
+    const archivedSource = store.putSourceObject({
+      bytes: Buffer.from('归档资料'), mediaType: 'text/plain', displayName: '归档.txt'
+    });
+    const remainingDocument = store.registerImportedDocument({
+      sourceObjectId: remainingSource.id, personId: person.id
+    });
+    const archivedDocument = store.registerImportedDocument({
+      sourceObjectId: archivedSource.id, personId: person.id
+    });
+    store.setDocumentStatus(remainingDocument.documentId, 'completed');
+    const accountFingerprint = 'archive-completed-issues-account';
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [remainingDocument.documentId, archivedDocument.documentId],
+      personIds: [person.id], accountFingerprint, version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{
+        personId: person.id,
+        documentIds: [remainingDocument.documentId, archivedDocument.documentId],
+        inputSignature: 'archive-completed-issues-job'
+      }]
+    });
+    const job = store.claimNextQueuedJob('archive-completed-issues-runner', accountFingerprint)!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: archivedDocument.documentId, jobId: job.id,
+      kind: 'person_conflict', severity: 'blocking', evidenceRefs: [], reportedName: '其他姓名'
+    });
+    store.updateJobProgress(job.id, 2);
+    store.finishJob(job.id, 'completed_with_issues');
+
+    const legacyDatabase = new Database(store.databasePath);
+    const legacyRow = legacyDatabase.prepare(`SELECT checkpoint_json FROM jobs WHERE id = ?`)
+      .get(job.id) as { checkpoint_json: string };
+    const legacyCheckpoint = JSON.parse(legacyRow.checkpoint_json) as Record<string, unknown>;
+    legacyDatabase.prepare(`UPDATE jobs SET checkpoint_json = ? WHERE id = ?`).run(JSON.stringify({
+      ...legacyCheckpoint,
+      extractionChunks: {
+        [archivedDocument.documentId]: { stale: { output: 'MUST_BE_REMOVED' } }
+      },
+      systemOutcomes: [{ systemId: 'cardiovascular', status: 'held' }]
+    }), job.id);
+    legacyDatabase.close();
+
+    store.resolveReviewIssue({
+      issueId, documentId: archivedDocument.documentId, action: 'archive_only'
+    });
+
+    const cleanedDatabase = new Database(store.databasePath, { readonly: true });
+    const cleanedRow = cleanedDatabase.prepare(`SELECT status, checkpoint_json FROM jobs WHERE id = ?`)
+      .get(job.id) as { status: string; checkpoint_json: string };
+    cleanedDatabase.close();
+    expect(cleanedRow.status).toBe('completed_with_issues');
+    expect(JSON.parse(cleanedRow.checkpoint_json)).toMatchObject({
+      documentIds: [remainingDocument.documentId], completedUnits: 1
+    });
+    expect(cleanedRow.checkpoint_json).not.toContain(archivedDocument.documentId);
+    expect(cleanedRow.checkpoint_json).not.toContain('MUST_BE_REMOVED');
+    expect(cleanedRow.checkpoint_json).not.toContain('systemOutcomes');
+
+    store.retryFailedJob(job.id);
+    expect(store.claimNextQueuedJob('archive-retry', accountFingerprint)).toMatchObject({
+      id: job.id,
+      stage: 'system_analysis',
+      documentIds: [remainingDocument.documentId]
+    });
+    store.close();
+  });
+
   it('schema v9 只重试可恢复的旧 PDF 覆盖误拦截，必须由原文件复核后才补全清单', { timeout: 15_000 }, () => {
     const directory = mkdtempSync(join(tmpdir(), 'family-health-store-v8-pdf-manifest-'));
     directories.push(directory);
@@ -2345,6 +2919,65 @@ describe('WorkspaceStore', () => {
       expectedRevision: 0, changeSetHash: '8'.repeat(64), summary: '不应提交', observations: [], executionGuard
     })).toThrow('CONSENT_REVOKED');
     expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.isDocumentCommitted(document.documentId)).toBe(false);
+    store.close();
+  });
+
+  it('运行中文档归属变化后，每次执行与事实发布边界都拒绝写入', () => {
+    const store = makeStore();
+    const originalPerson = store.createPerson({ displayName: '原成员' });
+    const targetPerson = store.createPerson({ displayName: '目标成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('运行中归属变化测试'), mediaType: 'text/plain', displayName: '归属变化.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: originalPerson.id });
+    const accountFingerprint = 'ownership-boundary-account';
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [originalPerson.id],
+      accountFingerprint, version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{
+        personId: originalPerson.id,
+        documentIds: [document.documentId],
+        inputSignature: 'ownership-boundary-job'
+      }]
+    });
+    const job = store.claimNextQueuedJob('ownership-boundary-runner', accountFingerprint)!;
+    const attemptId = store.startJobAttempt(job.id, 'synthetic-runtime');
+    const executionGuard = { jobId: job.id, attemptId, consentId, accountFingerprint };
+
+    // 用底层写入模拟外部并发改归；正常业务 API 会禁止改归运行中任务。
+    const database = new Database(store.databasePath);
+    database.prepare(`UPDATE documents SET person_id = ? WHERE id = ?`)
+      .run(targetPerson.id, document.documentId);
+    database.close();
+
+    expect(() => store.assertJobExecutionActive(executionGuard, document.documentId))
+      .toThrow('DOCUMENT_PERSON_SCOPE_MISMATCH');
+    expect(() => store.saveExtractionChunkCheckpoint({
+      guard: executionGuard,
+      documentId: document.documentId,
+      signature: 'f'.repeat(64),
+      chunkIndex: 0,
+      output: { shouldNotPersist: true },
+      threadId: 'ownership-thread',
+      turnId: 'ownership-turn',
+      extractionTurnId: 'ownership-turn'
+    })).toThrow('DOCUMENT_PERSON_SCOPE_MISMATCH');
+    expect(() => store.publishFacts({
+      personId: originalPerson.id,
+      documentId: document.documentId,
+      documentCommitKey: 'a'.repeat(64),
+      expectedRevision: 0,
+      changeSetHash: 'b'.repeat(64),
+      summary: '不应写入',
+      observations: [],
+      executionGuard
+    })).toThrow('DOCUMENT_PERSON_SCOPE_MISMATCH');
+    expect(store.getFactRevision(originalPerson.id)).toBe(0);
+    expect(store.getFactRevision(targetPerson.id)).toBe(0);
     expect(store.isDocumentCommitted(document.documentId)).toBe(false);
     store.close();
   });

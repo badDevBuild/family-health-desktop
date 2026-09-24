@@ -380,6 +380,9 @@ describe('App member display editing', () => {
     expect(await screen.findByRole('dialog', { name: '确认报告姓名与成员身份' })).toBeTruthy();
     expect(screen.getByText('测试姓名甲')).toBeTruthy();
     expect(screen.getByText('书书 · 本人')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /属于另一位成员/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /不纳入任何成员/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /是同一人/ }));
     expect(screen.getByText(/不会修改成员名称，也不是医学结论/)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '确认是同一人' }));
 
@@ -387,6 +390,98 @@ describe('App member display editing', () => {
       action: 'confirm_identity', issueId: 'identity-review-1', documentId: 'document-identity-1', personId: 'personal-person-1'
     }));
     expect(await screen.findByText('身份关系已确认，任务将从事实提取重新核对并继续。')).toBeTruthy();
+  });
+
+  it('身份不一致时不默认误选第一位成员，并说明改归后需要重新授权', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.persons[0]!.displayName = '书书';
+    snapshot.persons.push({
+      ...snapshot.persons[0]!,
+      id: 'personal-person-2',
+      displayName: '妈妈',
+      relation: '母亲'
+    });
+    snapshot.persons.push({
+      ...snapshot.persons[0]!,
+      id: 'personal-person-3',
+      displayName: '爸爸',
+      relation: '父亲'
+    });
+    snapshot.reviews = [{
+      id: 'identity-review-2', personId: 'personal-person-1', documentId: 'document-identity-2',
+      kind: 'person_conflict', severity: 'blocking', title: '确认报告姓名与成员身份',
+      description: '报告姓名与当前成员不同。', evidenceRefs: ['identity-span-2'],
+      candidateOptions: [], candidateDiffs: [], reportedName: '测试姓名乙', reasonCodes: [], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'reassign_person' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /确认报告姓名与成员身份/ }));
+    fireEvent.click(screen.getByRole('button', { name: /属于另一位成员/ }));
+    const memberSelect = screen.getByRole('combobox', { name: '选择另一位成员' }) as HTMLSelectElement;
+    expect(memberSelect.value).toBe('');
+    expect(Array.from(memberSelect.options).map((option) => option.textContent)).toEqual(['请选择成员', '妈妈 · 母亲', '爸爸 · 父亲']);
+    expect(screen.getByText(/需要针对这位成员重新确认接收方、用途和资料范围/)).toBeTruthy();
+    const submit = screen.getByRole('button', { name: '确认改归成员' }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(memberSelect, { target: { value: 'personal-person-2' } });
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'reassign_person', issueId: 'identity-review-2', documentId: 'document-identity-2', personId: 'personal-person-2'
+    }));
+    expect(await screen.findByText('已改归到另一位成员；请针对新成员重新授权后，再开始处理。')).toBeTruthy();
+  });
+
+  it('没有其他成员时引导先创建，不根据报告姓名暗中创建', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.reviews = [{
+      id: 'identity-review-no-person', personId: 'personal-person-1', documentId: 'document-identity-no-person',
+      kind: 'person_conflict', severity: 'blocking', title: '确认报告姓名与成员身份',
+      description: '报告姓名与当前成员不同。', evidenceRefs: [], candidateOptions: [], candidateDiffs: [],
+      reportedName: '测试姓名丙', reasonCodes: [], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    installBridge(snapshot);
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /确认报告姓名与成员身份/ }));
+    fireEvent.click(screen.getByRole('button', { name: /属于另一位成员/ }));
+    expect(screen.getByText(/应用不会根据报告姓名暗中创建成员/)).toBeTruthy();
+    expect((screen.getByRole('button', { name: '确认改归成员' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '先创建成员' }));
+    expect(await screen.findByRole('dialog', { name: '添加成员' })).toBeTruthy();
+  });
+
+  it('不纳入任何成员前要求再次确认，并说明既有模型审计不会撤回', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.reviews = [{
+      id: 'identity-review-archive', personId: 'personal-person-1', documentId: 'document-identity-archive',
+      kind: 'person_conflict', severity: 'blocking', title: '确认报告姓名与成员身份',
+      description: '报告姓名与当前成员不同。', evidenceRefs: [], candidateOptions: [], candidateDiffs: [],
+      reportedName: '测试姓名丁', reasonCodes: [], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'archive_only' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /确认报告姓名与成员身份/ }));
+    fireEvent.click(screen.getByRole('button', { name: /不纳入任何成员/ }));
+    expect(screen.getByText(/已经授权并发送给模型的处理审计仍会保留/)).toBeTruthy();
+    const submit = screen.getByRole('button', { name: '确认不纳入' }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.click(screen.getByRole('checkbox', { name: '我确认不把这份资料纳入任何成员' }));
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'archive_only', issueId: 'identity-review-archive', documentId: 'document-identity-archive'
+    }));
+    expect(await screen.findByText(/不会进入任何成员档案或后续分析/)).toBeTruthy();
   });
 
   it('旧版全量核对不再展示 77 个输入项，而是一键按新规则重跑', async () => {

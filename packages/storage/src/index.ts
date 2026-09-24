@@ -1347,9 +1347,23 @@ export class WorkspaceStore {
 
   registerImportedDocument(input: { sourceObjectId: string; personId: string | null; assignmentBasis?: 'user_selected' | 'folder_binding' }): ImportedDocumentReceipt {
     const existing = this.db.prepare(`
-      SELECT id, person_id FROM documents WHERE source_object_id = ? ORDER BY created_at LIMIT 1
-    `).get(input.sourceObjectId) as { id: string; person_id: string | null } | undefined;
-    if (existing && existing.person_id === input.personId) {
+      SELECT id, person_id, person_assignment_basis, status
+      FROM documents
+      WHERE source_object_id = ?
+      ORDER BY CASE WHEN person_assignment_basis = 'identity_confirmed' THEN 0 ELSE 1 END,
+               created_at, id
+      LIMIT 1
+    `).get(input.sourceObjectId) as {
+      id: string;
+      person_id: string | null;
+      person_assignment_basis: string;
+      status: string;
+    } | undefined;
+    // 人工核对过的姓名关系比目录归属更可靠。旧目录被再次扫描时，
+    // 必须复用这个明确决定，不能重建一个新的跨成员冲突。
+    if (existing && (existing.status === 'ignored'
+      || existing.person_id === input.personId
+      || existing.person_assignment_basis === 'identity_confirmed')) {
       return { documentId: existing.id, status: 'duplicate', duplicate: true };
     }
 
@@ -2118,6 +2132,15 @@ export class WorkspaceStore {
     return createHash('sha256').update(JSON.stringify(rows.map((row) => row.id))).digest('hex');
   }
 
+  /** 任务范围不能只相信创建时的 checkpoint；成员归属可能在核对后改变。 */
+  private checkpointDocumentPersonMismatches(documentIds: string[], personId: string): string[] {
+    const belongsToPerson = this.db.prepare(`
+      SELECT 1 FROM documents WHERE id = ? AND person_id = ? LIMIT 1
+    `);
+    return [...new Set(documentIds)]
+      .filter((documentId) => !belongsToPerson.get(documentId, personId));
+  }
+
   retryExtractionReview(input: { issueId: string; documentId: string }): void {
     const transaction = this.db.transaction(() => {
       const issue = this.db.prepare(`
@@ -2254,6 +2277,179 @@ export class WorkspaceStore {
     transaction();
   }
 
+  reassignDocumentPerson(input: { issueId: string; documentId: string; personId: string }): void {
+    const transaction = this.db.transaction(() => {
+      const issue = this.db.prepare(`
+        SELECT ri.job_id, ri.kind, ri.severity, ri.resolution_status, ri.payload_json,
+               d.person_id, d.status, d.confirmed_reported_name,
+               EXISTS(SELECT 1 FROM document_commits dc WHERE dc.document_id = d.id) AS committed,
+               EXISTS(
+                 SELECT 1
+                 FROM observation_revisions observation_revision
+                 JOIN source_spans source_span ON source_span.id = observation_revision.source_span_id
+                 WHERE source_span.document_id = d.id
+               ) AS has_observations
+        FROM review_issues ri
+        JOIN documents d ON ri.field_ref = 'document:' || d.id
+        WHERE ri.id = ? AND d.id = ?
+      `).get(input.issueId, input.documentId) as {
+        job_id: string | null;
+        kind: string;
+        severity: string;
+        resolution_status: string;
+        payload_json: string | null;
+        person_id: string | null;
+        status: string;
+        confirmed_reported_name: string | null;
+        committed: number;
+        has_observations: number;
+      } | undefined;
+      if (!issue || issue.resolution_status !== 'open'
+        || issue.kind !== 'person_conflict' || issue.severity !== 'blocking') {
+        throw new Error('REVIEW_ISSUE_NOT_OPEN');
+      }
+      if (!issue.person_id || issue.person_id === input.personId || issue.status !== 'needs_review') {
+        throw new Error('DOCUMENT_IDENTITY_CONFLICT');
+      }
+      const targetPerson = this.db.prepare(`
+        SELECT id FROM persons WHERE id = ? AND archived_at IS NULL
+      `).get(input.personId) as { id: string } | undefined;
+      if (!targetPerson) throw new Error('PERSON_NOT_FOUND');
+      if (issue.committed === 1) throw new Error('DOCUMENT_ALREADY_COMMITTED');
+      if (issue.has_observations === 1) throw new Error('DOCUMENT_HAS_OBSERVATIONS');
+
+      const relatedJobs = this.db.prepare(`
+        SELECT id, person_id, stage, status, checkpoint_json
+        FROM jobs
+        WHERE checkpoint_json IS NOT NULL
+      `).all() as Array<{
+        id: string;
+        person_id: string | null;
+        stage: StoredJobSummary['stage'];
+        status: StoredJobSummary['status'];
+        checkpoint_json: string;
+      }>;
+      const jobsContainingDocument: Array<{
+        id: string;
+        personId: string | null;
+        stage: StoredJobSummary['stage'];
+        status: StoredJobSummary['status'];
+        checkpoint: ({ documentIds?: string[]; completedUnits?: number; extractionChunks?: Record<string, unknown> } & Record<string, unknown>);
+      }> = [];
+      for (const job of relatedJobs) {
+        let checkpoint: ({ documentIds?: string[]; completedUnits?: number; extractionChunks?: Record<string, unknown> } & Record<string, unknown>);
+        try {
+          checkpoint = JSON.parse(job.checkpoint_json) as typeof checkpoint;
+        } catch {
+          if (job.id === issue.job_id) throw new Error('JOB_CHECKPOINT_INVALID');
+          continue;
+        }
+        if (!checkpoint.documentIds?.includes(input.documentId)) continue;
+        if (job.status === 'running') throw new Error('DOCUMENT_HAS_RUNNING_JOB');
+        jobsContainingDocument.push({
+          id: job.id, personId: job.person_id, stage: job.stage, status: job.status, checkpoint
+        });
+      }
+
+      const payload = issue.payload_json
+        ? JSON.parse(issue.payload_json) as { reportedName?: string }
+        : {};
+      const reportedName = payload.reportedName?.trim() || issue.confirmed_reported_name?.trim();
+      if (!reportedName) throw new Error('REPORTED_NAME_REQUIRED');
+
+      const changedAt = this.now().toISOString();
+      const updated = this.db.prepare(`
+        UPDATE documents
+        SET person_id = ?, status = 'queued', person_assignment_basis = 'identity_confirmed',
+            confirmed_reported_name = ?
+        WHERE id = ? AND person_id = ? AND status = 'needs_review'
+          AND NOT EXISTS (SELECT 1 FROM document_commits dc WHERE dc.document_id = documents.id)
+      `).run(input.personId, reportedName, input.documentId, issue.person_id);
+      if (updated.changes !== 1) throw new Error('DOCUMENT_IDENTITY_CONFLICT');
+      this.db.prepare(`
+        UPDATE review_issues
+        SET resolution_status = 'resolved', resolution_revision = 1,
+            payload_json = json_set(
+              COALESCE(payload_json, '{}'),
+              '$.identityConfirmed', json('true'),
+              '$.reassignedPersonId', ?
+            )
+        WHERE id = ? AND resolution_status = 'open'
+      `).run(input.personId, input.issueId);
+
+      // 改归后的资料不得继续使用旧成员批次的授权或原文缓存。
+      // 旧批次仍可以用原授权对“剩余的原成员资料”重建综合结果。
+      for (const job of jobsContainingDocument) {
+        if (['cancelled', 'succeeded'].includes(job.status)) continue;
+        const remainingDocumentIds = (job.checkpoint.documentIds ?? [])
+          .filter((documentId) => documentId !== input.documentId);
+        const checkpoint: ({
+          documentIds: string[];
+          completedUnits?: number;
+          extractionChunks?: Record<string, unknown>;
+        } & Record<string, unknown>) = { ...job.checkpoint, documentIds: remainingDocumentIds };
+        if (checkpoint.extractionChunks && typeof checkpoint.extractionChunks === 'object') {
+          delete checkpoint.extractionChunks[input.documentId];
+          if (Object.keys(checkpoint.extractionChunks).length === 0) delete checkpoint.extractionChunks;
+        }
+        // completed_with_issues 可以被用户重试，所以终态检查点也必须清掉旧成员系统结果。
+        delete checkpoint.systemOutcomes;
+
+        if (remainingDocumentIds.length === 0) {
+          this.db.prepare(`
+            UPDATE jobs
+            SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+                checkpoint_json = ?, updated_at = ?
+            WHERE id = ? AND status != 'running'
+          `).run(JSON.stringify({ ...checkpoint, completedUnits: 0 }), changedAt, job.id);
+          continue;
+        }
+
+        let nextStatus = job.status;
+        let nextStage = job.stage;
+        let completedUnits = Math.min(Number(job.checkpoint.completedUnits ?? 0), remainingDocumentIds.length);
+        if (job.status === 'waiting_user') {
+          const stillBlocked = remainingDocumentIds.some((documentId) => this.hasOpenBlockingReview(documentId));
+          if (!stillBlocked) {
+            const pendingExtraction = remainingDocumentIds.some((documentId) => {
+              const document = this.db.prepare(`
+                SELECT status,
+                       EXISTS(SELECT 1 FROM document_commits dc WHERE dc.document_id = documents.id) AS committed,
+                       excluded_from_analysis
+                FROM documents WHERE id = ?
+              `).get(documentId) as { status: string; committed: number; excluded_from_analysis: number } | undefined;
+              return document?.status === 'queued' && document.committed === 0 && document.excluded_from_analysis === 0;
+            });
+            nextStatus = 'queued';
+            nextStage = pendingExtraction ? 'extract' : 'analyze';
+            completedUnits = pendingExtraction ? 0 : remainingDocumentIds.length;
+            delete checkpoint.systemOutcomes;
+          }
+        }
+        this.db.prepare(`
+          UPDATE jobs
+          SET status = ?, stage = ?, lease_owner = NULL, lease_expires_at = NULL,
+              checkpoint_json = ?, updated_at = ?
+          WHERE id = ? AND status != 'running'
+        `).run(
+          nextStatus,
+          nextStage,
+          JSON.stringify({ ...checkpoint, completedUnits }),
+          changedAt,
+          job.id
+        );
+      }
+
+      this.invalidateMemberAssessmentSnapshots(issue.person_id);
+      this.invalidateMemberAssessmentSnapshots(input.personId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'review_issue.identity_reassigned', ?, '用户确认报告属于其他成员；旧批次已移除该资料，重新处理前需再次授权', ?)
+      `).run(randomUUID(), input.issueId, changedAt);
+    });
+    transaction();
+  }
+
   resolveReviewIssue(input: {
     issueId: string;
     documentId: string;
@@ -2271,9 +2467,93 @@ export class WorkspaceStore {
       if (input.action === 'archive_only') {
         const document = this.db.prepare(`SELECT person_id FROM documents WHERE id = ?`).get(input.documentId) as { person_id: string | null } | undefined;
         const affectedSystemIds = this.systemIdsForDocuments([input.documentId]);
-        this.db.prepare(`
-          UPDATE documents SET status = 'completed', excluded_from_analysis = 1 WHERE id = ?
-        `).run(input.documentId);
+        const detachFromMember = issue.kind === 'person_conflict';
+
+        // 归档不等于继续挂在原成员名下。在改变归属前先锁定所有非终态任务，
+        // 运行中任务不允许直接改归，避免正在传输或写库时变更主体。
+        const relatedJobs = detachFromMember ? this.db.prepare(`
+          SELECT id, status, checkpoint_json
+          FROM jobs
+          WHERE checkpoint_json IS NOT NULL
+            AND status NOT IN ('cancelled', 'succeeded')
+        `).all() as Array<{
+          id: string;
+          status: StoredJobSummary['status'];
+          checkpoint_json: string;
+        }> : [];
+        const jobsContainingDocument: Array<{
+          id: string;
+          status: StoredJobSummary['status'];
+          checkpoint: ({
+            documentIds?: string[];
+            completedUnits?: number;
+            extractionChunks?: Record<string, unknown>;
+          } & Record<string, unknown>);
+        }> = [];
+        for (const job of relatedJobs) {
+          let checkpoint: ({
+            documentIds?: string[];
+            completedUnits?: number;
+            extractionChunks?: Record<string, unknown>;
+          } & Record<string, unknown>);
+          try {
+            checkpoint = JSON.parse(job.checkpoint_json) as typeof checkpoint;
+          } catch {
+            if (job.id === issue.job_id) throw new Error('JOB_CHECKPOINT_INVALID');
+            continue;
+          }
+          if (!checkpoint.documentIds?.includes(input.documentId)) continue;
+          if (job.status === 'running') throw new Error('DOCUMENT_HAS_RUNNING_JOB');
+          jobsContainingDocument.push({ id: job.id, status: job.status, checkpoint });
+        }
+
+        if (detachFromMember) {
+          this.db.prepare(`
+            UPDATE documents
+            SET person_id = NULL, status = 'ignored', excluded_from_analysis = 1
+            WHERE id = ?
+          `).run(input.documentId);
+        } else {
+          this.db.prepare(`
+            UPDATE documents SET status = 'completed', excluded_from_analysis = 1 WHERE id = ?
+          `).run(input.documentId);
+        }
+
+        const changedAt = this.now().toISOString();
+        for (const job of jobsContainingDocument) {
+          const remainingDocumentIds = (job.checkpoint.documentIds ?? [])
+            .filter((documentId) => documentId !== input.documentId);
+          const checkpoint: ({
+            documentIds: string[];
+            completedUnits: number;
+            extractionChunks?: Record<string, unknown>;
+          } & Record<string, unknown>) = {
+            ...job.checkpoint,
+            documentIds: remainingDocumentIds,
+            completedUnits: Math.min(
+              Number(job.checkpoint.completedUnits ?? 0),
+              remainingDocumentIds.length
+            )
+          };
+          if (checkpoint.extractionChunks && typeof checkpoint.extractionChunks === 'object') {
+            delete checkpoint.extractionChunks[input.documentId];
+            if (Object.keys(checkpoint.extractionChunks).length === 0) delete checkpoint.extractionChunks;
+          }
+          delete checkpoint.systemOutcomes;
+          this.db.prepare(`
+            UPDATE jobs
+            SET status = CASE WHEN ? = 0 THEN 'cancelled' ELSE status END,
+                lease_owner = NULL, lease_expires_at = NULL,
+                checkpoint_json = ?, updated_at = ?
+            WHERE id = ? AND status != 'running'
+          `).run(
+            remainingDocumentIds.length,
+            JSON.stringify(checkpoint),
+            changedAt,
+            job.id
+          );
+        }
+
         if (document?.person_id) {
           this.db.prepare(`
             INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)
@@ -2281,6 +2561,7 @@ export class WorkspaceStore {
           `).run(document.person_id);
           this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`).run(document.person_id);
           this.invalidateSystemSnapshots(document.person_id, affectedSystemIds);
+          this.invalidateMemberAssessmentSnapshots(document.person_id);
         }
       }
       this.db.prepare(`
@@ -2355,8 +2636,20 @@ export class WorkspaceStore {
       const stillBlockedForLegacyDocument = checkpoint.documentIds?.some((id) => this.hasOpenBlockingReview(id)) ?? false;
       const stillBlocked = stillBlockedForJob || stillBlockedForLegacyDocument;
       if (stillBlocked) continue;
-      const resumeExtraction = !finishWithoutResume && (job.stage === 'extract' || job.stage === 'review_facts');
-      const status = resumeExtraction ? 'queued' : 'succeeded';
+      const pendingExtraction = checkpoint.documentIds.some((id) => {
+        const document = this.db.prepare(`
+          SELECT status,
+                 EXISTS(SELECT 1 FROM document_commits dc WHERE dc.document_id = documents.id) AS committed,
+                 excluded_from_analysis
+          FROM documents WHERE id = ?
+        `).get(id) as { status: string; committed: number; excluded_from_analysis: number } | undefined;
+        return document?.status === 'queued' && document.committed === 0 && document.excluded_from_analysis === 0;
+      });
+      const resumeExtraction = !finishWithoutResume
+        && (pendingExtraction || job.stage === 'extract' || job.stage === 'review_facts');
+      const resumeAnalysis = !finishWithoutResume && !resumeExtraction;
+      const status = resumeExtraction || resumeAnalysis ? 'queued' : 'succeeded';
+      if (resumeAnalysis) delete checkpoint.systemOutcomes;
       this.db.prepare(`
         UPDATE jobs
         SET status = ?, stage = ?, lease_owner = NULL, lease_expires_at = NULL,
@@ -2364,7 +2657,7 @@ export class WorkspaceStore {
         WHERE id = ?
       `).run(
         status,
-        resumeExtraction ? 'extract' : job.stage,
+        resumeExtraction ? 'extract' : resumeAnalysis ? 'analyze' : job.stage,
         JSON.stringify({
           ...checkpoint,
           // 保留原批次范围。JobRunner 会跳过已经提交或明确排除的资料，
@@ -2895,6 +3188,13 @@ export class WorkspaceStore {
         this.db.prepare(`UPDATE jobs SET status = 'waiting_user', updated_at = ? WHERE id = ?`).run(this.now().toISOString(), row.id);
         return null;
       }
+      if (this.checkpointDocumentPersonMismatches(checkpoint.documentIds, row.person_id).length > 0) {
+        // 归属变更后，旧任务与旧授权不得再读取该资料；同时清理可能含原文的缓存。
+        this.scrubExtractionChunksFromJob(row.id);
+        this.db.prepare(`UPDATE jobs SET status = 'waiting_user', updated_at = ? WHERE id = ?`)
+          .run(this.now().toISOString(), row.id);
+        return null;
+      }
       const consent = this.db.prepare(`SELECT id, account_fingerprint, scope_json FROM consents WHERE id = ? AND revoked_at IS NULL`).get(checkpoint.consentId) as { id: string; account_fingerprint: string | null; scope_json: string } | undefined;
       const scope = consent ? JSON.parse(consent.scope_json) as {
         type?: string;
@@ -3005,7 +3305,7 @@ export class WorkspaceStore {
 
   assertJobExecutionActive(guard: JobExecutionGuard, documentId?: string): void {
     const row = this.db.prepare(`
-      SELECT j.status, j.checkpoint_json, a.status AS attempt_status,
+      SELECT j.status, j.person_id, j.checkpoint_json, a.status AS attempt_status,
              c.revoked_at, c.account_fingerprint
       FROM jobs j
       JOIN job_attempts a ON a.job_id = j.id AND a.id = ?
@@ -3013,6 +3313,7 @@ export class WorkspaceStore {
       WHERE j.id = ?
     `).get(guard.attemptId, guard.consentId, guard.jobId) as {
       status: string;
+      person_id: string | null;
       checkpoint_json: string | null;
       attempt_status: string;
       revoked_at: string | null;
@@ -3028,6 +3329,10 @@ export class WorkspaceStore {
     if (checkpoint.consentId !== guard.consentId || row.revoked_at !== null) throw new Error('CONSENT_REVOKED');
     if (row.account_fingerprint !== guard.accountFingerprint) throw new Error('ACCOUNT_FINGERPRINT_MISMATCH');
     if (documentId && !checkpoint.documentIds?.includes(documentId)) throw new Error('DOCUMENT_OUTSIDE_CONSENT_SCOPE');
+    if (!row.person_id || !checkpoint.documentIds?.length
+      || this.checkpointDocumentPersonMismatches(checkpoint.documentIds, row.person_id).length > 0) {
+      throw new Error('DOCUMENT_PERSON_SCOPE_MISMATCH');
+    }
   }
 
   /** 仅当前有效执行可读取；签名绑定原文件、证据片段与规则版本，授权 ID 改变则不可复用。 */
@@ -3738,6 +4043,10 @@ export class WorkspaceStore {
              e.clinical_date, e.date_precision
       FROM report_records r
       JOIN report_source_links l ON l.report_id = r.id
+      JOIN documents d
+        ON d.id = l.document_id
+       AND d.person_id = r.person_id
+       AND d.excluded_from_analysis = 0
       LEFT JOIN health_events_v2 e ON e.id = r.event_id
       LEFT JOIN report_metadata_revisions mr
         ON mr.report_id = r.id AND mr.revision = r.metadata_revision
@@ -4548,6 +4857,12 @@ export class WorkspaceStore {
   }
 
   publishFacts(input: PublishFactsInput): { publicationId: string; revision: number; idempotent: boolean } {
+    const currentDocumentOwner = this.db.prepare(`
+      SELECT person_id FROM documents WHERE id = ?
+    `).get(input.documentId) as { person_id: string | null } | undefined;
+    if (!currentDocumentOwner || currentDocumentOwner.person_id !== input.personId) {
+      throw new Error('DOCUMENT_PERSON_SCOPE_MISMATCH');
+    }
     const correctionIssue = input.resolvedReviewIssueId
       ? this.db.prepare(`
           SELECT id, job_id, kind, resolution_status, payload_json
@@ -4602,6 +4917,10 @@ export class WorkspaceStore {
 
     const transaction = this.db.transaction(() => {
       if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard, input.documentId);
+      const ownedDocument = this.db.prepare(`
+        SELECT 1 FROM documents WHERE id = ? AND person_id = ? LIMIT 1
+      `).get(input.documentId, input.personId);
+      if (!ownedDocument) throw new Error('DOCUMENT_PERSON_SCOPE_MISMATCH');
       const committed = this.db.prepare(`
         SELECT publication_id, revision FROM document_commits
         WHERE document_id = ? OR commit_key = ?

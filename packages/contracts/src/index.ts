@@ -940,6 +940,12 @@ export const resolveReviewInputSchema = z.discriminatedUnion('action', [
     personId: idSchema
   }).strict(),
   z.object({
+    action: z.literal('reassign_person'),
+    issueId: idSchema,
+    documentId: idSchema,
+    personId: idSchema
+  }).strict(),
+  z.object({
     action: z.literal('retry_review'),
     issueId: idSchema,
     documentId: idSchema
