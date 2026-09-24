@@ -43,10 +43,10 @@ function instructionPart(prompt: string): string {
 
 describe('pipeline prompts', () => {
   it('版本号与阶段签名保持一致', () => {
-    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v5');
+    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v6');
     expect(DERIVED_PROMPT_VERSION).toBe('derived-v4');
     expect(promptMetaForStage('extract')).toEqual({
-      promptVersion: 'extract-v5',
+      promptVersion: 'extract-v6',
       rulesVersion: ACCEPTANCE_RULES_VERSION
     });
     expect(promptMetaForStage('analyze')).toEqual({
@@ -59,6 +59,8 @@ describe('pipeline prompts', () => {
     const prompt = buildP01Prompt({ displayName: '合成成员' }, { spans: [{ quote: '此图仅用于软件测试' }] });
     expect(prompt).toContain('软件测试声明等非临床说明不是个人健康事实');
     expect(prompt).toContain('不要为了覆盖而把它们建成“报告说明”候选');
+    expect(prompt).toContain('“报告者、报告人、审核人、检验者、申请医生、签发人”等工作人员姓名绝不是 subject');
+    expect(prompt).toContain('subject.evidence.quote 摘录患者身份字段的标签和姓名');
   });
 
   it('V3 综合明确使用授权全历史，药物讨论标签不能豁免直接指令', () => {

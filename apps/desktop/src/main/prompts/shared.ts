@@ -13,7 +13,7 @@ import { ASSESSMENT_VALIDATION_RULES_VERSION } from '../assessment-validation.js
  */
 
 /** 事实提取/复核提示词版本，进入任务 inputSignature。 */
-export const EXTRACTION_PROMPT_VERSION = 'extract-v5';
+export const EXTRACTION_PROMPT_VERSION = 'extract-v6';
 
 /** 派生分析/安全复核提示词版本，写入 derived_snapshots.prompt_version。 */
 export const DERIVED_PROMPT_VERSION = 'derived-v4';

@@ -699,6 +699,29 @@ function normalizedPersonName(value: string): string {
   return value.normalize('NFKC').replace(/[\s·•・·]/g, '').toLocaleLowerCase('zh-CN');
 }
 
+function subjectEvidenceNamesOnlyReportStaff(
+  result: ExtractionResult,
+  bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
+): boolean {
+  const name = result.subject.reportedName?.normalize('NFKC').replace(/\s+/g, '');
+  if (!name || result.subject.evidence.length === 0) return false;
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patientLabel = new RegExp(`(?:患者姓名|病人姓名|受检者姓名|受检人姓名|就诊人姓名|体检人姓名|患者|病人|受检者|受检人|就诊人|体检人)[:：]?${escapedName}`);
+  const genericNameLabel = new RegExp(`(?:^|[,，;；|])姓名[:：]?${escapedName}`);
+  const staffLabel = new RegExp(`(?:报告者|报告人|报告医生|报告医师|审核人|审核者|检验者|检验人|申请医生|签发人|录入人|操作者)(?:姓名)?[:：]?${escapedName}`);
+  const spans = new Map(bundle.manifest.spans.map((span) => [span.id, span]));
+  return result.subject.evidence.every((reference) => {
+    const span = spans.get(reference.sourceSpanId);
+    if (!span || !reference.quote) return false;
+    const quote = reference.quote?.normalize('NFKC').replace(/\s+/g, '') ?? '';
+    if (span.quote) {
+      const source = span.quote.normalize('NFKC').replace(/\s+/g, '');
+      if (!source.includes(quote) || patientLabel.test(source) || genericNameLabel.test(source)) return false;
+    }
+    return staffLabel.test(quote) && !patientLabel.test(quote) && !genericNameLabel.test(quote);
+  });
+}
+
 function subjectEvidenceIsValid(
   result: ExtractionResult,
   bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
@@ -730,6 +753,8 @@ function subjectIsConsistent(
   const trustedAssignment = bundle.personAssignmentBasis === 'user_selected'
     || bundle.personAssignmentBasis === 'folder_binding'
     || bundle.personAssignmentBasis === 'identity_confirmed';
+  // 报告者、审核人等工作人员姓名不是受检者身份；用户已选成员时不据此产生身份冲突。
+  if (subjectEvidenceNamesOnlyReportStaff(result, bundle)) return trustedAssignment;
   // 没有姓名或只是模糊读取时，可以沿用用户明确归属。
   // 但模型已在图像来源上给出明确姓名时，即使没有本地文字层，
   // 也必须比较并把异名交给用户核对，不能把“无法文字验证”当成“没有冲突”。
@@ -742,6 +767,7 @@ function conflictingReportedName(
   result: ExtractionResult,
   bundle: ReturnType<WorkspaceStore['getDocumentExtractionBundle']>
 ): string | null {
+  if (subjectEvidenceNamesOnlyReportStaff(result, bundle)) return null;
   if ((!subjectEvidenceIsValid(result, bundle) && !subjectEvidenceReferencesKnownSource(result, bundle)) || !result.subject.reportedName) return null;
   const expectedName = bundle.confirmedReportedName ?? bundle.personDisplayName;
   return normalizedPersonName(result.subject.reportedName) === normalizedPersonName(expectedName)
@@ -1026,7 +1052,9 @@ export class DocumentExtractionPipeline {
       unresolved.push(...outOfChunk.map((candidate) => ({ candidate, reasons: ['EVIDENCE_OUTSIDE_CHUNK'] })));
       uncoveredSpanIds.push(...missing);
       coveredSourceSpanIds.push(...extracted.coveredSourceSpanIds.filter((id) => expected.has(id)));
-      subjects.push(extracted.subject);
+      subjects.push(subjectEvidenceNamesOnlyReportStaff(extracted, bundle)
+        ? { reportedName: null, evidence: [], confidence: 'absent' }
+        : extracted.subject);
       metadata.push(reportMetadataEvidence(extracted.reportMetadata).every((ref) => expected.has(ref.sourceSpanId))
         ? extracted.reportMetadata : null);
       return true;

@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
+import { createCanvas } from '@napi-rs/canvas';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
 import { createSyntheticTwoPageScannedPdf } from '../../../../packages/evaluation/src/scanned-pdf-fixture.js';
@@ -448,6 +449,50 @@ describe('DocumentExtractionPipeline', () => {
       kind: 'person_conflict', reportedName: '测试姓名乙'
     });
     expect(service.store.getFactRevision(personId)).toBe(0);
+    service.close();
+  });
+
+  it('图片仅写报告者姓名时不触发受检者身份冲突', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-image-reporter-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '图片报告者工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const canvas = createCanvas(900, 260);
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, 900, 260);
+    context.fillStyle = '#222222';
+    context.font = '30px sans-serif';
+    context.fillText('报告者：测试报告者/870376', 30, 70);
+    context.fillText('低密度脂蛋白胆固醇 4.2 mmol/L', 30, 140);
+    const receipt = await service.importFiles([{
+      path: '/tmp/图片报告者.png', bytes: canvas.encodeSync('png')
+    }], personId);
+    expect(receipt.rejected).toEqual([]);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
+    const output: ExtractionResult = {
+      schemaVersion: 1, documentId,
+      subject: {
+        reportedName: '测试报告者', confidence: 'explicit',
+        evidence: [{ sourceSpanId: spanId, quote: '报告者：测试报告者/870376' }]
+      },
+      coveredSourceSpanIds: [spanId],
+      candidates: [{
+        localKey: 'ldl-image-reporter', originalName: '低密度脂蛋白胆固醇', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: null,
+        evidence: [{ sourceSpanId: spanId, quote: null }], issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'reporter-image-thread', turnId: 'reporter-image-turn', output })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(service.store.getFactRevision(personId)).toBe(1);
     service.close();
   });
 
@@ -1181,6 +1226,45 @@ describe('DocumentExtractionPipeline', () => {
     await expect(pipeline.process(documentId)).resolves.toMatchObject({
       status: 'published', candidateCount: 1, revision: 1
     });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    service.close();
+  });
+
+  it('报告者是工作人员时不把其姓名当作受检者冲突', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-reporter-role-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '报告者角色工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/报告者角色.txt',
+      bytes: Buffer.from('报告者：测试报告者/870376\n2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
+    const reporterSpan = spans.find((span) => span.quote?.includes('报告者'))!;
+    const resultSpan = spans.find((span) => span.quote?.includes('低密度脂蛋白'))!;
+    const output: ExtractionResult = {
+      schemaVersion: 1, documentId,
+      subject: {
+        reportedName: '测试报告者', confidence: 'explicit',
+        evidence: [{ sourceSpanId: reporterSpan.id, quote: '报告者：测试报告者/870376' }]
+      },
+      coveredSourceSpanIds: spans.map((span) => span.id),
+      candidates: [{
+        localKey: 'ldl-reporter', originalName: '低密度脂蛋白胆固醇', standardNameCandidate: 'LDL-C',
+        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
+        evidence: [{ sourceSpanId: resultSpan.id, quote: '2026-09-17 低密度脂蛋白胆固醇 4.2 mmol/L' }],
+        issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'reporter-thread', turnId: 'reporter-turn', output })
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     expect(service.store.getFactRevision(personId)).toBe(1);
     service.close();

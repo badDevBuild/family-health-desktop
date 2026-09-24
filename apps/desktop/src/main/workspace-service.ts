@@ -1622,7 +1622,7 @@ export class PersonalWorkspaceService {
           kind: issue.kind,
           severity: issue.severity,
           title: issue.kind === 'person_conflict'
-            ? '确认报告姓名与成员身份'
+            ? '核对识别到的姓名与成员归属'
             : partialPublishLimitation
               ? issue.candidateOptions.length > 0
                 ? `${issue.candidateOptions.length} 个项目未纳入本次结果`
@@ -1637,7 +1637,7 @@ export class PersonalWorkspaceService {
                   : `发现 ${differenceCount} 项核心事实差异`
             : issue.kind === 'derived_safety' ? '健康说明未通过安全复核' : '资料覆盖需要人工确认',
           description: issue.kind === 'person_conflict'
-            ? `报告写的是“${issue.reportedName ?? '未识别姓名'}”，当前准备归入已选成员。请确认两者是否为同一人。`
+            ? `应用把“${issue.reportedName ?? '未识别姓名'}”识别为受检者，当前准备归入已选成员。请对照原图：如果这是报告者、审核人等工作人员，可选择重新核对姓名。`
             : partialPublishLimitation
               ? '其他有可靠依据的报告事实已经保存；这部分因依据不足未纳入。未纳入只表示暂时无法可靠确认，不等于结果正常。'
             : issue.kind === 'derived_safety'

@@ -3212,6 +3212,38 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('受检者姓名误读可在原成员和原授权范围内重新提取，不预先确认错误姓名', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '测试成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('报告者：测试报告者；检验结果 4.2 mmol/L'),
+      mediaType: 'text/plain', displayName: '报告者误读.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id], accountFingerprint: 'account-fingerprint', version: 1
+    });
+    store.createWaitingAuthBatch({
+      cutoff: '2026-09-24T00:00:00Z',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'reporter-recheck' }],
+      initialStatus: 'queued', consentId
+    });
+    const job = store.claimNextQueuedJob('test-runner', 'account-fingerprint')!;
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId, kind: 'person_conflict', severity: 'blocking',
+      evidenceRefs: [], reportedName: '测试报告者', reasonCodes: ['PERSON_IDENTITY_NOT_CONFIRMED']
+    });
+    store.finishJob(job.id, 'waiting_user');
+
+    store.retryExtractionReview({ issueId, documentId: document.documentId });
+
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
+    expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract' });
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    store.close();
+  });
+
   it('旧流程留下的纯异常标记冲突可以重新交给模型裁决', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '测试成员' });

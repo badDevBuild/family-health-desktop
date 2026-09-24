@@ -2153,7 +2153,8 @@ export class WorkspaceStore {
         resolution_status: string;
         payload_json: string | null;
       } | undefined;
-      if (!issue || issue.resolution_status !== 'open' || issue.kind !== 'field_conflict') {
+      if (!issue || issue.resolution_status !== 'open'
+        || (issue.kind !== 'field_conflict' && issue.kind !== 'person_conflict')) {
         throw new Error('REVIEW_ISSUE_NOT_OPEN');
       }
       const payload = issue.payload_json
@@ -2169,8 +2170,10 @@ export class WorkspaceStore {
       const evidenceIssueOnly = candidateDiffs.length > 0
         && candidateDiffs.every((difference) => difference.fields.length === 1 && difference.fields[0] === 'issues');
       const legacyComparisonIssue = payload.reasonCodes?.includes('INDEPENDENT_REVIEW_MISMATCH') === true;
-      if (!payload.candidateOptions?.length
-        || (candidateDiffs.length > 0 && !abnormalFlagOnly && !evidenceIssueOnly && !legacyComparisonIssue)) {
+      const identityMisreadReview = issue.kind === 'person_conflict'
+        && payload.reasonCodes?.includes('PERSON_IDENTITY_NOT_CONFIRMED') === true;
+      if (!identityMisreadReview && (!payload.candidateOptions?.length
+        || (candidateDiffs.length > 0 && !abnormalFlagOnly && !evidenceIssueOnly && !legacyComparisonIssue))) {
         throw new Error('REVIEW_ACTION_INVALID');
       }
       const document = this.db.prepare(`SELECT status FROM documents WHERE id = ?`).get(input.documentId) as { status: string } | undefined;

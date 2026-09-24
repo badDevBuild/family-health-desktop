@@ -392,6 +392,32 @@ describe('App member display editing', () => {
     expect(await screen.findByText('身份关系已确认，任务将从事实提取重新核对并继续。')).toBeTruthy();
   });
 
+  it('报告者被误认成受检者时可以重新识别，不要求确认同一人', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.reviews = [{
+      id: 'reporter-review', personId: 'personal-person-1', documentId: 'reporter-document',
+      kind: 'person_conflict', severity: 'blocking', title: '核对识别到的姓名与成员归属',
+      description: '应用识别到了报告者的姓名。', evidenceRefs: ['reporter-span'],
+      candidateOptions: [], candidateDiffs: [], reportedName: '测试报告者',
+      reasonCodes: ['PERSON_IDENTITY_NOT_CONFIRMED'], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'retry_review' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /核对识别到的姓名与成员归属/ }));
+    expect(screen.getByText('测试报告者')).toBeTruthy();
+    expect((screen.getByRole('button', { name: '请选择处理方式' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /姓名识别有误，重新核对/ }));
+    expect(screen.getByText(/不会确认两个人是同一人/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '重新核对姓名' }));
+
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'retry_review', issueId: 'reporter-review', documentId: 'reporter-document'
+    }));
+  });
+
   it('身份不一致时不默认误选第一位成员，并说明改归后需要重新授权', async () => {
     const snapshot = createPersonalSnapshot();
     snapshot.persons[0]!.displayName = '书书';

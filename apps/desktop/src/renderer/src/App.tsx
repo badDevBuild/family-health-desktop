@@ -934,7 +934,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const [personId, setPersonId] = useState(snapshot.persons[0]?.id ?? '');
   const [busy, setBusy] = useState(false);
   const [candidates, setCandidates] = useState(review.candidateOptions);
-  const [identityResolution, setIdentityResolution] = useState<'confirm_identity' | 'reassign_person' | 'archive_only' | null>(null);
+  const [identityResolution, setIdentityResolution] = useState<'retry_review' | 'confirm_identity' | 'reassign_person' | 'archive_only' | null>(null);
   const [archiveConfirmed, setArchiveConfirmed] = useState(false);
   const [excludedLocalKeys, setExcludedLocalKeys] = useState<Set<string>>(() => new Set(
     review.candidateDiffs.filter((difference) => difference.fields.includes('issues')).map((difference) => difference.localKey)
@@ -979,7 +979,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const canSubmit = !busy
     && (!isAssignment || Boolean(personId))
     && (!isIdentityConfirmation || (Boolean(targetPerson)
-      && (identityResolution === 'confirm_identity'
+      && (identityResolution === 'retry_review' || identityResolution === 'confirm_identity'
         || (identityResolution === 'reassign_person' && Boolean(reassignPersonId))
         || (identityResolution === 'archive_only' && archiveConfirmed))))
     && (!isFieldConflict || isLegacyFieldReview || canRetryModelReview || canCorrect);
@@ -990,7 +990,9 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
       const resolution: ResolveReviewInput = isAssignment
         ? { action: 'assign_person', documentId: review.documentId, personId }
         : isIdentityConfirmation && targetPerson
-          ? identityResolution === 'reassign_person'
+          ? identityResolution === 'retry_review'
+            ? { action: 'retry_review', issueId: review.id, documentId: review.documentId }
+            : identityResolution === 'reassign_person'
             ? { action: 'reassign_person', issueId: review.id, documentId: review.documentId, personId: reassignPersonId }
             : identityResolution === 'archive_only'
               ? { action: 'archive_only', issueId: review.id, documentId: review.documentId }
@@ -1026,10 +1028,13 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
           ) : isIdentityConfirmation && targetPerson ? (
             <>
               <dl className="identity-confirmation">
-                <div><dt>报告姓名</dt><dd>{review.reportedName}</dd></div>
+                <div><dt>识别到的姓名</dt><dd>{review.reportedName}</dd></div>
                 <div><dt>当前归属</dt><dd>{targetPerson.displayName}{targetPerson.relation ? ` · ${targetPerson.relation}` : ''}</dd></div>
               </dl>
               <div className="identity-resolution-options" role="group" aria-label="选择这份报告的处理方式">
+                <button type="button" className={`identity-resolution-option${identityResolution === 'retry_review' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'retry_review'} onClick={() => { setIdentityResolution('retry_review'); setArchiveConfirmed(false); }}>
+                  <RefreshCw size={21} /><span><strong>姓名识别有误，重新核对</strong><small>如果图片写的是报告者、审核人或检验者，而不是受检者，让应用按身份字段重新识别。</small></span>{identityResolution === 'retry_review' && <Check size={20} />}
+                </button>
                 <button type="button" className={`identity-resolution-option${identityResolution === 'confirm_identity' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'confirm_identity'} onClick={() => { setIdentityResolution('confirm_identity'); setArchiveConfirmed(false); }}>
                   <ShieldCheck size={21} /><span><strong>是同一人</strong><small>报告姓名与当前成员指的是同一个人。系统会重新核对后再保存事实。</small></span>{identityResolution === 'confirm_identity' && <Check size={20} />}
                 </button>
@@ -1040,6 +1045,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
                   <Archive size={21} /><span><strong>不纳入任何成员</strong><small>保留本机原始资料，但阻止后续入库和成员分析。</small></span>{identityResolution === 'archive_only' && <Check size={20} />}
                 </button>
               </div>
+              {identityResolution === 'retry_review' && <div className="info-callout compact"><RefreshCw size={18} /><div><strong>重新识别报告中的人物角色</strong><p>这不会确认两个人是同一人。应用会重新读取原始报告；如果报告确实写了另一位受检者，仍会暂停等待核对。</p></div></div>}
               {identityResolution === 'confirm_identity' && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。</p></div></div>}
               {identityResolution === 'reassign_person' && (otherPeople.length > 0 ? <>
                 <label className="identity-resolution-select">选择另一位成员
@@ -1092,7 +1098,8 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
           <button className="primary-button" disabled={!canSubmit} onClick={() => void submitResolution()}>
             {busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />}
             {isAssignment ? '确认归属' : isIdentityConfirmation
-              ? identityResolution === 'confirm_identity' ? '确认是同一人'
+              ? identityResolution === 'retry_review' ? '重新核对姓名'
+                : identityResolution === 'confirm_identity' ? '确认是同一人'
                 : identityResolution === 'reassign_person' ? '确认改归成员'
                   : identityResolution === 'archive_only' ? '确认不纳入'
                     : '请选择处理方式'
@@ -1616,8 +1623,11 @@ export default function App() {
     setToast(input.action === 'assign_person'
       ? '成员归属已确认，资料已进入待处理队列。'
       : input.action === 'confirm_identity' ? '身份关系已确认，任务将从事实提取重新核对并继续。'
+      : input.action === 'retry_review'
+        ? snapshot?.reviews.some((issue) => issue.id === input.issueId && issue.kind === 'person_conflict')
+          ? '正在重新识别报告中的人物角色；若仍有受检者身份冲突，会再次提示你。'
+          : '报告正在按新规则重新核对；只有仍无法判断时才会再次询问你。'
       : input.action === 'reassign_person' ? '已改归到另一位成员；请针对新成员重新授权后，再开始处理。'
-      : input.action === 'retry_review' ? '报告正在按新规则重新核对；只有仍无法判断时才会再次询问你。'
       : input.action === 'archive_only' ? '资料已归档，不会进入任何成员档案或后续分析；已有的模型处理审计仍会保留。'
       : input.action === 'accept_correction' ? '修正后的事实已保存，并保留原始证据链。'
       : '报告事实已保留，本次未通过复核的说明不会发布。');

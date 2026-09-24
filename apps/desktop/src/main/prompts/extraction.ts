@@ -11,7 +11,7 @@ const EXTRACTION_HARD_RULES: string[] = [
 
 const EXTRACTION_FIELD_GUIDE: string[] = [
   'schemaVersion 固定为 1；documentId 必须与 SOURCE_PACKAGE.documentId 完全一致。',
-  'subject：报告明示姓名时 confidence=explicit，reportedName 逐字摘录并给出 evidence；找不到姓名时 reportedName=null、confidence=absent、evidence=[]；看见疑似姓名但无法确认时 confidence=uncertain。不得根据目标成员显示名反推。',
+  'subject 只指患者/受检者：仅从“姓名、患者、受检者、就诊人”等患者身份字段逐字摘录。报告者、报告人、审核人、检验者、申请医生、签发人等工作人员姓名不能作为 subject。图片没有文字层时，subject.evidence.quote 仍需摘录患者身份标签和姓名；只有工作人员姓名时 reportedName=null、confidence=absent、evidence=[]；疑似患者姓名但无法确认时 confidence=uncertain。不得根据目标成员显示名反推。',
   'localKey：本块内稳定可读的短键，例如 ldl-c-2023、ldl-c-2024；不要用随机 UUID。同一指标若有多个明确日期结果列，必须每列各建一个候选并使用不同 localKey。',
   'evidence.sourceRole：一条观测的主要依据标 primary。只有检查编号/样本编号或报告结构明确证明摘要页与明细页是同一次真实检测时，才合成一个候选，把其他来源标 duplicate_source，并在 duplicateBasis 填 report_structure、exam_item_id 或 sample_id。同日、同名、同数值或同一姓名都不足以判定重复；可疑重复必须保留为两个独立候选。',
   'originalName 用报告原文；standardNameCandidate 填通用中文或常见缩写（如 LDL-C），不确定则 null。',
@@ -30,7 +30,7 @@ const EXTRACTION_EXAMPLES: string[] = [
   '重复来源：报告摘要和检验明细用同一检查编号展示同一次 LDL-C 4.20。输出一个候选，主明细依据标 primary，摘要依据标 duplicate_source，duplicateBasis=exam_item_id。如果只是同日同值而没有结构或编号证据，仍输出两个候选。',
   '日期精度：报告只写“2024 年”时，reportMetadata.times.value=2024、precision=year；不得填写 2024-01-01。签发日和采样日同时出现时保留两条不同 role。',
   '提示列：LDL-C 4.20 mmol/L，参考 0-3.37，提示列写 H 或偏高。reportedAbnormalFlag=偏高。',
-  'subject：页眉写“姓名：张三”，subject.reportedName=张三，confidence=explicit，evidence.quote 含“姓名：张三”。'
+  'subject：页眉写“姓名：张三”，subject.reportedName=张三，confidence=explicit，evidence.quote 含“姓名：张三”。若只写“报告者：李四”，李四是工作人员，subject.reportedName=null、confidence=absent。'
 ];
 
 function extractionSections(input: {
