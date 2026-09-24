@@ -823,17 +823,25 @@ function isReadOnlyResultLimitation(review: ReviewIssue): boolean {
     && review.candidateDiffs.length === 0;
 }
 
-function ResultLimitationNotice({ review, count, onEvidence, onDismiss }: {
-  review: ReviewIssue;
-  count: number;
-  onEvidence(): void;
+function ResultLimitationNotice({ reviews, onEvidence, onDismiss }: {
+  reviews: ReviewIssue[];
+  onEvidence(review: ReviewIssue): void;
   onDismiss(): void;
 }) {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const reviewIndex = Math.min(activeIndex, reviews.length - 1);
+  const review = reviews[reviewIndex]!;
+  const documentCount = new Set(reviews.map((item) => item.documentId)).size;
+  const omittedCount = new Set(reviews.flatMap((item) => item.candidateOptions.map((candidate) => `${item.documentId}:${candidate.localKey}`))).size;
+  const title = reviews.length > 1
+    ? `${documentCount} 份资料${omittedCount > 0 ? `共 ${omittedCount} 个项目` : '有部分项目'}未纳入本次结果`
+    : review.title;
   return <section className="info-callout compact assessment-refresh-callout" role="status">
     <ShieldCheck size={20} />
-    <div><strong>{review.title}</strong><p>{review.description}{count > 1 ? ` 当前共有 ${count} 份结果边界说明。` : ''}</p></div>
+    <div><strong>{title}</strong><p>{review.description}{reviews.length > 1 ? ` 当前查看第 ${reviewIndex + 1}/${reviews.length} 份资料的依据。` : ''}</p></div>
     <div className="button-row">
-      <button className="text-button" onClick={onEvidence}><FileCheck2 size={17} /> 查看依据</button>
+      <button className="text-button" onClick={() => onEvidence(review)}><FileCheck2 size={17} /> 查看依据</button>
+      {reviews.length > 1 && <button className="text-button" onClick={() => setActiveIndex((reviewIndex + 1) % reviews.length)}>下一份</button>}
       <button className="icon-button" onClick={onDismiss} aria-label="关闭结果限制提示"><X size={18} /></button>
     </div>
   </section>;
@@ -1583,7 +1591,6 @@ export default function App() {
   const resultLimitations = snapshot.reviews.filter((review) => review.resolutionStatus === 'open'
     && isReadOnlyResultLimitation(review)
     && !dismissedResultLimitationIds.has(review.id));
-  const resultLimitation = resultLimitations[0];
 
   async function handleOpenEvidence(next: Evidence) {
     if (!evidence && document.activeElement instanceof HTMLElement) evidenceReturnFocusRef.current = document.activeElement;
@@ -2061,16 +2068,15 @@ export default function App() {
         <Topbar snapshot={snapshot} onLogin={() => void handleLogin()} onProcessing={() => setPage('processing')} />
         <main className="content-area">
           {openReview && page !== 'settings' && <ReviewBanner review={openReview} openCount={openReviews.length} onOpen={() => setReviewDialog(openReview)} />}
-          {resultLimitation && page !== 'settings' && <ResultLimitationNotice
-            review={resultLimitation}
-            count={resultLimitations.length}
-            onEvidence={() => void handleOpenEvidence({
-              title: resultLimitation.title,
+          {resultLimitations.length > 0 && page !== 'settings' && <ResultLimitationNotice
+            reviews={resultLimitations}
+            onEvidence={(review) => void handleOpenEvidence({
+              title: review.title,
               label: '本机导入资料',
               quote: '查看这部分未纳入内容的原始依据。',
-              meta: resultLimitation.description,
-              sourceSpanId: resultLimitation.evidenceRefs[0] ?? null,
-              documentId: resultLimitation.evidenceRefs.length === 0 ? resultLimitation.documentId : null
+              meta: review.description,
+              sourceSpanId: review.evidenceRefs[0] ?? null,
+              documentId: review.evidenceRefs.length === 0 ? review.documentId : null
             })}
             onDismiss={() => setDismissedResultLimitationIds((current) => new Set([
               ...current,

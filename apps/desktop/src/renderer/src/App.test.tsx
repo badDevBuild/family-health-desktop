@@ -584,6 +584,53 @@ describe('App member display editing', () => {
     expect(screen.queryByText('1 个项目未纳入本次结果')).toBeNull();
   });
 
+  it('多份结果边界汇总去重后的项目数，并能逐份查看依据', async () => {
+    const snapshot = createPersonalSnapshot();
+    const candidate = {
+      localKey: 'same-item', originalName: '虚构项目', standardNameCandidate: '虚构项目',
+      value: { kind: 'numeric' as const, rawText: '1', decimal: '1', comparator: 'eq' as const },
+      unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-24',
+      evidence: [{ sourceSpanId: 'first-span', quote: '虚构项目 1' }], issues: []
+    };
+    snapshot.reviews = [
+      {
+        id: 'first-limitation', personId: 'personal-person-1', documentId: 'first-document',
+        kind: 'field_conflict', severity: 'warning', title: '2 个项目未纳入本次结果',
+        description: '第一份资料有部分项目依据不足。', evidenceRefs: ['first-span'],
+        candidateOptions: [candidate, candidate], candidateDiffs: [], reportedName: null,
+        reasonCodes: ['evidence_mismatch'], resolutionStatus: 'open'
+      },
+      {
+        id: 'second-limitation', personId: 'personal-person-1', documentId: 'second-document',
+        kind: 'field_conflict', severity: 'warning', title: '1 个项目未纳入本次结果',
+        description: '第二份资料有部分项目依据不足。', evidenceRefs: ['second-span'],
+        candidateOptions: [{ ...candidate, evidence: [{ sourceSpanId: 'second-span', quote: '虚构项目 1' }] }],
+        candidateDiffs: [], reportedName: null, reasonCodes: ['evidence_mismatch'], resolutionStatus: 'open'
+      }
+    ];
+    const getEvidence = vi.fn(async () => ({
+      ok: true as const,
+      data: {
+        sourceSpanId: 'first-span', documentId: 'first-document', displayName: '虚构资料.txt',
+        mediaType: 'text/plain', locator: '第 1 行', quote: '虚构项目 1',
+        readability: 'clear' as const, conversionView: false, previewImageDataUrl: null
+      }
+    }));
+    installBridge(snapshot, { getEvidence });
+    render(<App />);
+
+    expect(await screen.findByText('2 份资料共 2 个项目未纳入本次结果')).toBeTruthy();
+    expect(screen.getByText(/当前查看第 1\/2 份资料的依据/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '查看依据' }));
+    await waitFor(() => expect(getEvidence).toHaveBeenCalledWith({ sourceSpanId: 'first-span' }));
+    fireEvent.click(screen.getByRole('button', { name: '关闭证据侧栏' }));
+    fireEvent.click(screen.getByRole('button', { name: '下一份' }));
+    expect(screen.getByText(/当前查看第 2\/2 份资料的依据/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '查看依据' }));
+    await waitFor(() => expect(getEvidence).toHaveBeenCalledWith({ sourceSpanId: 'second-span' }));
+  });
+
   it('真正的核心冲突只展示差异项并保留滚动内容区', async () => {
     const snapshot = createPersonalSnapshot();
     const candidates = ['收缩压', '舒张压', '身高'].map((name, index) => ({
