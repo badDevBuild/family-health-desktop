@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { aiModelOptionSchema, aiReasoningEffortSchema, type AccountState, type AiModelOption, type AiPreferences } from '@contracts';
 import { spawnCodexAppServer, type CodexRpcClient } from '@codex';
 import { createHealthThreadStartParams } from './codex-thread-config.js';
+import { HEALTH_MODEL_TURN_TIMEOUT_MS } from './ai-runtime-policy.js';
 import { restoreCodexOptionalFields, toCodexOutputSchema } from './structured-output-schema.js';
 
 interface RuntimeClient extends EventEmitter {
@@ -326,7 +327,10 @@ export class CodexRuntimeManager extends EventEmitter {
       aiPreferences: input.aiPreferences,
       allowWebSearch
     }));
-    const completion = this.waitForTurn(thread.thread.id, input.timeoutMs ?? this.options.requestTimeoutMs ?? 120_000);
+    const completion = this.waitForTurn(
+      thread.thread.id,
+      input.timeoutMs ?? this.options.requestTimeoutMs ?? HEALTH_MODEL_TURN_TIMEOUT_MS
+    );
     let started: { turn: { id: string } };
     try {
       started = await this.client.request<{ turn: { id: string } }>('turn/start', {

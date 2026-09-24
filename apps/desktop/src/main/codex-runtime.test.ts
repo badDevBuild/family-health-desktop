@@ -2,12 +2,14 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { HEALTH_MODEL_TURN_TIMEOUT_MS } from './ai-runtime-policy.js';
 import { CodexRuntimeManager } from './codex-runtime.js';
 
 class FakeClient extends EventEmitter {
   requests: Array<{ method: string; params: unknown }> = [];
   authenticated = false;
+  autoCompleteTurn = true;
   turnNotifications: Array<{ method: string; params: unknown }> | null = null;
   turnCompletion = {
     threadId: 'thread-1',
@@ -30,6 +32,7 @@ class FakeClient extends EventEmitter {
     if (method === 'thread/start') return { thread: { id: 'thread-1' } } as T;
     if (method === 'turn/start') {
       queueMicrotask(() => {
+        if (!this.autoCompleteTurn) return;
         if (this.turnNotifications) {
           for (const notification of this.turnNotifications) this.emit(notification.method, notification.params);
         } else {
@@ -62,6 +65,7 @@ function setup() {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -120,6 +124,27 @@ describe('CodexRuntimeManager', () => {
         { type: 'localImage', path: '/isolated/fixture.png', detail: 'original' }
       ]
     });
+    manager.shutdown();
+  });
+
+  it('健康模型默认允许完整等待 30 分钟，到点才中断未完成轮次', async () => {
+    vi.useFakeTimers();
+    expect(HEALTH_MODEL_TURN_TIMEOUT_MS).toBe(30 * 60_000);
+    const { manager, client } = setup();
+    client.authenticated = true;
+    client.autoCompleteTurn = false;
+    await manager.start();
+    const pending = manager.runStructuredTurn({
+      prompt: '只处理纯虚构的大型整篇报告',
+      aiPreferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false }
+    });
+    const rejected = expect(pending).rejects.toThrow('CODEX_TURN_TIMEOUT');
+    await vi.advanceTimersByTimeAsync(HEALTH_MODEL_TURN_TIMEOUT_MS - 1);
+    expect(client.requests.some((request) => request.method === 'turn/interrupt')).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    expect(client.requests.some((request) => request.method === 'turn/interrupt')).toBe(true);
     manager.shutdown();
   });
 

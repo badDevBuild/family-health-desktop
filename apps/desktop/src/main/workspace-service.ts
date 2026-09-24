@@ -4,7 +4,7 @@ import type { AccountState, ActionItem, ActionStatus, AdoptMemberAssessmentActio
 import { bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
 import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, sameAdoptedActionScope, stableHash, type TrendObservationInput } from '@core';
 import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
-import { WorkspaceStore, type AcceptedObservationSummary } from '@storage';
+import { WorkspaceStore, type AcceptedObservationSummary, type OpenExtractionReviewIssue } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
 import { buildSourceUrgentNotices } from './source-urgent-notice.js';
@@ -108,6 +108,18 @@ function formatLabel(mediaType: string): string {
     'text/plain': '纯文本'
   };
   return labels[mediaType] ?? mediaType;
+}
+
+function isReadOnlyPartialPublishIssue(
+  issue: OpenExtractionReviewIssue,
+  documentStatus: 'queued' | 'needs_review' | 'completed' | 'blocked' | 'ignored' | undefined,
+  committed: boolean
+): boolean {
+  return issue.severity === 'warning'
+    && (issue.kind === 'field_conflict' || issue.kind === 'coverage_gap')
+    && issue.candidateDiffs.length === 0
+    && documentStatus === 'completed'
+    && committed;
 }
 
 function normalizeAbnormalFlag(value: string | null) {
@@ -1582,10 +1594,17 @@ export class PersonalWorkspaceService {
     const extractionIssues = this.store.listOpenExtractionReviewIssues()
       .filter((issue) => issue.personId === null || activePersonIds.has(issue.personId));
     const extractionDocumentIds = new Set(extractionIssues.map((issue) => issue.documentId));
+    const importedById = new Map(imported.map((document) => [document.id, document]));
     const reviews = [
       ...assignmentReviews.filter((issue) => !extractionDocumentIds.has(issue.documentId)),
       ...extractionIssues.map((issue) => {
-        const legacyFieldReview = issue.kind === 'field_conflict'
+        const partialPublishLimitation = isReadOnlyPartialPublishIssue(
+          issue,
+          importedById.get(issue.documentId)?.status,
+          this.store.isDocumentCommitted(issue.documentId)
+        );
+        const legacyFieldReview = issue.severity === 'blocking'
+          && issue.kind === 'field_conflict'
           && issue.candidateOptions.length > 0
           && (issue.candidateDiffs.length === 0 || issue.reasonCodes.includes('INDEPENDENT_REVIEW_MISMATCH'));
         const unverifiedIdentity = issue.reasonCodes.includes('PERSON_IDENTITY_NOT_CONFIRMED')
@@ -1604,6 +1623,10 @@ export class PersonalWorkspaceService {
           severity: issue.severity,
           title: issue.kind === 'person_conflict'
             ? '确认报告姓名与成员身份'
+            : partialPublishLimitation
+              ? issue.candidateOptions.length > 0
+                ? `${issue.candidateOptions.length} 个项目未纳入本次结果`
+                : '这份报告有部分内容未纳入本次结果'
             : legacyFieldReview ? '按新规则重新核对这份报告'
             : unverifiedIdentity ? '这份资料没有可确认的姓名'
             : issue.kind === 'field_conflict'
@@ -1615,6 +1638,8 @@ export class PersonalWorkspaceService {
             : issue.kind === 'derived_safety' ? '健康说明未通过安全复核' : '资料覆盖需要人工确认',
           description: issue.kind === 'person_conflict'
             ? `报告写的是“${issue.reportedName ?? '未识别姓名'}”，当前准备归入已选成员。请确认两者是否为同一人。`
+            : partialPublishLimitation
+              ? '其他有可靠依据的报告事实已经保存；这部分因依据不足未纳入。未纳入只表示暂时无法可靠确认，不等于结果正常。'
             : issue.kind === 'derived_safety'
             ? issue.reasonCodes.some((code) => code.startsWith('evidence_mismatch:'))
               ? '报告事实已经安全保存；这次生成的说明有内容缺少对应事实依据，因此没有发布。'
@@ -1665,7 +1690,7 @@ export class PersonalWorkspaceService {
       scheduleRevision: schedule.revision,
       queuePaused: this.store.isQueuePaused(),
       pendingInboxCount: inbox.filter((item) => !item.inProcessingCenter && ['queued', 'needs_review'].includes(item.status)).length,
-      openReviewCount: reviews.length,
+      openReviewCount: reviews.filter((review) => review.severity === 'blocking' && review.resolutionStatus === 'open').length,
       persons,
       organs: persons.flatMap((person) => organNames.map(([id, name]) => {
         const related = acceptedObservations.filter((observation) => observation.personId === person.id && observationOrgans(observation).includes(id));

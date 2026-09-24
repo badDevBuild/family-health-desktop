@@ -826,6 +826,59 @@ describe('PersonalWorkspaceService', () => {
     service.close();
   });
 
+  it('部分发布的 warning 只说明未纳入范围，不冒充需要用户确认的旧版核对', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/部分发布资料.txt',
+      bytes: Buffer.from('项目甲 1.0 mmol/L')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const candidate = {
+      localKey: 'item-a', originalName: '项目甲', standardNameCandidate: null,
+      value: { kind: 'numeric' as const, rawText: '1.0', decimal: '1.0', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+    };
+    const initialReviewId = service.store.saveExtractionReviewIssue({
+      documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: [span.id],
+      candidateOptions: [candidate],
+      candidateDiffs: [{ localKey: candidate.localKey, itemName: candidate.originalName, fields: ['value'] }],
+      reasonCodes: ['TEST_FIXTURE'],
+      documentRun: {
+        coverageComplete: true, coveredSourceSpanIds: [span.id], manifestSpanIds: [span.id], chunkCount: 1
+      }
+    });
+    service.acceptCorrectedFacts({ issueId: initialReviewId, documentId, candidates: [candidate] });
+    expect(service.store.isDocumentCommitted(documentId)).toBe(true);
+
+    const warningId = service.store.saveExtractionReviewIssue({
+      documentId, stage: 'extract', kind: 'field_conflict', severity: 'warning',
+      preserveDocumentStatus: true, evidenceRefs: [span.id], candidateOptions: [candidate],
+      reasonCodes: ['numeric_value_not_in_evidence']
+    });
+    let snapshot = service.getSnapshot(null);
+    expect(snapshot.inbox).toContainEqual(expect.objectContaining({ id: documentId, status: 'completed' }));
+    expect(snapshot.openReviewCount).toBe(0);
+    expect(snapshot.reviews.find((review) => review.id === warningId)).toMatchObject({
+      severity: 'warning',
+      title: '1 个项目未纳入本次结果',
+      description: expect.stringContaining('未纳入只表示暂时无法可靠确认，不等于结果正常')
+    });
+    expect(snapshot.reviews.find((review) => review.id === warningId)?.title).not.toContain('按新规则重新核对');
+
+    const blockingId = service.store.saveExtractionReviewIssue({
+      documentId, kind: 'field_conflict', severity: 'blocking', preserveDocumentStatus: true,
+      evidenceRefs: [span.id], candidateOptions: [candidate]
+    });
+    snapshot = service.getSnapshot(null);
+    expect(snapshot.openReviewCount).toBe(1);
+    expect(snapshot.reviews.find((review) => review.id === blockingId)?.title).toBe('按新规则重新核对这份报告');
+    service.close();
+  });
+
   it('事实冲突可选择仅归档，派生安全问题可只放弃说明', async () => {
     const service = makeService();
     const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });

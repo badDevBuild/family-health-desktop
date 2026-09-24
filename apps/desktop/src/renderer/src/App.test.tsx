@@ -428,6 +428,41 @@ describe('App member display editing', () => {
     expect(await screen.findByText('报告正在按新规则重新核对；只有仍无法判断时才会再次询问你。')).toBeTruthy();
   });
 
+  it('部分发布 warning 只展示可关闭的结果边界，不显示确认入口、红点或重试操作', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.reviews = [{
+      id: 'partial-publish-warning', personId: 'personal-person-1', documentId: 'partial-document',
+      kind: 'field_conflict', severity: 'warning', title: '1 个项目未纳入本次结果',
+      description: '其他有可靠依据的报告事实已经保存；这部分因依据不足未纳入。未纳入只表示暂时无法可靠确认，不等于结果正常。',
+      evidenceRefs: ['partial-span'], candidateOptions: [], candidateDiffs: [],
+      reportedName: null, reasonCodes: ['numeric_value_not_in_evidence'], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 0;
+    const getEvidence = vi.fn(async () => ({
+      ok: true as const,
+      data: {
+        sourceSpanId: 'partial-span', documentId: 'partial-document', displayName: '部分发布资料.txt',
+        mediaType: 'text/plain', locator: '第 1 行', quote: '项目甲 1.0 mmol/L', readability: 'clear' as const,
+        conversionView: false, previewImageDataUrl: null
+      }
+    }));
+    installBridge(snapshot, { getEvidence });
+    render(<App />);
+
+    expect(await screen.findByText('1 个项目未纳入本次结果')).toBeTruthy();
+    expect(screen.getByText(/未纳入只表示暂时无法可靠确认，不等于结果正常/)).toBeTruthy();
+    expect(screen.queryByText('需要你的确认')).toBeNull();
+    expect(screen.queryByRole('button', { name: '按新规则重新核对' })).toBeNull();
+    expect(screen.getByRole('button', { name: '查看处理通知与任务' }).querySelector('i')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '查看依据' }));
+    expect(await screen.findByLabelText('证据侧栏')).toBeTruthy();
+    expect(getEvidence).toHaveBeenCalledWith({ sourceSpanId: 'partial-span' });
+    fireEvent.click(screen.getByRole('button', { name: '关闭证据侧栏' }));
+    fireEvent.click(screen.getByRole('button', { name: '关闭结果限制提示' }));
+    expect(screen.queryByText('1 个项目未纳入本次结果')).toBeNull();
+  });
+
   it('真正的核心冲突只展示差异项并保留滚动内容区', async () => {
     const snapshot = createPersonalSnapshot();
     const candidates = ['收缩压', '舒张压', '身高'].map((name, index) => ({

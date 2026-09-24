@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult } from '@contracts';
 import { createSyntheticTwoPageScannedPdf } from '../../../../packages/evaluation/src/scanned-pdf-fixture.js';
+import { HEALTH_MODEL_TURN_TIMEOUT_MS } from './ai-runtime-policy.js';
 import { PersonalWorkspaceService as BasePersonalWorkspaceService } from './workspace-service.js';
 import { compareIndependentExtractions, DocumentExtractionPipeline, mergeIndependentlyConfirmedEvidence, partitionPdfSpans, partitionSourceSpans, scopeCandidateKeys } from './processing-pipeline.js';
 
@@ -313,7 +314,7 @@ describe('DocumentExtractionPipeline', () => {
     const pipeline = new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async (input) => {
         expect(input.imagePaths).toHaveLength(1);
-        expect(input.timeoutMs).toBe(600_000);
+        expect(input.timeoutMs).toBe(HEALTH_MODEL_TURN_TIMEOUT_MS);
         expect(existsSync(input.imagePaths![0]!)).toBe(true);
         expect(input.prompt).toContain(imageSpan.id);
         observedPaths.push(input.imagePaths![0]!);
@@ -1283,9 +1284,11 @@ describe('DocumentExtractionPipeline', () => {
       ...item, value: { kind: 'numeric' as const, rawText: '999', decimal: '999', comparator: 'eq' as const }
     })) };
     let calls = 0;
+    const observedTimeouts: Array<number | undefined> = [];
     const pipeline = new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async (input) => {
         calls += 1;
+        observedTimeouts.push(input.timeoutMs);
         if (calls === 1) return { threadId: 'p01', turnId: 'first', output: wrong };
         expect(input.prompt).toContain('REPAIR_REQUEST=');
         expect(input.prompt).toContain('numeric_value_not_in_evidence');
@@ -1294,6 +1297,7 @@ describe('DocumentExtractionPipeline', () => {
     });
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 2 });
     expect(calls).toBe(2);
+    expect(observedTimeouts).toEqual([HEALTH_MODEL_TURN_TIMEOUT_MS, HEALTH_MODEL_TURN_TIMEOUT_MS]);
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(2);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();

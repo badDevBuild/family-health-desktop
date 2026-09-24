@@ -19,6 +19,7 @@ import {
   ACCEPTANCE_RULES_VERSION,
   EXTRACTION_PROMPT_VERSION
 } from './prompts/index.js';
+import { HEALTH_MODEL_TURN_TIMEOUT_MS } from './ai-runtime-policy.js';
 import { buildP01Prompt, buildP03Prompt } from './prompts/lean.js';
 
 interface StructuredRuntime {
@@ -1137,7 +1138,7 @@ export class DocumentExtractionPipeline {
             personId: bundle.personId, displayName: bundle.personDisplayName,
             note: '显示名只用于归属核对，不能作为报告身份来源。'
           }, JSON.parse(sourcePackage)),
-          imagePaths, outputSchema, allowWebSearch: false, timeoutMs: 600_000
+          imagePaths, outputSchema, allowWebSearch: false, timeoutMs: HEALTH_MODEL_TURN_TIMEOUT_MS
         });
         lastReceipt = { threadId: generated.threadId, turnId: generated.turnId };
         let effectiveReceipt = lastReceipt;
@@ -1183,7 +1184,7 @@ export class DocumentExtractionPipeline {
           };
           const repairedTurn = await this.runTurn(documentId, 'extraction_repair', {
             prompt: buildP03Prompt(repairRequest, JSON.parse(sourcePackage), extracted),
-            imagePaths, outputSchema, allowWebSearch: false, timeoutMs: 600_000
+            imagePaths, outputSchema, allowWebSearch: false, timeoutMs: HEALTH_MODEL_TURN_TIMEOUT_MS
           });
           lastReceipt = { threadId: repairedTurn.threadId, turnId: repairedTurn.turnId };
           const repairedParsed = extractionResultSchema.safeParse(repairedTurn.output);

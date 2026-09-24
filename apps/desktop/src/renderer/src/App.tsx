@@ -176,7 +176,7 @@ function Topbar({ snapshot, onLogin, onProcessing }: { snapshot: DashboardSnapsh
       <div className="topbar__actions">
         <button className="icon-button" aria-label="查看处理通知与任务" onClick={onProcessing}>
           <Bell size={19} />
-          {(snapshot.jobs.some((job) => ['running', 'waiting_user', 'failed'].includes(job.status)) || snapshot.reviews.some((review) => review.resolutionStatus === 'open')) && <i />}
+          {(snapshot.jobs.some((job) => ['running', 'waiting_user', 'failed'].includes(job.status)) || snapshot.openReviewCount > 0) && <i />}
         </button>
         <button className={accountPresentation.className} onClick={onLogin} title={snapshot.account.displayLabel ?? undefined}>
           <span className="ai-state__dot" />
@@ -817,6 +817,28 @@ function ReviewBanner({ review, openCount, onOpen }: { review: ReviewIssue; open
   return <button className="review-banner" onClick={onOpen}><span className="review-banner__icon"><CircleHelp size={21} /></span><span><strong>{review.title}</strong><small>{review.description}{openCount > 1 ? ` 当前共有 ${openCount} 项待核对。` : ''}</small></span><StatusBadge tone="warning">{openCount > 1 ? `待确认 ${openCount} 项` : '需要你的确认'}</StatusBadge><ChevronRight size={18} /></button>;
 }
 
+function isReadOnlyResultLimitation(review: ReviewIssue): boolean {
+  return review.severity === 'warning'
+    && (review.kind === 'field_conflict' || review.kind === 'coverage_gap')
+    && review.candidateDiffs.length === 0;
+}
+
+function ResultLimitationNotice({ review, count, onEvidence, onDismiss }: {
+  review: ReviewIssue;
+  count: number;
+  onEvidence(): void;
+  onDismiss(): void;
+}) {
+  return <section className="info-callout compact assessment-refresh-callout" role="status">
+    <ShieldCheck size={20} />
+    <div><strong>{review.title}</strong><p>{review.description}{count > 1 ? ` 当前共有 ${count} 份结果边界说明。` : ''}</p></div>
+    <div className="button-row">
+      <button className="text-button" onClick={onEvidence}><FileCheck2 size={17} /> 查看依据</button>
+      <button className="icon-button" onClick={onDismiss} aria-label="关闭结果限制提示"><X size={18} /></button>
+    </div>
+  </section>;
+}
+
 const reviewDiffFieldLabels: Record<ReviewIssue['candidateDiffs'][number]['fields'][number], string> = {
   presence: '是否存在这项',
   originalName: '报告项目名',
@@ -921,7 +943,8 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
     : null;
   const isDerived = review.kind === 'derived_safety';
   const isFieldConflict = review.kind === 'field_conflict';
-  const isLegacyFieldReview = isFieldConflict
+  const isLegacyFieldReview = review.severity === 'blocking'
+    && isFieldConflict
     && candidates.length > 0
     && (review.candidateDiffs.length === 0 || review.reasonCodes.includes('INDEPENDENT_REVIEW_MISMATCH'));
   const differenceByLocalKey = new Map(review.candidateDiffs.map((difference) => [difference.localKey, difference]));
@@ -1360,6 +1383,7 @@ export default function App() {
   const [cancelJob, setCancelJob] = useState<JobSummary | null>(null);
   const [backupDialogOpen, setBackupDialogOpen] = useState(false);
   const [reviewDialog, setReviewDialog] = useState<ReviewIssue | null>(null);
+  const [dismissedResultLimitationIds, setDismissedResultLimitationIds] = useState<Set<string>>(() => new Set());
   const [desktopDialogOpen, setDesktopDialogOpen] = useState(false);
   const [displayDialogOpen, setDisplayDialogOpen] = useState(false);
   const [aiDialogOpen, setAiDialogOpen] = useState(false);
@@ -1501,8 +1525,12 @@ export default function App() {
     evidenceWasOpenRef.current = isOpen;
   }, [evidence]);
 
-  const openReviews = snapshot.reviews.filter((review) => review.resolutionStatus === 'open');
+  const openReviews = snapshot.reviews.filter((review) => review.resolutionStatus === 'open' && review.severity === 'blocking');
   const openReview = openReviews[0];
+  const resultLimitations = snapshot.reviews.filter((review) => review.resolutionStatus === 'open'
+    && isReadOnlyResultLimitation(review)
+    && !dismissedResultLimitationIds.has(review.id));
+  const resultLimitation = resultLimitations[0];
 
   async function handleOpenEvidence(next: Evidence) {
     if (!evidence && document.activeElement instanceof HTMLElement) evidenceReturnFocusRef.current = document.activeElement;
@@ -1976,6 +2004,22 @@ export default function App() {
         <Topbar snapshot={snapshot} onLogin={() => void handleLogin()} onProcessing={() => setPage('processing')} />
         <main className="content-area">
           {openReview && page !== 'settings' && <ReviewBanner review={openReview} openCount={openReviews.length} onOpen={() => setReviewDialog(openReview)} />}
+          {resultLimitation && page !== 'settings' && <ResultLimitationNotice
+            review={resultLimitation}
+            count={resultLimitations.length}
+            onEvidence={() => void handleOpenEvidence({
+              title: resultLimitation.title,
+              label: '本机导入资料',
+              quote: '查看这部分未纳入内容的原始依据。',
+              meta: resultLimitation.description,
+              sourceSpanId: resultLimitation.evidenceRefs[0] ?? null,
+              documentId: resultLimitation.evidenceRefs.length === 0 ? resultLimitation.documentId : null
+            })}
+            onDismiss={() => setDismissedResultLimitationIds((current) => new Set([
+              ...current,
+              ...resultLimitations.map((review) => review.id)
+            ]))}
+          />}
           {content}
         </main>
       </div>
