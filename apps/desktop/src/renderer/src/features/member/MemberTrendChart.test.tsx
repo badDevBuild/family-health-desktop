@@ -107,6 +107,8 @@ describe('MemberTrendChart', () => {
     expect(positions).toHaveLength(3);
     expect(positions[1]! - positions[0]!).toBeLessThan((positions[2]! - positions[1]!) / 5);
     expect(screen.getByLabelText(/低密度脂蛋白胆固醇按真实日期间距绘制的趋势图/)).toBeTruthy();
+    expect(screen.getByText('2026-01-01').getAttribute('text-anchor')).toBe('start');
+    expect(screen.getByText('2026-01-11').getAttribute('text-anchor')).toBe('end');
   });
 
   it('界限值只保留在表格语义中，不伪装成精确趋势点', () => {

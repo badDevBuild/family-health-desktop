@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FileCheck2 } from 'lucide-react';
 import type { MemberEvidenceRef, MetricSeriesDetailV2 } from '@contracts';
 import { MemberTrendChart } from './MemberTrendChart.js';
@@ -12,6 +12,12 @@ export function MetricHistory({ series, onBack, onOpenEvidence }: {
   onOpenEvidence(title: string, evidence: MemberEvidenceRef): void;
 }) {
   const [selectedId, setSelectedId] = useState(series[0]!.id);
+  const container = useRef<HTMLElement>(null);
+  useEffect(() => {
+    // 从长列表进入详情时，标题和分组选择必须出现在首屏，不能沿用列表底部的位置。
+    container.current?.scrollIntoView?.({ block: 'start' });
+    container.current?.focus({ preventScroll: true });
+  }, []);
   const selected = series.find((item) => item.id === selectedId) ?? series[0]!;
   const rows = sortHistoryPoints(series.flatMap((item) => item.tableRows.map((point) => ({ ...point, seriesId: item.id }))));
   const groupNumber = (id: string) => series.findIndex((item) => item.id === id) + 1;
@@ -22,7 +28,7 @@ export function MetricHistory({ series, onBack, onOpenEvidence }: {
     `部位：${item.comparisonConditions.bodySite ?? '未记录'}`
   ].join(' · ');
 
-  return <section className="member-metric-detail">
+  return <section ref={container} tabIndex={-1} className="member-metric-detail" aria-label={`${series[0]!.name}指标历史`}>
     <button className="text-button" onClick={onBack}>← 返回身体系统</button>
     <div className="panel__heading"><div><span className="eyebrow">指标历史</span><h2>{series[0]!.name}</h2></div><span>共 {rows.length} 条记录</span></div>
     {series.length > 1 && <div className="metric-comparison-picker">

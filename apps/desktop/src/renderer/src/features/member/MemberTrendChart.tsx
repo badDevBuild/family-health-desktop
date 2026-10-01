@@ -72,7 +72,7 @@ export function MemberTrendChart({ series }: { series: MetricSeriesSummary }) {
       {exact.map((point, index) => <g key={point.id} tabIndex={0} role="img" aria-label={`${point.time.value ?? '日期未记录'}，${formatResult(point.displayValue, point.unit)}，报告标记 ${abnormalFlagLabels[point.abnormalFlag]}`}>
         <title>{point.time.value ?? '日期未记录'}：{formatResult(point.displayValue, point.unit)}</title>
         <circle cx={xFor(point, timestamps)} cy={yFor(point.numericValue!)} r="6" className={['high', 'low', 'positive'].includes(point.abnormalFlag) ? 'trend-dot is-attention' : 'trend-dot'} />
-        {visibleDateLabels.has(index) && <text x={xFor(point, timestamps)} y={HEIGHT - 18} textAnchor="middle">{point.time.value}</text>}
+        {visibleDateLabels.has(index) && <text x={xFor(point, timestamps)} y={HEIGHT - 18} textAnchor={index === 0 ? 'start' : index === exact.length - 1 ? 'end' : 'middle'}>{point.time.value}</text>}
       </g>)}
     </svg>
     <div className="member-trend-legend"><span><i className="is-value" />报告数值{series.unit ? `（${series.unit}）` : ''}</span>{(referenceSegments('referenceHigh').length > 0 || referenceSegments('referenceLow').length > 0) && <span><i className="is-reference" />各次报告参考边界</span>}<span>{series.trendFacts.statement}</span></div>

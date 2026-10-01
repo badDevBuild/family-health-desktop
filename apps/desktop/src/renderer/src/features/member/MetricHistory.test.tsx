@@ -24,6 +24,20 @@ function fixture() {
 afterEach(() => { cleanup(); delete window.healthDesktop; });
 
 describe('指标阅读分组', () => {
+  it('进入详情时把标题滚入可见区域并移动键盘焦点，切换分组不再跳动', () => {
+    const original = HTMLElement.prototype.scrollIntoView;
+    const scroll = vi.fn();
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      const series = fixture();
+      render(<MetricHistory series={series} onBack={vi.fn()} onOpenEvidence={vi.fn()} />);
+      expect(scroll).toHaveBeenCalledWith({ block: 'start' });
+      expect(document.activeElement).toBe(screen.getByRole('region', { name: '低密度脂蛋白胆固醇指标历史' }));
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: series[1]!.id } });
+      expect(scroll).toHaveBeenCalledTimes(1);
+    } finally { HTMLElement.prototype.scrollIntoView = original; }
+  });
+
   it('同一指标只有一个入口，条件不同的序列和全部来源完整保留', () => {
     const series = fixture();
     const before = JSON.stringify(series);
