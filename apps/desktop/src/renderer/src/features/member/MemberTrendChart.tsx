@@ -1,4 +1,5 @@
 import type { MetricSeriesSummary, TrendPointV2 } from '@contracts';
+import { formatResult } from './metric-presentation.js';
 
 const WIDTH = 760;
 const HEIGHT = 250;
@@ -16,9 +17,10 @@ function xFor(point: TrendPointV2, timestamps: number[]): number {
 }
 
 export function MemberTrendChart({ series }: { series: MetricSeriesSummary }) {
-  const exact = series.points.filter((point) => point.timestamp !== null && point.numericValue !== null);
+  const exact = series.points.filter((point) => point.comparable && point.comparator === 'eq'
+    && point.timestamp !== null && point.numericValue !== null);
   if (exact.length === 0) {
-    return <div className="member-trend-empty">没有可按时间绘制的精确数值；带“&lt; / &gt;”的结果会保留在表格中，但不会伪装成点。</div>;
+    return <div className="member-trend-empty">没有可按时间比较的精确数值；日期、单位或条件未明确的记录，以及带“&lt; / &gt;”的结果会保留在表格中，但不会伪装成点。</div>;
   }
   const values = exact.flatMap((point) => [point.numericValue!, point.referenceLow, point.referenceHigh].filter((value): value is number => value !== null));
   const rawMin = Math.min(...values);
@@ -31,15 +33,22 @@ export function MemberTrendChart({ series }: { series: MetricSeriesSummary }) {
   // 只连接原始序列中相邻的精确点。界限值、缺失值或不可比记录会显式打断折线，
   // 避免用一条线跨过未知的中间状态。
   const pointIndex = new Map(series.points.map((point, index) => [point.id, index]));
+  // 同一天多条记录不跨接到前后日期，避免用任意一个同日值代表整天。
+  const timestampCounts = new Map<number, number>();
+  exact.forEach((point) => timestampCounts.set(point.timestamp!, (timestampCounts.get(point.timestamp!) ?? 0) + 1));
+  const canConnect = (previous: TrendPointV2, point: TrendPointV2) =>
+    pointIndex.get(point.id) === (pointIndex.get(previous.id) ?? -2) + 1
+    && point.timestamp! > previous.timestamp!
+    && timestampCounts.get(point.timestamp!) === 1 && timestampCounts.get(previous.timestamp!) === 1;
   const dataSegments = exact.slice(1).flatMap((point, index) => {
     const previous = exact[index]!;
-    return pointIndex.get(point.id) === (pointIndex.get(previous.id) ?? -2) + 1
+    return canConnect(previous, point)
       ? [[previous, point] as const]
       : [];
   });
   const referenceSegments = (key: 'referenceHigh' | 'referenceLow') => exact.slice(1).flatMap((point, index) => {
     const previous = exact[index]!;
-    return pointIndex.get(point.id) === (pointIndex.get(previous.id) ?? -2) + 1
+    return canConnect(previous, point)
       && previous[key] !== null && point[key] !== null
       ? [[previous, point] as const]
       : [];
@@ -60,8 +69,8 @@ export function MemberTrendChart({ series }: { series: MetricSeriesSummary }) {
       {referenceSegments('referenceHigh').map(([left, right]) => <path key={`high-${left.id}-${right.id}`} d={`M ${xFor(left, timestamps)} ${yFor(left.referenceHigh!)} L ${xFor(right, timestamps)} ${yFor(right.referenceHigh!)}`} className="trend-reference-line" />)}
       {referenceSegments('referenceLow').map(([left, right]) => <path key={`low-${left.id}-${right.id}`} d={`M ${xFor(left, timestamps)} ${yFor(left.referenceLow!)} L ${xFor(right, timestamps)} ${yFor(right.referenceLow!)}`} className="trend-reference-line" />)}
       {dataSegments.map(([left, right]) => <path key={`${left.id}-${right.id}`} d={`M ${xFor(left, timestamps)} ${yFor(left.numericValue!)} L ${xFor(right, timestamps)} ${yFor(right.numericValue!)}`} className="trend-data-line" />)}
-      {exact.map((point, index) => <g key={point.id} tabIndex={0} role="img" aria-label={`${point.time.value ?? '日期未记录'}，${point.displayValue}${point.unit ? ` ${point.unit}` : ''}，报告标记 ${abnormalFlagLabels[point.abnormalFlag]}`}>
-        <title>{point.time.value ?? '日期未记录'}：{point.displayValue}{point.unit ? ` ${point.unit}` : ''}</title>
+      {exact.map((point, index) => <g key={point.id} tabIndex={0} role="img" aria-label={`${point.time.value ?? '日期未记录'}，${formatResult(point.displayValue, point.unit)}，报告标记 ${abnormalFlagLabels[point.abnormalFlag]}`}>
+        <title>{point.time.value ?? '日期未记录'}：{formatResult(point.displayValue, point.unit)}</title>
         <circle cx={xFor(point, timestamps)} cy={yFor(point.numericValue!)} r="6" className={['high', 'low', 'positive'].includes(point.abnormalFlag) ? 'trend-dot is-attention' : 'trend-dot'} />
         {visibleDateLabels.has(index) && <text x={xFor(point, timestamps)} y={HEIGHT - 18} textAnchor="middle">{point.time.value}</text>}
       </g>)}

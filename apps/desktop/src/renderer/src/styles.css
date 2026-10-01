@@ -632,8 +632,10 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .system-metric-list > button:last-child { border-bottom: 0; }
 .system-metric-list > button:hover { background: var(--warm-50); }
 .system-metric-list strong, .system-metric-list small { display: block; }
-.system-metric-list strong { font-size: 15px; }
-.system-metric-list span small { margin-top: 5px; color: var(--warm-400); font-size: 12px; }
+.system-metric-list strong { font-size: 16px; }
+.system-metric-list span small { margin-top: 5px; color: var(--warm-600); font-size: 14px; }
+.system-metric-list .metric-latest { text-align: right; }
+.system-metric-list > button:disabled { cursor: wait; opacity: .7; }
 .system-metric-list b { min-width: 0; color: var(--warm-900); font-size: 17px; text-align: right; overflow-wrap: anywhere; }
 .system-metric-list b small { display: inline; color: var(--warm-400); font-size: 12px; font-weight: 500; }
 .system-finding-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
@@ -661,9 +663,16 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .member-trend-legend i.is-reference { height: 0; border-top: 2px dashed #c1a35f; background: transparent; }
 .member-trend-empty { padding: 30px; border: 1px dashed var(--warm-200); border-radius: 14px; color: var(--warm-600); background: var(--warm-50); font-size: 14px; line-height: 1.6; }
 .metric-history-table { display: grid; overflow: hidden; border: 1px solid var(--warm-200); border-radius: 14px; }
-.metric-history-table > div { min-height: 52px; display: grid; grid-template-columns: 1fr 1fr .8fr 1fr; align-items: center; gap: 12px; padding: 8px 13px; border-bottom: 1px solid var(--warm-200); font-size: 13px; }
+.metric-history-table > div { min-height: 56px; display: grid; grid-template-columns: 1fr 1fr .8fr 1fr; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid var(--warm-200); font-size: 16px; overflow-wrap: anywhere; }
 .metric-history-table > div:last-child { border-bottom: 0; }
 .metric-history-table__head { min-height: 42px !important; color: var(--warm-400); background: var(--warm-100); font-size: 12px !important; font-weight: 650; }
+.metric-comparison-picker { margin: 16px 0; padding: 16px; border-radius: 16px; background: var(--warm-50); font-size: 16px; line-height: 1.6; }
+.metric-comparison-picker label { display: grid; gap: 8px; }
+.metric-comparison-picker select { width: 100%; min-width: 0; min-height: 44px; font-size: 16px; }
+.metric-row-group { display: block; margin-top: 4px; color: var(--warm-600); font-size: 14px; }
+.unprovided-results { margin-top: 24px; }
+.unprovided-results > div { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 8px 0; }
+.unprovided-results > div strong { flex: 1 1 200px; }
 
 .timeline-filters { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0 4px; }
 .timeline-filters label { display: grid; gap: 5px; color: var(--warm-600); font-size: 12px; font-weight: 650; }

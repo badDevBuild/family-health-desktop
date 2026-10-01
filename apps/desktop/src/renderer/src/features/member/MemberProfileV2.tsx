@@ -3,7 +3,8 @@ import { Activity, AlertTriangle, Archive, CalendarClock, Check, ChevronRight, F
 import type { AdoptLifestyleProposalInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptReviewBundle, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, InboxItem, LifestylePlanV2, MemberAssessmentSnapshotV3, MemberEvidenceRef, MemberOverviewV2, MetricSeriesDetailV2, PersonSummary, SetConceptMappingInput, UpdateReportMetadataInput } from '@contracts';
 import { StatusBadge, type Tone } from '../../components/StatusBadge.js';
 import { ConceptReviewPanel } from './ConceptReviewPanel.js';
-import { MemberTrendChart } from './MemberTrendChart.js';
+import { MetricHistory } from './MetricHistory.js';
+import { groupMetricSeries, isUnprovidedResult } from './metric-presentation.js';
 
 type EvidenceRequest = {
   title: string;
@@ -20,10 +21,6 @@ const systemSymbol: Record<BodySystemId, string> = {
   cardiovascular: '♥', endocrine_metabolic: '◒', hepatobiliary: '◇', renal_urinary: '◉',
   digestive: '≈', respiratory: '∞', hematology_immune: '✦', musculoskeletal: '⌁',
   neurological: '⌘', sensory_oral: '◎', reproductive: '◌', dermatological: '◍'
-};
-
-const abnormalFlagLabels: Record<MetricSeriesDetailV2['tableRows'][number]['abnormalFlag'], string> = {
-  high: '偏高', low: '偏低', positive: '阳性', negative: '阴性', normal: '正常', unknown: '未标记'
 };
 
 const adoptedActionStatusLabels: Record<LifestylePlanV2['adoptedActions'][number]['status'], string> = {
@@ -123,26 +120,6 @@ function SystemDirectory({ systems, selected, onSelect }: { systems: BodySystemS
   </nav>;
 }
 
-function MetricDetail({ metric, onOpenEvidence, onBack }: { metric: MetricSeriesDetailV2; onOpenEvidence(request: EvidenceRequest): void; onBack(): void }) {
-  return <section className="member-metric-detail">
-    <button className="text-button" onClick={onBack}>← 返回身体系统</button>
-    <div className="panel__heading"><div><span className="eyebrow">指标历史</span><h2>{metric.name}</h2></div><StatusBadge tone={metric.trendFacts.status === 'comparable' ? 'success' : 'info'}>{metric.trendFacts.status === 'comparable' ? '可比较' : metric.trendFacts.status === 'conditional' ? '有条件可比较' : '暂不可比较'}</StatusBadge></div>
-    <p className="body-copy">{metric.trendFacts.statement}</p>
-    <MemberTrendChart series={metric} />
-    <div className="metric-history-table" role="table" aria-label={`${metric.name}历史记录`}>
-      <div role="row" className="metric-history-table__head"><span>临床日期</span><span>结果</span><span>报告标记</span><span>原始依据</span></div>
-      {metric.tableRows.map((point) => {
-        const sources = point.evidenceSources ?? [point.evidence];
-        return <div role="row" key={point.id}><span>{point.time.displayLabel}</span><strong>{point.displayValue} {point.unit ?? ''}</strong><span>{abnormalFlagLabels[point.abnormalFlag]}</span>{sources.length === 1
-          ? <button className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${metric.name}原始依据`, sources[0]!))}><FileCheck2 size={16} /> 查看依据</button>
-          : <details className="evidence-disclosure evidence-disclosure--compact"><summary><FileCheck2 size={16} /> 查看 {sources.length} 处依据</summary><div className="evidence-source-list">{sources.map((source, index) => <button key={source.id} className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${metric.name}原始依据 ${index + 1}`, source))}>依据 {index + 1}{index > 0 ? ' · 同次检查的重复来源' : ''}</button>)}</div></details>}
-        </div>;
-      })}
-    </div>
-    {metric.trendFacts.reasons.length > 0 && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>比较边界</strong><p>{metric.trendFacts.reasons.join(' ')}</p></div></div>}
-  </section>;
-}
-
 export function systemAnalysisHeading(headline: string, keyPoints: Array<{ text: string }>) {
   if (keyPoints.length === 0) return headline;
   const normalize = (value: string) => value.toLocaleLowerCase('zh-CN').replace(/[\s，。；：、,.!?！？:;（）()\-—]/g, '');
@@ -223,19 +200,23 @@ export function MemberAssessmentSystemCard({ assessment, systemId, factCount, on
   </article>;
 }
 
-function SystemDetail({ detail, assessment, search, onSearch, selectedMetric, onSelectMetric, onOpenEvidence }: {
+function SystemDetail({ detail, assessment, search, onSearch, selectedMetric, metricLoading, metricError, onSelectMetric, onOpenEvidence }: {
   detail: BodySystemDetailV2;
   assessment: MemberAssessmentSnapshotV3 | null;
   search: string;
   onSearch(value: string): void;
-  selectedMetric: MetricSeriesDetailV2 | null;
+  selectedMetric: MetricSeriesDetailV2[] | null;
+  metricLoading: boolean;
+  metricError: boolean;
   onSelectMetric(id: string | null): void;
   onOpenEvidence(request: EvidenceRequest): void;
 }) {
-  if (selectedMetric) return <MetricDetail metric={selectedMetric} onOpenEvidence={onOpenEvidence} onBack={() => onSelectMetric(null)} />;
+  if (selectedMetric) return <MetricHistory key={selectedMetric[0]!.id} series={selectedMetric} onOpenEvidence={(title, evidence) => onOpenEvidence(evidenceRequest(title, evidence))} onBack={() => onSelectMetric(null)} />;
   const query = search.trim().toLocaleLowerCase('zh-CN');
-  const metrics = detail.metrics.filter((metric) => !query || metric.name.toLocaleLowerCase('zh-CN').includes(query));
-  const findings = detail.findings.filter((finding) => !query || `${finding.title}${finding.value}`.toLocaleLowerCase('zh-CN').includes(query));
+  const metrics = groupMetricSeries(detail.metrics).filter((group) => !query || group.series.some((metric) => metric.name.toLocaleLowerCase('zh-CN').includes(query)));
+  const matchedFindings = detail.findings.filter((finding) => !query || `${finding.title}${finding.value}`.toLocaleLowerCase('zh-CN').includes(query));
+  const findings = matchedFindings.filter((finding) => !isUnprovidedResult(finding.value));
+  const unprovided = matchedFindings.filter((finding) => isUnprovidedResult(finding.value));
   return <section className="system-detail">
     <div className="system-detail__hero"><span className={`system-directory__symbol is-${detail.summary.status}`}>{systemSymbol[detail.registry.id]}</span><div><span className="eyebrow">{detail.registry.name}</span><h2>{detail.registry.shortName}</h2><p>{detail.analysis?.status === 'stale' ? '旧版说明供回看；下面的指标和原始依据仍可查看。' : detail.analysis ? '先看结论和下一步，需要时再展开指标与原始依据。' : detail.summary.summary}</p></div></div>
     {assessment?.systems.some((item) => item.systemId === detail.registry.id)
@@ -243,8 +224,11 @@ function SystemDetail({ detail, assessment, search, onSearch, selectedMetric, on
       : <SystemAnalysisCard detail={detail} onOpenEvidence={onOpenEvidence} />}
     <label className="member-search"><Search size={18} /><span className="sr-only">搜索本系统指标</span><input value={search} onChange={(event) => onSearch(event.target.value)} placeholder={`搜索${detail.registry.shortName}指标`} /></label>
     <div className="system-section-heading"><div><h3>指标与历史</h3><p>点开指标查看按真实日期间隔绘制的历史；不会因点击而调用模型。</p></div><StatusBadge tone="neutral">{metrics.length} 项</StatusBadge></div>
-    {metrics.length > 0 ? <div className="system-metric-list">{metrics.map((metric) => <button key={metric.id} onClick={() => onSelectMetric(metric.id)}><span><strong>{metric.name}</strong><small>{metric.trendFacts.statement}</small></span><b>{metric.latestValue ?? '—'} <small>{metric.unit ?? ''}</small></b><ChevronRight size={17} /></button>)}</div> : <div className="table-empty compact-empty"><Activity size={24} /><strong>没有匹配的指标</strong><span>可以清空搜索词，或等待新报告完成事实处理。</span></div>}
+    {metricLoading && <p role="status">正在读取这个指标的全部历史…</p>}
+    {metricError && <p role="alert">部分历史暂时未能读取，请再点一次指标重试。不会只展示部分记录冒充完整历史。</p>}
+    {metrics.length > 0 ? <div className="system-metric-list">{metrics.map((metric) => <button key={metric.id} disabled={metricLoading} onClick={() => onSelectMetric(metric.id)}><span><strong>{metric.name}</strong><small>{metric.description}</small></span><span className="metric-latest"><b>{metric.latestValue}</b><small>{metric.latestDate ?? '日期未明确'}{metric.undatedCount > 0 && metric.latestDate ? ` · 另有 ${metric.undatedCount} 条未明日期` : ''}</small></span><ChevronRight size={17} /></button>)}</div> : <div className="table-empty compact-empty"><Activity size={24} /><strong>没有匹配的指标</strong><span>可以清空搜索词，或等待新报告完成事实处理。</span></div>}
     {findings.length > 0 && <><div className="system-section-heading"><div><h3>文字检查结果</h3><p>影像小结、阴性或未见异常等文字结论会完整换行显示。</p></div></div><div className="system-finding-grid">{findings.map((finding) => <article key={finding.id}><div><strong>{finding.title}</strong><small>{finding.time.displayLabel}</small></div><b>{finding.value}</b>{finding.evidence[0] && <button className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${finding.title}原始依据`, finding.evidence[0]!))}><FileCheck2 size={16} /> 查看依据</button>}</article>)}</div></>}
+    {unprovided.length > 0 && <details className="analysis-boundaries unprovided-results"><summary>原报告未提供结果（{unprovided.length} 项）</summary><p>这些是空白或未检测项目，不表示正常，也不需要确认。原文仍保留，可按需查看。</p>{unprovided.map((finding) => <div key={finding.id}><strong>{finding.title}</strong><span>{finding.value || '空白'}</span>{finding.evidence[0] && <button className="evidence-link" onClick={() => onOpenEvidence(evidenceRequest(`${finding.title}原始依据`, finding.evidence[0]!))}>查看依据</button>}</div>)}</details>}
     {detail.unmappedFactCount > 0 && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>{detail.unmappedFactCount} 条事实保留原始名称</strong><p>词典没有经过验证的精确映射时，系统不会自行改名或合并。</p></div></div>}
   </section>;
 }
@@ -344,7 +328,9 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
   const [systems, setSystems] = useState<BodySystemSummaryV2[]>([]);
   const [selectedSystem, setSelectedSystem] = useState<BodySystemId | null>(null);
   const [systemDetail, setSystemDetail] = useState<BodySystemDetailV2 | null>(null);
-  const [selectedMetric, setSelectedMetric] = useState<MetricSeriesDetailV2 | null>(null);
+  const [selectedMetric, setSelectedMetric] = useState<MetricSeriesDetailV2[] | null>(null);
+  const [metricLoading, setMetricLoading] = useState(false);
+  const [metricError, setMetricError] = useState(false);
   const [events, setEvents] = useState<HealthEventV2[]>([]);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [selectedEvent, setSelectedEvent] = useState<HealthEventDetailV2 | null>(null);
@@ -371,6 +357,8 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
   const [loadError, setLoadError] = useState(false);
   const [partialLoadError, setPartialLoadError] = useState(false);
   const metricRequestGeneration = useRef(0);
+
+  useEffect(() => () => { metricRequestGeneration.current += 1; }, [person.id, person.dataRevision]);
 
   useEffect(() => {
     let active = true;
@@ -454,16 +442,29 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
 
   const chooseMetric = (seriesId: string | null) => {
     const generation = ++metricRequestGeneration.current;
+    setMetricError(false);
+    setMetricLoading(false);
     if (!seriesId) { setSelectedMetric(null); return; }
     const bridge = window.healthDesktop;
-    if (!bridge?.getMetricSeries) return;
-    void bridge.getMetricSeries(person.id, seriesId).then((result) => {
-      if (generation === metricRequestGeneration.current && result?.ok) setSelectedMetric(result.data);
+    if (!bridge?.getMetricSeries || !systemDetail) return;
+    const group = groupMetricSeries(systemDetail.metrics).find((item) => item.id === seriesId);
+    if (!group) return;
+    setMetricLoading(true);
+    void Promise.all(group.series.map((item) => bridge.getMetricSeries(person.id, item.id))).then((results) => {
+      if (generation !== metricRequestGeneration.current) return;
+      if (results.some((result) => !result?.ok)) { setMetricError(true); return; }
+      setSelectedMetric(results.flatMap((result) => result.ok ? [result.data] : []));
+    }).catch(() => {
+      if (generation === metricRequestGeneration.current) setMetricError(true);
+    }).finally(() => {
+      if (generation === metricRequestGeneration.current) setMetricLoading(false);
     });
   };
   const chooseSystem = (systemId: BodySystemId) => {
     metricRequestGeneration.current += 1;
     setSelectedMetric(null);
+    setMetricLoading(false);
+    setMetricError(false);
     setSelectedSystem(systemId);
   };
   const chooseEvent = (eventId: string) => {
@@ -673,7 +674,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
     </div>}
     {!loading && tab === 'body' && <>
       {selectedEvent && <div className="context-return-bar"><span><strong>正在从检查事件查看身体系统</strong><small>{selectedEvent.time.displayLabel} · {selectedEvent.title}</small></span><button className="secondary-button" onClick={() => setTab('timeline')}>返回这次检查</button></div>}
-      <div className="body-workspace"><aside className="panel"><div className="body-workspace__label"><span className="eyebrow">身体目录</span><strong>12 个系统</strong></div><SystemDirectory systems={systems} selected={selectedSystem} onSelect={chooseSystem} /></aside><main className="panel">{systemDetail && selectedSystem === systemDetail.registry.id ? <SystemDetail detail={systemDetail} assessment={assessment} search={search} onSearch={setSearch} selectedMetric={selectedMetric} onSelectMetric={chooseMetric} onOpenEvidence={onOpenEvidence} /> : <div className="table-empty"><LoaderCircle size={24} className="spin" /><strong>正在读取系统档案</strong></div>}</main></div>
+      <div className="body-workspace"><aside className="panel"><div className="body-workspace__label"><span className="eyebrow">身体目录</span><strong>12 个系统</strong></div><SystemDirectory systems={systems} selected={selectedSystem} onSelect={chooseSystem} /></aside><main className="panel">{systemDetail && selectedSystem === systemDetail.registry.id ? <SystemDetail detail={systemDetail} assessment={assessment} search={search} onSearch={setSearch} selectedMetric={selectedMetric} metricLoading={metricLoading} metricError={metricError} onSelectMetric={chooseMetric} onOpenEvidence={onOpenEvidence} /> : <div className="table-empty"><LoaderCircle size={24} className="spin" /><strong>正在读取系统档案</strong></div>}</main></div>
       {conceptError && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>这次归类没有保存</strong><p>原始事实未改变，可以稍后重试。</p></div></div>}
       {conceptReview && <ConceptReviewPanel bundle={conceptReview} busyObservationId={conceptBusyId} onSave={saveConceptMapping} onUndo={undoConceptMapping} onOpenEvidence={onOpenEvidence} />}
     </>}

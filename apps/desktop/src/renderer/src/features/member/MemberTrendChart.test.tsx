@@ -76,6 +76,25 @@ function series(points: TrendPointV2[]): MetricSeriesSummary {
 afterEach(cleanup);
 
 describe('MemberTrendChart', () => {
+  it('不可比记录即使有数值也不绘点，并打断前后折线', () => {
+    const before = point('before', '2026-01-01', 3);
+    const uncertain = { ...point('unknown-unit', '2026-01-02', 3.5), comparable: false };
+    const after = point('after', '2026-01-03', 4);
+    const { container } = render(<MemberTrendChart series={series([before, uncertain, after])} />);
+    expect(container.querySelectorAll('circle')).toHaveLength(2);
+    expect(container.querySelectorAll('.trend-data-line')).toHaveLength(0);
+    expect(container.querySelectorAll('.trend-reference-line')).toHaveLength(0);
+  });
+
+  it('同一天的不同数值不被连成变化趋势，也不任取一条连接到邻近日期', () => {
+    const { container } = render(<MemberTrendChart series={series([
+      point('before', '2026-01-01', 3), point('one', '2026-01-02', 3.4),
+      point('two', '2026-01-02', 3.8), point('after', '2026-01-03', 4)
+    ])} />);
+    expect(container.querySelectorAll('circle')).toHaveLength(4);
+    expect(container.querySelectorAll('.trend-data-line')).toHaveLength(0);
+  });
+
   it('横轴按真实日期间隔，而不是把每次检查等距排列', () => {
     const { container } = render(<MemberTrendChart series={series([
       point('one', '2026-01-01', 3),
