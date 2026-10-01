@@ -115,10 +115,11 @@ interface DesktopState {
     dateStyle: 'friendly' | 'numeric';
   };
   aiPreferences: AiPreferences;
+  aiPreferencesScopeVersion: 2;
 }
 
 const allowedExternalHosts = new Set(['auth.openai.com', 'chatgpt.com', 'openai.com']);
-const lockedRuntimeVersion = '0.145.0';
+const lockedRuntimeVersion = '0.156.1';
 
 function bundledCodexPath(): string {
   const executableName = process.platform === 'win32' ? 'codex.exe' : 'codex';
@@ -377,10 +378,17 @@ function readDesktopState(): DesktopState {
       openAtLogin: parsed.openAtLogin === true,
       notificationsEnabled: parsed.notificationsEnabled !== false,
       displayPreferences: displayPreferencesSchema.catch({ fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' }).parse(parsed.displayPreferences),
-      aiPreferences: aiPreferencesSchema.catch(DEFAULT_AI_PREFERENCES).parse(parsed.aiPreferences)
+      aiPreferences: (() => {
+        const saved = aiPreferencesSchema.catch(DEFAULT_AI_PREFERENCES).parse(parsed.aiPreferences);
+        // 旧版只有全流程通用设置；把旧默认值迁移为新的分析专用默认值。
+        return parsed.aiPreferencesScopeVersion !== 2
+          && saved.modelId === 'gpt-5.6-sol' && saved.reasoningEffort === 'medium'
+          ? DEFAULT_AI_PREFERENCES : saved;
+      })(),
+      aiPreferencesScopeVersion: 2
     };
   } catch {
-    return { activeWorkspaceMode: 'demo', workspaceName: null, stayInTray: null, openAtLogin: false, notificationsEnabled: true, displayPreferences: { fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' }, aiPreferences: DEFAULT_AI_PREFERENCES };
+    return { activeWorkspaceMode: 'demo', workspaceName: null, stayInTray: null, openAtLogin: false, notificationsEnabled: true, displayPreferences: { fontScale: 'standard', reduceMotion: false, dateStyle: 'friendly' }, aiPreferences: DEFAULT_AI_PREFERENCES, aiPreferencesScopeVersion: 2 };
   }
 }
 

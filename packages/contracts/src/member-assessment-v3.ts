@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { bodySystemIdSchema, memberEvidenceRefSchema } from './member-v2.js';
+import { clinicalContextSchema } from './clinical-context.js';
 
 const id = z.string().min(1).max(160);
 const signature = z.string().regex(/^[a-f0-9]{64}$/);
@@ -161,7 +162,8 @@ export const memberEvidencePackageV3Schema = z.object({
     documentId: id,
     systemIds: z.array(bodySystemIdSchema),
     evidenceIds: z.array(id).min(1),
-    sourceKind: z.literal('report')
+    sourceKind: z.literal('report'),
+    clinicalContext: clinicalContextSchema.nullable().optional()
   }).strict()),
   evidenceCatalog: z.array(memberEvidenceRefSchema),
   trends: z.array(z.object({ id, systemIds: z.array(bodySystemIdSchema), payload: z.unknown() }).strict()),
@@ -256,6 +258,11 @@ export const memberAssessmentSnapshotV3Schema = memberAssessmentCandidateV3Schem
   validationMode: z.enum(['local_only', 'local_and_focused_review']),
   reviewedTargetIds: z.array(id),
   heldTargetIds: z.array(id),
+  /** 主进程的只读展示投影；不是模型结果或新的校验凭据，不回写持久化快照。 */
+  presentation: z.object({
+    version: id,
+    rebuiltNodeIds: z.array(id)
+  }).strict().optional(),
   limitations: z.array(text),
   evidenceCatalog: z.array(memberEvidenceRefSchema),
   /** 应用记录的执行路径；不由模型回填。 */

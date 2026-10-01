@@ -1,9 +1,11 @@
 import { z } from 'zod';
 import { actionStatusSchema } from './action-status.js';
+import { clinicalContextSchema } from './clinical-context.js';
 
 export * from './member-v2.js';
 export * from './member-assessment-v3.js';
 export * from './action-status.js';
+export * from './clinical-context.js';
 
 export const idSchema = z.string().min(1).max(120);
 export const utcTimestampSchema = z.string().datetime({ offset: true });
@@ -82,6 +84,8 @@ export const observationCandidateSchema = z.object({
   method: z.string().nullable(),
   bodySite: z.string().nullable(),
   clinicalDate: localDateSchema.nullable(),
+  // 缺字段表示旧版本尚未检查，不能把它当成“没有额外条件”。
+  clinicalContext: clinicalContextSchema.nullable().optional(),
   evidence: z.array(evidenceRefSchema).min(1),
   issues: z.array(z.object({
     code: z.string().min(1),
@@ -666,7 +670,7 @@ export const aiPreferencesSchema = z.object({
 }).strict();
 export type AiPreferences = z.infer<typeof aiPreferencesSchema>;
 export const DEFAULT_AI_PREFERENCES: AiPreferences = {
-  modelId: 'gpt-5.6-sol',
+  modelId: 'gpt-6-sol',
   reasoningEffort: 'medium'
 };
 

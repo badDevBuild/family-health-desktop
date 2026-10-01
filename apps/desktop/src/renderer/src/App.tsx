@@ -84,7 +84,8 @@ const reasoningEffortLabels: Record<AiReasoningEffort, string> = {
 };
 
 function modelPreferenceLabel(preferences: AiPreferences): string {
-  const model = preferences.modelId === 'gpt-5.6-sol' ? 'GPT-5.6-Sol' : preferences.modelId;
+  const model = preferences.modelId === 'gpt-6-sol' ? 'GPT-6-Sol'
+    : preferences.modelId === 'gpt-5.6-sol' ? 'GPT-5.6-Sol' : preferences.modelId;
   return `${model} · ${reasoningEffortLabels[preferences.reasoningEffort]}推理`;
 }
 
@@ -439,13 +440,20 @@ function manualProcessingScope(snapshot: DashboardSnapshot, documentIds?: string
   const selectedIds = documentIds ? new Set(documentIds) : null;
   const readyDocuments = snapshot.inbox.filter((item) => !item.inProcessingCenter && item.status === 'queued'
     && item.personId !== null && (!selectedIds || selectedIds.has(item.id)));
+  const blockedDocumentIds = new Set(snapshot.reviews.filter((review) => review.resolutionStatus === 'open'
+    && review.severity === 'blocking').map((review) => review.documentId));
+  const repairableIds = new Set(snapshot.reviews.filter((review) => review.resolutionStatus === 'open'
+    && isReadOnlyResultLimitation(review) && review.personId !== null
+    && !blockedDocumentIds.has(review.documentId)).map((review) => review.documentId));
+  const repairDocuments = selectedIds ? snapshot.inbox.filter((item) => selectedIds.has(item.id)
+    && item.status === 'completed' && item.personId !== null && repairableIds.has(item.id)) : [];
   const readyPersonIds = new Set(readyDocuments.map((item) => item.personId));
   const activePersonLabels = new Set(snapshot.jobs.filter((job) => ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status))
     .map((job) => job.personLabel).filter((label): label is string => label !== null));
   const refreshPersons = documentIds ? [] : snapshot.persons.filter((person) => person.acceptedFactCount > 0
     && person.derivedStatus !== 'current' && !readyPersonIds.has(person.id)
     && !activePersonLabels.has(person.displayName));
-  return { readyDocuments, refreshPersons };
+  return { readyDocuments, repairDocuments, refreshPersons };
 }
 
 function InboxRefreshPrompt({ snapshot, onRefresh }: { snapshot: DashboardSnapshot; onRefresh(): void }) {
@@ -498,7 +506,7 @@ function InboxRow({ item, selected, onToggle, onOpen }: { item: InboxItem; selec
   return <div className="inbox-table__row inbox-table__row--selectable"><label className="select-cell"><input aria-label={`选中 ${item.displayName}`} type="checkbox" checked={selected} onChange={onToggle} /></label><span className="file-cell"><span className="file-icon"><FileText size={19} /></span><span><strong>{item.displayName}</strong><small>{item.format} · {item.sourceLabel}</small></span></span><span>{item.personLabel ?? <span className="attention-text">待确认</span>}</span><span>{formatDateTime(item.discoveredAt)}</span><span><StatusBadge tone={status.tone}>{statusLabel}</StatusBadge>{item.issue && <small className="row-note">{item.issue}</small>}</span><button className="icon-button" aria-label={`查看 ${item.displayName} 的来源`} onClick={onOpen}><FileText size={18} /></button></div>;
 }
 
-function ProcessingPage({ snapshot, onCancel, onRetry, onTogglePause, onDetails }: { snapshot: DashboardSnapshot; onCancel(job: JobSummary): void; onRetry(job: JobSummary): void; onTogglePause(): void; onDetails(job: JobSummary): void }) {
+function ProcessingPage({ snapshot, resultLimitations, onOpenLimitationEvidence, onRepairLimitation, onCancel, onRetry, onTogglePause, onDetails }: { snapshot: DashboardSnapshot; resultLimitations: ReviewIssue[]; onOpenLimitationEvidence(review: ReviewIssue): void; onRepairLimitation(review: ReviewIssue): void; onCancel(job: JobSummary): void; onRetry(job: JobSummary): void; onTogglePause(): void; onDetails(job: JobSummary): void }) {
   const isCurrentJob = (job: JobSummary) => job.status !== 'succeeded'
     && job.status !== 'cancelled'
     && (job.status !== 'failed' || job.canRetry);
@@ -513,6 +521,7 @@ function ProcessingPage({ snapshot, onCancel, onRetry, onTogglePause, onDetails 
     <section className="page-title-row"><div><span className="eyebrow">处理中心</span><h1>每一步都能看懂、能恢复</h1><p>技术等待不会被误写成健康风险，已保存的事实不会因后续失败回滚。</p></div><button className="secondary-button" onClick={onTogglePause}>{snapshot.queuePaused ? <Play size={17} /> : <Pause size={17} />}{snapshot.queuePaused ? '继续队列' : '暂停队列'}</button></section>
     {snapshot.queuePaused && <div className="info-callout"><Pause size={20} /><div><strong>队列已暂停</strong><p>不会领取新的 AI 任务；正在进行的原子步骤会安全收口，日程设置和已保存资料不受影响。</p></div></div>}
     {currentJobs.length > 0 && <section className="section-block"><div className="section-heading"><div><h2>正在处理与需要关注</h2><p>只把当前仍可能需要操作的任务放在前面。</p></div><StatusBadge tone="neutral">{currentJobs.length} 项</StatusBadge></div><div className="job-grid">{currentJobs.map((job) => renderJob(job))}</div></section>}
+    {resultLimitations.length > 0 && <ResultLimitationsPanel snapshot={snapshot} reviews={resultLimitations} onEvidence={onOpenLimitationEvidence} onRepair={onRepairLimitation} />}
     {historyJobs.length > 0 && <section className="section-block"><div className="section-heading"><div><h2>最近记录</h2><p>已结束或被新任务替代的记录收在这里，需要时再查看。</p></div><StatusBadge tone="neutral">{historyJobs.length} 项</StatusBadge></div><div className="job-history-list">{historyJobs.map((job) => renderJob(job, true))}</div></section>}
     {snapshot.jobs.length === 0 && <section className="panel table-empty"><Clock3 size={24} /><strong>还没有处理任务</strong><span>导入资料后，可手动开始或等待已启用的每日检查。</span></section>}
     <section className="panel process-explainer"><span className="eyebrow">工作方式</span><h2>模型给候选，应用负责正式保存</h2><div className="process-flow"><span>本地准备</span><ArrowRight /><span>每块提取一次</span><ArrowRight /><span>本地校验</span><ArrowRight /><span>成员综合一次</span><ArrowRight /><span>结果发布</span></div><p>清晰的单份报告通常只需一次提取、一次综合；具体问题才局部修复，高影响判断才重点复核。只有成员归属、关键数值冲突或安全问题需要你处理。</p></section>
@@ -648,7 +657,7 @@ function SettingsPage({ snapshot, desktopBehavior, displayPreferences, aiPrefere
   const accountAction = snapshot.account.status === 'connected' ? '刷新状态' : snapshot.account.status === 'connecting' ? '等待完成' : '连接账户';
   const settings = [
     { icon: Sparkles, title: '账户与 AI', text: accountText, action: accountAction },
-    { icon: Activity, title: 'AI 模型', text: `${modelPreferenceLabel(aiPreferences)} · 新任务生效`, action: '更改' },
+    { icon: Activity, title: '分析报告模型', text: `${modelPreferenceLabel(aiPreferences)} · 新分析生效`, action: '更改' },
     { icon: FolderHeart, title: '报告收件箱', text: snapshot.workspaceMode === 'personal' ? '只监控你明确授权的本机目录' : '个人工作区建立后可指定目录', action: '管理目录' },
     { icon: CalendarClock, title: '自动处理', text: snapshot.scheduleEnabled ? `每天 ${snapshot.scheduleLocalTime}（${snapshot.scheduleTimeZone}）· 下次 ${formatDateTime(snapshot.nextScheduledRun)}` : '尚未启用；不会自动发送资料', action: '调整时间' },
     { icon: Bell, title: '桌面行为', text: `${desktopBehavior.stayInTray === null ? '关闭窗口时询问是否驻留' : desktopBehavior.stayInTray ? '关闭后驻留后台' : '关闭窗口即退出'} · 处理通知：${desktopBehavior.notificationsEnabled ? '开启' : '关闭'}`, action: '更改' },
@@ -657,7 +666,7 @@ function SettingsPage({ snapshot, desktopBehavior, displayPreferences, aiPrefere
     { icon: Archive, title: '备份与恢复', text: recoveryStatus.pointCount > 0 ? `${recoveryStatus.pointCount} 个本机恢复点 · ${formatBytes(recoveryStatus.totalBytes)} · 最近 ${formatDateTime(recoveryStatus.latestAt)}` : '尚无本机恢复点；首次正式写入前会自动创建', action: '创建加密备份' },
     { icon: CircleHelp, title: '关于与诊断', text: '版本、运行时、依赖许可与已知限制', action: '查看' }
   ];
-  return <div className="page-stack"><section className="page-title-row"><div><span className="eyebrow">设置</span><h1>运行方式和资料边界</h1><p>退出 Codex 不会删除健康档案；更换账户或扩大目录范围需要重新确认。</p></div></section><section className="panel settings-list">{settings.map(({ icon: Icon, title, text, action }) => <button key={title} onClick={title === '账户与 AI' ? onAccount : title === 'AI 模型' ? onAi : title === '报告收件箱' ? onDirectories : title === '自动处理' ? onSchedule : title === '桌面行为' ? onDesktop : title === '显示' ? onDisplay : title === '数据与隐私' ? onPrivacy : title === '备份与恢复' ? onBackup : onAbout}><span className="settings-icon"><Icon size={20} /></span><span><strong>{title}</strong><small>{text}</small></span><span className="settings-action">{action}<ChevronRight size={16} /></span></button>)}</section><section className="panel boundary-card"><div><ShieldCheck size={24} /><span><h3>真实边界</h3><p>资料保存在当前 OS 用户目录；AI 处理会通过你的 Codex 账户发送必要内容给 OpenAI。这不是全程离线推理，也不等于医学审核。</p></span></div><button className="secondary-button" onClick={onPrivacy}>查看数据处理说明</button></section></div>;
+  return <div className="page-stack"><section className="page-title-row"><div><span className="eyebrow">设置</span><h1>运行方式和资料边界</h1><p>退出 Codex 不会删除健康档案；更换账户或扩大目录范围需要重新确认。</p></div></section><section className="panel settings-list">{settings.map(({ icon: Icon, title, text, action }) => <button key={title} onClick={title === '账户与 AI' ? onAccount : title === '分析报告模型' ? onAi : title === '报告收件箱' ? onDirectories : title === '自动处理' ? onSchedule : title === '桌面行为' ? onDesktop : title === '显示' ? onDisplay : title === '数据与隐私' ? onPrivacy : title === '备份与恢复' ? onBackup : onAbout}><span className="settings-icon"><Icon size={20} /></span><span><strong>{title}</strong><small>{text}</small></span><span className="settings-action">{action}<ChevronRight size={16} /></span></button>)}</section><section className="panel boundary-card"><div><ShieldCheck size={24} /><span><h3>真实边界</h3><p>资料保存在当前 OS 用户目录；AI 处理会通过你的 Codex 账户发送必要内容给 OpenAI。这不是全程离线推理，也不等于医学审核。</p></span></div><button className="secondary-button" onClick={onPrivacy}>查看数据处理说明</button></section></div>;
 }
 
 function AiPreferencesDialog({ preferences, onClose, onSave }: { preferences: AiPreferences; onClose(): void; onSave(input: AiPreferences): Promise<boolean> }) {
@@ -683,7 +692,7 @@ function AiPreferencesDialog({ preferences, onClose, onSave }: { preferences: Ai
   }, []);
   const selectedModel = models.find((model) => model.id === modelId) ?? null;
   const effortDescription = selectedModel?.supportedReasoningEfforts.find((item) => item.reasoningEffort === reasoningEffort)?.description ?? '';
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-preferences-title"><header><div><span className="eyebrow">AI 模型</span><h2 id="ai-preferences-title">模型与推理强度</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭 AI 模型设置"><X size={19} /></button></header>{loading ? <div className="table-empty"><LoaderCircle size={24} className="spin" /><strong>正在读取当前账号可用模型</strong></div> : loadFailed ? <div className="info-callout compact"><CircleHelp size={18} /><div><strong>暂时无法读取模型列表</strong><p>请确认 Codex 已连接后重试。为避免保存无效组合，本次不会更改现有设置。</p></div></div> : <><label>模型<select aria-label="模型" value={modelId} onChange={(event) => { const next = models.find((model) => model.id === event.target.value); if (!next) return; setModelId(next.id); setReasoningEffort(next.defaultReasoningEffort); }}>{models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label>{selectedModel?.description && <p>{selectedModel.description}</p>}<label>推理强度<select aria-label="推理强度" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as AiReasoningEffort)}>{selectedModel?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{reasoningEffortLabels[option.reasoningEffort]}</option>)}</select></label>{effortDescription && <p>{effortDescription}</p>}<div className="info-callout compact"><ShieldCheck size={18} /><div><strong>默认：GPT-5.6-Sol · 中等推理</strong><p>更高强度通常更慢并消耗更多额度。变更只影响之后新领取的任务；正在处理的任务会继续使用启动时冻结的设置。AI 结果由应用校验；高影响医学判断才重点复核，也不等于医生审核。</p></div></div></>}<div className="dialog-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={loading || loadFailed || busy || !selectedModel} onClick={async () => { setBusy(true); try { if (await onSave({ modelId, reasoningEffort })) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 保存设置</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-preferences-title"><header><div><span className="eyebrow">分析报告模型</span><h2 id="ai-preferences-title">模型与推理强度</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭 AI 模型设置"><X size={19} /></button></header>{loading ? <div className="table-empty"><LoaderCircle size={24} className="spin" /><strong>正在读取当前账号可用模型</strong></div> : loadFailed ? <div className="info-callout compact"><CircleHelp size={18} /><div><strong>暂时无法读取模型列表</strong><p>请确认 Codex 已连接后重试。为避免保存无效组合，本次不会更改现有设置。</p></div></div> : <><label>模型<select aria-label="模型" value={modelId} onChange={(event) => { const next = models.find((model) => model.id === event.target.value); if (!next) return; setModelId(next.id); setReasoningEffort(next.defaultReasoningEffort); }}>{models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}</select></label>{selectedModel?.description && <p>{selectedModel.description}</p>}<label>推理强度<select aria-label="推理强度" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as AiReasoningEffort)}>{selectedModel?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{reasoningEffortLabels[option.reasoningEffort]}</option>)}</select></label>{effortDescription && <p>{effortDescription}</p>}<div className="info-callout compact"><ShieldCheck size={18} /><div><strong>默认：GPT-6-Sol · 中等推理</strong><p>此设置只影响之后新启动的综合分析与复核，报告事实提取仍沿用原模型。已生成的报告不会自动重算；正在处理的任务继续使用启动时冻结的设置。AI 结果由应用校验，也不等于医生审核。</p></div></div></>}<div className="dialog-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" disabled={loading || loadFailed || busy || !selectedModel} onClick={async () => { setBusy(true); try { if (await onSave({ modelId, reasoningEffort })) onClose(); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Check size={18} />} 保存设置</button></div></section></div>;
 }
 
 function AccountDialog({ snapshot, onClose, onConnect, onRefresh, onLogout }: {
@@ -715,7 +724,7 @@ function AboutDialog({ snapshot, onClose, onNotice }: { snapshot: DashboardSnaps
     });
     return () => { active = false; };
   }, []);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog about-dialog" role="dialog" aria-modal="true" aria-labelledby="about-dialog-title"><header><div><span className="eyebrow">关于与诊断</span><h2 id="about-dialog-title">家庭健康看板</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭关于信息"><X size={19} /></button></header><p>版本 0.1.0 · 本机 Beta 构建。下列诊断预览只有计数和运行状态，不包含报告正文、成员姓名、文件名、路径、凭据或登录链接。</p><dl className="detail-list"><div><dt>Codex 状态</dt><dd>{snapshot.account.status === 'connected' ? '已连接' : snapshot.account.status === 'connecting' ? '等待官方登录' : '未连接'}</dd></div><div><dt>锁定运行时</dt><dd>{diagnostic?.application.runtimeVersion ?? 'codex-cli 0.145.0'}</dd></div><div><dt>工作区计数</dt><dd>{diagnostic ? `${diagnostic.workspace.personCount} 位成员 · ${diagnostic.workspace.documentCount} 份资料 · ${diagnostic.taskSummary.total} 个任务` : '正在生成脱敏预览…'}</dd></div><div><dt>发行状态</dt><dd>未签名本机测试构建</dd></div></dl><div className="consent-facts"><span><FileCheck2 size={17} /> 关键依赖许可随应用附带在 THIRD_PARTY_NOTICES.md</span><span><ShieldCheck size={17} /> 当前只验证了 macOS arm64；x64、Windows、签名和公证仍需目标环境</span><span><CircleHelp size={17} /> 诊断文件只保存到你选择的本机位置，不自动上传或创建 Issue</span></div><div className="dialog-actions"><button className="secondary-button" disabled={!diagnostic || busy} onClick={async () => { setBusy(true); try { const result = await window.healthDesktop?.exportDiagnostic(); if (result?.ok && result.data) onNotice(`已保存 ${result.data.displayName}；它不包含健康正文或凭据。`); else if (result && !result.ok) onNotice('脱敏诊断信息没有保存，请稍后重试。'); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Archive size={18} />} 预览后保存诊断</button><button className="primary-button" onClick={onClose}>完成</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="member-dialog about-dialog" role="dialog" aria-modal="true" aria-labelledby="about-dialog-title"><header><div><span className="eyebrow">关于与诊断</span><h2 id="about-dialog-title">家庭健康看板</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭关于信息"><X size={19} /></button></header><p>版本 0.1.0 · 本机 Beta 构建。下列诊断预览只有计数和运行状态，不包含报告正文、成员姓名、文件名、路径、凭据或登录链接。</p><dl className="detail-list"><div><dt>Codex 状态</dt><dd>{snapshot.account.status === 'connected' ? '已连接' : snapshot.account.status === 'connecting' ? '等待官方登录' : '未连接'}</dd></div><div><dt>锁定运行时</dt><dd>{diagnostic?.application.runtimeVersion ?? 'codex-cli 0.156.1'}</dd></div><div><dt>工作区计数</dt><dd>{diagnostic ? `${diagnostic.workspace.personCount} 位成员 · ${diagnostic.workspace.documentCount} 份资料 · ${diagnostic.taskSummary.total} 个任务` : '正在生成脱敏预览…'}</dd></div><div><dt>发行状态</dt><dd>未签名本机测试构建</dd></div></dl><div className="consent-facts"><span><FileCheck2 size={17} /> 关键依赖许可随应用附带在 THIRD_PARTY_NOTICES.md</span><span><ShieldCheck size={17} /> 当前只验证了 macOS arm64；x64、Windows、签名和公证仍需目标环境</span><span><CircleHelp size={17} /> 诊断文件只保存到你选择的本机位置，不自动上传或创建 Issue</span></div><div className="dialog-actions"><button className="secondary-button" disabled={!diagnostic || busy} onClick={async () => { setBusy(true); try { const result = await window.healthDesktop?.exportDiagnostic(); if (result?.ok && result.data) onNotice(`已保存 ${result.data.displayName}；它不包含健康正文或凭据。`); else if (result && !result.ok) onNotice('脱敏诊断信息没有保存，请稍后重试。'); } finally { setBusy(false); } }}>{busy ? <LoaderCircle size={18} className="spin" /> : <Archive size={18} />} 预览后保存诊断</button><button className="primary-button" onClick={onClose}>完成</button></div></section></div>;
 }
 
 function DesktopBehaviorDialog({ behavior, onClose, onSave }: { behavior: DesktopBehavior; onClose(): void; onSave(input: { stayInTray: boolean; openAtLogin: boolean; notificationsEnabled: boolean }): Promise<boolean> }) {
@@ -823,27 +832,39 @@ function isReadOnlyResultLimitation(review: ReviewIssue): boolean {
     && review.candidateDiffs.length === 0;
 }
 
-function ResultLimitationNotice({ reviews, onEvidence, onDismiss }: {
+function distinctLimitationCandidates(reviews: ReviewIssue[]): ReviewIssue['candidateOptions'] {
+  const seen = new Set<string>();
+  return reviews.flatMap((review) => review.candidateOptions.filter((candidate) => {
+    // 旧资料可能复用 localKey；同 key 但项目、值或来源不同的候选不能被合并隐藏。
+    const key = `${review.documentId}:${JSON.stringify(candidate)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }));
+}
+
+function ResultLimitationsPanel({ snapshot, reviews, onEvidence, onRepair }: {
+  snapshot: DashboardSnapshot;
   reviews: ReviewIssue[];
   onEvidence(review: ReviewIssue): void;
-  onDismiss(): void;
+  onRepair(review: ReviewIssue): void;
 }) {
-  const [activeIndex, setActiveIndex] = useState(0);
-  const reviewIndex = Math.min(activeIndex, reviews.length - 1);
-  const review = reviews[reviewIndex]!;
   const documentCount = new Set(reviews.map((item) => item.documentId)).size;
-  const omittedCount = new Set(reviews.flatMap((item) => item.candidateOptions.map((candidate) => `${item.documentId}:${candidate.localKey}`))).size;
-  const title = reviews.length > 1
-    ? `${documentCount} 份资料${omittedCount > 0 ? `共 ${omittedCount} 个项目` : '有部分项目'}未纳入本次结果`
-    : review.title;
-  return <section className="info-callout compact assessment-refresh-callout" role="status">
-    <ShieldCheck size={20} />
-    <div><strong>{title}</strong><p>{review.description}{reviews.length > 1 ? ` 当前查看第 ${reviewIndex + 1}/${reviews.length} 份资料的依据。` : ''}</p></div>
-    <div className="button-row">
-      <button className="text-button" onClick={() => onEvidence(review)}><FileCheck2 size={17} /> 查看依据</button>
-      {reviews.length > 1 && <button className="text-button" onClick={() => setActiveIndex((reviewIndex + 1) % reviews.length)}>下一份</button>}
-      <button className="icon-button" onClick={onDismiss} aria-label="关闭结果限制提示"><X size={18} /></button>
-    </div>
+  const omittedCount = distinctLimitationCandidates(reviews).length;
+  return <section className="panel" aria-label="报告结果边界">
+    <div className="panel__heading"><div><span className="eyebrow">报告结果边界</span><h2>{documentCount} 份资料{omittedCount > 0 ? `共 ${omittedCount} 个项目` : '有部分项目'}未纳入本次结果</h2></div><StatusBadge tone="info">已保存其他可靠事实</StatusBadge></div>
+    <p className="body-copy">这些项目没有作为已确认事实进入健康分析。未纳入只表示目前无法可靠确认，不等于结果正常；可逐份查看原始依据。</p>
+    <div className="document-list">{reviews.map((review) => {
+      const document = snapshot.inbox.find((item) => item.id === review.documentId);
+      const documentName = document?.displayName ?? '本机报告';
+      const candidates = distinctLimitationCandidates([review]);
+      return <article className="document-row" key={review.id}>
+        <div><strong>{documentName}</strong><p>{candidates.length > 0 ? `${candidates.length} 个项目未纳入` : review.title} · {review.description}</p>
+          {candidates.length > 0 && <details><summary>查看未纳入项目</summary><ul>{candidates.map((candidate, index) => <li key={index}>{candidate.originalName}</li>)}</ul></details>}
+        </div>
+        <div className="button-row"><button className="text-button" aria-label={`查看${documentName}的依据`} onClick={() => onEvidence(review)}><FileCheck2 size={17} /> 查看依据</button><button className="text-button" aria-label={`重新核对这份报告：${documentName}`} disabled={!document || document.status !== 'completed' || !document.personId} onClick={() => onRepair(review)}><RefreshCw size={17} /> 重新核对这份报告</button></div>
+      </article>;
+    })}</div>
   </section>;
 }
 
@@ -949,6 +970,8 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   ));
   const isAssignment = review.kind === 'person_conflict' && review.personId === null;
   const isIdentityConfirmation = review.kind === 'person_conflict' && review.personId !== null && review.reportedName !== null;
+  const isCommittedIdentityConflict = isIdentityConfirmation
+    && review.reasonCodes.includes('COMMITTED_PERSON_IDENTITY_CONFLICT');
   const targetPerson = isIdentityConfirmation
     ? snapshot.persons.find((person) => person.id === review.personId) ?? null
     : null;
@@ -987,8 +1010,8 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   const canSubmit = !busy
     && (!isAssignment || Boolean(personId))
     && (!isIdentityConfirmation || (Boolean(targetPerson)
-      && (identityResolution === 'retry_review' || identityResolution === 'confirm_identity'
-        || (identityResolution === 'reassign_person' && Boolean(reassignPersonId))
+      && ((!isCommittedIdentityConflict && identityResolution === 'retry_review') || identityResolution === 'confirm_identity'
+        || (!isCommittedIdentityConflict && identityResolution === 'reassign_person' && Boolean(reassignPersonId))
         || (identityResolution === 'archive_only' && archiveConfirmed))))
     && (!isFieldConflict || isLegacyFieldReview || canRetryModelReview || canCorrect);
 
@@ -1039,22 +1062,23 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
                 <div><dt>识别到的姓名</dt><dd>{review.reportedName}</dd></div>
                 <div><dt>当前归属</dt><dd>{targetPerson.displayName}{targetPerson.relation ? ` · ${targetPerson.relation}` : ''}</dd></div>
               </dl>
+              {isCommittedIdentityConflict && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>原先已保存的事实暂不参与分析</strong><p>这份报告曾经入档，但重新核对时发现身份不一致。资料和事实仍保存在本机；确认身份后才恢复到当前成员的分析中。</p></div></div>}
               <div className="identity-resolution-options" role="group" aria-label="选择这份报告的处理方式">
-                <button type="button" className={`identity-resolution-option${identityResolution === 'retry_review' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'retry_review'} onClick={() => { setIdentityResolution('retry_review'); setArchiveConfirmed(false); }}>
+                {!isCommittedIdentityConflict && <button type="button" className={`identity-resolution-option${identityResolution === 'retry_review' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'retry_review'} onClick={() => { setIdentityResolution('retry_review'); setArchiveConfirmed(false); }}>
                   <RefreshCw size={21} /><span><strong>姓名识别有误，重新核对</strong><small>如果图片写的是报告者、审核人或检验者，而不是受检者，让应用按身份字段重新识别。</small></span>{identityResolution === 'retry_review' && <Check size={20} />}
-                </button>
+                </button>}
                 <button type="button" className={`identity-resolution-option${identityResolution === 'confirm_identity' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'confirm_identity'} onClick={() => { setIdentityResolution('confirm_identity'); setArchiveConfirmed(false); }}>
-                  <ShieldCheck size={21} /><span><strong>是同一人</strong><small>报告姓名与当前成员指的是同一个人。系统会重新核对后再保存事实。</small></span>{identityResolution === 'confirm_identity' && <Check size={20} />}
+                  <ShieldCheck size={21} /><span><strong>是同一人</strong><small>{isCommittedIdentityConflict ? '恢复这份报告的已保存事实参与当前成员分析，并继续核对未纳入项目。' : '报告姓名与当前成员指的是同一个人。系统会重新核对后再保存事实。'}</small></span>{identityResolution === 'confirm_identity' && <Check size={20} />}
                 </button>
-                <button type="button" className={`identity-resolution-option${identityResolution === 'reassign_person' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'reassign_person'} onClick={() => { setIdentityResolution('reassign_person'); setReassignPersonId(''); setArchiveConfirmed(false); }}>
+                {!isCommittedIdentityConflict && <button type="button" className={`identity-resolution-option${identityResolution === 'reassign_person' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'reassign_person'} onClick={() => { setIdentityResolution('reassign_person'); setReassignPersonId(''); setArchiveConfirmed(false); }}>
                   <UsersRound size={21} /><span><strong>属于另一位成员</strong><small>{otherPeople.length > 0 ? '从其他现有成员中选择正确归属。' : '目前没有其他可选成员，需要先创建成员。'}</small></span>{identityResolution === 'reassign_person' && <Check size={20} />}
-                </button>
+                </button>}
                 <button type="button" className={`identity-resolution-option${identityResolution === 'archive_only' ? ' is-active' : ''}`} aria-pressed={identityResolution === 'archive_only'} onClick={() => setIdentityResolution('archive_only')}>
-                  <Archive size={21} /><span><strong>不纳入任何成员</strong><small>保留本机原始资料，但阻止后续入库和成员分析。</small></span>{identityResolution === 'archive_only' && <Check size={20} />}
+                  <Archive size={21} /><span><strong>不纳入任何成员</strong><small>{isCommittedIdentityConflict ? '保留原始资料和审计记录，已保存事实不再参与当前成员分析；正确成员需重新导入并授权。' : '保留本机原始资料，但阻止后续入库和成员分析。'}</small></span>{identityResolution === 'archive_only' && <Check size={20} />}
                 </button>
               </div>
               {identityResolution === 'retry_review' && <div className="info-callout compact"><RefreshCw size={18} /><div><strong>重新识别报告中的人物角色</strong><p>这不会确认两个人是同一人。应用会重新读取原始报告；如果报告确实写了另一位受检者，仍会暂停等待核对。</p></div></div>}
-              {identityResolution === 'confirm_identity' && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。</p></div></div>}
+              {identityResolution === 'confirm_identity' && <div className="info-callout compact"><ShieldCheck size={18} /><div><strong>只确认这份报告的身份关系</strong><p>{isCommittedIdentityConflict ? '不会修改已保存事实或成员名称。确认后恢复事实参与分析，并继续核对尚未纳入的项目。' : '不会修改成员名称，也不是医学结论。确认后系统会重新核对报告，再保存有来源的事实。'}</p></div></div>}
               {identityResolution === 'reassign_person' && (otherPeople.length > 0 ? <>
                 <label className="identity-resolution-select">选择另一位成员
                   <select aria-label="选择另一位成员" value={reassignPersonId} onChange={(event) => setReassignPersonId(event.target.value)}>
@@ -1068,7 +1092,7 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
                 <button type="button" className="secondary-button" onClick={onCreateMember}><Plus size={17} /> 先创建成员</button>
               </div>)}
               {identityResolution === 'archive_only' && <>
-                <div className="info-callout compact"><Archive size={18} /><div><strong>这份资料不会进入任何成员档案</strong><p>后续不会入库或参与分析；此前已经授权并发送给模型的处理审计仍会保留，不能通过这个操作撤回。</p></div></div>
+                <div className="info-callout compact"><Archive size={18} /><div><strong>这份资料不会进入任何成员档案</strong><p>{isCommittedIdentityConflict ? '原先已保存的事实也会从当前成员分析中排除，但保留本机资料与审计记录；若属于其他成员，请为正确成员重新导入并授权。' : '后续不会入库或参与分析；此前已经授权并发送给模型的处理审计仍会保留，不能通过这个操作撤回。'}</p></div></div>
                 <label className="identity-archive-confirm"><input type="checkbox" checked={archiveConfirmed} onChange={(event) => setArchiveConfirmed(event.target.checked)} /> 我确认不把这份资料纳入任何成员</label>
               </>}
             </>
@@ -1119,13 +1143,15 @@ function ReviewResolutionDialog({ review, snapshot, onClose, onEvidence, onResol
   );
 }
 
-function EvidencePanel({ evidence, demo, onClose }: { evidence: Evidence | null; demo: boolean; onClose(): void }) {
+function EvidencePanel({ evidence, demo, resultLimitations, onClose }: { evidence: Evidence | null; demo: boolean; resultLimitations: ReviewIssue[]; onClose(): void }) {
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (evidence) closeButtonRef.current?.focus();
   }, [evidence]);
   if (!evidence) return null;
-  return <aside className="evidence-panel" aria-label="证据侧栏" onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); onClose(); } }}><header><div><span className="eyebrow">证据与来源</span><h2>{evidence.title}</h2></div><button ref={closeButtonRef} className="icon-button" onClick={onClose} aria-label="关闭证据侧栏"><X size={19} /></button></header><div className="evidence-preview">{evidence.previewImageDataUrl ? <img src={evidence.previewImageDataUrl} alt={`${evidence.title}的受控预览`} /> : <div className="evidence-page"><span>{demo ? '虚构资料预览' : '来源摘录'}</span><p>……检验项目与结果……</p><mark>{evidence.quote}</mark><p>……报告其余内容……</p></div>}</div><div className="evidence-meta"><StatusBadge tone="info">来源定位</StatusBadge><strong>{evidence.label}</strong><p>{evidence.meta}</p></div><div className="evidence-note"><ShieldCheck size={18} /><p>界面只按对象 ID 读取资料，不向页面暴露本机文件路径。</p></div></aside>;
+  const sourceLimitations = resultLimitations.filter((review) => review.documentId === evidence.documentId);
+  const omittedCandidates = distinctLimitationCandidates(sourceLimitations);
+  return <aside className="evidence-panel" aria-label="证据侧栏" onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); onClose(); } }}><header><div><span className="eyebrow">证据与来源</span><h2>{evidence.title}</h2></div><button ref={closeButtonRef} className="icon-button" onClick={onClose} aria-label="关闭证据侧栏"><X size={19} /></button></header><div className="evidence-preview">{sourceLimitations.length > 0 && <details className="analysis-boundaries"><summary>{omittedCandidates.length > 0 ? `${omittedCandidates.length} 个项目未纳入本次结果` : '本报告有项目未纳入本次结果'}</summary><p>这些内容没有作为已确认事实进入健康分析。未纳入不等于结果正常。</p>{sourceLimitations.map((review) => <p key={review.id}>{review.description}</p>)}{omittedCandidates.length > 0 && <ul>{omittedCandidates.map((candidate, index) => <li key={index}>{candidate.originalName}</li>)}</ul>}</details>}{evidence.previewImageDataUrl ? <img src={evidence.previewImageDataUrl} alt={`${evidence.title}的受控预览`} /> : <div className="evidence-page"><span>{demo ? '虚构资料预览' : '来源摘录'}</span><p>……检验项目与结果……</p><mark>{evidence.quote}</mark><p>……报告其余内容……</p></div>}</div><div className="evidence-meta"><StatusBadge tone="info">来源定位</StatusBadge><strong>{evidence.label}</strong><p>{evidence.meta}</p></div><div className="evidence-note"><ShieldCheck size={18} /><p>界面只按对象 ID 读取资料，不向页面暴露本机文件路径。</p></div></aside>;
 }
 
 function WorkspaceDialog({ snapshot, onClose, onCreate, onSwitch }: {
@@ -1394,16 +1420,17 @@ function ProcessConsentDialog({ snapshot, documentIds, onClose, onConfirm, onLog
 }) {
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
-  const { readyDocuments, refreshPersons } = manualProcessingScope(snapshot, documentIds);
+  const { readyDocuments, repairDocuments, refreshPersons } = manualProcessingScope(snapshot, documentIds);
   const readyCount = readyDocuments.length;
+  const repairCount = repairDocuments.length;
   const derivedRefreshCount = refreshPersons.length;
-  const processingCount = readyCount + derivedRefreshCount;
+  const processingCount = readyCount + repairCount + derivedRefreshCount;
   const connected = snapshot.account.status === 'connected';
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="member-dialog process-consent-dialog" role="dialog" aria-modal="true" aria-labelledby="process-consent-title">
         <header><div><span className="eyebrow">本次手动处理</span><h2 id="process-consent-title">确认发送范围</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭处理确认"><X size={19} /></button></header>
-        <p>{readyCount > 0 ? `将处理 ${readyCount} 份${documentIds ? '选中的' : ''}已归属新资料` : '本次不处理新资料'}{derivedRefreshCount > 0 ? `，并为 ${refreshPersons.map((person) => person.displayName).join('、')}刷新综合说明` : ''}。{readyCount === 0 ? '已完成的报告不会重新上传或提取；' : '新资料会先提取；'}成员综合会复用<strong>该成员已接纳的相关历史事实和必要的本人补充</strong>。这些必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>
+        {repairCount > 0 ? <p>将重新核对 {repairCount} 份已完成的报告。应用会重读整份报告；原始报告的必要内容可能再次发送给 <strong>OpenAI/Codex</strong>。已有已接纳事实会保留，经核验的新结果才会增量更新。成员综合会复用<strong>该成员已接纳的相关历史事实和必要的本人补充</strong>，原始资料仍保存在本机。</p> : <p>{readyCount > 0 ? `将处理 ${readyCount} 份${documentIds ? '选中的' : ''}已归属新资料` : '本次不处理新资料'}{derivedRefreshCount > 0 ? `，并为 ${refreshPersons.map((person) => person.displayName).join('、')}刷新综合说明` : ''}。{readyCount === 0 ? '已完成的报告不会重新上传或提取；' : '新资料会先提取；'}成员综合会复用<strong>该成员已接纳的相关历史事实和必要的本人补充</strong>。这些必要内容会发送给 <strong>OpenAI/Codex</strong>，原始资料仍保存在本机。</p>}
         <p>纯合成联网测试已观察到检验数值进入搜索词；应用无法在查询发出前拦截。若继续授权，真实报告内容也可能发生同类情况。</p>
         <div className="consent-facts"><span><ShieldCheck size={17} /> 不发送未归属资料或本次范围外的成员资料</span><span><FileCheck2 size={17} /> 历史事实只限上述成员且在授权清单中记录</span><span><FileCheck2 size={17} /> 事实入库由应用校验；重要综合判断按需重点复核</span><span><CircleHelp size={17} /> 综合分析可使用内置 Web Search；应用目前无法在发送前逐条检查搜索词，敏感内容可能被错误带入查询</span><span><Sparkles size={17} /> 使用当前 Codex 账户额度，额度规则可能变化</span></div>
         <label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> 我确认本次接收方、用途和资料范围</label>
@@ -1444,7 +1471,6 @@ export default function App() {
   const [cancelJob, setCancelJob] = useState<JobSummary | null>(null);
   const [backupDialogOpen, setBackupDialogOpen] = useState(false);
   const [reviewDialog, setReviewDialog] = useState<ReviewIssue | null>(null);
-  const [dismissedResultLimitationIds, setDismissedResultLimitationIds] = useState<Set<string>>(() => new Set());
   const [desktopDialogOpen, setDesktopDialogOpen] = useState(false);
   const [displayDialogOpen, setDisplayDialogOpen] = useState(false);
   const [aiDialogOpen, setAiDialogOpen] = useState(false);
@@ -1588,9 +1614,23 @@ export default function App() {
 
   const openReviews = snapshot.reviews.filter((review) => review.resolutionStatus === 'open' && review.severity === 'blocking');
   const openReview = openReviews[0];
+  const blockedDocumentIds = new Set(snapshot.reviews.filter((review) => review.resolutionStatus === 'open'
+    && review.severity === 'blocking').map((review) => review.documentId));
   const resultLimitations = snapshot.reviews.filter((review) => review.resolutionStatus === 'open'
-    && isReadOnlyResultLimitation(review)
-    && !dismissedResultLimitationIds.has(review.id));
+    && isReadOnlyResultLimitation(review) && review.personId !== null
+    && !blockedDocumentIds.has(review.documentId)
+    && snapshot.inbox.some((item) => item.id === review.documentId && item.status === 'completed'));
+
+  function handleOpenLimitationEvidence(review: ReviewIssue): void {
+    void handleOpenEvidence({
+      title: review.title,
+      label: '本机导入资料',
+      quote: '查看这部分未纳入内容的原始依据。',
+      meta: review.description,
+      sourceSpanId: review.evidenceRefs[0] ?? null,
+      documentId: review.documentId
+    });
+  }
 
   async function handleOpenEvidence(next: Evidence) {
     if (!evidence && document.activeElement instanceof HTMLElement) evidenceReturnFocusRef.current = document.activeElement;
@@ -1629,7 +1669,11 @@ export default function App() {
     setSnapshot(next);
     setToast(input.action === 'assign_person'
       ? '成员归属已确认，资料已进入待处理队列。'
-      : input.action === 'confirm_identity' ? '身份关系已确认，任务将从事实提取重新核对并继续。'
+      : input.action === 'confirm_identity'
+        ? snapshot?.reviews.some((issue) => issue.id === input.issueId
+          && issue.reasonCodes.includes('COMMITTED_PERSON_IDENTITY_CONFLICT'))
+          ? '身份关系已确认，原先保存的事实已恢复参与分析；未纳入项目仍可继续核对。'
+          : '身份关系已确认，任务将从事实提取重新核对并继续。'
       : input.action === 'retry_review'
         ? snapshot?.reviews.some((issue) => issue.id === input.issueId && issue.kind === 'person_conflict')
           ? '正在重新识别报告中的人物角色；若仍有受检者身份冲突，会再次提示你。'
@@ -1653,7 +1697,7 @@ export default function App() {
         if (snapshot.workspaceMode !== 'personal') setWorkspaceDialogOpen(true);
         else setDirectoryDialogOpen(true);
       }} /></>;
-      case 'processing': return <ProcessingPage snapshot={snapshot} onCancel={setCancelJob} onRetry={(job) => void handleRetryJob(job)} onTogglePause={() => void handleToggleQueuePause()} onDetails={setJobDetail} />;
+      case 'processing': return <ProcessingPage snapshot={snapshot} resultLimitations={resultLimitations} onOpenLimitationEvidence={handleOpenLimitationEvidence} onRepairLimitation={(review) => { setProcessDocumentIds([review.documentId]); setProcessConsentOpen(true); }} onCancel={setCancelJob} onRetry={(job) => void handleRetryJob(job)} onTogglePause={() => void handleToggleQueuePause()} onDetails={setJobDetail} />;
       case 'actions': return <ActionsPage snapshot={snapshot} onCreate={() => {
         if (snapshot.workspaceMode !== 'personal') setToast('演示工作区不会保存事项；请先建立或切换到个人工作区。');
         else setActionDialogOpen(true);
@@ -1679,11 +1723,13 @@ export default function App() {
 
   async function handleProcessNow(documentIds?: string[]): Promise<boolean> {
     if (!window.healthDesktop) { setToast('演示模式不会发送资料。'); return false; }
-    const refreshOnly = manualProcessingScope(snapshot, documentIds).readyDocuments.length === 0;
+    const { readyDocuments, repairDocuments } = manualProcessingScope(snapshot, documentIds);
+    const refreshOnly = readyDocuments.length === 0 && repairDocuments.length === 0;
     const result = await window.healthDesktop.processNow({ consentVersion: 1, confirmedDataRecipient: 'OpenAI/Codex', documentIds });
     if (result.ok) {
       setSnapshot(await window.healthDesktop.getSnapshot());
       setToast(result.revision === 0 ? '这批资料已经在处理中，没有重复创建任务。'
+        : repairDocuments.length > 0 ? '本次授权已记录，正在重读整份报告并核对未纳入项目；已接纳事实会保留。'
         : refreshOnly ? '本次授权已记录，正在复用已保存事实生成新版综合；旧报告不会重新上传或提取。'
           : '本次授权已记录，正在通过 Codex 提取新资料；随后会按成员整理综合结果。');
       return true;
@@ -2054,7 +2100,7 @@ export default function App() {
       return false;
     }
     setAiPreferences(result.data);
-    setToast(`已设置为 ${modelPreferenceLabel(result.data)}；之后新启动的任务会使用这组设置。`);
+    setToast(`分析报告已设置为 ${modelPreferenceLabel(result.data)}；之后新启动的综合分析会使用这组设置。`);
     return true;
   }
 
@@ -2068,25 +2114,10 @@ export default function App() {
         <Topbar snapshot={snapshot} onLogin={() => void handleLogin()} onProcessing={() => setPage('processing')} />
         <main className="content-area">
           {openReview && page !== 'settings' && <ReviewBanner review={openReview} openCount={openReviews.length} onOpen={() => setReviewDialog(openReview)} />}
-          {resultLimitations.length > 0 && page !== 'settings' && <ResultLimitationNotice
-            reviews={resultLimitations}
-            onEvidence={(review) => void handleOpenEvidence({
-              title: review.title,
-              label: '本机导入资料',
-              quote: '查看这部分未纳入内容的原始依据。',
-              meta: review.description,
-              sourceSpanId: review.evidenceRefs[0] ?? null,
-              documentId: review.evidenceRefs.length === 0 ? review.documentId : null
-            })}
-            onDismiss={() => setDismissedResultLimitationIds((current) => new Set([
-              ...current,
-              ...resultLimitations.map((review) => review.id)
-            ]))}
-          />}
           {content}
         </main>
       </div>
-      <EvidencePanel evidence={evidence} demo={snapshot.workspaceMode === 'demo'} onClose={() => setEvidence(null)} />
+      <EvidencePanel evidence={evidence} demo={snapshot.workspaceMode === 'demo'} resultLimitations={resultLimitations} onClose={() => setEvidence(null)} />
       {workspaceDialogOpen && <WorkspaceDialog snapshot={snapshot} onClose={() => setWorkspaceDialogOpen(false)} onCreate={handleCreateWorkspace} onSwitch={handleSwitchWorkspace} />}
       {memberDialogOpen && <MemberDialog onClose={() => setMemberDialogOpen(false)} onCreate={handleCreatePerson} />}
       {memberEditDialogOpen && snapshot.persons.find((person) => person.id === selectedPersonId) && <MemberEditDialog person={snapshot.persons.find((person) => person.id === selectedPersonId)!} onClose={() => setMemberEditDialogOpen(false)} onSave={handleUpdatePersonDisplay} onArchive={() => { const person = snapshot.persons.find((item) => item.id === selectedPersonId); if (person) { setMemberEditDialogOpen(false); setArchivePerson(person); } }} />}

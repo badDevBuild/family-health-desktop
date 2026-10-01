@@ -196,7 +196,7 @@ function calendarDateMatches(text: string): Array<{ date: string; index: number;
 
 function labelledCalendarDateMatches(text: string): Array<{ date: string; index: number; length: number }> {
   const matches: Array<{ date: string; index: number; length: number }> = [];
-  const pattern = /(?:检查|检验|采样|采集|体检|就诊|临床|报告)\s*日期\s*[：:]?\s*((?<!\d)(\d{4})\s*(?:([-/.])\s*(\d{1,2})\s*\3\s*(\d{1,2})|年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?)(?!\d))/g;
+  const pattern = /(?:检查|检验|采样|采集|体检|复查|就诊|临床|报告)\s*日期\s*[：:]?\s*((?<!\d)(\d{4})\s*(?:([-/.])\s*(\d{1,2})\s*\3\s*(\d{1,2})|年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?)(?!\d))/g;
   for (const match of text.matchAll(pattern)) {
     const year = Number(match[2]);
     const month = Number(match[4] ?? match[6]);
@@ -323,21 +323,78 @@ function strengthenUnambiguousClinicalDateEvidence(
       }
       const span = spansById.get(reference.sourceSpanId);
       if (!span?.quote || span.readability !== 'clear' || !reference.quote) return [reference];
+      const previousPageEvidence = previousPageSummaryDateEvidence(
+        candidate, span, reference.quote, clinicalDate, sourceSpans
+      );
+      // 跨页小结位于下一页开头时，当前页后半段的日期通常属于下一个科室。
+      if (previousPageEvidence) return [reference, previousPageEvidence];
       const strengthenedQuote = contextualDateEvidenceQuote(span.quote, reference.quote, clinicalDate);
       if (strengthenedQuote) return [{ ...reference, quote: strengthenedQuote }];
-      const previousPageEvidence = previousPageSummaryDateEvidence(
-        candidate,
-        span,
-        reference.quote,
-        clinicalDate,
-        sourceSpans
-      );
-      return previousPageEvidence ? [reference, previousPageEvidence] : [reference];
+      return [reference];
     });
     const uniqueEvidence = [...new Map(evidence.map((reference) => (
       [`${reference.sourceSpanId}\u0000${reference.quote ?? ''}`, reference] as const
     ))).values()];
     return { ...candidate, evidence: uniqueEvidence };
+  });
+}
+
+function inheritReportClinicalDate(
+  candidates: ObservationCandidate[],
+  sourceSpans: SourceSpan[],
+  reportMetadata: ReportMetadataCandidate | null | undefined
+): ObservationCandidate[] {
+  const spansById = new Map(sourceSpans.map((span) => [span.id, span]));
+  const reportTimes = reportMetadata?.times.filter((time) => (
+    time.precision === 'day' && ['sampled', 'examined', 'encounter'].includes(time.role)
+  )) ?? [];
+  const dates = [...new Set(reportTimes.map((time) => time.value))];
+  // 同一报告出现不同检查日时，不能把其中一个日期套到所有项目上。
+  if (dates.length !== 1) return candidates;
+  const reportDate = dates[0]!;
+  const reportYear = reportDate.slice(0, 4);
+  const hasCompetingFullReportDate = sourceSpans.some((span) => {
+    const quote = span.quote;
+    if (!quote) return false;
+    if (calendarDateMatches(quote).some((match) => match.date !== reportDate)) return true;
+    if (/历次|跨年|年度对比|历史结果/.test(quote)) return true;
+    return [...quote.matchAll(/(?<!\d)((?:19|20)\d{2})(?:\s*年度|\s*年)?(?!\d)/g)]
+      .some((match) => match[1] !== reportYear);
+  });
+  // 模型的元数据可能漏掉后续块、章节或年度对比中的日期。只有整份报告的所有
+  // 可读片段都没有第二个日历日期、其他年份或年度对比语境时，才允许把
+  // 首页日期继承给无日期候选。不能证明是同一次检查，就保留空值。
+  if (hasCompetingFullReportDate) return candidates;
+  const dateEvidence = reportTimes
+    .flatMap((time) => time.evidence)
+    .find((reference) => {
+      const span = spansById.get(reference.sourceSpanId);
+      return span?.readability === 'clear'
+        && Boolean(span.quote && reference.quote && span.quote.includes(reference.quote))
+        && calendarDateMatches(reference.quote ?? '').some((match) => match.date === reportDate);
+    });
+  if (!dateEvidence) return candidates;
+
+  return candidates.map((candidate) => {
+    if (candidate.clinicalDate && candidate.clinicalDate !== reportDate) return candidate;
+    const citedSpans = candidate.evidence
+      .map((reference) => spansById.get(reference.sourceSpanId))
+      .filter((span): span is SourceSpan => Boolean(span?.quote && span.readability === 'clear'));
+    if (citedSpans.length === 0) return candidate;
+    // 历次结果、跨年对比或页面自身的其他日期必须按列/章节核对，不能继承封面日期。
+    if (citedSpans.some((span) => (
+      calendarDateMatches(span.quote ?? '').some((match) => match.date !== reportDate)
+      || /历次|跨年|年度对比|历史结果/.test(span.quote ?? '')
+    ))) return candidate;
+    if (candidate.evidence.some((reference) => (
+      reference.sourceSpanId === dateEvidence.sourceSpanId
+      && reference.quote === dateEvidence.quote
+    ))) return candidate.clinicalDate ? candidate : { ...candidate, clinicalDate: reportDate };
+    return {
+      ...candidate,
+      clinicalDate: reportDate,
+      evidence: [...candidate.evidence, dateEvidence]
+    };
   });
 }
 
@@ -371,14 +428,37 @@ function expandAbbreviatedEvidenceQuotes(
   }));
 }
 
-function normalizeCandidates(candidates: ObservationCandidate[], sourceSpans: SourceSpan[]): ObservationCandidate[] {
+function relocateUnambiguousEvidenceRefs(
+  candidates: ObservationCandidate[],
+  sourceSpans: SourceSpan[]
+): ObservationCandidate[] {
+  const spansById = new Map(sourceSpans.map((span) => [span.id, span]));
+  const compact = (value: string): string => value.normalize('NFKC').replace(/\s+/g, '');
+  return candidates.map((candidate) => ({
+    ...candidate,
+    evidence: candidate.evidence.map((reference) => {
+      if (!reference.quote || compact(reference.quote).length < 6) return reference;
+      const existing = spansById.get(reference.sourceSpanId);
+      if (existing?.readability === 'clear' && existing.quote
+        && compact(existing.quote).includes(compact(reference.quote))) return reference;
+      const matches = sourceSpans.filter((span) => (
+        span.readability === 'clear' && Boolean(span.quote)
+        && compact(span.quote!).includes(compact(reference.quote!))
+      ));
+      // 只有报告内唯一一处能逐字对上时才改来源定位；同值重复绝不猜页码。
+      return matches.length === 1 ? { ...reference, sourceSpanId: matches[0]!.id } : reference;
+    })
+  }));
+}
+
+function normalizeCandidates(
+  candidates: ObservationCandidate[],
+  sourceSpans: SourceSpan[],
+  reportMetadata?: ReportMetadataCandidate | null
+): ObservationCandidate[] {
   return strengthenUnambiguousClinicalDateEvidence(
-    expandAbbreviatedEvidenceQuotes(normalizeBloodPressureCandidates(candidates
-      .filter((candidate) => !(candidate.value.kind === 'unknown'
-        && candidate.value.rawText === null
-        && candidate.issues.length === 0
-        && /空白|未填写|未填|空栏|未记录/.test(candidate.value.reason)))
-      .map(normalizeModelEntities), sourceSpans), sourceSpans),
+    inheritReportClinicalDate(expandAbbreviatedEvidenceQuotes(relocateUnambiguousEvidenceRefs(normalizeBloodPressureCandidates(candidates
+      .map(normalizeModelEntities), sourceSpans), sourceSpans), sourceSpans), sourceSpans, reportMetadata),
     sourceSpans
   );
 }
@@ -951,8 +1031,93 @@ function candidateToObservation(candidate: ObservationCandidate, acceptanceId: s
     specimen: candidate.specimen,
     method: candidate.method,
     bodySite: candidate.bodySite,
+    clinicalContext: candidate.clinicalContext ?? null,
     evidence: candidate.evidence
   };
+}
+
+type CommittedObservationComparable = Pick<ReturnType<typeof candidateToObservation>,
+  'originalName' | 'clinicalDate' | 'specimen' | 'method' | 'bodySite' | 'conceptKey' |
+  'valueKind' | 'decimalValue' | 'rawText' | 'qualifier' | 'unit' | 'referenceRange' | 'abnormalFlag'>;
+
+function committedObservationIdentity(observation: CommittedObservationComparable): string {
+  return stableHash([
+    normalizedComparableText(observation.originalName), observation.clinicalDate ?? '',
+    normalizedComparableText(observation.specimen), normalizedComparableText(observation.method),
+    normalizedComparableText(observation.bodySite)
+  ]);
+}
+
+function committedObservationValue(observation: CommittedObservationComparable): string {
+  return stableHash([
+    normalizedComparableText(observation.conceptKey), observation.valueKind,
+    observation.valueKind === 'numeric' && observation.decimalValue !== null
+      ? String(Number(observation.decimalValue)) : normalizedComparableText(observation.rawText),
+    normalizedComparableText(observation.qualifier), normalizedComparableText(observation.unit),
+    normalizedComparableText(observation.referenceRange), observation.abnormalFlag
+  ]);
+}
+
+function sameReportFinding(old: ObservationCandidate, accepted: ObservationCandidate[], sourceSpans: SourceSpan[]): boolean {
+  const sameName = accepted.filter((candidate) => (
+    normalizedComparableText(candidate.originalName) === normalizedComparableText(old.originalName)
+    && old.clinicalDate === candidate.clinicalDate
+  ));
+  if (sameName.length !== 1) return false;
+  const replacement = sameName[0]!;
+  const byId = new Map(sourceSpans.map((span) => [span.id, span]));
+  const compact = (value: string | null): string => (normalizedComparableText(value) ?? '').replace(/[()（）\s]/g, '');
+  const normalizedName = compact(old.originalName);
+  if (!normalizedName) return false;
+  // 旧版本可能只把 sourceSpanId 写错。仅当旧引文在整份清晰原文中唯一命中时，
+  // 才把它重新定位用于“旧缺口已解决”的判断；绝不凭项目名或相同数值猜来源。
+  const relocatedOld = relocateUnambiguousEvidenceRefs([old], sourceSpans)[0]!;
+  const sameUniqueSource = relocatedOld.evidence.some((reference) => replacement.evidence.some((other) => {
+    if (reference.sourceSpanId !== other.sourceSpanId) return false;
+    const span = byId.get(reference.sourceSpanId);
+    if (!span?.quote || span.readability !== 'clear') return false;
+    const source = compact(span.quote);
+    const index = source.indexOf(normalizedName);
+    return index >= 0 && source.indexOf(normalizedName, index + normalizedName.length) < 0;
+  }));
+  if (old.value.kind === 'unknown') return sameUniqueSource;
+  if (old.value.kind === replacement.value.kind
+    && stableHash(comparableValue(old)) === stableHash(comparableValue(replacement))) {
+    return sameUniqueSource;
+  }
+  // 旧候选的值本身可能误读，但只有同一清晰来源处该项目唯一时，才可由新结果结清。
+  return sameUniqueSource;
+}
+
+function confirmedBlankOldCandidate(
+  candidate: ObservationCandidate,
+  allOldCandidates: ObservationCandidate[],
+  newCandidates: ObservationCandidate[],
+  coveredSourceSpanIds: string[],
+  sourceSpans: SourceSpan[]
+): boolean {
+  if (candidate.value.kind !== 'unknown' || candidate.value.rawText !== null
+    || candidate.issues.length > 0 || !/检查结果为空|结果栏为空|明确空白|未填写/.test(candidate.value.reason)) return false;
+  const compact = (value: string): string => value.normalize('NFKC').replace(/[\s（）()：:；;，,。]/g, '');
+  const name = compact(candidate.originalName);
+  if (!name || newCandidates.some((item) => compact(item.originalName) === name)) return false;
+  const knownNames = [...new Set([...allOldCandidates, ...newCandidates]
+    .map((item) => compact(item.originalName)).filter((item) => item && item !== name))];
+  const byId = new Map(sourceSpans.map((span) => [span.id, span]));
+  return candidate.evidence.length > 0 && candidate.evidence.every((reference) => {
+    const span = byId.get(reference.sourceSpanId);
+    if (!coveredSourceSpanIds.includes(reference.sourceSpanId)
+      || span?.readability !== 'clear' || !span.quote || !reference.quote
+      || !compact(span.quote).includes(compact(reference.quote))) return false;
+    const cited = compact(reference.quote);
+    const index = cited.indexOf(name);
+    if (index < 0 || cited.indexOf(name, index + name.length) >= 0) return false;
+    const after = index + name.length;
+    const nextIndexes = knownNames.map((known) => cited.indexOf(known, after)).filter((value) => value >= 0);
+    const segment = cited.slice(after, nextIndexes.length > 0 ? Math.min(...nextIndexes) : cited.length);
+    // 只自动结清原文明确标为“空白/未填写”的栏位；缺字不等于能证明原件空白。
+    return /^(?:空白|未填写|—|–|--)$/.test(segment);
+  });
 }
 
 export class DocumentExtractionPipeline {
@@ -983,6 +1148,14 @@ export class DocumentExtractionPipeline {
 
 
   async process(documentId: string): Promise<ExtractionPipelineResult> {
+    const committedReviewIssue = this.store.isDocumentCommitted(documentId)
+      ? this.store.listOpenExtractionReviewIssues().find((issue) => (
+        issue.documentId === documentId && issue.severity === 'warning' && issue.stage === 'extract'
+      ))
+      : null;
+    if (this.store.isDocumentCommitted(documentId) && !committedReviewIssue) {
+      throw new Error('COMMITTED_DOCUMENT_REPAIR_ISSUE_REQUIRED');
+    }
     let bundle = this.store.getDocumentExtractionBundle(documentId);
     if (bundle.manifest.conversionWarnings.includes('historical_manifest_metadata_unavailable')) {
       if (bundle.manifest.mediaType !== 'application/pdf') throw new Error('LEGACY_MANIFEST_RECOVERY_UNSAFE');
@@ -1178,7 +1351,7 @@ export class DocumentExtractionPipeline {
         }
         let extracted: ExtractionResult = {
           ...parsed.data,
-          candidates: scopeCandidateKeys(normalizeCandidates(parsed.data.candidates, spans), chunkIndex)
+          candidates: scopeCandidateKeys(normalizeCandidates(parsed.data.candidates, spans, parsed.data.reportMetadata), chunkIndex)
         };
         if (!subjectIsConsistent(extracted, bundle)) {
           const reportedName = conflictingReportedName(extracted, bundle);
@@ -1221,7 +1394,7 @@ export class DocumentExtractionPipeline {
             && evidenceIsConfinedToChunk(repairedParsed.data, expectedSpanIds)) {
             const repaired: ExtractionResult = {
               ...repairedParsed.data,
-              candidates: scopeCandidateKeys(normalizeCandidates(repairedParsed.data.candidates, spans), chunkIndex)
+              candidates: scopeCandidateKeys(normalizeCandidates(repairedParsed.data.candidates, spans, repairedParsed.data.reportMetadata), chunkIndex)
             };
             const oldByKey = new Map(extracted.candidates.map((candidate) => [candidate.localKey, candidate]));
             const newByKey = new Map(repaired.candidates.map((candidate) => [candidate.localKey, candidate]));
@@ -1260,18 +1433,28 @@ export class DocumentExtractionPipeline {
       if (temporaryRoot) rmSync(temporaryRoot, { recursive: true, force: true });
     }
     if (!lastReceipt) throw new Error('EXTRACTION_RECEIPT_MISSING');
-    if (acceptedCandidates.length === 0) {
+    if (acceptedCandidates.length === 0 && !committedReviewIssue) {
       return this.needsReview(documentId, 'coverage_gap', uncoveredSpanIds.length ? uncoveredSpanIds : bundle.manifest.spans.map((span) => span.id),
         'NO_ACCEPTABLE_FACTS', lastReceipt.threadId, lastReceipt.turnId,
         unresolved.map((item) => item.candidate));
     }
+    const reviewedMetadata = aggregateReportMetadata(metadata);
+    // 每个 P01 块先按块内证据做规范化；首页元数据不会被传给后续块。所有块都
+    // 已通过边界检查后，再用整份报告的元数据与全部片段做一次受控日期补齐。
+    // inheritReportClinicalDate 会在发现任意其他日历日期时整体放弃继承。
+    const reviewedCandidates = inheritReportClinicalDate(
+      acceptedCandidates,
+      bundle.manifest.spans,
+      reviewedMetadata
+    );
     const reviewed: ExtractionResult = {
       schemaVersion: 1, documentId, subject: aggregateReviewedSubject(subjects),
-      reportMetadata: aggregateReportMetadata(metadata),
-      coveredSourceSpanIds: [...new Set(coveredSourceSpanIds)], candidates: acceptedCandidates
+      reportMetadata: reviewedMetadata,
+      coveredSourceSpanIds: [...new Set(coveredSourceSpanIds)], candidates: reviewedCandidates
     };
     const reviewRef = 'lean-extract:' + stableHash(extractionTurnIds);
     const accepted: Array<ReturnType<typeof candidateToObservation>> = [];
+    const acceptedPairs: Array<{ candidate: ObservationCandidate; observation: ReturnType<typeof candidateToObservation> }> = [];
     for (const candidate of reviewed.candidates) {
       const outcome = evaluateObservationCandidate(candidate, bundle.manifest, {
         personConsistent: reviewedSubjectsAreConsistent(subjects), overwritesUserLockedValue: false
@@ -1285,12 +1468,102 @@ export class DocumentExtractionPipeline {
         method: 'auto', actor: 'policy', rulesVersion: ACCEPTANCE_RULES_VERSION,
         inputSignature, outputHash: stableHash({ candidate, outcome }), reviewRef, decision: outcome.decision
       });
-      accepted.push(candidateToObservation(candidate, acceptanceId, documentId));
+      const observation = candidateToObservation(candidate, acceptanceId, documentId);
+      accepted.push(observation);
+      acceptedPairs.push({ candidate, observation });
     }
-    if (accepted.length === 0) {
+    if (accepted.length === 0 && !committedReviewIssue) {
       return this.needsReview(documentId, 'field_conflict', bundle.manifest.spans.map((span) => span.id),
         'NO_ACCEPTABLE_FACTS', lastReceipt.threadId, lastReceipt.turnId,
         unresolved.map((item) => item.candidate));
+    }
+    if (committedReviewIssue) {
+      // 旧候选仅作为待核对线索：必须由本轮模型重新提取并通过本地规则，不能只靠改版后的规则补入。
+
+      const existing = this.store.listAcceptedObservations(bundle.personId)
+        .filter((observation) => observation.documentId === documentId);
+      const acceptedForResolution: ObservationCandidate[] = [];
+      const additions: Array<ReturnType<typeof candidateToObservation>> = [];
+      const conflictCandidates: ObservationCandidate[] = [];
+      for (const pair of acceptedPairs) {
+        const identity = committedObservationIdentity(pair.observation);
+        const value = committedObservationValue(pair.observation);
+        const prior = [
+          ...existing.filter((observation) => committedObservationIdentity(observation) === identity),
+          ...additions.filter((observation) => committedObservationIdentity(observation) === identity)
+        ];
+        if (prior.some((observation) => committedObservationValue(observation) === value
+          && observation.sourceSpanId === pair.observation.sourceSpanId)) {
+          acceptedForResolution.push(pair.candidate);
+          continue;
+        }
+        const sourceDateConflict = existing.some((observation) => (
+          normalizedComparableText(observation.originalName) === normalizedComparableText(pair.observation.originalName)
+          && observation.sourceSpanId === pair.observation.sourceSpanId
+          && (observation.clinicalDate === null || pair.observation.clinicalDate === null)
+        ));
+        if (prior.length > 0 || sourceDateConflict) {
+          conflictCandidates.push(pair.candidate);
+          continue;
+        }
+        additions.push(pair.observation);
+        acceptedForResolution.push(pair.candidate);
+      }
+      const oldGapIds = [...new Set([
+        ...committedReviewIssue.reasonCodes
+          .filter((reason) => reason.startsWith('UNCOVERED_SPAN:'))
+          .map((reason) => reason.slice('UNCOVERED_SPAN:'.length)),
+        ...(committedReviewIssue.kind === 'coverage_gap' ? committedReviewIssue.evidenceRefs : [])
+      ])];
+      const explicitlyBlankLine = (spanId: string): boolean => {
+        const span = bundle.manifest.spans.find((item) => item.id === spanId);
+        return span?.spanKind === 'line' && span.readability === 'clear'
+          && /^[^:：;；\n]{2,50}[:：]\s*(?:空白|未填写|—|–|--)\s*$/u.test(span.quote?.trim() ?? '');
+      };
+      const unresolvedOldGapIds = oldGapIds.filter((spanId) => (
+        !coveredSourceSpanIds.includes(spanId)
+        || (!explicitlyBlankLine(spanId)
+          && !acceptedForResolution.some((candidate) => candidate.evidence.some((reference) => reference.sourceSpanId === spanId)))
+      ));
+      const oldRemaining = committedReviewIssue.candidateOptions.filter((candidate) => (
+        !sameReportFinding(candidate, acceptedForResolution, bundle.manifest.spans)
+        && !confirmedBlankOldCandidate(
+          candidate, committedReviewIssue.candidateOptions, reviewed.candidates,
+          coveredSourceSpanIds, bundle.manifest.spans
+        )
+      ));
+      const candidateIdentity = (candidate: ObservationCandidate): string =>
+        stableHash({ localKey: candidate.localKey, candidate });
+      const remainingByKey = new Map(oldRemaining.map((candidate) => [candidateIdentity(candidate), candidate]));
+      for (const { candidate } of unresolved) remainingByKey.set(candidateIdentity(candidate), candidate);
+      for (const candidate of conflictCandidates) remainingByKey.set(candidateIdentity(candidate), candidate);
+      const remainingCandidates = [...remainingByKey.values()];
+      const remainingEvidenceRefs = [...new Set([
+        ...unresolvedOldGapIds,
+        ...uncoveredSpanIds,
+        ...remainingCandidates.flatMap((candidate) => candidate.evidence.map((reference) => reference.sourceSpanId))
+      ])];
+      const remainingReasonCodes = [...new Set([
+        ...(oldRemaining.length > 0 ? ['PREVIOUS_CANDIDATE_NOT_VERIFIED'] : []),
+        ...unresolvedOldGapIds.map((id) => `UNCOVERED_SPAN:${id}`),
+        ...unresolved.flatMap((item) => item.reasons),
+        ...(conflictCandidates.length > 0 ? ['COMMITTED_FACT_CONFLICT'] : []),
+        ...uncoveredSpanIds.map((id) => `UNCOVERED_SPAN:${id}`)
+      ])];
+      const publication = this.store.appendCommittedFacts({
+        personId: bundle.personId, documentId,
+        expectedRevision: this.store.getFactRevision(bundle.personId),
+        summary: `旧报告重新核对后增量接纳 ${additions.length} 条有来源事实`,
+        observations: additions,
+        reviewUpdate: {
+          issueId: committedReviewIssue.id,
+          remainingCandidates, remainingReasonCodes, remainingEvidenceRefs
+        },
+        ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
+      });
+      if (this.executionGuard) this.store.clearExtractionChunkCheckpoints(this.executionGuard, documentId);
+      return { status: 'published', documentId, revision: publication.revision,
+        candidateCount: publication.appendedCount, threadId: lastReceipt.threadId, turnId: lastReceipt.turnId };
     }
     const publication = this.store.publishFacts({
       personId: bundle.personId, documentId,
@@ -1304,25 +1577,22 @@ export class DocumentExtractionPipeline {
       summary: '从 1 份资料接纳 ' + accepted.length + ' 条有来源事实',
       reportMetadata: reviewed.reportMetadata ?? null,
       observations: accepted,
+      ...(unresolved.length > 0 || uncoveredSpanIds.length > 0 ? {
+        unresolvedReview: {
+          kind: unresolved.length > 0 ? 'field_conflict' as const : 'coverage_gap' as const,
+          evidenceRefs: [...new Set([
+            ...uncoveredSpanIds,
+            ...unresolved.flatMap((item) => item.candidate.evidence.map((ref) => ref.sourceSpanId))
+          ])],
+          candidateOptions: unresolved.map((item) => item.candidate),
+          reasonCodes: [...new Set([
+            ...uncoveredSpanIds.map((id) => 'UNCOVERED_SPAN:' + id),
+            ...unresolved.flatMap((item) => item.reasons)
+          ])]
+        }
+      } : {}),
       ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
     });
-    if (unresolved.length > 0 || uncoveredSpanIds.length > 0) {
-      this.store.saveExtractionReviewIssue({
-        documentId,
-        ...(this.executionGuard ? { jobId: this.executionGuard.jobId, attemptId: this.executionGuard.attemptId } : {}),
-        stage: 'extract', kind: unresolved.length > 0 ? 'field_conflict' : 'coverage_gap',
-        severity: 'warning', preserveDocumentStatus: true,
-        evidenceRefs: [...new Set([
-          ...uncoveredSpanIds,
-          ...unresolved.flatMap((item) => item.candidate.evidence.map((ref) => ref.sourceSpanId))
-        ])],
-        candidateOptions: unresolved.map((item) => item.candidate),
-        reasonCodes: [...new Set([
-          ...uncoveredSpanIds.map((id) => 'UNCOVERED_SPAN:' + id),
-          ...unresolved.flatMap((item) => item.reasons)
-        ])]
-      });
-    }
     // 整份事实已提交后不再需要带原文的块级恢复记录；失败重试仍保留未提交块。
     if (this.executionGuard) this.store.clearExtractionChunkCheckpoints(this.executionGuard, documentId);
     return { status: 'published', documentId, revision: publication.revision, candidateCount: accepted.length,
@@ -1346,6 +1616,21 @@ export class DocumentExtractionPipeline {
       chunkCount: number;
     }
   ): ExtractionPipelineResult {
+    if (this.store.isDocumentCommitted(documentId)) {
+      if (kind === 'person_conflict' && reportedName) {
+        const issueId = this.store.saveCommittedIdentityReviewIssue({
+          documentId, reportedName, evidenceRefs, reasonCodes: [reason],
+          ...(this.executionGuard ? { executionGuard: this.executionGuard } : {})
+        });
+        return { status: 'needs_review', documentId, issueId, reason,
+          ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}) };
+      }
+      const existing = this.store.listOpenExtractionReviewIssues().find((issue) => (
+        issue.documentId === documentId && issue.severity === 'warning' && issue.stage === 'extract'
+      ));
+      if (!existing) throw new Error('COMMITTED_DOCUMENT_REPAIR_ISSUE_REQUIRED');
+      return { status: 'needs_review', documentId, issueId: existing.id, reason, ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}) };
+    }
     const issueId = this.store.saveExtractionReviewIssue({
       documentId,
       ...(this.executionGuard ? { jobId: this.executionGuard.jobId, attemptId: this.executionGuard.attemptId } : {}),

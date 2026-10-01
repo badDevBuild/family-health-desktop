@@ -9,6 +9,8 @@ import { ProcessingJobRunner } from './job-runner.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { MemberAssessmentPipeline, repairTargets } from './member-assessment-pipeline.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
+import { expandMemberEvidence } from './member-evidence-transport.js';
+import { buildMemberAnalysisPackage, createMemberAnalysisTransport } from './member-analysis-package.js';
 import { buildMemberAggregatePackage, buildMemberSystemPartitions, splitMemberPartition } from './member-assessment-partition.js';
 import { validateAssessmentCandidate } from './assessment-validation.js';
 import { buildAssessmentKnowledgeVerifications, canonicalizeAssessmentKnowledge } from './assessment-knowledge.js';
@@ -35,12 +37,13 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
-async function fixture() {
+async function fixture(legacyContext = false) {
   const root = mkdtempSync(join(tmpdir(), 'family-health-lean-assessment-'));
   roots.push(root);
   const service = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
   const personId = service.ensurePrimaryMember({ displayName: '合成成员', relation: '本人' });
-  await service.importFiles([{ path: '/tmp/合成血脂报告.txt', bytes: Buffer.from('2026-09-21 LDL-C 4.2 mmol/L, reference 0-3.4') }], personId);
+  await service.importFiles([{ path: '/tmp/合成血脂报告.txt', bytes: Buffer.from(
+    '2026-09-21 LDL-C 4.2 mmol/L, reference 0-3.4' + (legacyContext ? '；采样时未服药。' : '')) }], personId);
   const documentId = service.getSnapshot(null).inbox[0]!.id;
   const sourceSpanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
   const extraction: ExtractionResult = {
@@ -51,7 +54,8 @@ async function fixture() {
       value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
       unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4', reportedAbnormalFlag: 'high',
       specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-21',
-      evidence: [{ sourceSpanId, quote: '2026-09-21 LDL-C 4.2 mmol/L, reference 0-3.4' }], issues: []
+      evidence: [{ sourceSpanId, quote: '2026-09-21 LDL-C 4.2 mmol/L, reference 0-3.4' }],
+      clinicalContext: legacyContext ? null : { version: 1, status: 'complete', conditions: [] }, issues: []
     }]
   };
   let extractionCalls = 0;
@@ -82,7 +86,7 @@ async function fixtureTwoSystems() {
       value: { kind: 'numeric', rawText: '42', decimal: '42', comparator: 'eq' },
       unitRaw: 'U/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
       specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-21',
-      evidence: [{ sourceSpanId: span.id, quote: '2026-09-21 谷丙转氨酶 42 U/L' }], issues: []
+      evidence: [{ sourceSpanId: span.id, quote: '2026-09-21 谷丙转氨酶 42 U/L' }], clinicalContext: { version: 1, status: 'complete', conditions: [] }, issues: []
     }]
   };
   const extracted = await new DocumentExtractionPipeline(service.store, {
@@ -111,7 +115,7 @@ async function fixtureUnclassified() {
       localKey: 'unclassified-result', originalName: '合成未归类检查', standardNameCandidate: null,
       value: { kind: 'text', rawText: '记录甲' }, unitRaw: null, referenceRangeRaw: null,
       reportedAbnormalFlag: null, specimen: null, method: null, bodySite: null,
-      clinicalDate: '2026-09-21', evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+      clinicalDate: '2026-09-21', evidence: [{ sourceSpanId: span.id, quote: span.quote }], clinicalContext: { version: 1, status: 'complete', conditions: [] }, issues: []
     }]
   };
   const result = await new DocumentExtractionPipeline(service.store, {
@@ -124,8 +128,10 @@ async function fixtureUnclassified() {
   return { service, personId, built };
 }
 
-function candidateFor(request: AssessmentRequestV3, source: MemberEvidencePackageV3): MemberAssessmentCandidateV3 {
-  const evidenceId = source.facts[0]!.evidenceIds[0]!;
+function candidateFor(request: AssessmentRequestV3, source: Pick<MemberEvidencePackageV3, 'facts'>
+  | Pick<ReturnType<typeof buildMemberAnalysisPackage>, 'facts'>): MemberAssessmentCandidateV3 {
+  const first = source.facts[0]!;
+  const evidenceId = 'evidenceIds' in first ? first.evidenceIds[0]! : first.observationId;
   const systemIds = request.requestedSystemIds;
   return {
     schemaVersion: 3, personId: request.personId, inputSignature: request.inputSignature,
@@ -160,12 +166,79 @@ function candidateFor(request: AssessmentRequestV3, source: MemberEvidencePackag
 }
 
 describe('MemberAssessmentPipeline', () => {
+  it('局部修复失败后的旧快照读取即恢复具体摘要，不重跑、不改库、不伪造健康状态', async () => {
+    const { service, personId, built } = await fixture();
+    const candidate = candidateFor(built.request, built.evidencePackage);
+    candidate.actions[0]!.evidenceIds = ['missing-evidence'];
+    let calls = 0;
+    const result = await new MemberAssessmentPipeline(service.store, {
+      runStructuredTurn: async () => {
+        calls += 1;
+        return { threadId: 'synthetic', turnId: String(calls), output: candidate };
+      }
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    const storedBefore = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
+    const factsBefore = service.store.listAcceptedObservations(personId);
+    expect(storedBefore.overview.headline).toBe('部分健康判断仍需核实');
+    const presented = service.getMemberAssessment(personId)!;
+    expect(presented.overview.headline).toBe(candidate.claims[0]!.text);
+    expect(presented.systems[0]!.headline).toBe(candidate.claims[0]!.text);
+    expect(presented.actions).toEqual([]);
+    expect(presented.heldTargetIds).toContain('action-review');
+    expect(service.listBodySystems(personId).find((system) => system.id === built.request.requestedSystemIds[0])).toMatchObject({
+      interpretationState: 'partial', status: 'building', summary: candidate.claims[0]!.text
+    });
+    expect(service.getMemberOverview(personId).headline).toBe(candidate.claims[0]!.text);
+    expect(service.getSnapshot(null).persons[0]!.changeSummary).toBe(candidate.claims[0]!.text);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]).toEqual(storedBefore);
+    expect(service.store.listAcceptedObservations(personId)).toEqual(factsBefore);
+    expect(calls).toBe(2);
+    service.close();
+  });
+
+  it('旧报告一次补齐后全量综合；次日再次综合只复用条件缓存，不再读原文', async () => {
+    const { service, personId } = await fixture(true);
+    const stages: string[] = [];
+    const runtime = { runStructuredTurn: async (input: { prompt: string; allowWebSearch?: boolean }) => {
+      if (input.prompt.includes('CLINICAL_CONTEXT_INPUT=')) {
+        stages.push('context');
+        expect(input.allowWebSearch).toBe(false);
+        const data = JSON.parse(input.prompt.split('CLINICAL_CONTEXT_INPUT=')[1]!) as {
+          facts: Array<{ observationId: string }>; sources: Array<{ sourceSpanId: string }> };
+        return { threadId: 'context', turnId: 'context', output: { version: 1, items: data.facts.map((fact) => ({
+          observationId: fact.observationId, context: { version: 1, status: 'complete',
+            conditions: [{ sourceSpanId: data.sources[0]!.sourceSpanId, quote: '采样时未服药。' }] }
+        })) } };
+      }
+      stages.push('full-analysis');
+      const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
+      const source = expandMemberEvidence<ReturnType<typeof buildMemberAnalysisPackage>>(
+        JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!));
+      expect(source.sourceContext).toEqual([]);
+      expect(source.evidenceCatalog).toEqual([]);
+      return { threadId: 'analysis', turnId: 'analysis', output: candidateFor(request, source) };
+    } };
+    await expect(new MemberAssessmentPipeline(service.store, runtime, undefined, undefined, undefined,
+      'test-model', 'medium', '2026-09-26').process(personId)).resolves.toMatchObject({ status: 'published', callCount: 2 });
+    await expect(new MemberAssessmentPipeline(service.store, runtime, undefined, undefined, undefined,
+      'test-model', 'medium', '2026-09-27').process(personId)).resolves.toMatchObject({ status: 'published', callCount: 1 });
+    expect(stages).toEqual(['context', 'full-analysis', 'full-analysis']);
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.getMemberAssessment(personId)!.evidenceCatalog.some((ref) => ref.quote?.includes('LDL-C'))).toBe(true);
+    const contextIds = service.getMemberAssessment(personId)!.evidenceCatalog.filter((ref) => ref.id.startsWith('context-')).map((ref) => ref.id);
+    expect(contextIds).toHaveLength(1);
+    expect(service.getMemberEvidenceBundle(personId, contextIds)).toMatchObject({ missingIds: [],
+      items: [{ quote: '采样时未服药。' }] });
+    const other = service.store.createPerson({ displayName: '另一个合成成员' });
+    expect(service.getMemberEvidenceBundle(other.id, contextIds).missingIds).toEqual(contextIds);
+  });
   it('待核对范围变化即使事实版本不变，也使旧综合失效并拒绝迟到发布', async () => {
     const { service, personId, documentId } = await fixture();
     const runtime = {
       runStructuredTurn: async (input: { prompt: string }) => {
         const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const source = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        const source = expandMemberEvidence(JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!));
         return { threadId: 'p02', turnId: 'turn', output: candidateFor(request, source) };
       }
     };
@@ -210,7 +283,7 @@ describe('MemberAssessmentPipeline', () => {
         localKey: 'diagnosis', originalName: '诊断', standardNameCandidate: null,
         value: { kind: 'text', rawText: '脂肪肝' }, unitRaw: null, referenceRangeRaw: null,
         reportedAbnormalFlag: null, specimen: null, method: '彩超', bodySite: '肝脏',
-        clinicalDate: '2025-06-10', evidence: [{ sourceSpanId: span.id, quote: sourceText }], issues: []
+        clinicalDate: '2025-06-10', evidence: [{ sourceSpanId: span.id, quote: sourceText }], clinicalContext: { version: 1, status: 'complete', conditions: [] }, issues: []
       }]
     };
     await expect(new DocumentExtractionPipeline(service.store, {
@@ -241,7 +314,7 @@ describe('MemberAssessmentPipeline', () => {
         value: { kind: 'numeric', rawText: '6.8', decimal: '6.8', comparator: 'eq' },
         unitRaw: 'mIU/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
         specimen: null, method: null, bodySite: '甲状腺', clinicalDate: '2025-06-10',
-        evidence: [{ sourceSpanId: span.id, quote: sourceText }], issues: []
+        evidence: [{ sourceSpanId: span.id, quote: sourceText }], clinicalContext: { version: 1, status: 'complete', conditions: [] }, issues: []
       }, {
         localKey: 'ultrasound-unreadable', originalName: '甲状腺超声', standardNameCandidate: null,
         value: { kind: 'unknown', rawText: null, reason: '超声结论无法辨认' },
@@ -279,7 +352,7 @@ describe('MemberAssessmentPipeline', () => {
         localKey: 'other-member', originalName: '其他成员敏感项目', standardNameCandidate: null,
         value: { kind: 'text', rawText: '不应外发' }, unitRaw: null, referenceRangeRaw: null,
         reportedAbnormalFlag: null, specimen: null, method: null, bodySite: null,
-        clinicalDate: null, evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+        clinicalDate: null, evidence: [{ sourceSpanId: span.id, quote: span.quote }], clinicalContext: { version: 1, status: 'complete', conditions: [] }, issues: []
       }]
     });
     const built = buildMemberAssessmentInput(service.store, personId, {
@@ -456,228 +529,76 @@ describe('MemberAssessmentPipeline', () => {
     service.close();
   });
 
-  it('真实上下文超限后按系统 P02 分区再聚合，记录失败尝试和 K+1 次成功调用', async () => {
+  it.each([
+    'CODEX_CONTEXT_WINDOW_EXCEEDED',
+    'CODEX_RPC_ERROR:-32602:Input exceeds the maximum length of 1048576 characters.'
+  ])('完整上下文超限时不分段、不发布：%s', async (message) => {
     const { service, personId, built } = await fixtureTwoSystems();
-    const modes: string[] = [];
-    const aggregatePackages: MemberEvidencePackageV3[] = [];
-    const result = await new MemberAssessmentPipeline(service.store, {
+    let calls = 0;
+    await expect(new MemberAssessmentPipeline(service.store, {
       runStructuredTurn: async (input) => {
-        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
-        modes.push(request.mode);
-        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
-        if (request.mode === 'aggregate') aggregatePackages.push(evidence);
-        const candidate = candidateFor(request, evidence);
-        const fact = evidence.facts[0]!;
-        candidate.claims[0]!.text = `${fact.originalName} ${fact.rawValue} ${fact.unit ?? ''}，应结合报告日期理解。`;
-        return { threadId: `p02-${modes.length}`, turnId: `p02-${modes.length}`, output: candidate };
+        calls += 1;
+        expect(input.prompt).toContain('"mode":"full"');
+        expect(input.prompt).toContain('member-evidence-table-v1');
+        throw new Error(message);
       }
-    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
-    const partitionCount = built.request.requestedSystemIds.length;
-    expect(modes).toEqual(['full', ...Array.from({ length: partitionCount }, () => 'partition'), 'aggregate']);
-    expect(result).toMatchObject({ status: 'published', callCount: partitionCount + 2 });
-    expect(aggregatePackages[0]?.partitionResults).toHaveLength(partitionCount);
-    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
-    expect(snapshot.mode).toBe('aggregate');
-    expect(snapshot.processingPlan).toEqual({
-      strategy: 'partitioned', trigger: 'runtime_context_window_exceeded', partitionCount,
-      partitionHeldTargetCount: 0, aggregateSummarizedOnlyObservationIds: []
-    });
-    expect(snapshot.evidenceCatalog.length).toBe(built.evidencePackage.evidenceCatalog.length);
+    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId))
+      .rejects.toThrow('MEMBER_ASSESSMENT_INPUT_TOO_LARGE');
+    expect(calls).toBe(1);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)).toEqual([]);
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(built.evidencePackage.facts.length);
     service.close();
   });
 
-  it('聚合省略普通原子事实时保留精确清单，并在成员总览和相关系统显示范围', async () => {
-    const { service, personId } = await fixtureTwoSystems();
-    await service.importFiles([{ path: '/tmp/合成心率报告.txt', bytes: Buffer.from('2026-09-21 心率 64 次/分') }], personId);
-    const documentId = service.getSnapshot(null).inbox.find((item) => item.displayName === '合成心率报告.txt')!.id;
-    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
-    const extraction: ExtractionResult = {
-      schemaVersion: 1, documentId, coveredSourceSpanIds: [span.id],
-      subject: { reportedName: null, evidence: [], confidence: 'absent' },
-      candidates: [{
-        localKey: 'heart-rate', originalName: '心率', standardNameCandidate: '心率',
-        value: { kind: 'numeric', rawText: '64', decimal: '64', comparator: 'eq' },
-        unitRaw: '次/分', referenceRangeRaw: null, reportedAbnormalFlag: null,
-        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-21',
-        evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
-      }]
-    };
-    expect((await new DocumentExtractionPipeline(service.store, {
-      runStructuredTurn: async () => ({ threadId: 'heart-rate', turnId: 'heart-rate', output: extraction })
-    }).process(documentId)).status).toBe('published');
-    const heartRateId = service.store.listAcceptedObservations(personId).find((item) => item.originalName === '心率')!.id;
+  it('一次完整分析接收全部紧凑事实，短引用在发布前恢复为真实来源', async () => {
+    const { service, personId, built } = await fixtureTwoSystems();
+    const referenceIds = createMemberAnalysisTransport(built.evidencePackage).referenceIds;
+    let calls = 0;
     const result = await new MemberAssessmentPipeline(service.store, {
       runStructuredTurn: async (input) => {
+        calls += 1;
         const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
-        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
-        return { threadId: 'p02', turnId: request.mode, output: candidateFor(request, evidence) };
+        const packet = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!);
+        expect(expandMemberEvidence(packet, referenceIds)).toEqual(buildMemberAnalysisPackage(built.evidencePackage));
+        const evidence = expandMemberEvidence(packet);
+        expect(evidence.facts[0]!.observationId).toMatch(/^ref:/);
+        expect(request).toEqual(built.request);
+        return { threadId: 'full', turnId: 'full', output: candidateFor(request, evidence) };
       }
     }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
-    expect(result.status).toBe('published');
+    expect(result).toMatchObject({ status: 'published', callCount: 1 });
+    expect(calls).toBe(1);
     const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
-    expect(service.store.listAcceptedObservations(personId).some((item) => item.id === heartRateId)).toBe(true);
-    expect(snapshot.processingPlan.aggregateSummarizedOnlyObservationIds).toContain(heartRateId);
-    expect(snapshot.overview.limitations.join(' ')).toContain('仅经分区摘要参与综合');
-    expect(snapshot.systems.find((item) => item.systemId === 'cardiovascular')?.limitations.join(' '))
-      .toContain('仅经分区摘要参与综合');
-    const overview = service.getMemberOverview(personId);
-    expect(overview.dataQuality).toBe('partial');
-    expect(overview.overview).toContain('仅经分区摘要参与综合');
+    expect(snapshot.claims[0]!.evidenceIds).toEqual(built.evidencePackage.facts[0]!.evidenceIds);
+    expect(snapshot.evidenceCatalog).toEqual(built.evidencePackage.evidenceCatalog);
+    expect(snapshot.processingPlan).toEqual({ strategy: 'full', trigger: 'none', partitionCount: 0, partitionHeldTargetCount: 0 });
     service.close();
   });
 
-  it('单条事实仍超限时明确失败，不伪装成完成了分区综合', async () => {
+  it('局部结构修复也使用完整紧凑资料，修复后的短引用正确恢复', async () => {
     const { service, personId, built } = await fixture();
-    expect(built.request.requestedSystemIds).toHaveLength(1);
-    const result = await new MemberAssessmentPipeline(service.store, {
-      runStructuredTurn: async () => { throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED'); }
-    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
-    expect(result).toMatchObject({ status: 'rejected', reason: 'single_fact_context_window_exceeded', callCount: 1 });
-    expect(service.store.listMemberAssessmentSnapshots(personId, true)).toEqual([]);
-    service.close();
-  });
-
-  it('同一个身体系统的两份历史报告超限后按报告分区，不丢任何一份', async () => {
-    const { service, personId } = await fixture();
-    await service.importFiles([{ path: '/tmp/合成第二次血脂报告.txt', bytes: Buffer.from('2024-09-21 LDL-C 3.8 mmol/L') }], personId);
-    const documentId = service.getSnapshot(null).inbox.find((item) => item.displayName === '合成第二次血脂报告.txt')!.id;
-    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
-    const extraction: ExtractionResult = {
-      schemaVersion: 1, documentId, coveredSourceSpanIds: [span.id],
-      subject: { reportedName: null, evidence: [], confidence: 'absent' },
-      candidates: [{ localKey: 'ldl-old', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
-        value: { kind: 'numeric', rawText: '3.8', decimal: '3.8', comparator: 'eq' },
-        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
-        specimen: null, method: null, bodySite: null, clinicalDate: '2024-09-21',
-        evidence: [{ sourceSpanId: span.id, quote: '2024-09-21 LDL-C 3.8 mmol/L' }], issues: [] }]
-    };
-    await new DocumentExtractionPipeline(service.store, {
-      runStructuredTurn: async () => ({ threadId: 'old', turnId: 'old', output: extraction })
-    }).process(documentId);
-    const modes: string[] = [];
-    const partitionDocuments: string[] = [];
+    const transport = createMemberAnalysisTransport(built.evidencePackage);
+    const valid = transport.aliasCandidate(candidateFor(built.request, built.evidencePackage));
+    let calls = 0;
     const result = await new MemberAssessmentPipeline(service.store, {
       runStructuredTurn: async (input) => {
-        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
-        modes.push(request.mode);
-        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
-        if (request.mode === 'partition') {
-          expect(request.partitionScope?.basis).toBe('document');
-          expect(evidence.facts).toHaveLength(1);
-          partitionDocuments.push(evidence.facts[0]!.documentId);
-        }
-        return { threadId: 'p02', turnId: `turn-${modes.length}`, output: candidateFor(request, evidence) };
-      }
-    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
-    expect(modes).toEqual(['full', 'partition', 'partition', 'aggregate']);
-    expect(new Set(partitionDocuments).size).toBe(2);
-    expect(result).toMatchObject({ status: 'published', callCount: 4 });
-    expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]!.processingPlan.partitionCount).toBe(2);
-    service.close();
-  });
-
-  it('聚合不能悄悄丢掉分区里尚未隔离的高影响判断', async () => {
-    const { service, personId } = await fixtureTwoSystems();
-    let partitionIndex = 0;
-    const result = await new MemberAssessmentPipeline(service.store, {
-      runStructuredTurn: async (input) => {
-        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
-        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
-        const candidate = candidateFor(request, evidence);
-        if (request.mode === 'partition' && partitionIndex++ === 0) candidate.claims[0]!.consequenceLevel = 'high';
-        if (request.mode === 'aggregate') {
-          candidate.claims[0]!.id = 'claim-rewritten';
-          candidate.overview.claimIds = ['claim-rewritten'];
-          candidate.actions[0]!.claimIds = ['claim-rewritten'];
-          for (const system of candidate.systems) system.claimIds = ['claim-rewritten'];
-        }
-        return { threadId: 'p02', turnId: 'p02', output: candidate };
-      }
-    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
-    expect(result).toMatchObject({ status: 'rejected', reason: 'aggregate_omitted_high_impact:claim-ldl' });
-    expect(service.store.listMemberAssessmentSnapshots(personId, true)).toEqual([]);
-    service.close();
-  });
-
-  it('聚合把分区高影响判断降级时仍强制一次 P04 核查改写及依赖', async () => {
-    const { service, personId, built } = await fixtureTwoSystems();
-    let partitionIndex = 0;
-    let reviewCalls = 0;
-    const result = await new MemberAssessmentPipeline(service.store, {
-      runStructuredTurn: async (input) => {
-        if (input.prompt.includes('REVIEW_REQUEST=')) {
-          reviewCalls += 1;
-          const reviewRequest = JSON.parse(input.prompt.split('REVIEW_REQUEST=')[1]!.split('\nSOURCE_CONTEXT=')[0]!) as {
-            targets: string[]; personId: string; inputSignature: string
-          };
-          expect(reviewRequest.targets).toEqual(expect.arrayContaining(['claim-ldl', 'action-review', 'overview']));
-          return { threadId: 'p04', turnId: 'review', output: {
-            schemaVersion: 1, personId, inputSignature: reviewRequest.inputSignature,
-            results: reviewRequest.targets.map((targetId) => ({
-              targetId, verdict: 'pass', reason: '合成复核已核查改写', replacement: null
-            }))
-          } };
-        }
-        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
-        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
-        const candidate = candidateFor(request, evidence);
-        if (request.mode === 'partition' && partitionIndex++ === 0) candidate.claims[0]!.consequenceLevel = 'high';
-        return { threadId: 'p02', turnId: `assessment-${partitionIndex}`, output: candidate };
-      }
-    }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
-    expect(result).toMatchObject({ status: 'published', callCount: built.request.requestedSystemIds.length + 3 });
-    expect(reviewCalls).toBe(1);
-    expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]!.reviewedTargetIds).toContain('claim-ldl');
-    service.close();
-  });
-
-  it('分区隔离过的节点被聚合带回时先复核，复核通过才可发布', async () => {
-    const { service, personId, built } = await fixtureTwoSystems();
-    let partitionIndex = 0;
-    let repairCalls = 0;
-    let reviewCalls = 0;
-    const result = await new MemberAssessmentPipeline(service.store, {
-      runStructuredTurn: async (input) => {
+        calls += 1;
         if (input.prompt.includes('REPAIR_REQUEST=')) {
-          repairCalls += 1;
-          const candidate = JSON.parse(input.prompt.split('TARGET_CANDIDATE=')[1]!) as MemberAssessmentCandidateV3;
-          return { threadId: 'p03', turnId: 'repair', output: candidate };
+          const packet = JSON.parse(input.prompt.split('SOURCE_CONTEXT=')[1]!.split('\nTARGET_CANDIDATE=')[0]!);
+          expect(expandMemberEvidence(packet, transport.referenceIds)).toEqual(buildMemberAnalysisPackage(built.evidencePackage));
+          const repairCandidate = JSON.parse(input.prompt.split('TARGET_CANDIDATE=')[1]!) as MemberAssessmentCandidateV3;
+          expect(repairCandidate.actions[0]!.evidenceIds[0]).toMatch(/^ref:/);
+          return { threadId: 'repair', turnId: 'repair', output: valid };
         }
-        if (input.prompt.includes('REVIEW_REQUEST=')) {
-          reviewCalls += 1;
-          const reviewRequest = JSON.parse(input.prompt.split('REVIEW_REQUEST=')[1]!.split('\nSOURCE_CONTEXT=')[0]!) as {
-            targets: string[]; personId: string; inputSignature: string
-          };
-          expect(reviewRequest.targets).toEqual(expect.arrayContaining(['claim-ldl', 'action-review', 'overview']));
-          expect(input.prompt).toContain('partition_held_reintroduced:claim-ldl');
-          return { threadId: 'p04', turnId: 'review', output: {
-            schemaVersion: 1, personId, inputSignature: reviewRequest.inputSignature,
-            results: reviewRequest.targets.map((targetId) => ({
-              targetId, verdict: 'pass', reason: '已核对聚合重新出现的主张及依赖。', replacement: null
-            }))
-          } };
-        }
-        const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
-        if (request.mode === 'full') throw new Error('CODEX_CONTEXT_WINDOW_EXCEEDED');
-        const candidate = candidateFor(request, evidence);
-        if (request.mode === 'partition' && partitionIndex++ === 0) candidate.claims[0]!.evidenceIds = ['missing-evidence'];
-        return { threadId: 'p02', turnId: `assessment-${partitionIndex}`, output: candidate };
+        const invalid = structuredClone(valid);
+        invalid.claims[0]!.evidenceIds = ['unknown-reference'];
+        return { threadId: 'full', turnId: 'full', output: invalid };
       }
     }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
-    expect(result).toMatchObject({ status: 'published', callCount: built.request.requestedSystemIds.length + 4 });
-    expect(repairCalls).toBe(1);
-    expect(reviewCalls).toBe(1);
-    const snapshot = service.store.listMemberAssessmentSnapshots(personId, true)[0]!;
-    expect(snapshot.claims.map((claim) => claim.id)).toContain('claim-ldl');
-    expect(snapshot.heldTargetIds).not.toContain('claim-ldl');
-    expect(snapshot.reviewedTargetIds).toContain('claim-ldl');
-    expect(snapshot.processingPlan.partitionHeldTargetCount).toBeGreaterThan(0);
+    expect(result).toMatchObject({ status: 'published', callCount: 2 });
+    expect(calls).toBe(2);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]!.claims[0]!.evidenceIds)
+      .toEqual(built.evidencePackage.facts[0]!.evidenceIds);
     service.close();
   });
 
@@ -803,7 +724,7 @@ describe('MemberAssessmentPipeline', () => {
     const runtime = {
       runStructuredTurn: async (input: { prompt: string }) => {
         const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const source = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        const source = expandMemberEvidence(JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!));
         return { threadId: 'p02', turnId: 'turn', output: candidateFor(request, source) };
       }
     };
@@ -894,7 +815,7 @@ describe('MemberAssessmentPipeline', () => {
 
     const reopened = new PersonalWorkspaceService(root, '合成工作区', () => new Date('2026-09-22T00:00:00Z'));
     const migratedDatabase = new Database(reopened.store.databasePath, { readonly: true });
-    expect(migratedDatabase.pragma('user_version', { simple: true })).toBe(35);
+    expect(migratedDatabase.pragma('user_version', { simple: true })).toBe(36);
     expect(migratedDatabase.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'member_assessment_snapshots_v3'`).get())
       .toEqual({ name: 'member_assessment_snapshots_v3' });
     migratedDatabase.close();
@@ -926,9 +847,9 @@ describe('MemberAssessmentPipeline', () => {
       runStructuredTurn: async (input) => {
         calls += 1;
         const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
-        expect(evidence.facts.some((item) => item.observationId === fact.id)).toBe(true);
-        expect(evidence.personalContext.some((item) => item.id === note.id)).toBe(true);
+        const evidence = expandMemberEvidence(JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!));
+        expect(evidence.facts.some((item) => item.originalName === fact.originalName && item.rawValue === fact.rawText)).toBe(true);
+        expect(evidence.personalContext.some((item) => item.text === note.immutableText)).toBe(true);
         return { threadId: 'v3-upgrade', turnId: 'v3-upgrade', output: candidateFor(request, evidence) };
       }
     }, undefined, undefined, undefined, 'test-model', 'medium', '2026-09-22').process(personId);
@@ -1050,7 +971,7 @@ describe('MemberAssessmentPipeline', () => {
         expect(input.prompt).toContain('ASSESSMENT_REQUEST=');
         expect(input.prompt).not.toContain('SOURCE_PACKAGE=');
         const request = JSON.parse(input.prompt.split('ASSESSMENT_REQUEST=')[1]!.split('\nMEMBER_EVIDENCE_PACKAGE=')[0]!) as AssessmentRequestV3;
-        const evidence = JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!) as MemberEvidencePackageV3;
+        const evidence = expandMemberEvidence(JSON.parse(input.prompt.split('MEMBER_EVIDENCE_PACKAGE=')[1]!));
         return { threadId: 'refresh', turnId: 'refresh', output: candidateFor(request, evidence) };
       }
     } as unknown as CodexRuntimeManager;

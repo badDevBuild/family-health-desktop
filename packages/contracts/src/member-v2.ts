@@ -383,6 +383,8 @@ export const bodySystemSummaryV2Schema = z.object({
   attentionCount: z.number().int().nonnegative(),
   latestDate: localDateSchema.nullable(),
   analysisStatus: systemAnalysisSnapshotSchema.shape.status,
+  /** 解读的完整性与身体健康状态分开，避免局部隔离被误读成“继续观察”。 */
+  interpretationState: z.enum(['complete', 'partial', 'unavailable']).optional(),
   topics: z.array(z.object({ id: idSchema, name: z.string().min(1), factCount: z.number().int().nonnegative() }).strict())
 }).strict();
 export type BodySystemSummaryV2 = z.infer<typeof bodySystemSummaryV2Schema>;

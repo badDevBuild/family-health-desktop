@@ -43,10 +43,10 @@ function instructionPart(prompt: string): string {
 
 describe('pipeline prompts', () => {
   it('版本号与阶段签名保持一致', () => {
-    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v6');
+    expect(EXTRACTION_PROMPT_VERSION).toBe('extract-v8');
     expect(DERIVED_PROMPT_VERSION).toBe('derived-v4');
     expect(promptMetaForStage('extract')).toEqual({
-      promptVersion: 'extract-v6',
+      promptVersion: 'extract-v8',
       rulesVersion: ACCEPTANCE_RULES_VERSION
     });
     expect(promptMetaForStage('analyze')).toEqual({
@@ -64,7 +64,7 @@ describe('pipeline prompts', () => {
   });
 
   it('V3 综合明确使用授权全历史，药物讨论标签不能豁免直接指令', () => {
-    expect(MEMBER_ASSESSMENT_PROMPT_VERSION).toBe('member-assessment-v8');
+    expect(MEMBER_ASSESSMENT_PROMPT_VERSION).toBe('member-assessment-v11');
     const prompt = buildP02Prompt({ newDocumentIds: ['doc-new'] }, { facts: [] });
     expect(prompt).toContain('不能只看 newDocumentIds');
     expect(prompt).toContain('不能用上次分析摘要代替历史事实');

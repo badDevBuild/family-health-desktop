@@ -756,7 +756,7 @@ describe('DocumentExtractionPipeline', () => {
   });
 
 
-  it('单轮把空白栏识别成未知时静默省略，已填写事实仍正常发布', async () => {
+  it('模型仅声称空白而原文未明确标空时保留缺口，已填写事实仍发布', async () => {
     const { service, personId, documentId, output } = await setup();
     const emptyUnknown = {
       ...output.candidates[0]!,
@@ -782,7 +782,9 @@ describe('DocumentExtractionPipeline', () => {
 
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
-    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ severity: 'warning', candidateOptions: [expect.objectContaining({ originalName: emptyUnknown.originalName })] })
+    ]);
     service.close();
   });
 
@@ -1056,6 +1058,288 @@ describe('DocumentExtractionPipeline', () => {
     ]);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();
+  });
+
+  it('后续页没有日期时可继承同一报告明示的唯一检查日，并附上首页日期依据', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-report-date-inheritance-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '整份报告日期工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([{ path: '/tmp/跨页报告.txt', bytes: Buffer.from('占位内容') }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const firstSpan = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const secondSpanId = '33333333-3333-4333-8333-333333333333';
+    const database = new Database(service.store.databasePath);
+    database.prepare("UPDATE source_spans SET span_kind = 'page', page_number = 1, quote = ? WHERE id = ?")
+      .run('体检报告 检查日期：2024-10-22', firstSpan.id);
+    database.prepare(`
+      INSERT INTO source_spans (
+        id, document_id, span_kind, page_number, block_id, line_start, line_end,
+        quote, readability, normalizer_version
+      ) SELECT ?, document_id, 'page', 2, NULL, NULL, NULL, ?, 'clear', normalizer_version
+        FROM source_spans WHERE id = ?
+    `).run(secondSpanId, '一般检查 身高 187 厘米', firstSpan.id);
+    database.prepare("UPDATE source_manifests SET total_units = 2, covered_unit_indexes_json = '[0,1]' WHERE document_id = ?")
+      .run(documentId);
+    database.close();
+    const output: ExtractionResult = {
+      schemaVersion: 1,
+      documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      reportMetadata: {
+        reportKind: null, title: null, organization: null, campus: null, department: null,
+        reportNumber: null, examItems: [],
+        times: [{ value: '2024-10-22', precision: 'day', role: 'examined',
+          evidence: [{ sourceSpanId: firstSpan.id, quote: '检查日期：2024-10-22' }] }]
+      },
+      coveredSourceSpanIds: [firstSpan.id, secondSpanId],
+      candidates: [{
+        localKey: 'height', originalName: '身高', standardNameCandidate: '身高',
+        value: { kind: 'numeric', rawText: '187', decimal: '187', comparator: 'eq' },
+        unitRaw: '厘米', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: null,
+        evidence: [{ sourceSpanId: secondSpanId, quote: '身高 187 厘米' }], issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'report-date-thread', turnId: 'report-date-turn', output })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '身高', decimalValue: '187', clinicalDate: '2024-10-22' })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+  });
+
+  it('跨块后续候选会在整份报告汇总后继承首页唯一检查日', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-cross-chunk-report-date-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '跨块报告日期工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const lines = [
+      '体检报告 检查日期：2024-10-22',
+      ...Array.from({ length: 39 }, (_, index) => `无可提取正文 ${index + 1}`),
+      '一般检查 身高 187 厘米'
+    ];
+    await service.importFiles([{ path: '/tmp/跨块日期报告.txt', bytes: Buffer.from(lines.join('\n')) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const chunks = partitionSourceSpans(service.store.getDocumentExtractionBundle(documentId).manifest.spans);
+    expect(chunks.map((chunk) => chunk.length)).toEqual([40, 1]);
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => {
+        const chunkIndex = turn++;
+        const spans = chunks[chunkIndex]!;
+        const output: ExtractionResult = {
+          schemaVersion: 1,
+          documentId,
+          subject: { reportedName: null, evidence: [], confidence: 'absent' },
+          reportMetadata: chunkIndex === 0 ? {
+            reportKind: null, title: null, organization: null, campus: null, department: null,
+            reportNumber: null, examItems: [],
+            times: [{
+              value: '2024-10-22', precision: 'day', role: 'examined',
+              evidence: [{ sourceSpanId: spans[0]!.id, quote: '检查日期：2024-10-22' }]
+            }]
+          } : null,
+          coveredSourceSpanIds: spans.map((span) => span.id),
+          candidates: chunkIndex === 1 ? [{
+            localKey: 'height', originalName: '身高', standardNameCandidate: '身高',
+            value: { kind: 'numeric', rawText: '187', decimal: '187', comparator: 'eq' },
+            unitRaw: '厘米', referenceRangeRaw: null, reportedAbnormalFlag: null,
+            specimen: null, method: null, bodySite: null, clinicalDate: null,
+            evidence: [{ sourceSpanId: spans[0]!.id, quote: '身高 187 厘米' }], issues: []
+          }] : []
+        };
+        return { threadId: 'cross-chunk-report-date-thread', turnId: `cross-chunk-report-date-${turn}`, output };
+      }
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(turn).toBe(2);
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '身高', decimalValue: '187', clinicalDate: '2024-10-22' })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it.each([
+    { name: '跨块其他章节出现不同日期时不会继承首页日期', contextLine: '超声科 复查日期：2024-10-25' },
+    { name: '跨块出现其他年度对比时不会继承首页日期', contextLine: '历次检查结果 2023 年度' }
+  ])('$name', async ({ contextLine }) => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-cross-chunk-competing-date-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '跨块多日期工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const lines = [
+      '体检报告 检查日期：2024-10-22',
+      ...Array.from({ length: 39 }, (_, index) => `无可提取正文 ${index + 1}`),
+      contextLine,
+      '检查结果 甲状腺回声分布不均匀'
+    ];
+    await service.importFiles([{ path: '/tmp/跨块多日期报告.txt', bytes: Buffer.from(lines.join('\n')) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const chunks = partitionSourceSpans(service.store.getDocumentExtractionBundle(documentId).manifest.spans);
+    expect(chunks.map((chunk) => chunk.length)).toEqual([40, 2]);
+    let turn = 0;
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => {
+        const chunkIndex = turn++;
+        const spans = chunks[chunkIndex]!;
+        const output: ExtractionResult = {
+          schemaVersion: 1,
+          documentId,
+          subject: { reportedName: null, evidence: [], confidence: 'absent' },
+          reportMetadata: chunkIndex === 0 ? {
+            reportKind: null, title: null, organization: null, campus: null, department: null,
+            reportNumber: null, examItems: [],
+            times: [{
+              value: '2024-10-22', precision: 'day', role: 'examined',
+              evidence: [{ sourceSpanId: spans[0]!.id, quote: '检查日期：2024-10-22' }]
+            }]
+          } : null,
+          coveredSourceSpanIds: spans.map((span) => span.id),
+          candidates: chunkIndex === 1 ? [{
+            localKey: 'thyroid', originalName: '甲状腺小结', standardNameCandidate: null,
+            value: { kind: 'text', rawText: '甲状腺回声分布不均匀' },
+            unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+            specimen: null, method: '超声', bodySite: '甲状腺', clinicalDate: null,
+            evidence: [{ sourceSpanId: spans[1]!.id, quote: '检查结果 甲状腺回声分布不均匀' }], issues: []
+          }] : []
+        };
+        return { threadId: 'cross-chunk-competing-date-thread', turnId: `cross-chunk-competing-date-${turn}`, output };
+      }
+    });
+
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(turn).toBe(2);
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '甲状腺小结', clinicalDate: null })
+    ]);
+    service.close();
+  });
+
+  it('报告首页日期不覆盖后续页自己的检查日期', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-report-date-section-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '独立章节日期工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([{ path: '/tmp/章节日期报告.txt', bytes: Buffer.from('占位内容') }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const database = new Database(service.store.databasePath);
+    database.prepare('UPDATE source_spans SET quote = ? WHERE id = ?')
+      .run('体检日期 2024-10-22；复查日期 2024-10-25 身高 187 厘米', span.id);
+    database.close();
+    const output: ExtractionResult = {
+      schemaVersion: 1, documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      reportMetadata: {
+        reportKind: null, title: null, organization: null, campus: null, department: null,
+        reportNumber: null, examItems: [], times: [{
+          value: '2024-10-22', precision: 'day', role: 'examined',
+          evidence: [{ sourceSpanId: span.id, quote: '体检日期 2024-10-22' }]
+        }]
+      },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'height', originalName: '身高', standardNameCandidate: '身高',
+        value: { kind: 'numeric', rawText: '187', decimal: '187', comparator: 'eq' },
+        unitRaw: '厘米', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2024-10-25',
+        evidence: [{ sourceSpanId: span.id, quote: '复查日期 2024-10-25 身高 187 厘米' }], issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'section-date-thread', turnId: 'section-date-turn', output })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '身高', clinicalDate: '2024-10-25' })
+    ]);
+  });
+
+  it('后续章节另有检查日时，不把首页日期继承到再下一页无日期的结果', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-multi-chapter-date-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '多章节日期工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([{ path: '/tmp/多章节报告.txt', bytes: Buffer.from('占位内容') }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const first = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const secondId = '55555555-5555-4555-8555-555555555555';
+    const thirdId = '66666666-6666-4666-8666-666666666666';
+    const db = new Database(service.store.databasePath);
+    db.prepare("UPDATE source_spans SET span_kind='page', page_number=1, quote=? WHERE id=?")
+      .run('首页 体检日期：2024-10-22', first.id);
+    const insert = db.prepare(`INSERT INTO source_spans (
+      id, document_id, span_kind, page_number, block_id, line_start, line_end,
+      quote, readability, normalizer_version
+    ) SELECT ?, document_id, 'page', ?, NULL, NULL, NULL, ?, 'clear', normalizer_version
+      FROM source_spans WHERE id = ?`);
+    insert.run(secondId, 2, '超声科 检查日期：2024-10-25', first.id);
+    insert.run(thirdId, 3, '检查结果 甲状腺回声分布不均匀', first.id);
+    db.prepare("UPDATE source_manifests SET total_units=3, covered_unit_indexes_json='[0,1,2]' WHERE document_id=?")
+      .run(documentId);
+    db.close();
+    const output: ExtractionResult = {
+      schemaVersion: 1, documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      reportMetadata: {
+        reportKind: null, title: null, organization: null, campus: null, department: null,
+        reportNumber: null, examItems: [], times: [{
+          value: '2024-10-22', precision: 'day', role: 'examined',
+          evidence: [{ sourceSpanId: first.id, quote: '体检日期：2024-10-22' }]
+        }]
+      },
+      coveredSourceSpanIds: [first.id, secondId, thirdId],
+      candidates: [{
+        localKey: 'thyroid', originalName: '甲状腺小结', standardNameCandidate: null,
+        value: { kind: 'text', rawText: '甲状腺回声分布不均匀' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: '超声', bodySite: '甲状腺', clinicalDate: null,
+        evidence: [{ sourceSpanId: thirdId, quote: '检查结果 甲状腺回声分布不均匀' }], issues: []
+      }]
+    };
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'chapter-thread', turnId: 'chapter-turn', output })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '甲状腺小结', clinicalDate: null })
+    ]);
+  });
+
+  it('左眼结果引用了无效片段时，仅在原报告唯一匹配处自动修正定位', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-vision-evidence-repair-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '视力引用修复工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([{ path: '/tmp/视力报告.txt', bytes: Buffer.from('矫正视力（左） 5.0') }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const output: ExtractionResult = {
+      schemaVersion: 1, documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'left-corrected-vision', originalName: '矫正视力（左）',
+        standardNameCandidate: '矫正视力（左）',
+        value: { kind: 'numeric', rawText: '5.0', decimal: '5.0', comparator: 'eq' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: '左眼', clinicalDate: null,
+        evidence: [{ sourceSpanId: '44444444-4444-4444-8444-444444444444', quote: '矫正视力（左） 5.0' }],
+        issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'vision-repair-thread', turnId: 'vision-repair-turn', output })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ conceptKey: '矫正视力（左）', decimalValue: '5.0', sourceSpanId: span.id })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
   });
 
   it('同一长来源片段包含多个科室日期时按项目之前最近的检查日期补齐证据', async () => {
@@ -1406,6 +1690,233 @@ describe('DocumentExtractionPipeline', () => {
       severity: 'warning', reasonCodes: expect.arrayContaining(['numeric_value_not_in_evidence'])
     })]);
     service.close();
+  });
+
+  it('已完成报告重读后只增量补入缺失事实，保留原有事实并关闭已解决警告', async () => {
+    const { service, personId, documentId, result } = await setupTwoMeasurements();
+    const correct = result('0-3.4', '1.0-1.8', 'high', 'normal');
+    const partlyWrong: ExtractionResult = { ...correct, candidates: [correct.candidates[0]!, {
+      ...correct.candidates[1]!, value: { kind: 'numeric', rawText: '999', decimal: '999', comparator: 'eq' }
+    }] };
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'old-extract', turnId: 'old-turn', output: partlyWrong })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.getFactRevision(personId)).toBe(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toHaveLength(1);
+    const oldObservationId = service.store.listAcceptedObservations(personId)[0]!.id;
+
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'new-extract', turnId: 'new-turn', output: correct })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1, revision: 2 });
+    const observations = service.store.listAcceptedObservations(personId);
+    expect(observations).toHaveLength(2);
+    expect(observations.some((observation) => observation.id === oldObservationId)).toBe(true);
+    expect(observations.map((observation) => observation.originalName).sort()).toEqual([
+      '低密度脂蛋白胆固醇', '高密度脂蛋白胆固醇'
+    ].sort());
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+  });
+
+  it('已完成报告新一轮仍无法核实的项目不会被当成已解决，也不会重复写入事实', async () => {
+    const { service, personId, documentId, result } = await setupTwoMeasurements();
+    const correct = result('0-3.4', '1.0-1.8', 'high', 'normal');
+    const partlyWrong: ExtractionResult = { ...correct, candidates: [correct.candidates[0]!, {
+      ...correct.candidates[1]!, value: { kind: 'numeric', rawText: '999', decimal: '999', comparator: 'eq' }
+    }] };
+    await new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'old-extract', turnId: 'old-turn', output: partlyWrong })
+    }).process(documentId);
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'new-extract', turnId: 'new-turn', output: partlyWrong })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 0, revision: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ severity: 'warning', candidateOptions: expect.arrayContaining([
+        expect.objectContaining({ originalName: '高密度脂蛋白胆固醇' })
+      ]) })
+    ]);
+  });
+
+  it('已入档报告重核发现另一位受检者时暂时退出分析，确认同一人后恢复原事实', async () => {
+    const { service, personId, documentId, output, subjectSpanId } = await setup();
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'first', turnId: 'first', output })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    const originalFactId = service.store.listAcceptedObservations(personId)[0]!.id;
+    const warningSpanId = output.candidates[0]!.evidence[0]!.sourceSpanId;
+    service.store.saveExtractionReviewIssue({
+      documentId, stage: 'extract', kind: 'coverage_gap', severity: 'warning',
+      preserveDocumentStatus: true, evidenceRefs: [warningSpanId], reasonCodes: ['TEST_REPAIR']
+    });
+    const conflicting: ExtractionResult = {
+      ...output,
+      subject: {
+        reportedName: '测试姓名甲', confidence: 'explicit',
+        evidence: [{ sourceSpanId: subjectSpanId, quote: '姓名：测试姓名甲 性别：男' }]
+      }
+    };
+    const result = await new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'repair', turnId: 'repair', output: conflicting })
+    }).process(documentId);
+    expect(result).toMatchObject({ status: 'needs_review', reason: 'PERSON_IDENTITY_NOT_CONFIRMED' });
+    if (result.status !== 'needs_review') throw new Error('EXPECTED_IDENTITY_REVIEW');
+    const identityIssue = service.store.listOpenExtractionReviewIssues().find((issue) => issue.id === result.issueId)!;
+    expect(identityIssue).toMatchObject({ kind: 'person_conflict', severity: 'blocking', reportedName: '测试姓名甲' });
+    expect(identityIssue.reasonCodes).toContain('COMMITTED_PERSON_IDENTITY_CONFLICT');
+    expect(service.store.listAcceptedObservations(personId)).toEqual([]);
+    service.store.confirmDocumentIdentity({ issueId: identityIssue.id, documentId, personId });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([
+      expect.objectContaining({ id: originalFactId })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ severity: 'warning', documentId })
+    ]);
+    service.close();
+  });
+
+  it('旧提醒的无效片段 ID 只有在引文唯一重定位并重新接纳后才结清', async () => {
+    const { service, personId, documentId, result } = await setupTwoMeasurements();
+    const complete = result('0-3.4', '1.0-1.8', 'high', 'normal');
+    const firstOnly: ExtractionResult = { ...complete, candidates: [complete.candidates[0]!] };
+    await new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'initial', turnId: 'initial', output: firstOnly })
+    }).process(documentId);
+    const oldMissing = {
+      ...complete.candidates[1]!,
+      evidence: [{
+        ...complete.candidates[1]!.evidence[0]!,
+        sourceSpanId: '99999999-9999-4999-8999-999999999999'
+      }]
+    };
+    service.store.saveExtractionReviewIssue({
+      documentId, stage: 'extract', kind: 'field_conflict', severity: 'warning',
+      preserveDocumentStatus: true, evidenceRefs: [oldMissing.evidence[0]!.sourceSpanId],
+      candidateOptions: [oldMissing], reasonCodes: ['evidence_span_missing']
+    });
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'repair', turnId: 'repair', output: complete })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(2);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('旧覆盖缺口不能仅凭模型声称已读过该片段就结清', async () => {
+    const { service, personId, documentId, result } = await setupTwoMeasurements();
+    const complete = result('0-3.4', '1.0-1.8', 'high', 'normal');
+    const firstOnly: ExtractionResult = { ...complete, candidates: [complete.candidates[0]!] };
+    await new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'initial', turnId: 'initial', output: firstOnly })
+    }).process(documentId);
+    const missedSpanId = complete.candidates[1]!.evidence[0]!.sourceSpanId;
+    service.store.saveExtractionReviewIssue({
+      documentId, stage: 'extract', kind: 'coverage_gap', severity: 'warning',
+      preserveDocumentStatus: true, evidenceRefs: [missedSpanId],
+      reasonCodes: [`UNCOVERED_SPAN:${missedSpanId}`]
+    });
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'retry', turnId: 'retry', output: firstOnly })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 0 });
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ severity: 'warning', evidenceRefs: [missedSpanId],
+        reasonCodes: [`UNCOVERED_SPAN:${missedSpanId}`] })
+    ]);
+    await expect(new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'resolved', turnId: 'resolved', output: complete })
+    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(2);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('旧覆盖缺口若原文单行明确标记未填写，可结清而不制造未知结果', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-explicit-blank-gap-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '明确空栏工作区', () => new Date('2026-09-18T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/明确空栏.txt', bytes: Buffer.from('2026-09-17 LDL 4.2 mmol/L\n裸眼视力（右）：—')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
+    const resultSpan = spans.find((span) => span.quote?.includes('LDL'))!;
+    const blankSpan = spans.find((span) => span.quote?.includes('裸眼视力'))!;
+    const output: ExtractionResult = {
+      schemaVersion: 1, documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: spans.map((span) => span.id),
+      candidates: [{
+        localKey: 'ldl', originalName: 'LDL', standardNameCandidate: 'LDL',
+        value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
+        unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
+        evidence: [{ sourceSpanId: resultSpan.id, quote: resultSpan.quote }], issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'blank', turnId: 'blank', output })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    service.store.saveExtractionReviewIssue({
+      documentId, stage: 'extract', kind: 'coverage_gap', severity: 'warning',
+      preserveDocumentStatus: true, evidenceRefs: [blankSpan.id],
+      reasonCodes: [`UNCOVERED_SPAN:${blankSpan.id}`]
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 0 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    service.close();
+  });
+
+  it('文字层未写结果但没有显式空值标记时，不仅凭模型说空白就结清旧缺口', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-blank-legacy-repair-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '明确空栏工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    const sourceText = '裸眼视力 ( 右 ) 裸眼视力 ( 左 ) 矫正视力 ( 右 ) 5.0';
+    await service.importFiles([{ path: '/tmp/空栏眼科.txt', bytes: Buffer.from(sourceText) }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const output: ExtractionResult = {
+      schemaVersion: 1, documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: [span.id],
+      candidates: [{
+        localKey: 'corrected-right', originalName: '矫正视力（右）', standardNameCandidate: '矫正视力（右）',
+        value: { kind: 'numeric', rawText: '5.0', decimal: '5.0', comparator: 'eq' },
+        unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+        specimen: null, method: null, bodySite: '右眼', clinicalDate: null,
+        evidence: [{ sourceSpanId: span.id, quote: '矫正视力 ( 右 ) 5.0' }], issues: []
+      }]
+    };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'blank-thread', turnId: 'blank-turn', output })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    const empty = (name: string, key: string, quote: string): ExtractionResult['candidates'][number] => ({
+      localKey: key, originalName: name, standardNameCandidate: null,
+      value: { kind: 'unknown', rawText: null, reason: '报告列出项目但检查结果为空' },
+      unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: span.id, quote }], issues: []
+    });
+    service.store.saveExtractionReviewIssue({
+      documentId, stage: 'extract', kind: 'field_conflict', severity: 'warning', preserveDocumentStatus: true,
+      evidenceRefs: [span.id], reasonCodes: ['value_unknown'], candidateOptions: [
+        empty('裸眼视力（右）', 'bare-right', sourceText),
+        // 历史任务可能复用 localKey；不能因此丢掉另一个项目。
+        empty('裸眼视力（左）', 'bare-right', '裸眼视力 ( 左 ) 矫正视力 ( 右 ) 5.0')
+      ]
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 0, revision: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ candidateOptions: expect.arrayContaining([
+        expect.objectContaining({ originalName: '裸眼视力（右）' }),
+        expect.objectContaining({ originalName: '裸眼视力（左）' })
+      ]) })
+    ]);
+    expect(service.store.listOpenExtractionReviewIssues()[0]!.candidateOptions).toHaveLength(2);
   });
 
   it('同日同名同值但来自两个独立来源片段时不自动去重', async () => {

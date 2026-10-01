@@ -7,6 +7,10 @@ import type { AccountState, AssessmentRequestV3, ExtractionResult, MemberAssessm
 import type { CodexRuntimeManager } from './codex-runtime.js';
 import { ProcessingJobRunner } from './job-runner.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
+import { DocumentExtractionPipeline } from './processing-pipeline.js';
+import { buildMemberAssessmentInput } from './member-assessment-input.js';
+import { expandMemberEvidence, restoreMemberEvidenceReferences } from './member-evidence-transport.js';
+import { buildMemberAnalysisPackage, createMemberAnalysisTransport } from './member-analysis-package.js';
 
 const roots: string[] = [];
 
@@ -46,11 +50,12 @@ describe('ProcessingJobRunner', () => {
 
   function parsePromptValue<T>(prompt: string, key: string, nextKey?: string): T {
     const content = prompt.split(key + '=')[1]!;
-    return JSON.parse(nextKey ? content.split('\n' + nextKey + '=')[0]! : content) as T;
+    const value = JSON.parse(nextKey ? content.split('\n' + nextKey + '=')[0]! : content);
+    return (key === 'MEMBER_EVIDENCE_PACKAGE' ? expandMemberEvidence(value) : value) as T;
   }
 
   function assessmentFor(request: AssessmentRequestV3, evidence: MemberEvidencePackageV3): MemberAssessmentCandidateV3 {
-    const evidenceId = evidence.facts[0]!.evidenceIds[0]!;
+    const evidenceId = evidence.facts[0]!.evidenceIds?.[0] ?? evidence.facts[0]!.observationId;
     return {
       schemaVersion: 3, personId: request.personId, inputSignature: request.inputSignature,
       mode: request.mode, requestedSystemIds: request.requestedSystemIds,
@@ -86,10 +91,11 @@ describe('ProcessingJobRunner', () => {
     let assessmentCalls = 0;
     const runtime = {
       getState: () => connectedState,
-      runStructuredTurn: async (input: { prompt: string; allowWebSearch?: boolean }) => {
+      runStructuredTurn: async (input: { prompt: string; allowWebSearch?: boolean; aiPreferences: { modelId: string; reasoningEffort: string } }) => {
         if (input.prompt.includes('SOURCE_PACKAGE=')) {
           extractionCalls += 1;
           expect(input.allowWebSearch).toBe(false);
+          expect(input.aiPreferences).toEqual({ modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' });
           const source = parsePromptValue<{ documentId: string; spans: Array<{ sourceSpanId: string; quote: string }> }>(input.prompt, 'SOURCE_PACKAGE');
           const span = source.spans[0]!;
           const value = span.quote.match(/LDL-C ([\d.]+)/)![1]!;
@@ -101,7 +107,7 @@ describe('ProcessingJobRunner', () => {
               value: { kind: 'numeric', rawText: value, decimal: value, comparator: 'eq' },
               unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
               specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
-              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: []
+              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], clinicalContext: { version: 1 as const, status: 'complete' as const, conditions: [] }, issues: []
             }]
           };
           return { threadId: 'extract', turnId: 'extract-' + extractionCalls, output: extraction,
@@ -110,6 +116,7 @@ describe('ProcessingJobRunner', () => {
         }
         assessmentCalls += 1;
         expect(input.prompt).toContain('ASSESSMENT_REQUEST=');
+        expect(input.aiPreferences).toEqual({ modelId: 'gpt-6-sol', reasoningEffort: 'medium' });
         const request = parsePromptValue<AssessmentRequestV3>(input.prompt, 'ASSESSMENT_REQUEST', 'MEMBER_EVIDENCE_PACKAGE');
         const evidence = parsePromptValue<MemberEvidencePackageV3>(input.prompt, 'MEMBER_EVIDENCE_PACKAGE');
         return { threadId: 'assess', turnId: 'assess-1', output: assessmentFor(request, evidence),
@@ -125,6 +132,7 @@ describe('ProcessingJobRunner', () => {
     });
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(documentCount);
     expect(service.store.listMemberAssessmentSnapshots(personId, true)).toHaveLength(1);
+    expect(service.store.listMemberAssessmentSnapshots(personId, true)[0]).toMatchObject({ modelId: 'gpt-6-sol', reasoningEffort: 'medium' });
     expect(recordedTurnUsage(service.store.databasePath)).toMatchObject({
       attemptedTurnRequests: { P01: documentCount, P02: 1, P03: 0, P04: 0, other: 0 },
       completedTurnResponses: { P01: documentCount, P02: 1, P03: 0, P04: 0, other: 0 },
@@ -136,6 +144,56 @@ describe('ProcessingJobRunner', () => {
       cachedInputTokens: 15
     });
     expect(recordedTurnUsage(service.store.databasePath).firstUsableFactMs).toBeGreaterThanOrEqual(0);
+    service.close();
+  });
+
+  it('显式重核已完成报告时实际重读 P01，并只补入新核实的项目', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'family-health-runner-committed-repair-'));
+    roots.push(root);
+    const service = new PersonalWorkspaceService(root, '旧报告补修工作区', () => new Date('2026-09-24T00:00:00Z'));
+    const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    await service.importFiles([{
+      path: '/tmp/旧报告补修.txt',
+      bytes: Buffer.from('2026-09-17 LDL-C 4.2 mmol/L\n2026-09-17 ALT 32 U/L')
+    }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
+    const candidate = (span: typeof spans[number], name: string, value: string, unit: string) => ({
+      localKey: name, originalName: name, standardNameCandidate: name,
+      value: { kind: 'numeric' as const, rawText: value, decimal: value, comparator: 'eq' as const },
+      unitRaw: unit, referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
+      evidence: [{ sourceSpanId: span.id, quote: span.quote }], clinicalContext: { version: 1 as const, status: 'complete' as const, conditions: [] }, issues: []
+    });
+    const result = (alt: string): ExtractionResult => ({
+      schemaVersion: 1, documentId,
+      subject: { reportedName: null, evidence: [], confidence: 'absent' },
+      coveredSourceSpanIds: spans.map((span) => span.id),
+      candidates: [candidate(spans[0]!, 'LDL-C', '4.2', 'mmol/L'), candidate(spans[1]!, 'ALT', alt, 'U/L')]
+    });
+    await new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'old-thread', turnId: 'old-turn', output: result('999') })
+    }).process(documentId);
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
+    expect(service.store.listOpenExtractionReviewIssues()).toHaveLength(1);
+    service.processNow({ accountState: connectedState, consentVersion: 1, documentIds: [documentId] });
+    let extractionCalls = 0;
+    const runtime = {
+      getState: () => connectedState,
+      runStructuredTurn: async (input: { prompt: string }) => {
+        if (input.prompt.includes('SOURCE_PACKAGE=')) {
+          extractionCalls += 1;
+          return { threadId: 'repair-thread', turnId: 'repair-turn', output: result('32') };
+        }
+        const request = parsePromptValue<AssessmentRequestV3>(input.prompt, 'ASSESSMENT_REQUEST', 'MEMBER_EVIDENCE_PACKAGE');
+        const evidence = parsePromptValue<MemberEvidencePackageV3>(input.prompt, 'MEMBER_EVIDENCE_PACKAGE');
+        return { threadId: 'assess-thread', turnId: 'assess-turn', output: assessmentFor(request, evidence) };
+      }
+    } as unknown as CodexRuntimeManager;
+    await new ProcessingJobRunner(runtime).runAvailableJobs(service.store);
+    expect(extractionCalls).toBe(1);
+    expect(service.store.listAcceptedObservations(personId)).toHaveLength(2);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
     service.close();
   });
 
@@ -168,7 +226,7 @@ describe('ProcessingJobRunner', () => {
               value: { kind: 'numeric', rawText: value, decimal: value, comparator: 'eq' },
               unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
               specimen: null, method: null, bodySite: null, clinicalDate,
-              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: []
+              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], clinicalContext: { version: 1 as const, status: 'complete' as const, conditions: [] }, issues: []
             }]
           } satisfies ExtractionResult };
         }
@@ -223,12 +281,23 @@ describe('ProcessingJobRunner', () => {
     await new ProcessingJobRunner(runtimeFor(nextRequests)).runAvailableJobs(reopened.store);
     expect(nextRequests.map((item) => item.stage)).toEqual(['P01', 'P02']);
     expect(nextRequests[0]?.documentId).toBe(documentD);
-    const fullEvidence = nextRequests[1]!.evidence!;
+    const fullPackage = buildMemberAssessmentInput(reopened.store, personId, {
+      modelId: 'gpt-6-sol', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-22', webSearchAllowed: true
+    }).evidencePackage;
+    const fullEvidence = restoreMemberEvidenceReferences(nextRequests[1]!.evidence!,
+      createMemberAnalysisTransport(fullPackage).referenceIds);
+    expect(fullEvidence).toEqual(buildMemberAnalysisPackage(fullPackage));
     expect(fullEvidence.facts.map((fact) => fact.rawValue)).toEqual(['4.1', '4.2', '4.3', '4.4']);
     expect(fullEvidence.facts.map((fact) => fact.observationId).slice(0, 3)).toEqual(historical.map((item) => item.id));
     expect(fullEvidence.trends.length).toBeGreaterThan(0);
-    expect(JSON.stringify(fullEvidence.trends)).toContain('2023-06-10');
-    expect(JSON.stringify(fullEvidence.trends)).toContain('2026-06-10');
+    expect(fullEvidence.facts.map((fact) => fact.clinicalDate)).toContain('2023-06-10');
+    expect(fullEvidence.facts.map((fact) => fact.clinicalDate)).toContain('2026-06-10');
+    // 趋势中的点引用完整事实，日期不重复抄写。
+    const knownFacts = new Set(fullEvidence.facts.map((fact) => fact.observationId));
+    for (const trend of fullEvidence.trends) {
+      expect((trend.payload as { points: Array<{ observationId: string }> }).points
+        .every((point) => knownFacts.has(point.observationId))).toBe(true);
+    }
     expect(JSON.stringify(fullEvidence)).not.toContain('其他成员独有的合成病史');
     expect(fullEvidence.existingActions).toEqual([expect.objectContaining({ id: action.id, title: '保留既有行动' })]);
     expect(reopened.store.listActionItems(personId)).toContainEqual(expect.objectContaining({ id: action.id, status: 'completed' }));
@@ -269,7 +338,7 @@ describe('ProcessingJobRunner', () => {
           value: { kind: 'numeric', rawText: value, decimal: value, comparator: 'eq' },
           unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
           specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-21',
-          evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: [] }]
+          evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], clinicalContext: { version: 1 as const, status: 'complete' as const, conditions: [] }, issues: [] }]
       };
     };
     const failingRuntime = {
@@ -351,7 +420,7 @@ describe('ProcessingJobRunner', () => {
               value: { kind: 'numeric', rawText: conflict ? '4.1' : '4.2', decimal: conflict ? '4.1' : '4.2', comparator: 'eq' },
               unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
               specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-17',
-              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], issues: []
+              evidence: [{ sourceSpanId: span.sourceSpanId, quote: span.quote }], clinicalContext: { version: 1 as const, status: 'complete' as const, conditions: [] }, issues: []
             }]
           };
           return { threadId: 'extract', turnId: 'extract-' + extractionCalls, output };
@@ -437,7 +506,7 @@ describe('ProcessingJobRunner', () => {
         localKey: 'ldl-late', originalName: 'LDL-C', standardNameCandidate: 'LDL-C',
         value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' }, unitRaw: 'mmol/L',
         referenceRangeRaw: null, reportedAbnormalFlag: null, specimen: null, method: null, bodySite: null,
-        clinicalDate: null, evidence: [{ sourceSpanId: spanId, quote: 'LDL-C 4.2 mmol/L' }], issues: []
+        clinicalDate: null, evidence: [{ sourceSpanId: spanId, quote: 'LDL-C 4.2 mmol/L' }], clinicalContext: { version: 1 as const, status: 'complete' as const, conditions: [] }, issues: []
       }]
     };
     const runtime = {

@@ -35,13 +35,15 @@ function systemTone(status: BodySystemSummaryV2['status']): Tone {
   return status === 'attention' ? 'warning' : status === 'stable' || status === 'no_signal_in_scope' ? 'success' : status === 'building' || status === 'monitor' ? 'info' : 'neutral';
 }
 
-function systemStatusLabel(system: BodySystemSummaryV2): string {
+export function systemStatusLabel(system: BodySystemSummaryV2): string {
+  if (system.interpretationState === 'partial') return '部分解读';
+  if (system.interpretationState === 'unavailable') return '解读待完善';
   if (system.status === 'attention') return '建议关注';
   if (system.status === 'monitor') return '继续观察';
   if (system.status === 'no_signal_in_scope') return '本次未提示问题';
   if (system.status === 'stable') return '继续保持';
   if (system.status === 'building') return system.factCount > 0 ? '解读待完成' : '整理中';
-  return '尚无相关检查';
+  return system.factCount > 0 ? '已有资料，解读有限' : '尚无相关检查';
 }
 
 function evidenceRequest(title: string, evidence: MemberEvidenceRef): EvidenceRequest {
@@ -187,9 +189,10 @@ export function assessmentKnowledgeStatusLabel(status: MemberAssessmentSnapshotV
   return 'AI 提供的网址；应用尚未核对正文';
 }
 
-function MemberAssessmentSystemCard({ assessment, systemId, onOpenEvidence }: {
+export function MemberAssessmentSystemCard({ assessment, systemId, factCount, onOpenEvidence }: {
   assessment: MemberAssessmentSnapshotV3;
   systemId: BodySystemId;
+  factCount: number;
   onOpenEvidence(request: EvidenceRequest): void;
 }) {
   const system = assessment.systems.find((item) => item.systemId === systemId);
@@ -198,8 +201,11 @@ function MemberAssessmentSystemCard({ assessment, systemId, onOpenEvidence }: {
     .filter((item): item is MemberAssessmentSnapshotV3['claims'][number] => Boolean(item));
   const actions = system.actionIds.map((id) => assessment.actions.find((item) => item.id === id))
     .filter((item): item is MemberAssessmentSnapshotV3['actions'][number] => Boolean(item));
+  const rebuilt = assessment.presentation?.rebuiltNodeIds.includes(system.id) ?? false;
+  const noInterpretation = rebuilt && claims.length === 0;
+  const headline = noInterpretation && factCount > 0 ? '已有检查，暂未形成完整解读' : system.headline;
   return <article className="system-analysis-card">
-    <div className="panel__heading"><div><span className="eyebrow">这部分身体情况</span><h3>{system.headline}</h3></div><StatusBadge tone="success">有来源依据</StatusBadge></div>
+    <div className="panel__heading"><div><span className="eyebrow">这部分身体情况</span><h3>{headline}</h3></div><StatusBadge tone={rebuilt ? 'info' : 'success'}>{rebuilt ? noInterpretation ? '解读待完善' : '部分解读' : '有来源依据'}</StatusBadge></div>
     <p className="system-analysis-overview">{system.summary}</p>
     {claims.length > 0 && <section className="analysis-explanation"><h4>为什么这样判断</h4><div className="system-analysis-points">{claims.map((claim) => {
       const evidence = claim.evidenceIds.map((id) => assessment.evidenceCatalog.find((item) => item.id === id)).find(Boolean);
@@ -213,7 +219,7 @@ function MemberAssessmentSystemCard({ assessment, systemId, onOpenEvidence }: {
       })}</div></details>}</section>;
     })}</div></section>}
     {actions.length > 0 && <section className="analysis-recommendations"><h4>接下来怎么做</h4><div>{actions.map((action) => <article key={action.id}><h5>{action.title}</h5><p>{action.why}</p><dl><div><dt>第一步</dt><dd>{action.firstStep}</dd></div>{action.timing && <div><dt>何时</dt><dd>{action.timing}</dd></div>}{action.reviewPlan && <div><dt>何时回看</dt><dd>{action.reviewPlan}</dd></div>}</dl>{action.caution && <small>{action.caution}</small>}</article>)}</div></section>}
-    {system.limitations.length > 0 && <details className="analysis-boundaries"><summary>这部分判断的范围</summary>{system.limitations.map((item) => <p key={item}>{item}</p>)}</details>}
+    {(rebuilt || system.limitations.length > 0) && <details className="analysis-boundaries"><summary>查看解读范围与处理说明</summary>{rebuilt && <p>这里仅展示本次保留下来的解读；另有内容尚未发布，不代表相应检查结果正常。处理范围的变化不会改写已保存的报告事实。</p>}{system.limitations.filter((item) => !rebuilt || item !== '部分判断因证据不足暂未发布。').map((item) => <p key={item}>{item}</p>)}</details>}
   </article>;
 }
 
@@ -233,7 +239,7 @@ function SystemDetail({ detail, assessment, search, onSearch, selectedMetric, on
   return <section className="system-detail">
     <div className="system-detail__hero"><span className={`system-directory__symbol is-${detail.summary.status}`}>{systemSymbol[detail.registry.id]}</span><div><span className="eyebrow">{detail.registry.name}</span><h2>{detail.registry.shortName}</h2><p>{detail.analysis?.status === 'stale' ? '旧版说明供回看；下面的指标和原始依据仍可查看。' : detail.analysis ? '先看结论和下一步，需要时再展开指标与原始依据。' : detail.summary.summary}</p></div></div>
     {assessment?.systems.some((item) => item.systemId === detail.registry.id)
-      ? <MemberAssessmentSystemCard assessment={assessment} systemId={detail.registry.id} onOpenEvidence={onOpenEvidence} />
+      ? <MemberAssessmentSystemCard assessment={assessment} systemId={detail.registry.id} factCount={detail.summary.factCount} onOpenEvidence={onOpenEvidence} />
       : <SystemAnalysisCard detail={detail} onOpenEvidence={onOpenEvidence} />}
     <label className="member-search"><Search size={18} /><span className="sr-only">搜索本系统指标</span><input value={search} onChange={(event) => onSearch(event.target.value)} placeholder={`搜索${detail.registry.shortName}指标`} /></label>
     <div className="system-section-heading"><div><h3>指标与历史</h3><p>点开指标查看按真实日期间隔绘制的历史；不会因点击而调用模型。</p></div><StatusBadge tone="neutral">{metrics.length} 项</StatusBadge></div>
@@ -657,7 +663,7 @@ export function MemberProfileV2({ snapshot, person, onSelectPerson, onOpenEviden
     {(loading || (!loadError && overview?.personId !== person.id)) && <section className="panel table-empty"><LoaderCircle size={24} className="spin" /><strong>正在整理成员档案</strong><span>只读取本机已保存结果，不会发起新的模型任务。</span></section>}
     {!loading && loadError && <section className="panel personal-empty-state"><ShieldCheck size={28} /><div><span className="eyebrow">读取未完成</span><h2>暂时无法打开新版成员档案</h2><p>现有报告和事实没有丢失。可先切换页面后重试；打开页面本身不会调用模型。</p></div></section>}
     {!loading && overview?.personId === person.id && !loadError && overview && tab === 'overview' && <div className="member-v2-overview">
-      <section className="panel member-health-headline"><div><span className="eyebrow">现在怎样</span><h2>{overview.headline}</h2><p>{overview.overview}</p>{!assessment && systems.some((system) => system.analysisStatus === 'stale') && <p>旧版解读可在“身体与指标”中回看，尚不能当作当前综合结论。</p>}<small>资料截至 {overview.latestClinicalDate ?? '日期待确认'}</small></div></section>
+      <section className="panel member-health-headline"><div><span className="eyebrow">现在怎样</span><h2>{overview.headline}</h2><p>{overview.overview}</p>{assessment?.presentation?.rebuiltNodeIds.includes('overview') && <details className="analysis-boundaries"><summary>查看本次解读范围</summary><p>总览仅使用本次保留下来的判断；另有内容尚未发布，不能据此认定未展示的部分正常。完整的已保存事实仍可在身体与指标、检查时间线中查看。</p></details>}{!assessment && systems.some((system) => system.analysisStatus === 'stale') && <p>旧版解读可在“身体与指标”中回看，尚不能当作当前综合结论。</p>}<small>资料截至 {overview.latestClinicalDate ?? '日期待确认'}</small></div></section>
       {overview.unclassifiedFactCount > 0 && <div className="info-callout compact" role="status"><ShieldCheck size={18} /><div><strong>有 {overview.unclassifiedFactCount} 条来源事实尚未归入身体系统</strong><p>事实已保存；{assessment ? '成员总览已纳入这些资料，但身体系统卡片可能暂不显示。' : '成员总览整理完成后会纳入这些资料，身体系统卡片可能暂不显示。'}</p></div></div>}
       {overview.priorityIssues.length > 0 && <section className="panel result-first-section"><div className="panel__heading"><div><span className="eyebrow">最值得先看</span><h2>优先关注</h2></div></div><div className="priority-issue-list">{overview.priorityIssues.map((issue) => <button key={issue.id} onClick={() => { chooseSystem(issue.systemId); setTab('body'); }}><span><strong>{issue.title}</strong><p>{issue.explanation}</p>{issue.nextStep && <small>先做：{issue.nextStep}</small>}</span><ChevronRight size={18} /></button>)}</div></section>}
       {overview.importantChanges.length > 0 && <section className="panel result-first-section"><div className="panel__heading"><div><span className="eyebrow">和以前相比</span><h2>有意义的变化</h2></div></div><div className="important-change-list">{overview.importantChanges.map((change) => <button key={change.id} onClick={() => { chooseSystem(change.systemId); setTab('body'); }}><span><strong>{change.title}</strong><p>{change.meaning}</p></span><ChevronRight size={18} /></button>)}</div></section>}

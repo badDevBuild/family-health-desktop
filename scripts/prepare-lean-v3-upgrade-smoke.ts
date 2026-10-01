@@ -12,7 +12,7 @@ const userData = resolve(rawUserData);
 if (dirname(userData) !== resolve(tmpdir()) || !basename(userData).startsWith('family-health-app-smoke-')) {
   throw new Error('SYNTHETIC_UPGRADE_PATH_NOT_ALLOWED');
 }
-if (WORKSPACE_SCHEMA_VERSION !== 35) throw new Error('SYNTHETIC_UPGRADE_SCHEMA_FIXTURE_OUTDATED');
+if (WORKSPACE_SCHEMA_VERSION !== 36) throw new Error('SYNTHETIC_UPGRADE_SCHEMA_FIXTURE_OUTDATED');
 
 const workspaceRoot = join(userData, 'workspace');
 const databasePath = join(workspaceRoot, 'health.db');
@@ -75,7 +75,7 @@ try {
 
 const database = new Database(databasePath);
 try {
-  if (database.pragma('user_version', { simple: true }) !== 35) throw new Error('SYNTHETIC_UPGRADE_SOURCE_SCHEMA_MISMATCH');
+  if (database.pragma('user_version', { simple: true }) !== 36) throw new Error('SYNTHETIC_UPGRADE_SOURCE_SCHEMA_MISMATCH');
   const sourceNames = database.prepare(`SELECT display_name FROM source_occurrences`).all() as Array<{ display_name: string }>;
   if (sourceNames.length !== 1 || sourceNames[0]?.display_name !== '合成年度健康报告.txt') {
     throw new Error('SYNTHETIC_UPGRADE_SOURCE_FILE_MISMATCH');
@@ -84,8 +84,10 @@ try {
   if (currentSnapshots.count !== 0) throw new Error('SYNTHETIC_UPGRADE_CURRENT_SNAPSHOT_MUST_BE_EMPTY');
   database.exec('BEGIN IMMEDIATE');
   try {
-    // v35 相对 v34 只新增此表；故只删除空的新表，不触碰旧数据表或 vault 原件。
+    // 仅限上面验证的合成种子；撤销新增结构，以便真实走 v34 → v36 升级。
     database.exec(`
+      DROP TABLE report_clinical_contexts;
+      ALTER TABLE observation_revisions DROP COLUMN clinical_context_json;
       DROP TABLE member_assessment_snapshots_v3;
       UPDATE workspaces SET schema_version = 34;
       PRAGMA user_version = 34;

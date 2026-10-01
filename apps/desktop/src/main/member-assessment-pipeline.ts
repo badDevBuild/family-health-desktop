@@ -9,7 +9,9 @@ import type { JobExecutionGuard, WorkspaceStore } from '@storage';
 import { normalizeAssessmentStructuralFields, validateAssessmentCandidate } from './assessment-validation.js';
 import { applyFocusedReview, routeFocusedReview } from './clinical-review-router.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
-import { buildMemberAggregatePackage, buildMemberSystemPartitions, splitMemberPartition } from './member-assessment-partition.js';
+import { assertAssessmentPromptFits, isAssessmentContextLimit, aliasMemberEvidenceReferences } from './member-evidence-transport.js';
+import { buildMemberAnalysisPackage, createMemberAnalysisTransport } from './member-analysis-package.js';
+import { prepareClinicalRecords } from './clinical-record-preparation.js';
 import { buildAssessmentKnowledgeVerifications, canonicalizeAssessmentKnowledge } from './assessment-knowledge.js';
 import { buildP02Prompt, buildP03Prompt, buildP04Prompt } from './prompts/lean.js';
 import { MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION } from './prompts/index.js';
@@ -214,16 +216,22 @@ export class MemberAssessmentPipeline {
     const runCountedTurn = async (stage: string, input: Parameters<StructuredRuntime['runStructuredTurn']>[0]) => {
       // 构包后的事实/授权可能被撤销；每次真正发送前以原始发送范围重查，而非以当前列表替代旧包。
       assertInputStillAuthorized();
-      calls += 1; // 失败的原始尝试也是真实请求，不能在分区模式中藏掉。
-      const result = await this.runTurn(stage, input);
-      lastReceipt = result;
-      return result;
+      assertAssessmentPromptFits(input.prompt);
+      calls += 1;
+      try {
+        const result = await this.runTurn(stage, input);
+        lastReceipt = result;
+        return result;
+      } catch (error) {
+        if (isAssessmentContextLimit(error)) throw new Error('MEMBER_ASSESSMENT_INPUT_TOO_LARGE', { cause: error });
+        throw error;
+      }
     };
     const validationInputFor = (scopeRequest: AssessmentRequestV3, scopePackage: MemberEvidencePackageV3) => ({
       personId, inputSignature: scopeRequest.inputSignature, mode: scopeRequest.mode,
       requestedSystemIds: scopeRequest.requestedSystemIds,
       evidenceCatalog: scopePackage.evidenceCatalog,
-      trendIds: scopePackage.trends.map((item) => item.id),
+      trendIds: buildMemberAnalysisPackage(scopePackage).trends.map((item) => item.id),
       catalogKnowledgeIds: scopePackage.knowledge.map((item) => item.id),
       criteriaSets: scopePackage.criteriaSets
     });
@@ -249,11 +257,14 @@ export class MemberAssessmentPipeline {
         allowedPaths: targetIds.map((id) => id === 'overview' ? 'overview' : `node:${id}`),
         issues: validation.issues, originalCandidateHash: stableHash(candidate)
       };
+      const repairTransport = createMemberAnalysisTransport(scopePackage);
       const repaired = await runCountedTurn('assessment_repair', {
-        prompt: buildP03Prompt(repairRequest, scopePackage, candidate),
+        prompt: buildP03Prompt(repairRequest, repairTransport.packet,
+          repairTransport.aliasCandidate(candidate)),
         outputSchema: candidateOutputSchema, allowWebSearch: false
       });
-      const repairParsed = memberAssessmentCandidateV3Schema.safeParse(repaired.output);
+      const repairParsed = memberAssessmentCandidateV3Schema.safeParse(
+        repairTransport.restoreOutput(repaired.output));
       const repairedCandidate = repairParsed.success
         ? canonicalizeAssessmentKnowledge(normalizeAssessmentStructuralFields(repairParsed.data), scopePackage)
         : null;
@@ -278,118 +289,37 @@ export class MemberAssessmentPipeline {
     };
 
     this.onStage?.('analyze');
-    let analysisRequest = request;
-    let analysisPackage = evidencePackage;
-    let generated: Awaited<ReturnType<typeof runCountedTurn>>;
-    let partitionCount = 0;
-    const partitionHeldIds: string[] = [];
-    const partitionHighImpact = new Map<string, Set<string>>();
-    try {
-      generated = await runCountedTurn('member_assessment', {
-        prompt: buildP02Prompt(request, evidencePackage), outputSchema: candidateOutputSchema,
-        allowWebSearch: request.webSearchAllowed
-      });
-    } catch (error) {
-      if (!(error instanceof Error) || error.message !== 'CODEX_CONTEXT_WINDOW_EXCEEDED') throw error;
-      const systemPartitions = buildMemberSystemPartitions(evidencePackage, request.requestedSystemIds);
-      const initialPartitions = systemPartitions.length === 1
-        ? splitMemberPartition(systemPartitions[0]!)
-        : systemPartitions;
-      if (!initialPartitions) return reject('single_fact_context_window_exceeded');
-      const pendingPartitions = [...initialPartitions];
-      const partitionResults: MemberAssessmentCandidateV3[] = [];
-      while (pendingPartitions.length > 0) {
-        const partition = pendingPartitions.shift()!;
-        const partitionRequest: AssessmentRequestV3 = {
-          ...request, mode: 'partition', requestedSystemIds: partition.systemIds,
-          partitionScope: {
-            basis: partition.basis, label: partition.label,
-            selectedFactCount: partition.evidencePackage.facts.length,
-            totalAcceptedFactCount: evidencePackage.facts.length,
-            primaryObservationIds: partition.primaryObservationIds,
-            contextObservationIds: partition.contextObservationIds
-          }
-        };
-        let turn: Awaited<ReturnType<typeof runCountedTurn>>;
-        try {
-          turn = await runCountedTurn('member_assessment_partition', {
-            prompt: buildP02Prompt(partitionRequest, partition.evidencePackage),
-            outputSchema: candidateOutputSchema, allowWebSearch: request.webSearchAllowed
-          });
-        } catch (partitionError) {
-          if (partitionError instanceof Error && partitionError.message === 'CODEX_CONTEXT_WINDOW_EXCEEDED') {
-            const children = splitMemberPartition(partition);
-            if (!children) return reject('single_fact_context_window_exceeded');
-            pendingPartitions.unshift(...children);
-            continue;
-          }
-          throw partitionError;
-        }
-        const parsedPartition = memberAssessmentCandidateV3Schema.safeParse(turn.output);
-        if (!parsedPartition.success) return reject('partition_schema_invalid');
-        const validatedPartition = await validateAndRepair(parsedPartition.data, partitionRequest, partition.evidencePackage);
-        if (!validatedPartition.candidate) return reject(`partition_${validatedPartition.reason}`);
-        partitionHeldIds.push(...validatedPartition.heldTargetIds);
-        for (const reason of routeFocusedReview(validatedPartition.candidate).reasons) {
-          const id = reason.slice(reason.indexOf(':') + 1);
-          const node = targetNode(validatedPartition.candidate, id);
-          if (!node) continue;
-          const hashes = partitionHighImpact.get(id) ?? new Set<string>();
-          hashes.add(stableHash(node));
-          partitionHighImpact.set(id, hashes);
-        }
-        partitionResults.push(validatedPartition.candidate);
-      }
-      partitionCount = partitionResults.length;
-      analysisRequest = { ...request, mode: 'aggregate' };
-      analysisPackage = buildMemberAggregatePackage(evidencePackage, partitionResults);
-      try {
-        generated = await runCountedTurn('member_assessment_aggregate', {
-          prompt: buildP02Prompt(analysisRequest, analysisPackage),
-          outputSchema: candidateOutputSchema, allowWebSearch: request.webSearchAllowed
-        });
-      } catch (aggregateError) {
-        if (aggregateError instanceof Error && aggregateError.message === 'CODEX_CONTEXT_WINDOW_EXCEEDED') {
-          return reject('aggregate_context_window_exceeded');
-        }
-        throw aggregateError;
-      }
-    }
-    const parsed = memberAssessmentCandidateV3Schema.safeParse(generated.output);
+    await prepareClinicalRecords({ store: this.store, evidencePackage, personId,
+      factRevision: built.factRevision, contextRevision: built.contextRevision,
+      ...(this.executionGuard ? { executionGuard: this.executionGuard } : {}),
+      assertActive: assertInputStillAuthorized,
+      runTurn: (input) => runCountedTurn('prepare_clinical_context', input) });
+    assertInputStillAuthorized();
+    // 以实际落库的缓存重新构包并签名；并发写入时也不发布未持久化的另一份条件。
+    const prepared = buildMemberAssessmentInput(this.store, personId, {
+      modelId: this.modelId, reasoningEffort: this.reasoningEffort,
+      analysisReferenceDate: this.analysisReferenceDate, webSearchAllowed: this.webSearchAllowed
+    });
+    assertInputStillAuthorized();
+    Object.assign(request, prepared.request);
+    Object.assign(evidencePackage, prepared.evidencePackage);
+    const analysisRequest = request;
+    const analysisPackage = evidencePackage;
+    const transport = createMemberAnalysisTransport(evidencePackage);
+    const generated = await runCountedTurn('member_assessment', {
+      prompt: buildP02Prompt(aliasMemberEvidenceReferences(request, transport.referenceIds), transport.packet), outputSchema: candidateOutputSchema,
+      allowWebSearch: request.webSearchAllowed
+    });
+    const parsed = memberAssessmentCandidateV3Schema.safeParse(
+      transport.restoreOutput(generated.output));
     if (!parsed.success) return reject('assessment_schema_invalid');
     const validated = await validateAndRepair(parsed.data, analysisRequest, analysisPackage);
     if (!validated.candidate) return reject(validated.reason ?? 'assessment_validation_failed');
     let candidate = validated.candidate;
-    let heldTargetIds = [...new Set([...validated.heldTargetIds, ...partitionHeldIds])];
+    let heldTargetIds = [...validated.heldTargetIds];
     let reviewedTargetIds: string[] = [];
     let validationMode: MemberAssessmentSnapshotV3['validationMode'] = 'local_only';
     const route = routeFocusedReview(candidate);
-    const addTargetAndDependents = (id: string, reason: string) => {
-      const linkedClaims = candidate.claims.some((item) => item.id === id) ? [id] : [];
-      const linkedActions = candidate.actions.some((item) => item.id === id)
-        ? [id]
-        : candidate.actions.filter((item) => item.claimIds.includes(id)).map((item) => item.id);
-      const dependents = [id, ...linkedActions,
-        ...candidate.systems.filter((item) => item.claimIds.some((claimId) => linkedClaims.includes(claimId))
-          || item.actionIds.some((actionId) => linkedActions.includes(actionId))).map((item) => item.id),
-        ...(candidate.overview.claimIds.some((claimId) => linkedClaims.includes(claimId))
-          || candidate.overview.actionIds.some((actionId) => linkedActions.includes(actionId)) ? ['overview'] : [])];
-      route.targetIds = [...new Set([...route.targetIds, ...dependents])];
-      route.reasons = [...new Set([...route.reasons, reason])];
-    };
-    for (const [id, reviewedHashes] of partitionHighImpact) {
-      const node = targetNode(candidate, id);
-      // 聚合不能悄悄丢掉分区中尚未隔离的高影响线索。
-      if (!node) return reject(`aggregate_omitted_high_impact:${id}`);
-      if (reviewedHashes.size === 1 && reviewedHashes.has(stableHash(node))) continue;
-      addTargetAndDependents(id, `partition_high_impact_changed:${id}`);
-    }
-    for (const id of new Set(partitionHeldIds)) {
-      // overview/system 是每个分区都会复用的保留 ID，不代表聚合重现同一判断。
-      if (id === 'overview' || id.startsWith('system:') || !targetNode(candidate, id)) continue;
-      // 局部修复隔离过的内容若被聚合带回，先重点复核该节点及其依赖，不能静默发布。
-      addTargetAndDependents(id, `partition_held_reintroduced:${id}`);
-    }
     if (route.targetIds.length > 0) {
       this.onStage?.('review_derived');
       const targetIds = route.targetIds;
@@ -418,14 +348,6 @@ export class MemberAssessmentPipeline {
       catch (error) { return reject(error instanceof Error ? error.message : 'focused_review_invalid'); }
       candidate = applied.candidate;
       heldTargetIds = [...new Set([...heldTargetIds, ...applied.heldTargetIds])];
-      for (const result of reviewParsed.data.results) {
-        if (result.verdict === 'pass' || result.verdict === 'replace') {
-          // 分区曾隔离，但本轮 P04 已确认可发布的节点不应继续标成“仍被隔离”。
-          if (partitionHeldIds.includes(result.targetId) && !applied.heldTargetIds.includes(result.targetId)) {
-            heldTargetIds = heldTargetIds.filter((id) => id !== result.targetId);
-          }
-        }
-      }
       reviewedTargetIds = targetIds;
       validationMode = 'local_and_focused_review';
       const after = routeFocusedReview(candidate);
@@ -449,27 +371,7 @@ export class MemberAssessmentPipeline {
       const validation = validateAssessmentCandidate(candidate, validationInputFor(analysisRequest, analysisPackage));
       if (validation.issues.length > 0) return reject(validation.issues.join(','));
     }
-    const directlyIncludedIds = new Set(analysisPackage.facts.map((fact) => fact.observationId));
-    const summarizedOnlyFacts = partitionCount > 0
-      ? evidencePackage.facts.filter((fact) => !directlyIncludedIds.has(fact.observationId))
-      : [];
-    const summarizedOnlyIds = summarizedOnlyFacts.map((fact) => fact.observationId);
-    const coverageLimitation = summarizedOnlyIds.length > 0
-      ? `本次资料量较大，${summarizedOnlyIds.length} 条已接纳事实仅经分区摘要参与综合，未作为原始项目再次送入最终聚合；不能据此断言所有检查均无问题。`
-      : null;
-    const publishCandidate = canonicalizeAssessmentKnowledge({
-      ...candidate,
-      overview: coverageLimitation
-        ? { ...candidate.overview, limitations: [...new Set([...candidate.overview.limitations, coverageLimitation])] }
-        : candidate.overview,
-      systems: candidate.systems.map((system) => {
-        const omittedCount = summarizedOnlyFacts.filter((fact) => fact.systemIds.includes(system.systemId)).length;
-        return omittedCount > 0 ? { ...system,
-          limitations: [...new Set([...system.limitations,
-            `本系统另有 ${omittedCount} 条已接纳事实仅经分区摘要参与综合，结论不能视为逐项复核。`])] }
-          : system;
-      })
-    }, evidencePackage);
+    const publishCandidate = canonicalizeAssessmentKnowledge(candidate, evidencePackage);
     const snapshot: Omit<MemberAssessmentSnapshotV3, 'id' | 'status' | 'generatedAt'> = {
       ...publishCandidate,
       factRevision: built.factRevision, contextRevision: built.contextRevision,
@@ -479,17 +381,11 @@ export class MemberAssessmentPipeline {
       reviewedTargetIds, heldTargetIds,
       limitations: [
         ...(heldTargetIds.length ? ['部分判断因数据或依据问题暂未发布。'] : []),
-        ...(coverageLimitation ? [coverageLimitation] : []),
         ...(evidencePackage.facts.some((fact) => fact.systemIds.length === 0)
           ? ['部分来源事实尚未完成身体系统归类；成员总览包含这些资料，但身体系统视图可能不完整。'] : [])
       ],
       evidenceCatalog: evidencePackage.evidenceCatalog,
-      processingPlan: {
-        strategy: partitionCount > 0 ? 'partitioned' : 'full',
-        trigger: partitionCount > 0 ? 'runtime_context_window_exceeded' : 'none',
-        partitionCount, partitionHeldTargetCount: partitionHeldIds.length,
-        ...(partitionCount > 0 ? { aggregateSummarizedOnlyObservationIds: summarizedOnlyIds } : {})
-      },
+      processingPlan: { strategy: 'full', trigger: 'none', partitionCount: 0, partitionHeldTargetCount: 0 },
       knowledgeVerifications: buildAssessmentKnowledgeVerifications(publishCandidate, evidencePackage)
     };
     const published = this.store.publishMemberAssessmentSnapshot({

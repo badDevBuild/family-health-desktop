@@ -6,6 +6,7 @@ import { buildSystemEvidenceBundle } from './system-evidence.js';
 import { HEALTH_PIPELINE_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, RUNTIME_PROMPT_VERSION } from './prompts/index.js';
 import { ASSESSMENT_VALIDATION_RULES_VERSION } from './assessment-validation.js';
 import { CLINICAL_ROUTER_VERSION } from './clinical-review-router.js';
+import { attachClinicalContextEvidence, hydrateCachedClinicalRecords, CLINICAL_RECORD_VERSION } from './clinical-record-preparation.js';
 
 export const MEMBER_EVIDENCE_SELECTOR_VERSION = 'member-evidence-v7';
 
@@ -105,7 +106,8 @@ export function buildMemberAssessmentInput(
       documentId: observation.documentId,
       systemIds: [...systemsByObservation.get(observation.id) ?? []],
       evidenceIds: refs.map((item) => item.id),
-      sourceKind: 'report' as const
+      sourceKind: 'report' as const,
+      clinicalContext: observation.clinicalContext ?? null
     };
   });
   const personalContext = store.listManualNotes(personId).map((note) => {
@@ -170,11 +172,13 @@ export function buildMemberAssessmentInput(
     knowledge: [...knowledgeById.values()], criteriaSets: [], partitionResults: []
   });
   const dates = facts.map((item) => item.clinicalDate).filter((value): value is string => value !== null).sort();
+  hydrateCachedClinicalRecords(store, personId, evidencePackage);
+  attachClinicalContextEvidence(evidencePackage);
   const factRevision = store.getFactRevision(personId);
   const contextRevision = store.getClinicalContextRevision(personId);
   const reviewScopeSignature = store.getOpenReviewScopeSignature(personId);
   const inputSignature = stableHash({
-    personId, selectorVersion: MEMBER_EVIDENCE_SELECTOR_VERSION,
+    personId, selectorVersion: MEMBER_EVIDENCE_SELECTOR_VERSION, clinicalRecordVersion: CLINICAL_RECORD_VERSION,
     pipelineVersion: HEALTH_PIPELINE_VERSION, runtimePromptVersion: RUNTIME_PROMPT_VERSION,
     promptVersion: MEMBER_ASSESSMENT_PROMPT_VERSION, rulesVersion: MEMBER_ASSESSMENT_RULES_VERSION,
     validationRulesVersion: ASSESSMENT_VALIDATION_RULES_VERSION, clinicalRouterVersion: CLINICAL_ROUTER_VERSION,

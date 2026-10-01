@@ -2,7 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
-import { memberAssessmentSnapshotV3Schema } from '@contracts';
+import { memberAssessmentSnapshotV3Schema, observationCandidateSchema, clinicalContextSchema,
+  clinicalContextHasValidSources, reportClinicalContextSchema, type ClinicalContext, type ReportClinicalContext } from '@contracts';
 import type {
   ActionItem,
   AdoptMemberAssessmentActionInput,
@@ -29,7 +30,7 @@ import type {
 } from '@contracts';
 import { BODY_SYSTEM_REGISTRY_VERSION, CONCEPT_DICTIONARY_VERSION, MEMBER_MODEL_VERSION, bodySystemRegistry, conceptDictionary, linkConceptToSystems, mapConcept, sameAdoptedActionScope, selectContextSystems } from '@core';
 
-export const WORKSPACE_SCHEMA_VERSION = 35;
+export const WORKSPACE_SCHEMA_VERSION = 36;
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 const assessmentActionSourcePrefix = 'assessment-v3:';
@@ -358,6 +359,7 @@ export interface PublishFactsInput {
     specimen: string | null;
     method: string | null;
     bodySite: string | null;
+    clinicalContext?: ClinicalContext | null;
     evidence: Array<{
       sourceSpanId: string;
       quote: string | null;
@@ -367,6 +369,64 @@ export interface PublishFactsInput {
   }>;
   executionGuard?: JobExecutionGuard;
   resolvedReviewIssueId?: string;
+  /** 首次发布时仍无法核实的项目；与事实和 document commit 同一事务落库。 */
+  unresolvedReview?: {
+    kind: 'field_conflict' | 'coverage_gap';
+    evidenceRefs: string[];
+    candidateOptions?: ObservationCandidate[];
+    reasonCodes?: string[];
+    documentRun?: NonNullable<OpenExtractionReviewIssue['documentRun']>;
+  };
+}
+
+/** 已提交报告只能追加经重新接纳的新事实，不走首次提交的幂等捷径。 */
+export interface AppendCommittedFactsInput {
+  personId: string;
+  documentId: string;
+  expectedRevision: number;
+  summary: string;
+  observations: PublishFactsInput['observations'];
+  reviewUpdate: {
+    issueId: string;
+    remainingCandidates: ObservationCandidate[];
+    remainingReasonCodes: string[];
+    remainingEvidenceRefs: string[];
+  };
+  executionGuard?: JobExecutionGuard;
+}
+
+export interface AppendCommittedFactsReceipt {
+  publicationId: string | null;
+  revision: number;
+  appendedCount: number;
+  duplicateCount: number;
+  idempotent: boolean;
+  reviewResolved: boolean;
+}
+
+type PublishedObservationInput = PublishFactsInput['observations'][number];
+
+function normalizedFactPart(value: string | null | undefined): string {
+  return (value ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('zh-CN');
+}
+
+/** 不用模型生成的 localKey 判重：它在重跑时可能变化。 */
+function committedFactIdentity(observation: PublishedObservationInput): string {
+  return JSON.stringify([
+    normalizedFactPart(observation.originalName || observation.conceptKey),
+    observation.clinicalDate ?? '', normalizedFactPart(observation.specimen),
+    normalizedFactPart(observation.method), normalizedFactPart(observation.bodySite)
+  ]);
+}
+
+function committedFactValue(observation: PublishedObservationInput): string {
+  return JSON.stringify([
+    normalizedFactPart(observation.conceptKey), observation.valueKind,
+    observation.valueKind === 'numeric' && observation.decimalValue !== null
+      ? String(Number(observation.decimalValue)) : normalizedFactPart(observation.rawText),
+    normalizedFactPart(observation.qualifier), normalizedFactPart(observation.unit),
+    normalizedFactPart(observation.referenceRange), observation.abnormalFlag
+  ]);
 }
 
 export interface AcceptedObservationSummary {
@@ -392,6 +452,7 @@ export interface AcceptedObservationSummary {
   specimen: string | null;
   method: string | null;
   bodySite: string | null;
+  clinicalContext?: ClinicalContext | null;
   evidence: Array<{
     sourceSpanId: string;
     quote: string | null;
@@ -2081,6 +2142,85 @@ export class WorkspaceStore {
     return id;
   }
 
+  /** 已提交报告重核发现受检者异名时，先隔离整份报告，绝不在原成员分析中继续使用其既有事实。 */
+  saveCommittedIdentityReviewIssue(input: {
+    documentId: string;
+    reportedName: string;
+    evidenceRefs: string[];
+    reasonCodes?: string[];
+    jobId?: string | null;
+    attemptId?: string | null;
+    executionGuard?: JobExecutionGuard;
+  }): string {
+    const transaction = this.db.transaction(() => {
+      if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard, input.documentId);
+      const reportedName = input.reportedName.trim();
+      if (!reportedName || input.evidenceRefs.length === 0) throw new Error('COMMITTED_IDENTITY_EVIDENCE_REQUIRED');
+      const document = this.db.prepare(`
+        SELECT d.person_id, d.status, d.excluded_from_analysis,
+               EXISTS(SELECT 1 FROM document_commits dc WHERE dc.document_id = d.id) AS committed
+        FROM documents d WHERE d.id = ?
+      `).get(input.documentId) as {
+        person_id: string | null; status: string; excluded_from_analysis: number; committed: number;
+      } | undefined;
+      if (!document?.person_id || document.status !== 'completed' || document.committed !== 1) {
+        throw new Error('DOCUMENT_NOT_COMMITTED_FOR_IDENTITY_REVIEW');
+      }
+      const existing = this.listOpenExtractionReviewIssues().find((issue) => (
+        issue.documentId === input.documentId && issue.kind === 'person_conflict'
+        && issue.severity === 'blocking'
+        && issue.reasonCodes.includes('COMMITTED_PERSON_IDENTITY_CONFLICT')
+      ));
+      if (existing) {
+        if (document.excluded_from_analysis !== 1) throw new Error('COMMITTED_IDENTITY_REVIEW_STATE_CONFLICT');
+        return existing.id;
+      }
+      if (document.excluded_from_analysis !== 0) throw new Error('DOCUMENT_ALREADY_EXCLUDED');
+      const hasRepairWarning = this.listOpenExtractionReviewIssues().some((issue) => (
+        issue.documentId === input.documentId && issue.severity === 'warning'
+        && issue.stage === 'extract'
+      ));
+      if (!hasRepairWarning) throw new Error('COMMITTED_DOCUMENT_REPAIR_ISSUE_REQUIRED');
+      const known = new Set((this.db.prepare(`
+        SELECT id FROM source_spans WHERE document_id = ?
+      `).all(input.documentId) as Array<{ id: string }>).map((span) => span.id));
+      if (input.evidenceRefs.some((ref) => !known.has(ref))) throw new Error('COMMITTED_IDENTITY_EVIDENCE_INVALID');
+      const affectedSystemIds = this.systemIdsForDocuments([input.documentId]);
+      const changed = this.db.prepare(`
+        UPDATE documents SET excluded_from_analysis = 1
+        WHERE id = ? AND person_id = ? AND status = 'completed' AND excluded_from_analysis = 0
+      `).run(input.documentId, document.person_id);
+      if (changed.changes !== 1) throw new Error('COMMITTED_IDENTITY_REVIEW_STATE_CONFLICT');
+      const issueId = this.saveExtractionReviewIssue({
+        documentId: input.documentId,
+        jobId: input.executionGuard?.jobId ?? input.jobId ?? null,
+        attemptId: input.executionGuard?.attemptId ?? input.attemptId ?? null,
+        stage: 'extract', kind: 'person_conflict', severity: 'blocking',
+        evidenceRefs: input.evidenceRefs, reportedName,
+        reasonCodes: [...new Set(['COMMITTED_PERSON_IDENTITY_CONFLICT', ...(input.reasonCodes ?? [])])],
+        preserveDocumentStatus: true
+      });
+      this.advanceRevisionAfterDocumentVisibilityChange(document.person_id, affectedSystemIds);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, 'review_issue.committed_identity_quarantined', ?, '已提交报告身份存疑；原始事实保留，暂不参与任何成员分析', ?)
+      `).run(randomUUID(), issueId, this.now().toISOString());
+      return issueId;
+    });
+    return transaction();
+  }
+
+  private advanceRevisionAfterDocumentVisibilityChange(personId: string, systemIds: string[]): void {
+    this.db.prepare(`
+      INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, 1)
+      ON CONFLICT(person_id) DO UPDATE SET fact_revision = fact_revision + 1
+    `).run(personId);
+    this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`)
+      .run(personId);
+    this.invalidateSystemSnapshots(personId, systemIds);
+    this.invalidateMemberAssessmentSnapshots(personId);
+  }
+
   listOpenExtractionReviewIssues(): OpenExtractionReviewIssue[] {
     const rows = this.db.prepare(`
       SELECT ri.id, ri.job_id, ri.kind, ri.severity, ri.evidence_refs_json, ri.payload_json,
@@ -2124,12 +2264,16 @@ export class WorkspaceStore {
   /** 待核对范围变化不一定增加事实版本；用独立签名阻止旧综合继续冒充当前结论。 */
   getOpenReviewScopeSignature(personId: string): string {
     const rows = this.db.prepare(`
-      SELECT ri.id FROM review_issues ri
+      SELECT ri.id, ri.kind, ri.severity, ri.evidence_refs_json, ri.payload_json FROM review_issues ri
       JOIN documents d ON ri.field_ref = 'document:' || d.id
       WHERE d.person_id = ? AND ri.resolution_status = 'open'
       ORDER BY ri.id
-    `).all(personId) as Array<{ id: string }>;
-    return createHash('sha256').update(JSON.stringify(rows.map((row) => row.id))).digest('hex');
+    `).all(personId) as Array<{
+      id: string; kind: string; severity: string; evidence_refs_json: string; payload_json: string | null;
+    }>;
+    // 同一个 issue 可在无事实新增时原地缩小待核对候选。只哈希 ID 会让在途综合
+    // 误以为范围未变；把受控提醒内容一起纳入签名，防止旧说明晚到后发布。
+    return createHash('sha256').update(JSON.stringify(rows)).digest('hex');
   }
 
   /** 任务范围不能只相信创建时的 checkpoint；成员归属可能在核对后改变。 */
@@ -2237,26 +2381,60 @@ export class WorkspaceStore {
   confirmDocumentIdentity(input: { issueId: string; documentId: string; personId: string }): void {
     const transaction = this.db.transaction(() => {
       const issue = this.db.prepare(`
-        SELECT ri.job_id, ri.kind, ri.resolution_status, ri.payload_json, d.person_id
+        SELECT ri.job_id, ri.kind, ri.severity, ri.resolution_status, ri.payload_json,
+               d.person_id, d.status, d.excluded_from_analysis,
+               EXISTS(SELECT 1 FROM document_commits dc WHERE dc.document_id = d.id) AS committed
         FROM review_issues ri
         JOIN documents d ON ri.field_ref = 'document:' || d.id
         WHERE ri.id = ? AND d.id = ?
       `).get(input.issueId, input.documentId) as {
         kind: string;
+        severity: string;
         job_id: string | null;
         resolution_status: string;
         payload_json: string | null;
         person_id: string | null;
+        status: string;
+        excluded_from_analysis: number;
+        committed: number;
       } | undefined;
       if (!issue || issue.resolution_status !== 'open' || issue.kind !== 'person_conflict') {
         throw new Error('REVIEW_ISSUE_NOT_OPEN');
       }
       if (issue.person_id !== input.personId) throw new Error('DOCUMENT_IDENTITY_CONFLICT');
       const payload = issue.payload_json
-        ? JSON.parse(issue.payload_json) as { reportedName?: string }
+        ? JSON.parse(issue.payload_json) as { reportedName?: string; reasonCodes?: string[] }
         : {};
       const reportedName = payload.reportedName?.trim();
       if (!reportedName) throw new Error('REPORTED_NAME_REQUIRED');
+
+      if (payload.reasonCodes?.includes('COMMITTED_PERSON_IDENTITY_CONFLICT')) {
+        if (issue.severity !== 'blocking' || issue.committed !== 1
+          || issue.status !== 'completed' || issue.excluded_from_analysis !== 1) {
+          throw new Error('COMMITTED_IDENTITY_REVIEW_STATE_CONFLICT');
+        }
+        const affectedSystemIds = this.systemIdsForDocuments([input.documentId]);
+        const restored = this.db.prepare(`
+          UPDATE documents SET excluded_from_analysis = 0,
+              person_assignment_basis = 'identity_confirmed', confirmed_reported_name = ?
+          WHERE id = ? AND person_id = ? AND status = 'completed' AND excluded_from_analysis = 1
+        `).run(reportedName, input.documentId, input.personId);
+        if (restored.changes !== 1) throw new Error('COMMITTED_IDENTITY_REVIEW_STATE_CONFLICT');
+        const resolved = this.db.prepare(`
+          UPDATE review_issues
+          SET resolution_status = 'resolved', resolution_revision = 1,
+              payload_json = json_set(payload_json, '$.identityConfirmed', json('true'))
+          WHERE id = ? AND resolution_status = 'open'
+        `).run(input.issueId);
+        if (resolved.changes !== 1) throw new Error('REVIEW_ISSUE_NOT_OPEN');
+        this.advanceRevisionAfterDocumentVisibilityChange(input.personId, affectedSystemIds);
+        this.db.prepare(`
+          INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+          VALUES (?, 'review_issue.committed_identity_confirmed', ?, '用户确认已提交报告属于当前成员；原有事实恢复参与分析，待核实项目保留', ?)
+        `).run(randomUUID(), input.issueId, this.now().toISOString());
+        this.resumeWaitingJobsAfterReview(input.documentId, false, issue.job_id);
+        return;
+      }
 
       const updated = this.db.prepare(`
         UPDATE documents
@@ -2629,6 +2807,12 @@ export class WorkspaceStore {
       if (!checkpoint.documentIds?.length) continue;
       if (issueJobId ? job.id !== issueJobId : !checkpoint.documentIds?.includes(documentId)) continue;
       if (!checkpoint.consentId || !this.db.prepare(`SELECT 1 FROM consents WHERE id = ? AND revoked_at IS NULL`).get(checkpoint.consentId)) {
+        // 旧授权已撤回：绝不自动恢复传输，也不能让僵住的 waiting_user 占着资料
+        // 阻止用户重新授权建立新批次。保留任务历史，以 cancelled 终结该批次。
+        this.db.prepare(`
+          UPDATE jobs SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+          WHERE id = ? AND status = 'waiting_user'
+        `).run(this.now().toISOString(), job.id);
         continue;
       }
       const stillBlockedForJob = Boolean(this.db.prepare(`
@@ -3695,6 +3879,8 @@ export class WorkspaceStore {
       const latestErrorCode = row.latest_error_code === null ? null : String(row.latest_error_code);
       const failedStatusText = latestErrorCode?.includes('failed to load configuration')
         ? '当前版本的 Codex 配置不兼容，请安装更新后重试'
+        : latestErrorCode === 'MEMBER_ASSESSMENT_INPUT_TOO_LARGE'
+          ? '完整资料仍超过本次分析容量，尚未生成新分析；资料已保留，未拆分或删减'
         : latestErrorCode === 'CODEX_OUTPUT_SCHEMA_INVALID'
           ? '结构化输出格式不兼容，请安装更新后重试'
           : latestErrorCode === 'CODEX_TURN_TIMEOUT'
@@ -3933,7 +4119,7 @@ export class WorkspaceStore {
       SELECT o.id, o.person_id, o.concept_key, o.original_name, o.model_standard_name_candidate, o.created_at,
              r.value_kind, r.raw_text, r.decimal_value, r.qualifier, r.unit,
              r.reference_range, r.abnormal_flag, r.source_span_id,
-             r.specimen, r.method, r.body_site, r.evidence_json,
+             r.specimen, r.method, r.body_site, r.evidence_json, r.clinical_context_json,
              e.clinical_date, ss.quote AS source_quote, d.id AS document_id,
              (
                SELECT rr.event_id
@@ -4027,6 +4213,8 @@ export class WorkspaceStore {
       specimen: row.specimen === null ? null : String(row.specimen),
       method: row.method === null ? null : String(row.method),
       bodySite: row.body_site === null ? null : String(row.body_site),
+      clinicalContext: row.clinical_context_json == null ? null
+        : clinicalContextSchema.parse(JSON.parse(String(row.clinical_context_json))),
       evidence: JSON.parse(String(row.evidence_json ?? '[]')) as AcceptedObservationSummary['evidence'],
       mapping,
       mappingVersion: row.correction_id === null
@@ -4859,6 +5047,60 @@ export class WorkspaceStore {
     return matches.size === 1 ? [...matches][0]! : null;
   }
 
+  private groundedClinicalContextJson(documentId: string, context: ClinicalContext | null | undefined): string | null {
+    if (!context) return null;
+    const parsed = clinicalContextSchema.safeParse(context);
+    if (!parsed.success) return null;
+    const sources = this.db.prepare('SELECT id, quote FROM source_spans WHERE document_id = ?')
+      .all(documentId) as Array<{ id: string; quote: string | null }>;
+    // 无效的补充条件不影响已经接纳的数值；留作旧格式，由定向补齐步骤处理。
+    return clinicalContextHasValidSources(parsed.data, sources, true) ? JSON.stringify(parsed.data) : null;
+  }
+
+  getReportClinicalContext(personId: string, documentId: string, inputSignature: string): ReportClinicalContext | null {
+    const row = this.db.prepare(`
+      SELECT c.payload_json FROM report_clinical_contexts c
+      JOIN documents d ON d.id = c.document_id AND d.person_id = c.person_id AND d.excluded_from_analysis = 0
+      WHERE c.person_id = ? AND c.document_id = ? AND c.input_signature = ?
+    `).get(personId, documentId, inputSignature) as { payload_json: string } | undefined;
+    if (!row) return null;
+    try {
+      const parsed = reportClinicalContextSchema.safeParse(JSON.parse(row.payload_json));
+      return parsed.success ? parsed.data : null;
+    } catch { return null; }
+  }
+
+  saveReportClinicalContext(input: {
+    personId: string; documentId: string; inputSignature: string; context: ReportClinicalContext;
+    expectedFactRevision: number; expectedContextRevision: number; executionGuard?: JobExecutionGuard;
+  }): void {
+    const context = reportClinicalContextSchema.parse(input.context);
+    this.db.transaction(() => {
+      const owner = this.db.prepare('SELECT person_id FROM documents WHERE id = ? AND excluded_from_analysis = 0')
+        .get(input.documentId) as { person_id: string | null } | undefined;
+      if (owner?.person_id !== input.personId) throw new Error('CLINICAL_CONTEXT_SCOPE_MISMATCH');
+      if (this.getFactRevision(input.personId) !== input.expectedFactRevision
+        || this.getClinicalContextRevision(input.personId) !== input.expectedContextRevision) {
+        throw new Error('CLINICAL_CONTEXT_REVISION_CONFLICT');
+      }
+      const facts = new Map(this.listAcceptedObservations(input.personId).map((fact) => [fact.id, fact]));
+      const ids = new Set(context.items.map((item) => item.observationId));
+      if (ids.size !== context.items.length || context.items.some((item) =>
+        facts.get(item.observationId)?.documentId !== input.documentId)) throw new Error('CLINICAL_CONTEXT_SCOPE_MISMATCH');
+      if (input.executionGuard) this.assertObservationScopeActive(input.executionGuard, input.personId,
+        context.items.map((item) => ({ id: item.observationId, documentId: input.documentId })));
+      const sources = this.db.prepare('SELECT id, quote FROM source_spans WHERE document_id = ?')
+        .all(input.documentId) as Array<{ id: string; quote: string | null }>;
+      if (context.items.some((item) => !clinicalContextHasValidSources(item.context, sources))) {
+        throw new Error('CLINICAL_CONTEXT_EVIDENCE_MISMATCH');
+      }
+      this.db.prepare(`INSERT INTO report_clinical_contexts
+        (person_id, document_id, input_signature, payload_json, created_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(person_id, document_id, input_signature) DO NOTHING`)
+        .run(input.personId, input.documentId, input.inputSignature, JSON.stringify(context), this.now().toISOString());
+    })();
+  }
+
   publishFacts(input: PublishFactsInput): { publicationId: string; revision: number; idempotent: boolean } {
     const currentDocumentOwner = this.db.prepare(`
       SELECT person_id FROM documents WHERE id = ?
@@ -4973,13 +5215,14 @@ export class WorkspaceStore {
           INSERT INTO observation_revisions (
             observation_id, revision, value_kind, raw_text, decimal_value,
             qualifier, unit, reference_range, abnormal_flag, source_span_id,
-            acceptance_id, specimen, method, body_site, evidence_json, created_at
-          ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            acceptance_id, specimen, method, body_site, evidence_json, clinical_context_json, created_at
+          ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           observationId, observation.valueKind, observation.rawText, observation.decimalValue,
           observation.qualifier, observation.unit, observation.referenceRange, observation.abnormalFlag,
           observation.sourceSpanId, observation.acceptanceId, observation.specimen, observation.method,
-          observation.bodySite, JSON.stringify(observation.evidence), this.now().toISOString()
+          observation.bodySite, JSON.stringify(observation.evidence),
+          this.groundedClinicalContextJson(input.documentId, observation.clinicalContext), this.now().toISOString()
         );
         const mapping = mapConcept({
           rawName: observation.originalName ?? observation.conceptKey,
@@ -5124,7 +5367,328 @@ export class WorkspaceStore {
         if (resolved.changes !== 1) throw new Error('REVIEW_ISSUE_NOT_OPEN');
         this.resumeWaitingJobsAfterReview(input.documentId, false, correctionIssue?.job_id ?? null);
       }
+      if (input.unresolvedReview) {
+        this.saveExtractionReviewIssue({
+          documentId: input.documentId,
+          ...(input.executionGuard ? {
+            jobId: input.executionGuard.jobId,
+            attemptId: input.executionGuard.attemptId
+          } : {}),
+          stage: 'extract',
+          kind: input.unresolvedReview.kind,
+          severity: 'warning',
+          preserveDocumentStatus: true,
+          evidenceRefs: input.unresolvedReview.evidenceRefs,
+          ...(input.unresolvedReview.candidateOptions
+            ? { candidateOptions: input.unresolvedReview.candidateOptions } : {}),
+          ...(input.unresolvedReview.reasonCodes
+            ? { reasonCodes: input.unresolvedReview.reasonCodes } : {}),
+          ...(input.unresolvedReview.documentRun
+            ? { documentRun: input.unresolvedReview.documentRun } : {})
+        });
+      }
       return { publicationId, revision: nextRevision, idempotent: false };
+    });
+    return transaction();
+  }
+
+  /** 对已经提交的报告做可审计增量补修；既有事实只能由显式纠错流程修改，不能在这里覆盖。 */
+  appendCommittedFacts(input: AppendCommittedFactsInput): AppendCommittedFactsReceipt {
+    const transaction = this.db.transaction((): AppendCommittedFactsReceipt => {
+      if (input.executionGuard) this.assertJobExecutionActive(input.executionGuard, input.documentId);
+      const document = this.db.prepare(`
+        SELECT d.person_id, d.status, d.excluded_from_analysis,
+               dc.publication_id AS initial_publication_id
+        FROM documents d
+        LEFT JOIN document_commits dc ON dc.document_id = d.id
+        WHERE d.id = ?
+      `).get(input.documentId) as {
+        person_id: string | null; status: string; excluded_from_analysis: number;
+        initial_publication_id: string | null;
+      } | undefined;
+      if (!document || document.person_id !== input.personId) throw new Error('DOCUMENT_PERSON_SCOPE_MISMATCH');
+      if (!document.initial_publication_id || document.status !== 'completed' || document.excluded_from_analysis !== 0) {
+        throw new Error('DOCUMENT_NOT_COMMITTED_FOR_APPEND');
+      }
+      const report = this.db.prepare(`
+        SELECT rr.id FROM report_source_links rsl
+        JOIN report_records rr ON rr.id = rsl.report_id
+        WHERE rsl.document_id = ? AND rr.person_id = ? LIMIT 1
+      `).get(input.documentId, input.personId);
+      if (!report) throw new Error('DOCUMENT_REPORT_LINK_MISSING');
+      const issue = this.db.prepare(`
+        SELECT kind, severity, resolution_status, payload_json, evidence_refs_json
+        FROM review_issues WHERE id = ? AND field_ref = 'document:' || ?
+      `).get(input.reviewUpdate.issueId, input.documentId) as {
+        kind: string; severity: string; resolution_status: string;
+        payload_json: string | null; evidence_refs_json: string;
+      } | undefined;
+      if (!issue || issue.severity !== 'warning'
+        || (issue.kind !== 'field_conflict' && issue.kind !== 'coverage_gap')) {
+        throw new Error('COMMITTED_REVIEW_ISSUE_INVALID');
+      }
+      const payload = issue.payload_json ? JSON.parse(issue.payload_json) as Record<string, unknown> : {};
+      if (payload.stage !== 'extract') throw new Error('COMMITTED_REVIEW_ISSUE_INVALID');
+      const originalCandidates = Array.isArray(payload.candidateOptions)
+        ? payload.candidateOptions as ObservationCandidate[] : [];
+      const sourceSpans = new Map((this.db.prepare(`
+        SELECT id, quote FROM source_spans WHERE document_id = ?
+      `).all(input.documentId) as Array<{ id: string; quote: string | null }>)
+        .map((span) => [span.id, span]));
+      for (const candidate of input.reviewUpdate.remainingCandidates) {
+        // 历史警告里可能有相同 localKey 的不同项目，不能按 key 强制合并。
+        // 待核对项可以记录“模型引用了无效片段”本身；只有正式接纳事实才要求
+        // 所有证据片段真实属于本文件。否则重核时反而无法保存这个缺口。
+        if (!observationCandidateSchema.safeParse(candidate).success) {
+          throw new Error('COMMITTED_REVIEW_REMAINDER_INVALID');
+        }
+      }
+      const reviewResolved = input.reviewUpdate.remainingCandidates.length === 0
+        && input.reviewUpdate.remainingReasonCodes.length === 0
+        && input.reviewUpdate.remainingEvidenceRefs.length === 0;
+      const accepted = this.db.prepare(`
+        SELECT decision FROM acceptance_decisions WHERE id = ?
+      `);
+      for (const observation of input.observations) {
+        if (observation.documentId !== input.documentId || observation.valueKind === 'unknown'
+          || !observation.rawText.trim() || !sourceSpans.has(observation.sourceSpanId)
+          || observation.evidence.length === 0
+          || !observation.evidence.some((reference) => reference.sourceSpanId === observation.sourceSpanId)
+          || observation.evidence.some((reference) => !sourceSpans.has(reference.sourceSpanId))) {
+          throw new Error('COMMITTED_FACT_EVIDENCE_INVALID');
+        }
+        if (observation.valueKind === 'numeric'
+          && (observation.decimalValue === null || !Number.isFinite(Number(observation.decimalValue)))) {
+          throw new Error('COMMITTED_FACT_VALUE_INVALID');
+        }
+        const decision = accepted.get(observation.acceptanceId) as { decision: string } | undefined;
+        if (!decision || (decision.decision !== 'accept' && decision.decision !== 'accept_with_warnings')) {
+          throw new Error('COMMITTED_FACT_NOT_ACCEPTED');
+        }
+      }
+
+      const existingRows = this.db.prepare(`
+        SELECT o.concept_key, o.original_name, r.value_kind, r.raw_text,
+               r.decimal_value, r.qualifier, r.unit, r.reference_range, r.abnormal_flag,
+               r.specimen, r.method, r.body_site, r.source_span_id, e.clinical_date
+        FROM observations o
+        JOIN observation_revisions r ON r.observation_id = o.id AND r.revision = o.current_revision
+        JOIN source_spans ss ON ss.id = r.source_span_id
+        LEFT JOIN encounters e ON e.id = o.encounter_id
+        WHERE ss.document_id = ? AND o.person_id = ?
+      `).all(input.documentId, input.personId) as Array<{
+        concept_key: string; original_name: string | null; value_kind: PublishedObservationInput['valueKind'];
+        raw_text: string; decimal_value: string | null; qualifier: string | null;
+        unit: string | null; reference_range: string | null;
+        abnormal_flag: PublishedObservationInput['abnormalFlag']; specimen: string | null;
+        method: string | null; body_site: string | null; source_span_id: string;
+        clinical_date: string | null;
+      }>;
+      const seen = new Map<string, Map<string, Set<string>>>();
+      const sourceDates = new Map<string, Set<string>>();
+      const remember = (observation: PublishedObservationInput): void => {
+        const identity = committedFactIdentity(observation);
+        const value = committedFactValue(observation);
+        const values = seen.get(identity) ?? new Map<string, Set<string>>();
+        const sources = values.get(value) ?? new Set<string>();
+        sources.add(observation.sourceSpanId);
+        values.set(value, sources);
+        seen.set(identity, values);
+        const sourceIdentity = JSON.stringify([
+          normalizedFactPart(observation.originalName || observation.conceptKey), observation.sourceSpanId
+        ]);
+        const dates = sourceDates.get(sourceIdentity) ?? new Set<string>();
+        dates.add(observation.clinicalDate ?? '');
+        sourceDates.set(sourceIdentity, dates);
+      };
+      for (const row of existingRows) remember({
+        conceptKey: row.concept_key, originalName: row.original_name ?? row.concept_key,
+        modelStandardNameCandidate: null, rawText: row.raw_text, valueKind: row.value_kind,
+        decimalValue: row.decimal_value, qualifier: row.qualifier, unit: row.unit,
+        referenceRange: row.reference_range, clinicalDate: row.clinical_date,
+        abnormalFlag: row.abnormal_flag, documentId: input.documentId,
+        sourceSpanId: row.source_span_id, acceptanceId: '', specimen: row.specimen,
+        method: row.method, bodySite: row.body_site, evidence: []
+      });
+      const additions: PublishedObservationInput[] = [];
+      let duplicateCount = 0;
+      for (const observation of input.observations) {
+        const identity = committedFactIdentity(observation);
+        const value = committedFactValue(observation);
+        const values = seen.get(identity);
+        if (values?.has(value)) {
+          if (!values.get(value)!.has(observation.sourceSpanId)) {
+            // 同日同名同值但原文位置独立，不能静默当作已存在的同一次检查。
+            throw new Error('COMMITTED_FACT_AMBIGUOUS_SOURCE');
+          }
+          duplicateCount += 1;
+          continue;
+        }
+        if (values?.size) throw new Error('COMMITTED_FACT_CONFLICT');
+        const sourceIdentity = JSON.stringify([
+          normalizedFactPart(observation.originalName || observation.conceptKey), observation.sourceSpanId
+        ]);
+        const dates = sourceDates.get(sourceIdentity);
+        if (dates?.has('') || (observation.clinicalDate === null && dates?.size)) {
+          // 同一原文位置已有未注明日期的事实时，不能用追加制造一条“修正日期”的副本。
+          throw new Error('COMMITTED_FACT_CONFLICT');
+        }
+        remember(observation);
+        additions.push(observation);
+      }
+
+      const currentRevision = this.getFactRevision(input.personId);
+      const existingRemainderHash = createHash('sha256').update(JSON.stringify({
+        candidates: originalCandidates, reasons: payload.reasonCodes ?? [],
+        evidence: JSON.parse(issue.evidence_refs_json) as string[]
+      })).digest('hex');
+      const nextRemainderHash = createHash('sha256').update(JSON.stringify({
+        candidates: input.reviewUpdate.remainingCandidates, reasons: input.reviewUpdate.remainingReasonCodes,
+        evidence: input.reviewUpdate.remainingEvidenceRefs
+      })).digest('hex');
+      const reviewChanged = issue.resolution_status === 'open'
+        && (reviewResolved || existingRemainderHash !== nextRemainderHash);
+      if (issue.resolution_status !== 'open') {
+        if (additions.length > 0 || !reviewResolved) throw new Error('COMMITTED_REVIEW_ISSUE_NOT_OPEN');
+        return {
+          publicationId: null, revision: currentRevision, appendedCount: 0,
+          duplicateCount, idempotent: true, reviewResolved: true
+        };
+      }
+      if (currentRevision !== input.expectedRevision) {
+        throw new RevisionConflictError(input.expectedRevision, currentRevision);
+      }
+      if (additions.length === 0 && !reviewChanged) {
+        return {
+          publicationId: null, revision: currentRevision, appendedCount: 0,
+          duplicateCount, idempotent: true, reviewResolved: false
+        };
+      }
+
+      const affectedSystemIds = new Set<string>();
+      const existingEncounter = this.db.prepare(`
+        SELECT e.id FROM encounters e
+        JOIN encounter_documents ed ON ed.encounter_id = e.id
+        WHERE ed.document_id = ? AND e.person_id = ? AND e.clinical_date IS ?
+        ORDER BY e.id LIMIT 1
+      `);
+      const encounters = new Map<string, string>();
+      for (const observation of additions) {
+        const dateKey = observation.clinicalDate ?? '';
+        let encounterId = encounters.get(dateKey);
+        if (!encounterId) {
+          encounterId = (existingEncounter.get(input.documentId, input.personId, observation.clinicalDate) as { id: string } | undefined)?.id;
+          if (!encounterId) {
+            encounterId = randomUUID();
+            this.db.prepare(`
+              INSERT INTO encounters (id, person_id, clinical_date, date_precision, type, source_text, version)
+              VALUES (?, ?, ?, ?, 'health_report', NULL, 1)
+            `).run(encounterId, input.personId, observation.clinicalDate, observation.clinicalDate ? 'day' : 'unknown');
+            this.db.prepare(`INSERT INTO encounter_documents (encounter_id, document_id) VALUES (?, ?)`)
+              .run(encounterId, input.documentId);
+          }
+          encounters.set(dateKey, encounterId);
+        }
+        const observationId = randomUUID();
+        const now = this.now().toISOString();
+        this.db.prepare(`
+          INSERT INTO observations (
+            id, person_id, encounter_id, concept_key, original_name,
+            model_standard_name_candidate, current_revision, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        `).run(observationId, input.personId, encounterId, observation.conceptKey,
+          observation.originalName ?? observation.conceptKey,
+          observation.modelStandardNameCandidate ?? null, now);
+        this.db.prepare(`
+          INSERT INTO observation_revisions (
+            observation_id, revision, value_kind, raw_text, decimal_value,
+            qualifier, unit, reference_range, abnormal_flag, source_span_id,
+            acceptance_id, specimen, method, body_site, evidence_json, clinical_context_json, created_at
+          ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(observationId, observation.valueKind, observation.rawText, observation.decimalValue,
+          observation.qualifier, observation.unit, observation.referenceRange, observation.abnormalFlag,
+          observation.sourceSpanId, observation.acceptanceId, observation.specimen,
+          observation.method, observation.bodySite, JSON.stringify(observation.evidence),
+          this.groundedClinicalContextJson(input.documentId, observation.clinicalContext), now);
+        const mapping = mapConcept({
+          rawName: observation.originalName ?? observation.conceptKey,
+          standardName: observation.modelStandardNameCandidate ?? null,
+          specimen: observation.specimen, method: observation.method,
+          bodySite: observation.bodySite, unit: observation.unit
+        });
+        this.db.prepare(`
+          INSERT INTO observation_concept_mappings (
+            observation_id, observation_revision, concept_id, normalized_name,
+            status, confidence, reasons_json, mapper_version, created_at
+          ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+        `).run(observationId, mapping.conceptId, mapping.normalizedName,
+          mapping.status, mapping.confidence, JSON.stringify(mapping.reasons),
+          CONCEPT_DICTIONARY_VERSION, now);
+        for (const link of linkConceptToSystems(mapping)) {
+          affectedSystemIds.add(link.systemId);
+          this.db.prepare(`
+            INSERT INTO system_fact_links (
+              observation_id, observation_revision, system_id, relation, linker_version, created_at
+            ) VALUES (?, 1, ?, ?, ?, ?)
+          `).run(observationId, link.systemId, link.relation,
+            BODY_SYSTEM_REGISTRY_VERSION, now);
+        }
+      }
+
+      let publicationId: string | null = null;
+      let revision = currentRevision;
+      if (additions.length > 0) {
+        publicationId = randomUUID();
+        revision += 1;
+        const changeSetHash = createHash('sha256').update(JSON.stringify([
+          'committed-fact-append-v1', input.documentId,
+          additions.map((observation) => [committedFactIdentity(observation), committedFactValue(observation)]).sort()
+        ])).digest('hex');
+        this.db.prepare(`
+          INSERT INTO person_revisions (person_id, fact_revision) VALUES (?, ?)
+          ON CONFLICT(person_id) DO UPDATE SET fact_revision = excluded.fact_revision
+        `).run(input.personId, revision);
+        this.db.prepare(`UPDATE derived_snapshots SET status = 'stale' WHERE person_id = ? AND status = 'current'`)
+          .run(input.personId);
+        const staleSystem = this.db.prepare(`
+          UPDATE system_analysis_snapshots_v2 SET status = 'stale'
+          WHERE person_id = ? AND system_id = ? AND status = 'current'
+        `);
+        for (const systemId of affectedSystemIds) staleSystem.run(input.personId, systemId);
+        this.db.prepare(`
+          INSERT INTO publication_events (
+            id, person_id, expected_revision, new_revision, change_set_hash, summary, committed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(publicationId, input.personId, currentRevision, revision,
+          changeSetHash, input.summary, this.now().toISOString());
+      }
+      if (reviewChanged) {
+        const nextPayload = {
+          ...payload,
+          candidateOptions: input.reviewUpdate.remainingCandidates,
+          reasonCodes: input.reviewUpdate.remainingReasonCodes
+        };
+        this.db.prepare(`
+          UPDATE review_issues
+          SET resolution_status = ?, resolution_revision = COALESCE(resolution_revision, 0) + 1,
+              evidence_refs_json = ?, payload_json = ?
+          WHERE id = ? AND resolution_status = 'open'
+        `).run(reviewResolved ? 'resolved' : 'open',
+          JSON.stringify(input.reviewUpdate.remainingEvidenceRefs),
+          JSON.stringify(nextPayload), input.reviewUpdate.issueId);
+      }
+      this.invalidateMemberAssessmentSnapshots(input.personId);
+      this.db.prepare(`
+        INSERT INTO audit_events (id, event_type, entity_id, summary, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(randomUUID(), reviewResolved ? 'review_issue.committed_reconciled' : 'review_issue.committed_narrowed',
+        input.reviewUpdate.issueId,
+        `已提交报告增量接纳 ${additions.length} 条、跳过重复 ${duplicateCount} 条；${reviewResolved ? '待核对范围已清空' : '保留仍无法核实的项目'}`,
+        this.now().toISOString());
+      return {
+        publicationId, revision, appendedCount: additions.length,
+        duplicateCount, idempotent: false, reviewResolved
+      };
     });
     return transaction();
   }
@@ -6733,6 +7297,24 @@ export class WorkspaceStore {
         current = 35;
       }
 
+      if (current === 35) {
+        const columns = this.db.pragma('table_info(observation_revisions)') as Array<{ name: string }>;
+        if (columns.length > 0 && !columns.some((column) => column.name === 'clinical_context_json')) {
+          this.db.exec('ALTER TABLE observation_revisions ADD COLUMN clinical_context_json TEXT');
+        }
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS report_clinical_contexts (
+            person_id TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            input_signature TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(person_id, document_id, input_signature)
+          ) STRICT;
+          UPDATE workspaces SET schema_version = 36;
+          PRAGMA user_version = 36;
+        `);
+        current = 36;
+      }
+
       if (current === 0) this.db.exec(`
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -6827,7 +7409,7 @@ export class WorkspaceStore {
         value_kind TEXT NOT NULL, raw_text TEXT NOT NULL, decimal_value TEXT, qualifier TEXT,
         unit TEXT, reference_range TEXT, abnormal_flag TEXT NOT NULL DEFAULT 'unknown', source_span_id TEXT NOT NULL,
         acceptance_id TEXT NOT NULL, specimen TEXT, method TEXT, body_site TEXT,
-        evidence_json TEXT NOT NULL DEFAULT '[]', supersedes INTEGER, created_at TEXT NOT NULL,
+        evidence_json TEXT NOT NULL DEFAULT '[]', clinical_context_json TEXT, supersedes INTEGER, created_at TEXT NOT NULL,
         PRIMARY KEY(observation_id, revision)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS clinical_statements (
@@ -7073,7 +7655,13 @@ export class WorkspaceStore {
         ON concept_mapping_corrections(observation_id) WHERE active = 1;
       CREATE INDEX IF NOT EXISTS idx_concept_mapping_corrections_history
         ON concept_mapping_corrections(observation_id, created_at, id);
-      PRAGMA user_version = 35;
+      CREATE TABLE IF NOT EXISTS report_clinical_contexts (
+        person_id TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        input_signature TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(person_id, document_id, input_signature)
+      ) STRICT;
+      PRAGMA user_version = 36;
       `);
 
       this.seedMemberModelV2();

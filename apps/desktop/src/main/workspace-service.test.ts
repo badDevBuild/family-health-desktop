@@ -879,6 +879,53 @@ describe('PersonalWorkspaceService', () => {
     service.close();
   });
 
+  it('显式选择已有信息性缺口的已完成报告时建立整份重核任务', async () => {
+    const service = makeService();
+    const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });
+    await service.importFiles([{ path: '/tmp/旧报告.txt', bytes: Buffer.from('项目甲 1.0 mmol/L') }], personId);
+    const documentId = service.getSnapshot(null).inbox[0]!.id;
+    const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
+    const candidate = {
+      localKey: 'item-a', originalName: '项目甲', standardNameCandidate: null,
+      value: { kind: 'numeric' as const, rawText: '1.0', decimal: '1.0', comparator: 'eq' as const },
+      unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: []
+    };
+    const blockingId = service.store.saveExtractionReviewIssue({
+      documentId, kind: 'field_conflict', severity: 'blocking', evidenceRefs: [span.id],
+      candidateOptions: [candidate], reasonCodes: ['TEST_FIXTURE'],
+      documentRun: {
+        coverageComplete: true, coveredSourceSpanIds: [span.id], manifestSpanIds: [span.id], chunkCount: 1
+      }
+    });
+    service.acceptCorrectedFacts({ issueId: blockingId, documentId, candidates: [candidate] });
+    service.store.saveExtractionReviewIssue({
+      documentId, stage: 'extract', kind: 'field_conflict', severity: 'warning',
+      preserveDocumentStatus: true, evidenceRefs: [span.id], candidateOptions: [candidate],
+      reasonCodes: ['TEST_FIXTURE']
+    });
+    const accountState = {
+      status: 'connected' as const, displayLabel: 'masked@example.com',
+      quota: { status: 'available' as const, primaryUsedPercent: 1, secondaryUsedPercent: null, resetsAt: null },
+      runtimeVersion: 'test-runtime', lastCheckedAt: '2026-09-24T01:00:00Z'
+    };
+    const oldBatch = service.store.createWaitingAuthBatch({
+      cutoff: '2026-09-23T01:00:00Z', initialStatus: 'queued',
+      groups: [{ personId, documentIds: [documentId], inputSignature: 'historical-failed-repair' }]
+    });
+    // 构造历史失败记录；本测试只关心重试调度，不依赖任务执行状态机。
+    const db = new Database(service.store.databasePath);
+    db.prepare("UPDATE jobs SET status = 'failed' WHERE id = ?").run(oldBatch.jobIds[0]!);
+    db.close();
+    expect(service.processNow({ accountState, consentVersion: 1, documentIds: [documentId] }))
+      .toMatchObject({ idempotent: false });
+    expect(service.store.listStoredJobs()).toContainEqual(expect.objectContaining({
+      stage: 'extract', status: 'queued', documentIds: [documentId]
+    }));
+    service.close();
+  });
+
   it('事实冲突可选择仅归档，派生安全问题可只放弃说明', async () => {
     const service = makeService();
     const personId = service.ensurePrimaryMember({ displayName: '测试用户', relation: '本人' });

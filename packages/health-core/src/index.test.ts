@@ -314,6 +314,8 @@ describe('自动接纳规则', () => {
     };
     const textCandidate: ObservationCandidate = {
       ...candidate,
+      originalName: '小结',
+      standardNameCandidate: '小结',
       value: { kind: 'text', rawText: '请结合实验室检查' },
       clinicalDate: '2023-10-09',
       evidence: [{ sourceSpanId: 'span-1', quote: '2023-10-09 小结 请结合实验室检 查' }]
@@ -325,6 +327,103 @@ describe('自动接纳规则', () => {
       value: { kind: 'text', rawText: '请结合实验室复查' }
     }, textManifest, { personConsistent: true, overwritesUserLockedValue: false }))
       .toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+  });
+
+  it('2022 内科检查的多行项目结果可按原顺序连接，漏掉否定或限定词仍拒绝', () => {
+    const first = '内科检查\n一般情况 正常\n心脏 心律齐';
+    const second = '肺部 未见异常\n腹部 腹软，未触及包块';
+    const rowManifest: SourceManifest = {
+      ...manifest,
+      totalUnits: 1,
+      coveredUnitIndexes: [0],
+      spans: [
+        { ...manifest.spans[0]!, quote: first },
+        { ...manifest.spans[1]!, quote: second }
+      ]
+    };
+    const internalExam: ObservationCandidate = {
+      ...candidate,
+      localKey: '2022-internal-exam',
+      originalName: '内科检查',
+      standardNameCandidate: '内科检查',
+      value: { kind: 'text', rawText: '一般情况：正常；心脏：心律齐；肺部：未见异常；腹部：腹软，未触及包块' },
+      unitRaw: null,
+      referenceRangeRaw: null,
+      clinicalDate: null,
+      evidence: [
+        { sourceSpanId: 'span-1', quote: first },
+        { sourceSpanId: 'span-2', quote: second }
+      ]
+    };
+    expect(evaluateObservationCandidate(internalExam, rowManifest, {
+      personConsistent: true, overwritesUserLockedValue: false
+    })).toEqual({ decision: 'accept_with_warnings', warnings: ['reference_range_not_provided'] });
+    expect(evaluateObservationCandidate({
+      ...internalExam,
+      value: { kind: 'text', rawText: '一般情况：正常；心脏：心律齐；肺部：见异常；腹部：腹软，未触及包块' }
+    }, rowManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+  });
+
+  it('文字小结不能删去原文的考虑限定，也不能借用另一侧的正常结果', () => {
+    const thyroidQuote = '甲状腺彩超 考虑桥本氏甲状腺炎超声改变';
+    const thyroidManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote: thyroidQuote }]
+    };
+    const thyroid: ObservationCandidate = {
+      ...candidate,
+      originalName: '甲状腺彩超', standardNameCandidate: '甲状腺彩超',
+      value: { kind: 'text', rawText: '桥本氏甲状腺炎超声改变' },
+      unitRaw: null, referenceRangeRaw: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote: thyroidQuote }]
+    };
+    expect(evaluateObservationCandidate(thyroid, thyroidManifest, {
+      personConsistent: true, overwritesUserLockedValue: false
+    })).toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+
+    const eyeQuote = '左眼 异常；右眼 正常';
+    const eyeManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote: eyeQuote }]
+    };
+    const leftEye: ObservationCandidate = {
+      ...thyroid,
+      originalName: '左眼', standardNameCandidate: '左眼',
+      value: { kind: 'text', rawText: '正常' },
+      evidence: [{ sourceSpanId: 'span-1', quote: eyeQuote }]
+    };
+    expect(evaluateObservationCandidate(leftEye, eyeManifest, {
+      personConsistent: true, overwritesUserLockedValue: false
+    })).toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+    expect(evaluateObservationCandidate({
+      ...leftEye,
+      standardNameCandidate: '右眼',
+      value: { kind: 'text', rawText: '右眼正常' }
+    }, eyeManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+  });
+
+  it('同页文字结果只能来自对应项目，不能借用另一科室的小结', () => {
+    const quote = '肝胆小结：肝囊肿；肾脏小结：未见异常';
+    const sectionManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const liver: ObservationCandidate = {
+      ...candidate,
+      originalName: '肝胆小结', standardNameCandidate: '肝胆小结',
+      value: { kind: 'text', rawText: '未见异常' },
+      unitRaw: null, referenceRangeRaw: null, clinicalDate: null,
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(liver, sectionManifest, {
+      personConsistent: true, overwritesUserLockedValue: false
+    })).toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+    expect(evaluateObservationCandidate({
+      ...liver, value: { kind: 'text', rawText: '肝囊肿' }
+    }, sectionManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'accept_with_warnings', warnings: ['reference_range_not_provided'] });
   });
 
   it('证据摘录与 PDF 原文仅空白排版不同时仍可定位，字符变化仍拒绝', () => {
@@ -339,6 +438,8 @@ describe('自动接纳规则', () => {
     };
     const whitespaceCandidate: ObservationCandidate = {
       ...candidate,
+      originalName: '肝胆脾胰彩色多普勒小结',
+      standardNameCandidate: '肝胆脾胰彩色多普勒小结',
       value: { kind: 'text', rawText: '未见明显异常声像' },
       unitRaw: null,
       referenceRangeRaw: null,

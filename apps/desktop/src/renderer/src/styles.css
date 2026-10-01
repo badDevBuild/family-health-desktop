@@ -596,7 +596,8 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px s
 .system-analysis-card p { margin: 10px 0 12px; color: var(--warm-700); font-size: 16px; line-height: 1.7; }
 .system-analysis-card .panel__heading { align-items: flex-start; }
 .system-analysis-card .panel__heading h3 { max-width: 720px; margin-top: 4px; line-height: 1.45; }
-.system-analysis-overview { padding: 14px 16px; border-left: 4px solid var(--primary); border-radius: 0 12px 12px 0; background: rgba(255, 255, 255, .78); }
+.system-analysis-overview { padding: 16px; border-left: 4px solid var(--primary); border-radius: 0 12px 12px 0; background: rgba(255, 255, 255, .78); white-space: pre-line; font-size: 16px; }
+.member-health-headline > div > p { white-space: pre-line; font-size: 16px; }
 .analysis-explanation, .analysis-recommendations { margin-top: 18px; }
 .analysis-explanation > h4, .analysis-recommendations > h4 { margin: 0 0 10px; font-size: 18px; }
 .system-analysis-points { display: grid; gap: 10px; margin: 14px 0; }

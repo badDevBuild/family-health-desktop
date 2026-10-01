@@ -9,6 +9,9 @@ import { DocumentExtractionPipeline } from './processing-pipeline.js';
 
 type LeanTurnStage = 'P01' | 'P02' | 'P03' | 'P04' | 'other';
 
+// 报告事实提取维持原模型；设置中的模型只用于成员综合分析及其复核。
+export const EXTRACTION_AI_PREFERENCES: AiPreferences = { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' };
+
 function classifyLeanTurn(prompt: string): LeanTurnStage {
   // 只看模板边界，不扫描 JSON 数据里的用户原文，避免资料内嵌文本冒充阶段。
   if (prompt.includes('\nREPAIR_REQUEST=')) return 'P03';
@@ -57,8 +60,11 @@ export class ProcessingJobRunner extends EventEmitter {
           continue;
         }
         // 每个任务领取时冻结模型设置，避免用户在处理中修改设置导致同一任务混用模型。
-        const aiPreferences = structuredClone(this.getAiPreferences());
-        const attemptId = store.startJobAttempt(job.id, account.runtimeVersion, aiPreferences.modelId, aiPreferences.reasoningEffort);
+        const analysisAiPreferences = structuredClone(this.getAiPreferences());
+        const resumeAnalysis = ['analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish'].includes(job.stage);
+        let activeAiPreferences = resumeAnalysis ? analysisAiPreferences : EXTRACTION_AI_PREFERENCES;
+        // 同批含提取与分析时，尝试记录先标识提取模型；综合快照另记实际分析模型。
+        const attemptId = store.startJobAttempt(job.id, account.runtimeVersion, activeAiPreferences.modelId, activeAiPreferences.reasoningEffort);
         const attemptStartedAtMs = Date.now();
         const turnUsage = {
           attemptedTurnRequests: emptyTurnCounts(), completedTurnResponses: emptyTurnCounts(),
@@ -75,7 +81,7 @@ export class ProcessingJobRunner extends EventEmitter {
             const stage = classifyLeanTurn(input.prompt);
             turnUsage.attemptedTurnRequests[stage] += 1;
             try {
-              const result = await this.runtime.runStructuredTurn<T>({ ...input, aiPreferences });
+              const result = await this.runtime.runStructuredTurn<T>({ ...input, aiPreferences: activeAiPreferences });
               turnUsage.completedTurnResponses[stage] += 1;
               if (result.metrics) {
                 turnUsage.observedTurnMetrics += 1;
@@ -108,7 +114,6 @@ export class ProcessingJobRunner extends EventEmitter {
         };
         try {
           const pipeline = new DocumentExtractionPipeline(store, jobRuntime, executionGuard);
-          const resumeAnalysis = ['analyze', 'guidance', 'review_derived', 'system_analysis', 'system_review', 'publish'].includes(job.stage);
           let completedUnits = resumeAnalysis ? job.documentIds.length : 0;
           let needsReview = false;
           let hasAssessmentRejection = false;
@@ -123,7 +128,16 @@ export class ProcessingJobRunner extends EventEmitter {
                 this.emit('changed');
                 continue;
               }
-              if (store.isDocumentCommitted(documentId) || store.isDocumentExcluded(documentId)) {
+              if (store.isDocumentExcluded(documentId)) {
+                completedUnits += 1;
+                store.updateJobProgress(job.id, completedUnits);
+                this.emit('changed');
+                continue;
+              }
+              if (store.isDocumentCommitted(documentId)
+                && !store.listOpenExtractionReviewIssues().some((issue) => (
+                  issue.documentId === documentId && issue.severity === 'warning' && issue.stage === 'extract'
+                ))) {
                 completedUnits += 1;
                 store.updateJobProgress(job.id, completedUnits);
                 this.emit('changed');
@@ -146,12 +160,13 @@ export class ProcessingJobRunner extends EventEmitter {
             }
           }
           if (store.isJobCancellationRequested(job.id)) throw new Error('JOB_CANCELLED');
+          activeAiPreferences = analysisAiPreferences;
           const assessment = await new MemberAssessmentPipeline(
             store, jobRuntime, (stage) => {
               store.updateJobStage(job.id, stage);
               this.emit('changed');
             }, executionGuard, job.documentIds[0]!,
-            aiPreferences.modelId, aiPreferences.reasoningEffort
+            analysisAiPreferences.modelId, analysisAiPreferences.reasoningEffort
           ).process(job.personId);
           if ('threadId' in assessment && assessment.threadId && assessment.turnId) {
             lastReceipt = { threadId: assessment.threadId, turnId: assessment.turnId };

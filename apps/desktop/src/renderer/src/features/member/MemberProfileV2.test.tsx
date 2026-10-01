@@ -2,10 +2,10 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AdoptLifestyleProposalInput, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, LifestylePlanV2, MemberAssessmentSnapshotV3, MemberOverviewV2 } from '@contracts';
+import type { AdoptLifestyleProposalInput, BodySystemSummaryV2, DashboardSnapshot, HealthEventDetailV2, HealthEventV2, LifestylePlanV2, MemberAssessmentSnapshotV3, MemberOverviewV2 } from '@contracts';
 import type { HealthDesktopBridge } from '../../../../preload/index.js';
 import { createDemoSnapshot } from '../../../../../../../packages/test-fixtures/src/index.js';
-import { assessmentKnowledgeStatusLabel, MemberProfileV2, systemAnalysisHeading } from './MemberProfileV2.js';
+import { assessmentKnowledgeStatusLabel, MemberAssessmentSystemCard, MemberProfileV2, systemAnalysisHeading, systemStatusLabel } from './MemberProfileV2.js';
 
 const now = '2026-09-21T00:00:00.000Z';
 const eventTime = (value: string) => ({
@@ -38,6 +38,38 @@ afterEach(() => {
 });
 
 describe('MemberProfileV2 event organization', () => {
+  it('局部隔离不再把软件处理状态显示成健康判断或无检查', () => {
+    const summary = { status: 'building', factCount: 8, interpretationState: 'partial' } as BodySystemSummaryV2;
+    expect(systemStatusLabel(summary)).toBe('部分解读');
+    expect(systemStatusLabel({ ...summary, interpretationState: 'unavailable' })).toBe('解读待完善');
+    expect(systemStatusLabel({ ...summary, status: 'insufficient', interpretationState: 'complete' })).toBe('已有资料，解读有限');
+    expect(systemStatusLabel({ ...summary, factCount: 0, status: 'insufficient', interpretationState: 'complete' })).toBe('尚无相关检查');
+  });
+
+  it('身体卡片首先展示具体情况，适用条件可见，处理说明放在折叠区且原文入口保留', () => {
+    const assessment = {
+      systems: [{ id: 'system:cardiovascular', systemId: 'cardiovascular',
+        headline: '合成项目有变化，尚不能单凭这一项确定原因。', summary: '合成检查条件尚不完整。',
+        claimIds: ['claim-1'], actionIds: [], limitations: ['部分判断因证据不足暂未发布。'] }],
+      claims: [{ id: 'claim-1', text: '合成项目有变化，尚不能单凭这一项确定原因。', rationale: '报告原文记载。',
+        materialUncertainty: '合成检查条件尚不完整。', evidenceIds: ['evidence-1'], knowledgeSourceIds: [], diagnosticStatus: null }],
+      actions: [], evidenceCatalog: [{ id: 'evidence-1', label: '合成来源', quote: '合成原文', locator: '第 1 页', sourceSpanId: 'span-1', documentId: 'doc-1' }],
+      knowledgeSources: [], presentation: { version: 'result-summary-v1', rebuiltNodeIds: ['system:cardiovascular'] }
+    } as unknown as MemberAssessmentSnapshotV3;
+    const onOpenEvidence = vi.fn();
+    const view = render(<MemberAssessmentSystemCard assessment={assessment} systemId="cardiovascular" factCount={8} onOpenEvidence={onOpenEvidence} />);
+    expect(screen.getByRole('heading', { name: '合成项目有变化，尚不能单凭这一项确定原因。' })).toBeTruthy();
+    expect(document.querySelector('.system-analysis-overview')?.textContent).toBe('合成检查条件尚不完整。');
+    expect(screen.queryByText('部分判断仍需核实')).toBeNull();
+    expect(document.querySelector('details')?.open).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '查看原始依据' }));
+    expect(onOpenEvidence).toHaveBeenCalledWith(expect.objectContaining({ sourceSpanId: 'span-1', documentId: 'doc-1' }));
+    const empty = { ...assessment, claims: [], systems: [{ ...assessment.systems[0]!, claimIds: [] }] };
+    view.rerender(<MemberAssessmentSystemCard assessment={empty} systemId="cardiovascular" factCount={8} onOpenEvidence={onOpenEvidence} />);
+    expect(screen.getByRole('heading', { name: '已有检查，暂未形成完整解读' })).toBeTruthy();
+    expect(screen.queryByText('尚无相关检查')).toBeNull();
+  });
+
   it('新版建议只在本人点击后加入行动，刷新后显示已加入', async () => {
     const snapshot = createDemoSnapshot() as DashboardSnapshot;
     snapshot.workspaceMode = 'personal';

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DashboardSnapshot, ResolveReviewInput } from '@contracts';
 import type { HealthDesktopBridge } from '../../preload/index.js';
@@ -392,6 +392,34 @@ describe('App member display editing', () => {
     expect(await screen.findByText('身份关系已确认，任务将从事实提取重新核对并继续。')).toBeTruthy();
   });
 
+  it('已入档报告出现新身份冲突时只提供实际可执行的确认或排除', async () => {
+    const snapshot = createPersonalSnapshot();
+    snapshot.reviews = [{
+      id: 'committed-identity-review', personId: 'personal-person-1', documentId: 'committed-document',
+      kind: 'person_conflict', severity: 'blocking', title: '重新核对报告归属',
+      description: '重核时识别到不同的受检者姓名。', evidenceRefs: ['identity-span'],
+      candidateOptions: [], candidateDiffs: [], reportedName: '测试姓名乙',
+      reasonCodes: ['COMMITTED_PERSON_IDENTITY_CONFLICT'], resolutionStatus: 'open'
+    }];
+    snapshot.openReviewCount = 1;
+    const resolveReview = vi.fn(async () => ({ ok: true as const, data: { action: 'confirm_identity' as const } }));
+    installBridge(snapshot, { resolveReview });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /重新核对报告归属/ }));
+    expect(screen.getByText(/原先已保存的事实暂不参与分析/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /姓名识别有误，重新核对/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /属于另一位成员/ })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /是同一人/ }));
+    expect(screen.getByText(/不会修改已保存事实或成员名称/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '确认是同一人' }));
+    await waitFor(() => expect(resolveReview).toHaveBeenCalledWith({
+      action: 'confirm_identity', issueId: 'committed-identity-review',
+      documentId: 'committed-document', personId: 'personal-person-1'
+    }));
+    expect(await screen.findByText(/原先保存的事实已恢复参与分析/)).toBeTruthy();
+  });
+
   it('报告者被误认成受检者时可以重新识别，不要求确认同一人', async () => {
     const snapshot = createPersonalSnapshot();
     snapshot.reviews = [{
@@ -549,8 +577,15 @@ describe('App member display editing', () => {
     expect(await screen.findByText('报告正在按新规则重新核对；只有仍无法判断时才会再次询问你。')).toBeTruthy();
   });
 
-  it('部分发布 warning 只展示可关闭的结果边界，不显示确认入口、红点或重试操作', async () => {
+  it('部分发布 warning 不在每次打开时占据页面顶部，处理中心和原始依据仍可查看', async () => {
     const snapshot = createPersonalSnapshot();
+    snapshot.persons[0]!.documentCount = 1;
+    snapshot.account = { ...snapshot.account, status: 'connected', displayLabel: 'masked@example.invalid' };
+    snapshot.inbox = [{
+      id: 'partial-document', displayName: '部分发布资料.txt', discoveredAt: '2026-09-18T00:00:00.000Z',
+      personId: 'personal-person-1', personLabel: '测试成员', status: 'completed', format: '纯文本',
+      sourceLabel: '手动导入', sentToAi: true, aiTransmissionStatus: 'acknowledged', inProcessingCenter: true, issue: null
+    }];
     snapshot.reviews = [{
       id: 'partial-publish-warning', personId: 'personal-person-1', documentId: 'partial-document',
       kind: 'field_conflict', severity: 'warning', title: '1 个项目未纳入本次结果',
@@ -567,25 +602,49 @@ describe('App member display editing', () => {
         conversionView: false, previewImageDataUrl: null
       }
     }));
-    installBridge(snapshot, { getEvidence });
+    const processNow = vi.fn(async () => ({ ok: true as const, data: { batchId: 'repair-batch' }, revision: 1 }));
+    installBridge(snapshot, { getEvidence, processNow });
     render(<App />);
 
-    expect(await screen.findByText('1 个项目未纳入本次结果')).toBeTruthy();
-    expect(screen.getByText(/未纳入只表示暂时无法可靠确认，不等于结果正常/)).toBeTruthy();
+    await screen.findByRole('button', { name: '处理中心' });
+    expect(screen.queryByText('1 个项目未纳入本次结果')).toBeNull();
     expect(screen.queryByText('需要你的确认')).toBeNull();
     expect(screen.queryByRole('button', { name: '按新规则重新核对' })).toBeNull();
     expect(screen.getByRole('button', { name: '查看处理通知与任务' }).querySelector('i')).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: '查看依据' }));
-    expect(await screen.findByLabelText('证据侧栏')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '处理中心' }));
+    const boundaries = await screen.findByRole('region', { name: '报告结果边界' });
+    expect(within(boundaries).getByText(/未纳入只表示目前无法可靠确认，不等于结果正常/)).toBeTruthy();
+    fireEvent.click(within(boundaries).getByRole('button', { name: '查看部分发布资料.txt的依据' }));
+    const evidence = await screen.findByLabelText('证据侧栏');
+    expect(within(evidence).getByText('1 个项目未纳入本次结果')).toBeTruthy();
     expect(getEvidence).toHaveBeenCalledWith({ sourceSpanId: 'partial-span' });
     fireEvent.click(screen.getByRole('button', { name: '关闭证据侧栏' }));
-    fireEvent.click(screen.getByRole('button', { name: '关闭结果限制提示' }));
-    expect(screen.queryByText('1 个项目未纳入本次结果')).toBeNull();
+    fireEvent.click(within(boundaries).getByRole('button', { name: '重新核对这份报告：部分发布资料.txt' }));
+    const consent = await screen.findByRole('dialog', { name: '确认发送范围' });
+    expect(consent.textContent).toContain('将重新核对 1 份已完成的报告');
+    expect(consent.textContent).toContain('重读整份报告');
+    expect(consent.textContent).toContain('必要内容可能再次发送给 OpenAI/Codex');
+    expect(consent.textContent).toContain('已有已接纳事实会保留');
+    expect(consent.textContent).not.toContain('已完成的报告不会重新上传或提取');
+    expect(screen.getByRole('button', { name: '授权并开始' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('checkbox', { name: /我确认本次接收方/ }));
+    fireEvent.click(screen.getByRole('button', { name: '授权并开始' }));
+    await waitFor(() => expect(processNow).toHaveBeenCalledWith({ consentVersion: 1, confirmedDataRecipient: 'OpenAI/Codex', documentIds: ['partial-document'] }));
+    expect(await screen.findByText(/正在重读整份报告并核对未纳入项目/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '家庭总览' }));
+    expect(screen.queryByRole('region', { name: '报告结果边界' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '处理中心' }));
+    expect(screen.getByRole('region', { name: '报告结果边界' })).toBeTruthy();
   });
 
-  it('多份结果边界汇总去重后的项目数，并能逐份查看依据', async () => {
+  it('多份报告结果边界汇总去重后的项目数，并能分别查看依据', async () => {
     const snapshot = createPersonalSnapshot();
+    snapshot.inbox = ['first', 'second'].map((name) => ({
+      id: `${name}-document`, displayName: `${name}.txt`, discoveredAt: '2026-09-18T00:00:00.000Z',
+      personId: 'personal-person-1', personLabel: '测试成员', status: 'completed' as const, format: '纯文本',
+      sourceLabel: '手动导入', sentToAi: true, aiTransmissionStatus: 'acknowledged' as const, inProcessingCenter: true, issue: null
+    }));
     const candidate = {
       localKey: 'same-item', originalName: '虚构项目', standardNameCandidate: '虚构项目',
       value: { kind: 'numeric' as const, rawText: '1', decimal: '1', comparator: 'eq' as const },
@@ -598,7 +657,11 @@ describe('App member display editing', () => {
         id: 'first-limitation', personId: 'personal-person-1', documentId: 'first-document',
         kind: 'field_conflict', severity: 'warning', title: '2 个项目未纳入本次结果',
         description: '第一份资料有部分项目依据不足。', evidenceRefs: ['first-span'],
-        candidateOptions: [candidate, candidate], candidateDiffs: [], reportedName: null,
+        candidateOptions: [candidate, {
+          ...candidate, originalName: '另一项目',
+          value: { kind: 'numeric' as const, rawText: '2', decimal: '2', comparator: 'eq' as const },
+          evidence: [{ sourceSpanId: 'first-span', quote: '另一项目 2' }]
+        }], candidateDiffs: [], reportedName: null,
         reasonCodes: ['evidence_mismatch'], resolutionStatus: 'open'
       },
       {
@@ -620,14 +683,16 @@ describe('App member display editing', () => {
     installBridge(snapshot, { getEvidence });
     render(<App />);
 
-    expect(await screen.findByText('2 份资料共 2 个项目未纳入本次结果')).toBeTruthy();
-    expect(screen.getByText(/当前查看第 1\/2 份资料的依据/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '查看依据' }));
+    expect(screen.queryByText('2 份资料共 3 个项目未纳入本次结果')).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: '处理中心' }));
+    const boundaries = await screen.findByRole('region', { name: '报告结果边界' });
+    expect(within(boundaries).getByText('2 份资料共 3 个项目未纳入本次结果')).toBeTruthy();
+    expect(within(boundaries).getByText(/2 个项目未纳入 ·/)).toBeTruthy();
+    expect(within(boundaries).getByText(/1 个项目未纳入 ·/)).toBeTruthy();
+    fireEvent.click(within(boundaries).getByRole('button', { name: '查看first.txt的依据' }));
     await waitFor(() => expect(getEvidence).toHaveBeenCalledWith({ sourceSpanId: 'first-span' }));
     fireEvent.click(screen.getByRole('button', { name: '关闭证据侧栏' }));
-    fireEvent.click(screen.getByRole('button', { name: '下一份' }));
-    expect(screen.getByText(/当前查看第 2\/2 份资料的依据/)).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '查看依据' }));
+    fireEvent.click(within(boundaries).getByRole('button', { name: '查看second.txt的依据' }));
     await waitFor(() => expect(getEvidence).toHaveBeenCalledWith({ sourceSpanId: 'second-span' }));
   });
 
@@ -905,7 +970,7 @@ describe('App member display editing', () => {
     expect(container.querySelector('.app-shell')?.className).toContain('reduce-motion');
   });
 
-  it('defaults to Sol medium and only offers reasoning efforts supported by the selected model', async () => {
+  it('分析报告默认 GPT-6 Sol medium，手动选择时只提供模型支持的推理强度', async () => {
     const updateAiPreferences = vi.fn(async () => ({
       ok: true as const,
       data: { modelId: 'gpt-5.6-terra', reasoningEffort: 'high' as const }
@@ -914,9 +979,9 @@ describe('App member display editing', () => {
       getAiSettings: async () => ({
         ok: true,
         data: {
-          preferences: { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
+          preferences: { modelId: 'gpt-6-sol', reasoningEffort: 'medium' },
           models: [
-            { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', description: 'Sol', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: '快速' }, { reasoningEffort: 'medium', description: '平衡' }], defaultReasoningEffort: 'low', isDefault: true },
+            { id: 'gpt-6-sol', displayName: 'GPT-6-Sol', description: 'Sol', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: '快速' }, { reasoningEffort: 'medium', description: '平衡' }], defaultReasoningEffort: 'medium', isDefault: true },
             { id: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', description: 'Terra', supportedReasoningEfforts: [{ reasoningEffort: 'medium', description: '平衡' }, { reasoningEffort: 'high', description: '深入' }], defaultReasoningEffort: 'medium', isDefault: false }
           ]
         }
@@ -926,10 +991,10 @@ describe('App member display editing', () => {
     render(<App />);
 
     fireEvent.click(await screen.findByRole('button', { name: '设置' }));
-    fireEvent.click(await screen.findByRole('button', { name: /AI 模型/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /分析报告模型/ }));
     expect(await screen.findByRole('dialog', { name: '模型与推理强度' })).toBeTruthy();
-    expect(screen.getByText(/高影响医学判断才重点复核/)).toBeTruthy();
-    expect((screen.getByLabelText('模型') as HTMLSelectElement).value).toBe('gpt-5.6-sol');
+    expect(screen.getByText(/报告事实提取仍沿用原模型/)).toBeTruthy();
+    expect((screen.getByLabelText('模型') as HTMLSelectElement).value).toBe('gpt-6-sol');
     expect((screen.getByLabelText('推理强度') as HTMLSelectElement).value).toBe('medium');
     fireEvent.change(screen.getByLabelText('模型'), { target: { value: 'gpt-5.6-terra' } });
     expect((screen.getByLabelText('推理强度') as HTMLSelectElement).value).toBe('medium');

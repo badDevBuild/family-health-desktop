@@ -11,6 +11,7 @@ import { buildSourceUrgentNotices } from './source-urgent-notice.js';
 import { buildCurrentSymptomNotices } from './current-symptom-notice.js';
 import { ACCEPTANCE_RULES_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, promptMetaForStage } from './prompts/index.js';
 import { buildSystemEvidenceBundle as buildSystemEvidenceBundleFromStore } from './system-evidence.js';
+import { presentMemberAssessment } from './assessment-presentation.js';
 
 const organNames = [
   ['cardiovascular', '心血管'],
@@ -314,7 +315,7 @@ export class PersonalWorkspaceService {
       || snapshot.contextRevision !== this.store.getClinicalContextRevision(personId)
       || snapshot.reviewScopeSignature !== this.store.getOpenReviewScopeSignature(personId)) return null;
     const parsed = memberAssessmentSnapshotV3Schema.safeParse(snapshot);
-    return parsed.success ? parsed.data : null;
+    return parsed.success ? presentMemberAssessment(parsed.data) : null;
   }
 
   getConceptReview(personId: string): ConceptReviewBundle {
@@ -475,6 +476,10 @@ export class PersonalWorkspaceService {
       const relatedSeries = series.filter((item) => item.points.some((point) => relatedObservationIds.has(point.observationId)));
       const analysis = this.currentSystemAnalysis(personId, registry.id, observations);
       const v3System = assessment?.systems.find((item) => item.systemId === registry.id);
+      const rebuilt = v3System && assessment?.presentation?.rebuiltNodeIds.includes(v3System.id);
+      const interpretationState = rebuilt
+        ? v3System.claimIds.some((id) => assessment?.claims.some((claim) => claim.id === id)) ? 'partial' : 'unavailable'
+        : v3System ? 'complete' : undefined;
       const currentAnalysis = analysis?.status === 'current' && analysis.review.status === 'passed'
         ? analysis
         : null;
@@ -489,7 +494,8 @@ export class PersonalWorkspaceService {
         id: registry.id,
         name: registry.name,
         shortName: registry.shortName,
-        status: v3System?.status ?? (direct.length === 0
+        // 隔离结果的 monitor/insufficient 是处理回退状态，不是新的健康判断。
+        status: rebuilt ? 'building' : v3System?.status ?? (direct.length === 0
           ? legacyRelatedCount > 0 ? 'building' : 'insufficient'
           : currentAnalysis?.assessmentStatus === 'attention' || attention.length > 0 ? 'attention'
             : currentAnalysis?.assessmentStatus === 'undetermined' || !currentAnalysis ? 'building' : 'stable'),
@@ -502,6 +508,7 @@ export class PersonalWorkspaceService {
         attentionCount: attention.length,
         latestDate: related.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort().at(-1) ?? null,
         analysisStatus: v3System ? 'current' : analysis?.status ?? 'unavailable',
+        ...(interpretationState ? { interpretationState } : {}),
         topics: registry.topics.map((topic) => ({ id: topic.id, name: topic.name, factCount: topicCounts.get(topic.id) ?? 0 }))
       });
     });
@@ -881,6 +888,23 @@ export class PersonalWorkspaceService {
       for (const source of memberEvidenceSources(observation)) {
         byId.set(source.id, source);
         if (source.sourceSpanId) byId.set(source.sourceSpanId, source);
+      }
+    }
+    // 条件补齐的来源可能不在旧观测的主引用里；只读取仍属本人的有效事实及同文件原页。
+    const requested = new Set(evidenceIds);
+    const liveFacts = new Map(observations.map((observation) => [observation.id, observation]));
+    for (const snapshot of this.store.listMemberAssessmentSnapshots(personId)) {
+      for (const evidence of snapshot.evidenceCatalog) {
+        if (!requested.has(evidence.id) || byId.has(evidence.id) || !evidence.id.startsWith('context-')
+          || !evidence.observationId || !evidence.sourceSpanId) continue;
+        const fact = liveFacts.get(evidence.observationId);
+        if (!fact || fact.documentId !== evidence.documentId) continue;
+        try {
+          const source = this.store.getEvidenceAccess({ sourceSpanId: evidence.sourceSpanId });
+          if (source.documentId !== fact.documentId
+            || (source.quote !== null && (!evidence.quote || !source.quote.includes(evidence.quote)))) continue;
+          byId.set(evidence.id, { ...evidence, locator: source.locator });
+        } catch { /* 原件已删除时明确返回 missingIds，不回退到其他文件。 */ }
       }
     }
     const items = evidenceIds.map((id) => byId.get(id)).filter((item): item is MemberEvidenceRef => Boolean(item));
@@ -1318,7 +1342,13 @@ export class PersonalWorkspaceService {
     const selectedIds = options?.documentIds ? new Set(options.documentIds) : null;
     const trackedDocumentIds = options ? this.store.listProcessingDocumentIds() : new Set<string>();
     const activeDocumentIds = options ? this.store.listActiveProcessingDocumentIds() : new Set<string>();
-    if (selectedIds && [...selectedIds].some((documentId) => trackedDocumentIds.has(documentId))) {
+    const committedReviewIssues = selectedIds ? this.store.listOpenExtractionReviewIssues().filter((issue) => (
+      issue.severity === 'warning' && issue.stage === 'extract'
+      && this.store.isDocumentCommitted(issue.documentId)
+    )) : [];
+    const repairableIds = new Set(committedReviewIssues.map((issue) => issue.documentId));
+    if (selectedIds && [...selectedIds].some((documentId) => trackedDocumentIds.has(documentId)
+      && (!repairableIds.has(documentId) || activeDocumentIds.has(documentId)))) {
       throw new Error('DOCUMENT_ALREADY_IN_PROCESSING');
     }
     const byPerson = new Map<string, { documentIds: string[]; stage: 'extract' | 'analyze' }>();
@@ -1328,6 +1358,19 @@ export class PersonalWorkspaceService {
       const group = byPerson.get(document.personId) ?? { documentIds: [], stage: 'extract' as const };
       group.documentIds.push(document.id);
       byPerson.set(document.personId, group);
+    }
+    if (selectedIds) {
+      // 明确点选旧报告时允许重新核对其未纳入项目；不把所有历史报告自动重传。
+      for (const issue of committedReviewIssues) {
+        if (!selectedIds.has(issue.documentId) || issue.severity !== 'warning'
+          || issue.stage !== 'extract' || !issue.personId
+          || !this.store.isDocumentCommitted(issue.documentId)
+          || this.store.isDocumentExcluded(issue.documentId)
+          || activeDocumentIds.has(issue.documentId)) continue;
+        const group = byPerson.get(issue.personId) ?? { documentIds: [], stage: 'extract' as const };
+        if (!group.documentIds.includes(issue.documentId)) group.documentIds.push(issue.documentId);
+        byPerson.set(issue.personId, group);
+      }
     }
     if (!selectedIds) {
       // 旧报告直接复用已接纳事实，按成员刷新唯一的 V3 综合快照。
@@ -1550,7 +1593,8 @@ export class PersonalWorkspaceService {
           clinicalContextRevision: person.clinicalContextRevision,
           displayRevision: person.displayRevision,
           derived: derived ? { id: derived.id, status: derived.status, createdAt: derived.createdAt } : null,
-          memberAssessment: assessment ? { id: assessment.id, inputSignature: assessment.inputSignature } : null,
+          memberAssessment: assessment ? { id: assessment.id, inputSignature: assessment.inputSignature,
+            presentationVersion: assessment.presentation?.version ?? null } : null,
           systemAnalyses: systemAnalyses.map((analysis) => ({ id: analysis.id, status: analysis.status, generatedAt: analysis.generatedAt })),
           proposals: proposals.map((proposal) => ({ id: proposal.id, status: proposal.status, version: proposal.version, updatedAt: proposal.updatedAt })),
           actions: personActions.map((action) => ({ id: action.id, userRevision: action.userRevision, status: action.status }))

@@ -40,6 +40,101 @@ function evidenceContainsReportedText(evidence: string, reported: string): boole
   return compactReported.length > 0 && compactEvidence.includes(compactReported);
 }
 
+function compactTextLayout(value: string): string {
+  // 文字层会把表格单元格拆成多行，模型则常以分号连接各行。
+  // 仅消去排版分隔符；数字中的小数点、比较符等原样保留。
+  return normalizeEvidenceText(value).replace(/[\s,，;；:：。|、]/g, '');
+}
+
+function sideInName(name: string): '左' | '右' | null {
+  const left = /左/.test(name);
+  const right = /右/.test(name);
+  return left === right ? null : left ? '左' : '右';
+}
+
+function expectedLaterality(candidate: ObservationCandidate): '左' | '右' | 'conflict' | null {
+  const original = sideInName(candidate.originalName);
+  const standardized = sideInName(candidate.standardNameCandidate ?? '');
+  if (original && standardized && original !== standardized) return 'conflict';
+  return original ?? standardized;
+}
+
+function textProjectWindows(candidate: ObservationCandidate, citedText: string[], allowAcrossReferences: boolean): string[] {
+  // 原报告项目名优先于模型给出的标准名。只有从这个项目标题开始，
+  // 到下一项同级标题前的文字，才可用于证明该项目的文字结果。
+  const original = compactTextLayout(candidate.originalName);
+  const shorter = original.replace(/(?:小结|检查|报告|结果)$/u, '');
+  const anchors = [original, ...(shorter.length >= 2 ? [shorter] : [])];
+  const allSources = allowAcrossReferences ? [citedText.join('\n')] : citedText;
+  const windows: string[] = [];
+
+  for (const source of allSources) {
+    const normalized = source.normalize('NFKC').toLowerCase();
+    const compactCharacters: string[] = [];
+    const originalOffsets: number[] = [];
+    for (let index = 0; index < normalized.length; index += 1) {
+      const character = normalized[index]!;
+      if (/[\s,，;；:：。|、]/u.test(character)) continue;
+      compactCharacters.push(character);
+      originalOffsets.push(index);
+    }
+    const compact = compactCharacters.join('');
+    const matchedAnchor = anchors.find((anchor) => anchor && compact.includes(anchor));
+    if (!matchedAnchor) continue;
+    let offset = 0;
+    while (offset < compact.length) {
+      const start = compact.indexOf(matchedAnchor, offset);
+      if (start < 0) break;
+      const originalStart = originalOffsets[start] ?? 0;
+      const afterAnchor = (originalOffsets[start + matchedAnchor.length - 1] ?? originalStart) + 1;
+      const remainder = normalized.slice(afterAnchor);
+      const nextHeader = /(?:^|[\r\n;；。])\s*[^\r\n;；:：。]{2,28}?(?:小结|检查|结论|报告|结果|彩超)(?=[:：]|\r?\n|$|[ \t]+\S)/mu.exec(remainder);
+      const originalEnd = nextHeader ? afterAnchor + nextHeader.index : normalized.length;
+      windows.push(normalized.slice(originalStart, originalEnd));
+      offset = start + matchedAnchor.length;
+    }
+  }
+  return [...new Set(windows)];
+}
+
+function textResultSupported(candidate: ObservationCandidate, citedText: string[]): boolean {
+  if (candidate.value.kind !== 'text') return false;
+  const reported = normalizeEvidenceText(candidate.value.rawText);
+  if (!reported) return true;
+
+  // 非数值文字可以跨同一组已核实引用的表格行匹配。含数字的文字仅沿用
+  // 原有的单段空白折叠匹配，不跨引用合并、也不消去数字间的标点。
+  const hasNumber = /\d/.test(reported);
+  const raw = hasNumber ? reported.replace(/\s+/g, '') : compactTextLayout(reported);
+  const side = expectedLaterality(candidate);
+  if (side === 'conflict') return false;
+  const sources = textProjectWindows(candidate, citedText, !hasNumber);
+  const rawSide = /左/.test(raw) === /右/.test(raw)
+    ? null
+    : /左/.test(raw) ? '左' : '右';
+  const protectedPrefixes = [
+    '不能排除', '不排除', '未见', '否认', '考虑', '疑似', '可能', '倾向', '提示',
+    '待排', '可疑', '轻微', '轻度', '中度', '重度', '明显', '弱', '强', '无', '未', '不'
+  ];
+
+  for (const source of sources) {
+    const compact = hasNumber
+      ? normalizeEvidenceText(source).replace(/\s+/g, '')
+      : compactTextLayout(source);
+    let start = compact.indexOf(raw);
+    while (start >= 0) {
+      const prefix = compact.slice(0, start);
+      const qualifierOmitted = protectedPrefixes.some((word) => prefix.endsWith(word));
+      const leftAt = prefix.lastIndexOf('左');
+      const rightAt = prefix.lastIndexOf('右');
+      const nearestSide = leftAt === rightAt ? null : leftAt > rightAt ? '左' : '右';
+      if (!qualifierOmitted && (!side || rawSide === side || (rawSide === null && nearestSide === side))) return true;
+      start = compact.indexOf(raw, start + 1);
+    }
+  }
+  return false;
+}
+
 function evidenceQuoteMatchesSource(source: string, cited: string): boolean {
   if (source.includes(cited)) return true;
   const compactSource = source.replace(/\s+/g, '');
@@ -181,9 +276,11 @@ function numericOccurrences(text: string): Array<{ value: number; comparator: Ev
 
 function evidenceContentProblems(candidate: ObservationCandidate, manifest: SourceManifest): string[] {
   const spans = new Map(manifest.spans.map((span) => [span.id, span]));
+  const spanOrder = new Map(manifest.spans.map((span, index) => [span.id, index]));
   const problems: string[] = [];
   const supportedText: string[] = [];
   const bindingText: string[] = [];
+  const orderedBindingText: Array<{ text: string; sourceSpanId: string }> = [];
   for (const reference of candidate.evidence) {
     const span = spans.get(reference.sourceSpanId);
     if (!span) continue;
@@ -200,6 +297,7 @@ function evidenceContentProblems(candidate: ObservationCandidate, manifest: Sour
       }
       supportedText.push(cited);
       bindingText.push(reference.quote);
+      orderedBindingText.push({ text: reference.quote, sourceSpanId: reference.sourceSpanId });
     }
   }
   if (candidate.value.kind === 'numeric' && supportedText.length > 0) {
@@ -254,7 +352,11 @@ function evidenceContentProblems(candidate: ObservationCandidate, manifest: Sour
   }
   if (candidate.value.kind === 'text' && supportedText.length > 0) {
     const raw = normalizeEvidenceText(candidate.value.rawText);
-    if (raw && !supportedText.some((text) => evidenceContainsReportedText(text, raw))) {
+    // 日期等辅助引用可能追加在结果引用之后；按报告原始顺序拼接才能判断跨页小结属于哪一节。
+    const reportOrderedQuotes = orderedBindingText
+      .sort((left, right) => (spanOrder.get(left.sourceSpanId) ?? Infinity) - (spanOrder.get(right.sourceSpanId) ?? Infinity))
+      .map((entry) => entry.text);
+    if (raw && !textResultSupported(candidate, reportOrderedQuotes)) {
       problems.push('reported_value_not_in_evidence');
     }
   }

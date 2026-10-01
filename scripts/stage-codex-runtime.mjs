@@ -8,7 +8,7 @@ import process from 'node:process';
 
 const require = createRequire(import.meta.url);
 
-const lockedVersion = '0.145.0';
+const lockedVersion = '0.156.1';
 const target = process.argv.find((argument) => argument.startsWith('--target='))?.slice('--target='.length)
   ?? `${process.platform}-${process.arch}`;
 const targets = {

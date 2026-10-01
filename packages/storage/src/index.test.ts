@@ -115,7 +115,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -133,7 +133,7 @@ describe('WorkspaceStore', () => {
   it('schema v35 建立成员档案注册表、版本化派生表与可撤销纠错表', () => {
     const store = makeStore();
     const database = new Database(store.databasePath, { readonly: true });
-    expect(database.pragma('user_version', { simple: true })).toBe(35);
+    expect(database.pragma('user_version', { simple: true })).toBe(36);
     const tables = new Set((database.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>).map((row) => row.name));
     for (const table of [
       'body_system_registry',
@@ -211,7 +211,7 @@ describe('WorkspaceStore', () => {
     ]);
     const migrated = new Database(upgraded.databasePath, { readonly: true });
     expect(migrated.prepare(`SELECT original_name FROM observations`).get()).toEqual({ original_name: null });
-    expect(migrated.pragma('user_version', { simple: true })).toBe(35);
+    expect(migrated.pragma('user_version', { simple: true })).toBe(36);
     migrated.close();
     upgraded.close();
   });
@@ -1412,7 +1412,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1468,7 +1468,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1524,7 +1524,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1580,7 +1580,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1636,7 +1636,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1692,7 +1692,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1748,7 +1748,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1804,7 +1804,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1861,7 +1861,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1918,7 +1918,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -1975,7 +1975,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -2031,7 +2031,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -2075,7 +2075,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -2114,7 +2114,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -2159,7 +2159,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -2204,7 +2204,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -2259,7 +2259,7 @@ describe('WorkspaceStore', () => {
     ]));
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0, totalUnits: 2 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     const checkpoint = JSON.parse((upgraded.prepare('SELECT checkpoint_json FROM jobs WHERE id = ?').get(job.id) as { checkpoint_json: string }).checkpoint_json) as { documentIds: string[] };
     expect(checkpoint.documentIds).toEqual(documentIds);
     upgraded.close();
@@ -2317,7 +2317,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toContainEqual({ id: document.documentId, personId: person.id });
     expect(store.listStoredJobs()[0]).toMatchObject({ id: job.id, status: 'queued', stage: 'extract', completedUnits: 0 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(35);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
     upgraded.close();
     store.close();
   });
@@ -2800,6 +2800,173 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('首次发布时未纳入项目与已接纳事实原子落库，提醒写入失败则全部回滚', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('甲 5.0\n乙 待核对'), mediaType: 'text/plain', displayName: '原子发布.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'atomic-manifest', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: '原子发布.txt', totalUnits: 1,
+      coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [],
+      createdAt: '2026-09-18T00:00:00.000Z', spans: [
+        { id: 'atomic-span-a', documentId: document.documentId, spanKind: 'line', page: null,
+          blockId: null, lineStart: 1, lineEnd: 1, quote: '甲 5.0', readability: 'clear' },
+        { id: 'atomic-span-b', documentId: document.documentId, spanKind: 'line', page: null,
+          blockId: null, lineStart: 2, lineEnd: 2, quote: '乙 待核对', readability: 'clear' }
+      ]
+    });
+    const acceptanceId = store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'atomic-input',
+      outputHash: 'atomic-output', reviewRef: null, decision: 'accept'
+    });
+    const input = {
+      personId: person.id, documentId: document.documentId,
+      documentCommitKey: 'a'.repeat(64), expectedRevision: 0,
+      changeSetHash: 'b'.repeat(64), summary: '合成原子发布',
+      observations: [{
+        conceptKey: '甲', originalName: '甲', rawText: '5.0', valueKind: 'numeric' as const,
+        decimalValue: '5.0', qualifier: 'eq', unit: null, referenceRange: null,
+        clinicalDate: null, abnormalFlag: 'unknown' as const, documentId: document.documentId,
+        sourceSpanId: 'atomic-span-a', acceptanceId, specimen: null, method: null,
+        bodySite: null, evidence: [{ sourceSpanId: 'atomic-span-a', quote: '甲 5.0' }]
+      }],
+      unresolvedReview: {
+        kind: 'field_conflict' as const, evidenceRefs: ['atomic-span-b'],
+        reasonCodes: ['VALUE_NOT_VERIFIED'], candidateOptions: []
+      }
+    };
+
+    const database = new Database(store.databasePath);
+    database.exec(`
+      CREATE TRIGGER reject_atomic_warning BEFORE INSERT ON review_issues
+      BEGIN SELECT RAISE(ABORT, 'INJECTED_WARNING_FAILURE'); END;
+    `);
+    expect(() => store.publishFacts(input)).toThrow('INJECTED_WARNING_FAILURE');
+    expect(store.isDocumentCommitted(document.documentId)).toBe(false);
+    expect(store.getFactRevision(person.id)).toBe(0);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+
+    database.exec('DROP TRIGGER reject_atomic_warning');
+    database.close();
+    expect(store.publishFacts(input)).toMatchObject({ revision: 1, idempotent: false });
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(1);
+    expect(store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({
+        documentId: document.documentId, severity: 'warning', stage: 'extract',
+        reasonCodes: ['VALUE_NOT_VERIFIED']
+      })
+    ]);
+    expect(store.publishFacts(input)).toMatchObject({ revision: 1, idempotent: true });
+    expect(store.listOpenExtractionReviewIssues()).toHaveLength(1);
+    expect(store.integrityCheck()).toBe('ok');
+    store.close();
+  });
+
+  it('已提交报告身份存疑时先隔离，只有显式确认同一人才能恢复事实与重排原任务', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('受检者：张某\n甲 5.0'), mediaType: 'text/plain', displayName: '身份复核.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'committed-identity-manifest', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: '身份复核.txt', totalUnits: 1,
+      coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [],
+      createdAt: '2026-09-18T00:00:00.000Z', spans: [{
+        id: 'committed-identity-span', documentId: document.documentId,
+        spanKind: 'line', page: null, blockId: null, lineStart: 1, lineEnd: 2,
+        quote: '受检者：张某\n甲 5.0', readability: 'clear'
+      }]
+    });
+    const acceptanceId = store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'identity-input',
+      outputHash: 'identity-output', reviewRef: null, decision: 'accept'
+    });
+    store.publishFacts({
+      personId: person.id, documentId: document.documentId,
+      documentCommitKey: 'c'.repeat(64), expectedRevision: 0,
+      changeSetHash: 'd'.repeat(64), summary: '合成首次发布',
+      observations: [{
+        conceptKey: '甲', originalName: '甲', rawText: '5.0', valueKind: 'numeric',
+        decimalValue: '5.0', qualifier: 'eq', unit: null, referenceRange: null,
+        clinicalDate: null, abnormalFlag: 'unknown', documentId: document.documentId,
+        sourceSpanId: 'committed-identity-span', acceptanceId,
+        specimen: null, method: null, bodySite: null,
+        evidence: [{ sourceSpanId: 'committed-identity-span', quote: '甲 5.0' }]
+      }],
+      unresolvedReview: { kind: 'field_conflict', evidenceRefs: ['committed-identity-span'],
+        candidateOptions: [], reasonCodes: ['PREVIOUS_FIELD_UNVERIFIED'] }
+    });
+    const originalObservationId = store.listAcceptedObservations(person.id)[0]!.id;
+    const consentId = store.createManualProcessingConsent({
+      documentIds: [document.documentId], personIds: [person.id],
+      historicalObservationIds: [originalObservationId],
+      accountFingerprint: 'synthetic-account', version: 1
+    });
+    const batch = store.createWaitingAuthBatch({
+      cutoff: '2026-09-18T00:00:00Z', consentId, initialStatus: 'queued',
+      groups: [{ personId: person.id, documentIds: [document.documentId],
+        stage: 'extract', inputSignature: 'synthetic-identity-repair' }]
+    });
+    const jobId = batch.jobIds[0]!;
+    const database = new Database(store.databasePath);
+    database.prepare(`UPDATE jobs SET status = 'waiting_user' WHERE id = ?`).run(jobId);
+    database.close();
+
+    const review = {
+      documentId: document.documentId, reportedName: '张某',
+      evidenceRefs: ['committed-identity-span'], reasonCodes: ['PERSON_IDENTITY_NOT_CONFIRMED'], jobId
+    };
+    const identityIssueId = store.saveCommittedIdentityReviewIssue(review);
+    expect(store.saveCommittedIdentityReviewIssue(review)).toBe(identityIssueId);
+    expect(store.getFactRevision(person.id)).toBe(2);
+    expect(store.isDocumentCommitted(document.documentId)).toBe(true);
+    expect(store.isDocumentExcluded(document.documentId)).toBe(true);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    expect(store.listOpenExtractionReviewIssues()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: identityIssueId, severity: 'blocking',
+        reasonCodes: expect.arrayContaining(['COMMITTED_PERSON_IDENTITY_CONFLICT']) }),
+      expect.objectContaining({ severity: 'warning', reasonCodes: ['PREVIOUS_FIELD_UNVERIFIED'] })
+    ]));
+    expect(() => store.retryExtractionReview({ issueId: identityIssueId, documentId: document.documentId }))
+      .toThrow('DOCUMENT_REVIEW_STATE_CONFLICT');
+    expect(store.isDocumentExcluded(document.documentId)).toBe(true);
+
+    store.confirmDocumentIdentity({
+      issueId: identityIssueId, documentId: document.documentId, personId: person.id
+    });
+    expect(store.getFactRevision(person.id)).toBe(3);
+    expect(store.isDocumentExcluded(document.documentId)).toBe(false);
+    expect(store.listAcceptedObservations(person.id).map((observation) => observation.id))
+      .toEqual([originalObservationId]);
+    expect(store.listOpenExtractionReviewIssues()).toEqual([
+      expect.objectContaining({ severity: 'warning', reasonCodes: ['PREVIOUS_FIELD_UNVERIFIED'] })
+    ]);
+    expect(store.listStoredJobs().find((job) => job.id === jobId)).toMatchObject({
+      status: 'queued', stage: 'extract'
+    });
+    const readOnly = new Database(store.databasePath, { readonly: true });
+    expect((readOnly.prepare(`SELECT status FROM documents WHERE id = ?`)
+      .get(document.documentId) as { status: string }).status).toBe('completed');
+    expect((readOnly.prepare(`SELECT COUNT(*) AS count FROM document_commits WHERE document_id = ?`)
+      .get(document.documentId) as { count: number }).count).toBe(1);
+    readOnly.close();
+
+    // 之后若再次发现身份冲突，“不纳入”仍可永久排除，不会删除旧事实记录。
+    const secondIssueId = store.saveCommittedIdentityReviewIssue(review);
+    store.resolveReviewIssue({ issueId: secondIssueId, documentId: document.documentId, action: 'archive_only' });
+    expect(store.isDocumentExcluded(document.documentId)).toBe(true);
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    expect(store.isDocumentCommitted(document.documentId)).toBe(true);
+    expect(store.integrityCheck()).toBe('ok');
+    store.close();
+  });
+
   it('目录授权只向界面暴露名称，停用时同步撤回 AI 授权', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '测试成员' });
@@ -3052,7 +3219,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('授权撤回后，即使解决阻断核对也不会恢复原任务', () => {
+  it('授权撤回后解决阻断核对会终结旧任务，重新处理必须另行授权', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '测试成员' });
     const source = store.putSourceObject({ bytes: Buffer.from('撤回授权后的核对'), mediaType: 'text/plain', displayName: 'fixture.txt' });
@@ -3080,7 +3247,7 @@ describe('WorkspaceStore', () => {
     store.resolveReviewIssue({ issueId, documentId: document.documentId, action: 'dismiss_derived' });
 
     expect(store.listOpenExtractionReviewIssues()).toEqual([]);
-    expect(store.listStoredJobs()[0]).toMatchObject({ id: job.id, status: 'waiting_user' });
+    expect(store.listStoredJobs()[0]).toMatchObject({ id: job.id, status: 'cancelled' });
     store.close();
   });
 
@@ -3123,6 +3290,194 @@ describe('WorkspaceStore', () => {
       resolvedReviewIssueId: issueId
     })).toThrow('DOCUMENT_ALREADY_COMMITTED_REVIEW_CONFLICT');
     expect(store.listOpenExtractionReviewIssues()).toHaveLength(1);
+    store.close();
+  });
+
+  it('已提交报告只增量接纳新事实，缩小再关闭旧警告，重复执行保持幂等', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const source = store.putSourceObject({
+      bytes: Buffer.from('甲 5.0\n乙 7.0\n丙 9.0'), mediaType: 'text/plain', displayName: '增量报告.txt'
+    });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const spanIds = ['append-span-a', 'append-span-b', 'append-span-c'];
+    store.saveSourceManifest({
+      id: 'append-manifest', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: '增量报告.txt', totalUnits: 1,
+      coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [],
+      createdAt: '2026-09-18T00:00:00.000Z',
+      spans: spanIds.map((id, index) => ({
+        id, documentId: document.documentId, spanKind: 'line' as const, page: null,
+        blockId: null, lineStart: index + 1, lineEnd: index + 1,
+        quote: `${'甲乙丙'[index]} ${[5, 7, 9][index]}.0`, readability: 'clear' as const
+      }))
+    });
+    const acceptanceId = store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'append-input',
+      outputHash: 'append-output', reviewRef: null, decision: 'accept'
+    });
+    const observation = (name: string, value: string, spanId: string) => ({
+      conceptKey: name, originalName: name, modelStandardNameCandidate: null,
+      rawText: value, valueKind: 'numeric' as const, decimalValue: value, qualifier: 'eq',
+      unit: null, referenceRange: null, clinicalDate: '2026-09-18',
+      abnormalFlag: 'unknown' as const, documentId: document.documentId,
+      sourceSpanId: spanId, acceptanceId, specimen: null, method: null, bodySite: null,
+      evidence: [{ sourceSpanId: spanId, quote: `${name} ${value}` }]
+    });
+    const first = observation('甲', '5.0', spanIds[0]!);
+    const second = observation('乙', '7.0', spanIds[1]!);
+    const third = observation('丙', '9.0', spanIds[2]!);
+    store.publishFacts({
+      personId: person.id, documentId: document.documentId, documentCommitKey: 'e'.repeat(64),
+      expectedRevision: 0, changeSetHash: 'f'.repeat(64), summary: '首次接纳', observations: [first]
+    });
+    const candidate = (key: string, name: string, value: string, spanId: string) => ({
+      localKey: key, originalName: name, standardNameCandidate: null,
+      value: { kind: 'numeric' as const, rawText: value, decimal: value, comparator: 'eq' as const },
+      unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
+      specimen: null, method: null, bodySite: null, clinicalDate: '2026-09-18',
+      evidence: [{ sourceSpanId: spanId, quote: `${name} ${value}` }], issues: []
+    });
+    const remaining = candidate('candidate-c', '丙', '9.0', spanIds[2]!);
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId, kind: 'field_conflict', severity: 'warning',
+      preserveDocumentStatus: true, stage: 'extract',
+      evidenceRefs: [spanIds[1]!, spanIds[2]!],
+      candidateOptions: [candidate('candidate-b', '乙', '7.0', spanIds[1]!), remaining],
+      reasonCodes: ['VALUE_NOT_IN_EVIDENCE']
+    });
+    const database = new Database(store.databasePath);
+    database.prepare(`
+      INSERT INTO member_assessment_snapshots_v3 (
+        id, person_id, input_signature, fact_revision, context_revision, prompt_version,
+        rules_version, model_id, reasoning_effort, validation_mode, payload_json, status, created_at
+      ) VALUES ('append-assessment', ?, 'old', 1, 0, 'test', 'test', 'test', 'medium',
+        'local_only', '{}', 'current', '2026-09-18T00:00:00.000Z')
+    `).run(person.id);
+    database.close();
+
+    const appended = store.appendCommittedFacts({
+      personId: person.id, documentId: document.documentId, expectedRevision: 1,
+      summary: '补入乙', observations: [first, second],
+      reviewUpdate: {
+        issueId, remainingCandidates: [remaining], remainingReasonCodes: ['UNREADABLE'],
+        remainingEvidenceRefs: [spanIds[2]!]
+      }
+    });
+    expect(appended).toMatchObject({
+      revision: 2, appendedCount: 1, duplicateCount: 1, idempotent: false, reviewResolved: false
+    });
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(2);
+    expect(store.listOpenExtractionReviewIssues()[0]).toMatchObject({
+      id: issueId, candidateOptions: [remaining], reasonCodes: ['UNREADABLE'],
+      evidenceRefs: [spanIds[2]!]
+    });
+    const readOnly = new Database(store.databasePath, { readonly: true });
+    expect(readOnly.prepare(`SELECT status FROM member_assessment_snapshots_v3 WHERE id = 'append-assessment'`).get())
+      .toEqual({ status: 'stale' });
+    expect((readOnly.prepare(`SELECT COUNT(*) AS count FROM document_commits WHERE document_id = ?`)
+      .get(document.documentId) as { count: number }).count).toBe(1);
+    expect((readOnly.prepare(`SELECT COUNT(*) AS count FROM report_source_links WHERE document_id = ?`)
+      .get(document.documentId) as { count: number }).count).toBe(1);
+    readOnly.close();
+
+    const scopeBeforeLocalRevision = store.getOpenReviewScopeSignature(person.id);
+    const changedWithoutNewFact = store.appendCommittedFacts({
+      personId: person.id, documentId: document.documentId, expectedRevision: 2,
+      summary: '更新待核对范围', observations: [],
+      reviewUpdate: {
+        issueId, remainingCandidates: [remaining], remainingReasonCodes: ['STILL_UNREADABLE'],
+        remainingEvidenceRefs: [spanIds[2]!]
+      }
+    });
+    expect(changedWithoutNewFact).toMatchObject({ revision: 2, appendedCount: 0, reviewResolved: false });
+    expect(store.getOpenReviewScopeSignature(person.id)).not.toBe(scopeBeforeLocalRevision);
+
+    const closed = store.appendCommittedFacts({
+      personId: person.id, documentId: document.documentId, expectedRevision: 2,
+      summary: '补入丙', observations: [third],
+      reviewUpdate: {
+        issueId, remainingCandidates: [], remainingReasonCodes: [], remainingEvidenceRefs: []
+      }
+    });
+    expect(closed).toMatchObject({ revision: 3, appendedCount: 1, reviewResolved: true });
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(3);
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    const replay = store.appendCommittedFacts({
+      personId: person.id, documentId: document.documentId, expectedRevision: 2,
+      summary: '补入丙', observations: [third],
+      reviewUpdate: {
+        issueId, remainingCandidates: [], remainingReasonCodes: [], remainingEvidenceRefs: []
+      }
+    });
+    expect(replay).toMatchObject({
+      revision: 3, appendedCount: 0, duplicateCount: 1, idempotent: true, reviewResolved: true
+    });
+    expect(store.getFactRevision(person.id)).toBe(3);
+    expect(store.integrityCheck()).toBe('ok');
+    store.close();
+  });
+
+  it('已提交报告补修拒绝未知值、无接纳决定与冲突覆盖，且整笔事务回滚', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const source = store.putSourceObject({ bytes: Buffer.from('甲 5.0'), mediaType: 'text/plain', displayName: '冲突报告.txt' });
+    const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({
+      id: 'conflict-manifest', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: '冲突报告.txt', totalUnits: 1,
+      coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [],
+      createdAt: '2026-09-18T00:00:00.000Z', spans: [{
+        id: 'conflict-span', documentId: document.documentId, spanKind: 'line', page: null,
+        blockId: null, lineStart: 1, lineEnd: 1, quote: '甲 5.0', readability: 'clear'
+      }, {
+        id: 'conflict-span-independent', documentId: document.documentId, spanKind: 'line', page: null,
+        blockId: null, lineStart: 2, lineEnd: 2, quote: '甲 5.0', readability: 'clear'
+      }]
+    });
+    const acceptanceId = store.saveAcceptanceDecision({
+      method: 'auto', actor: 'policy', rulesVersion: 'test', inputSignature: 'conflict-input',
+      outputHash: 'conflict-output', reviewRef: null, decision: 'accept'
+    });
+    const first = {
+      conceptKey: '甲', originalName: '甲', rawText: '5.0', valueKind: 'numeric' as const,
+      decimalValue: '5.0', qualifier: 'eq', unit: null, referenceRange: null,
+      clinicalDate: '2026-09-18', abnormalFlag: 'unknown' as const,
+      documentId: document.documentId, sourceSpanId: 'conflict-span', acceptanceId,
+      specimen: null, method: null, bodySite: null,
+      evidence: [{ sourceSpanId: 'conflict-span', quote: '甲 5.0' }]
+    };
+    store.publishFacts({
+      personId: person.id, documentId: document.documentId, documentCommitKey: '1'.repeat(64),
+      expectedRevision: 0, changeSetHash: '2'.repeat(64), summary: '首次接纳', observations: [first]
+    });
+    const issueId = store.saveExtractionReviewIssue({
+      documentId: document.documentId, kind: 'field_conflict', severity: 'warning',
+      preserveDocumentStatus: true, stage: 'extract', evidenceRefs: ['conflict-span'],
+      candidateOptions: [], reasonCodes: ['TEST_UNRESOLVED']
+    });
+    const input = {
+      personId: person.id, documentId: document.documentId, expectedRevision: 1,
+      summary: '不应发布', reviewUpdate: {
+        issueId, remainingCandidates: [], remainingReasonCodes: [], remainingEvidenceRefs: []
+      }
+    };
+    expect(() => store.appendCommittedFacts({ ...input, observations: [{ ...first, valueKind: 'unknown' }] }))
+      .toThrow('COMMITTED_FACT_EVIDENCE_INVALID');
+    expect(() => store.appendCommittedFacts({ ...input, observations: [{ ...first, acceptanceId: 'missing-acceptance' }] }))
+      .toThrow('COMMITTED_FACT_NOT_ACCEPTED');
+    expect(() => store.appendCommittedFacts({ ...input, observations: [{ ...first, rawText: '6.0', decimalValue: '6.0' }] }))
+      .toThrow('COMMITTED_FACT_CONFLICT');
+    expect(() => store.appendCommittedFacts({ ...input, observations: [{
+      ...first, sourceSpanId: 'conflict-span-independent',
+      evidence: [{ sourceSpanId: 'conflict-span-independent', quote: '甲 5.0' }]
+    }] })).toThrow('COMMITTED_FACT_AMBIGUOUS_SOURCE');
+    expect(() => store.appendCommittedFacts({ ...input, expectedRevision: 0, observations: [] }))
+      .toThrow(RevisionConflictError);
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(1);
+    expect(store.listOpenExtractionReviewIssues()).toHaveLength(1);
+    expect(store.getFactRevision(person.id)).toBe(1);
+    expect(store.integrityCheck()).toBe('ok');
     store.close();
   });
 

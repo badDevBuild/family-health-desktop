@@ -13,13 +13,13 @@ import { ASSESSMENT_VALIDATION_RULES_VERSION } from '../assessment-validation.js
  */
 
 /** 事实提取/复核提示词版本，进入任务 inputSignature。 */
-export const EXTRACTION_PROMPT_VERSION = 'extract-v6';
+export const EXTRACTION_PROMPT_VERSION = 'extract-v8';
 
 /** 派生分析/安全复核提示词版本，写入 derived_snapshots.prompt_version。 */
 export const DERIVED_PROMPT_VERSION = 'derived-v4';
 
 /** 本地事实接纳规则版本，与 health-core 的 evaluateObservationCandidate 对齐。 */
-export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v4';
+export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v5';
 
 /** 派生安全规则版本，与 derived-pipeline 本地拦截对齐。 */
 export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
@@ -27,7 +27,7 @@ export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
 /** 成员档案 v2 的系统级综合与独立复核版本。 */
 export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v2';
 export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v2';
-export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v8';
+export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v11';
 /** 本地校验规则变化必须使旧成员快照过期，避免旧结果被误当成新规则产物。 */
 export const MEMBER_ASSESSMENT_RULES_VERSION = `lean-health-v3.9+${ASSESSMENT_VALIDATION_RULES_VERSION}`;
 export const HEALTH_PIPELINE_VERSION = 'lean-health-v3';
