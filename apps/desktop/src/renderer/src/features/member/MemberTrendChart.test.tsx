@@ -113,7 +113,7 @@ describe('MemberTrendChart', () => {
 
   it('界限值只保留在表格语义中，不伪装成精确趋势点', () => {
     render(<MemberTrendChart series={series([point('bounded', '2026-01-01', 0.1, 'lt')])} />);
-    expect(screen.getByText(/带“< \/ >”的结果会保留在表格中/)).toBeTruthy();
+    expect(screen.getByText(/结果带有“< \/ >”，暂不能直接比较。完整结果见下方表格。/)).toBeTruthy();
   });
 
   it('精确值之间出现界限值时打断折线', () => {

@@ -1,0 +1,46 @@
+{
+  "v": 3,
+  "createdOnFiles": {
+    "v": 1,
+    "at": "2026-10-26T04:09:46Z"
+  },
+  "title": "家庭健康 · 阅读体验优化",
+  "launch": {
+    "view": "canvas"
+  },
+  "pages": [],
+  "boards": {
+    "Main.dc.html": {
+      "x": 0,
+      "y": 0,
+      "w": 1440,
+      "h": 1060,
+      "title": "家庭总览",
+      "expand": "fill",
+      "is_interactive": true
+    },
+    "Member.dc.html": {
+      "x": 1520,
+      "y": 0,
+      "w": 1440,
+      "h": 1680,
+      "title": "成员档案",
+      "expand": "fill",
+      "is_interactive": true
+    }
+  },
+  "order": [
+    "Main.dc.html",
+    "Member.dc.html"
+  ],
+  "notes": {},
+  "designSystems": [
+    {
+      "title": "家庭健康",
+      "namespace": "familyhealth",
+      "artifact": "../health-system",
+      "version": null,
+      "copiedAt": "2026-10-26T04:09:46Z"
+    }
+  ]
+}

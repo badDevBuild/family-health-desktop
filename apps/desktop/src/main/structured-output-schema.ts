@@ -53,6 +53,19 @@ export function toCodexOutputSchema(schema: JsonSchema): JsonSchema {
   return adaptNode(schema, true) as JsonSchema;
 }
 
+/** nullable 外壳可能再次包住判别联合；只选择唯一、与原判别值一致的对象分支。 */
+function matchingObjectBranches(output: JsonSchema, schema: JsonSchema): JsonSchema[] {
+  const branches = schema.oneOf ?? schema.anyOf;
+  if (Array.isArray(branches)) {
+    return branches.flatMap((branch) => isRecord(branch) ? matchingObjectBranches(output, branch) : []);
+  }
+  if (!isRecord(schema.properties)) return [];
+  if (typeof schema.type === 'string' && schema.type !== 'object'
+    || Array.isArray(schema.type) && !schema.type.includes('object')) return [];
+  return Object.entries(schema.properties).every(([key, field]) => !isRecord(field)
+    || !('const' in field) || output[key] === field.const) ? [schema] : [];
+}
+
 /** 线协议用 null 表示原 Zod 契约中的可选字段；入库前恢复为“未提供”。 */
 export function restoreCodexOptionalFields(output: unknown, originalSchema: JsonSchema): unknown {
   if (Array.isArray(output)) {
@@ -73,12 +86,7 @@ export function restoreCodexOptionalFields(output: unknown, originalSchema: Json
     }
     return restored;
   }
-  const branches = originalSchema.oneOf ?? originalSchema.anyOf;
-  if (Array.isArray(branches)) {
-    const matching = branches.filter((branch) => isRecord(branch) && isRecord(branch.properties)
-      && Object.entries(branch.properties).every(([key, field]) => !isRecord(field) || !('const' in field)
-        || output[key] === field.const));
-    if (matching.length === 1) return restoreCodexOptionalFields(output, matching[0] as JsonSchema);
-  }
+  const matching = matchingObjectBranches(output, originalSchema);
+  if (matching.length === 1) return restoreCodexOptionalFields(output, matching[0]!);
   return output;
 }

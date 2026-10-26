@@ -1,12 +1,14 @@
 import type { BodySystemId, HealthEventV2, MemberEvidenceRef, MetricSeriesSummary, SystemEvidenceBundle, SystemEvidenceFact } from '@contracts';
 import { healthEventV2Schema, systemEvidenceBundleSchema } from '@contracts';
-import { bodySystemRegistry, buildMetricSeries, conceptDictionary, linkConceptToSystems, linkLegacyCandidateToSystems, linkTextToSystems, selectContextSystems, stableHash, type TrendObservationInput } from '@core';
+import { bodySystemRegistry, buildMetricSeries, classifyHealthEventType, conceptDictionary, linkConceptToSystems, linkLegacyCandidateToSystems, linkTextToSystems, selectContextSystems, stableHash, type TrendObservationInput } from '@core';
 import type { AcceptedObservationSummary, WorkspaceStore } from '@storage';
 import {
   SYSTEM_ANALYSIS_PROMPT_VERSION,
   SYSTEM_ANALYSIS_RULES_VERSION
 } from './prompts/index.js';
 import { SYSTEM_KNOWLEDGE_VERSION, knowledgeForSystem } from './system-knowledge.js';
+import { EVENT_DATE_PROJECTION_VERSION, projectEventDate, readEventDateSources } from './event-date-projection.js';
+import { withDocumentTimes, observationDisplayTime, OBSERVATION_DATE_POLICY_VERSION, type ObservationWithDocumentTime } from './observation-date-presentation.js';
 
 function parseReferenceRange(value: string | null): { low: number | null; high: number | null } {
   if (!value) return { low: null, high: null };
@@ -32,10 +34,13 @@ function evidenceFor(observation: AcceptedObservationSummary, eventId: string | 
   };
 }
 
-function evidenceSourcesFor(observation: AcceptedObservationSummary, eventId: string | null = null): MemberEvidenceRef[] {
-  const refs = observation.evidence.length > 0
-    ? observation.evidence
+function evidenceSourcesFor(observation: ObservationWithDocumentTime, eventId: string | null = null): MemberEvidenceRef[] {
+  const refs: AcceptedObservationSummary['evidence'] = observation.evidence.length > 0
+    ? [...observation.evidence]
     : [{ sourceSpanId: observation.sourceSpanId, quote: observation.sourceQuote }];
+  for (const timeRef of observation.effectiveTimeEvidence ?? []) {
+    if (!refs.some(ref => ref.sourceSpanId === timeRef.sourceSpanId && ref.quote === timeRef.quote)) refs.push(timeRef);
+  }
   return refs.map((reference, index) => ({
     id: `evidence-${observation.id}-${reference.sourceSpanId}-${index}`,
     kind: 'observation',
@@ -93,7 +98,7 @@ function trendMappingFor(observation: AcceptedObservationSummary) {
   };
 }
 
-function trendInput(observation: AcceptedObservationSummary, eventId: string | null = null): TrendObservationInput {
+function trendInput(observation: ObservationWithDocumentTime, eventId: string | null = null): TrendObservationInput {
   const range = parseReferenceRange(observation.referenceRange);
   const qualifier = ['eq', 'lt', 'lte', 'gt', 'gte'].includes(observation.qualifier ?? '')
     ? observation.qualifier as TrendObservationInput['comparator']
@@ -115,6 +120,8 @@ function trendInput(observation: AcceptedObservationSummary, eventId: string | n
     referenceHigh: range.high,
     abnormalFlag: observation.abnormalFlag,
     clinicalDate: observation.clinicalDate,
+    ...(observation.effectiveTime ? { effectiveTime: observation.effectiveTime } : {}),
+    ...(observation.documentTime ? { documentTime: observation.documentTime } : {}),
     dateRole: 'unknown',
     specimen: observation.specimen,
     method: observation.method,
@@ -128,7 +135,7 @@ function trendInput(observation: AcceptedObservationSummary, eventId: string | n
   };
 }
 
-function metricSeries(observations: AcceptedObservationSummary[], eventIds: Map<string, string>): MetricSeriesSummary[] {
+function metricSeries(observations: ObservationWithDocumentTime[], eventIds: Map<string, string>): MetricSeriesSummary[] {
   return buildMetricSeries(observations.map((observation) => trendInput(observation, eventIds.get(observation.documentId) ?? null)));
 }
 
@@ -149,39 +156,25 @@ function eventsFor(store: WorkspaceStore, personId: string, observations: Accept
     const report = reports.find((item) => item.metadataStatus === 'corrected') ?? reports[0];
     const extracted = report?.extracted;
     const dates = [...new Set(items.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)))].sort();
-    const firstDate = dates[0] ?? null;
-    const lastDate = dates.at(-1) ?? null;
-    const spanDays = firstDate && lastDate
-      ? Math.round((Date.parse(`${lastDate}T00:00:00Z`) - Date.parse(`${firstDate}T00:00:00Z`)) / 86_400_000)
-      : null;
-    const extractedClinicalTime = extracted?.times
-      .filter((time) => ['day', 'month', 'year'].includes(time.precision) && ['sampled', 'examined', 'encounter'].includes(time.role))
-      .sort((left, right) => ({ day: 3, month: 2, year: 1 }[right.precision as 'day' | 'month' | 'year']
-        - { day: 3, month: 2, year: 1 }[left.precision as 'day' | 'month' | 'year']))[0];
-    const explicitClinicalTime = report?.metadataStatus === 'corrected'
-      ? { ...report.clinicalTime, role: 'examined' as const }
-      : extractedClinicalTime;
-    const eventDate = explicitClinicalTime?.value ?? (dates.length === 1 || (spanDays !== null && spanDays <= 14) ? firstDate : null);
-    const endDate = explicitClinicalTime ? null : eventDate && lastDate !== eventDate ? lastDate : null;
-    const eventPrecision = explicitClinicalTime?.precision as 'year' | 'month' | 'day' | undefined
-      ?? (eventDate ? 'day' : 'unknown');
+    const { eventDate, endDate, eventPrecision, explicitClinicalTime, basis } = projectEventDate(
+      readEventDateSources(store, personId, reports), dates);
     const verifiedEventText = reports.map((item) => (
       item.metadataStatus === 'corrected'
         ? [item.reportKind, item.title]
         : [item.extracted?.reportKind?.value, item.extracted?.title?.value]
     ).filter(Boolean).join(' ')).join(' ');
-    const looksLikeCheckup = /体检|健康检查|健康体检/i.test(verifiedEventText);
-    const looksLikeImaging = items.some((item) => /超声|彩超|ct|mr|磁共振|x线|dr|影像/i.test(`${item.method ?? ''}${item.conceptKey}`));
     // 父事件优先使用已提取/已修正的报告元数据。文件名不是临床元数据，
     // 而年度体检中包含一个影像子项也不应把整个父事件改成“影像”。
-    const type: HealthEventV2['type'] = looksLikeCheckup
-      ? 'checkup'
-      : /(影像|超声|彩超|ct|mr|磁共振|x线|dr)/i.test(verifiedEventText)
-        ? 'imaging'
-        : looksLikeImaging && reports.length === 0 ? 'imaging' : 'laboratory';
+    const type = classifyHealthEventType({
+      verifiedReportText: verifiedEventText,
+      fallbackObservationTexts: reports.length === 0 ? items.flatMap((item) => [
+        item.method ?? '', item.originalNameStatus === 'recorded' ? item.originalName : ''
+      ]) : []
+    });
+    const looksLikeCheckup = type === 'checkup';
     const fallbackTitle = type === 'checkup'
       ? `${eventDate?.slice(0, 4) ?? '日期待确认'} 年度体检`
-      : type === 'imaging' ? '影像检查' : '检验记录';
+      : type === 'imaging' ? '影像检查' : type === 'laboratory' ? '检验记录' : '检查记录';
     return healthEventV2Schema.parse({
       id: report?.eventId ?? `event-document-${first.documentId}`,
       personId,
@@ -191,9 +184,10 @@ function eventsFor(store: WorkspaceStore, personId: string, observations: Accept
         value: eventDate,
         endValue: endDate,
         precision: eventPrecision,
-        role: explicitClinicalTime?.role === 'sampled' ? 'specimen' : explicitClinicalTime ? 'exam' : looksLikeCheckup ? 'exam' : 'unknown',
-        source: explicitClinicalTime ? 'explicit' : eventDate ? 'inherited' : 'unknown',
-        displayLabel: eventDate ? (endDate ? `${eventDate} 至 ${endDate}` : eventDate) : '报告日期待确认'
+        role: eventDate === null ? 'unknown' : basis === 'report' ? 'report' : explicitClinicalTime?.role === 'sampled' ? 'specimen' : explicitClinicalTime ? 'exam' : looksLikeCheckup ? 'exam' : 'unknown',
+        source: explicitClinicalTime || basis === 'report' ? 'explicit' : eventDate ? 'inherited' : 'unknown',
+        basis,
+        displayLabel: eventDate ? `${endDate ? `${eventDate} 至 ${endDate}` : eventDate}${basis === 'report' ? ' · 按报告日期' : ''}` : '日期未记录'
       },
       organization: report?.metadataStatus === 'corrected' ? report.organization : extracted?.organization?.value ?? report?.organization ?? null,
       department: report?.metadataStatus === 'corrected' ? report.department : extracted?.department?.value ?? null,
@@ -235,7 +229,9 @@ export function buildSystemEvidenceBundle(
   store: WorkspaceStore,
   personId: string,
   systemId: BodySystemId,
-  options: { modelId?: string; analysisWindow?: 'all_history'; excludedDocumentIds?: ReadonlySet<string> } = {}
+  options: { modelId?: string; analysisWindow?: 'all_history'; excludedDocumentIds?: ReadonlySet<string>;
+    /** 同一次成员输入构建已完成的只读投影，避免每个系统重复读取全部原件出处。 */
+    preparedObservations?: readonly ObservationWithDocumentTime[] } = {}
 ): SystemEvidenceBundle {
   const person = store.listPersons().find((item) => item.id === personId && item.archivedAt === null);
   if (!person) throw new Error('PERSON_NOT_FOUND');
@@ -243,11 +239,11 @@ export function buildSystemEvidenceBundle(
   const conflictedDocumentIds = new Set(store.listOpenExtractionReviewIssues()
     .filter((issue) => issue.personId === personId && issue.kind === 'person_conflict')
     .map((issue) => issue.documentId));
-  const observations = store.listAcceptedObservations(personId)
-    .filter((observation) => !conflictedDocumentIds.has(observation.documentId)
+  const observations = (options.preparedObservations ?? withDocumentTimes(store, personId, store.listAcceptedObservations(personId)))
+    .filter((observation) => observation.personId === personId && !conflictedDocumentIds.has(observation.documentId)
       && !options.excludedDocumentIds?.has(observation.documentId));
   const eventIdsByDocument = new Map(store.listReportMetadata(personId).map((item) => [item.documentId, item.eventId]));
-  const selected: Array<{ observation: AcceptedObservationSummary; fact: SystemEvidenceFact }> = [];
+  const selected: Array<{ observation: ObservationWithDocumentTime; fact: SystemEvidenceFact }> = [];
   const unclassifiedObservationIds: string[] = [];
   const excludedObservationIds: string[] = [];
   const unusableObservationIds: string[] = [];
@@ -273,14 +269,7 @@ export function buildSystemEvidenceBundle(
         name: displayNameFor(observation),
         value: `${observation.rawText}${observation.unit ? ` ${observation.unit}` : ''}`,
         abnormalFlag: observation.abnormalFlag,
-        time: {
-          value: observation.clinicalDate,
-          endValue: null,
-          precision: observation.clinicalDate ? 'day' : 'unknown',
-          role: 'measurement',
-          source: observation.clinicalDate ? 'explicit' : 'unknown',
-          displayLabel: observation.clinicalDate ?? '日期未记录'
-        },
+        time: observationDisplayTime(observation, false),
         relation: link.relation,
         relationReason: link.relation === 'direct'
           ? '该事实属于此身体系统的直接检查或测量。'
@@ -291,7 +280,8 @@ export function buildSystemEvidenceBundle(
     });
   }
   const selectedObservations = selected.map((item) => item.observation);
-  const dates = selectedObservations.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)).sort();
+  const dates = selectedObservations.map((item) => item.clinicalDate ?? (item.effectiveTime?.precision === 'day' ? item.effectiveTime.value : null))
+    .filter((value): value is string => Boolean(value)).sort();
   const factRevision = store.getFactRevision(personId);
   const contextRevision = store.getClinicalContextRevision(personId);
   const allNotes = store.listManualNotes(personId);
@@ -354,6 +344,7 @@ export function buildSystemEvidenceBundle(
       unit: item.observation.unit,
       referenceRange: item.observation.referenceRange,
       clinicalDate: item.observation.clinicalDate,
+      effectiveTime: item.observation.effectiveTime ?? null,
       abnormalFlag: item.observation.abnormalFlag
     })),
     unusableObservationIds,
@@ -368,12 +359,14 @@ export function buildSystemEvidenceBundle(
     eventDependencies,
     knowledge,
     selectorVersions: {
+      observationDatePolicy: OBSERVATION_DATE_POLICY_VERSION,
       conceptDictionary: conceptDictionary[0]?.version ?? 'unknown',
       systemRegistry: bodySystemRegistry[0]?.version ?? 'unknown',
       contextSelector: 'context-selector-v2-global-safety-first',
       actionSelector: 'action-selector-v1',
       analysisWindow: 'all-history-v1',
       sourceFactFilter: 'nonempty-result-v1',
+      eventDateProjection: EVENT_DATE_PROJECTION_VERSION,
       knowledge: SYSTEM_KNOWLEDGE_VERSION
     },
     promptVersion: SYSTEM_ANALYSIS_PROMPT_VERSION,

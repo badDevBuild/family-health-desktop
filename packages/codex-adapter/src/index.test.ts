@@ -16,6 +16,16 @@ function createHarness() {
 }
 
 describe('Codex RPC framing', () => {
+  it('正式initialize允许推理摘要活动信号，但继续禁收原始推理正文', async () => {
+    const harness = createHarness(); const pending = harness.client.initialize();
+    const request = JSON.parse((harness.toServer.read()?.toString() ?? '').trim());
+    expect(request.params.capabilities.optOutNotificationMethods).toContain('item/reasoning/textDelta');
+    expect(request.params.capabilities.optOutNotificationMethods).not.toContain('item/reasoning/summaryTextDelta');
+    expect(request.params.capabilities.optOutNotificationMethods).toContain('item/reasoning/summaryPartAdded');
+    harness.fromServer.write(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+    await pending; harness.client.shutdown();
+  });
+
   it('能把拆分的响应帧关联到请求', async () => {
     const harness = createHarness();
     const request = harness.client.request<{ ok: boolean }>('account/read', {});

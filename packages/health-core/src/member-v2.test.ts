@@ -3,6 +3,7 @@ import { cardiovascularLongitudinalFixture, thyroidAliasFixture } from '../../te
 import {
   bodySystemRegistry,
   buildMetricSeries,
+  classifyHealthEventType,
   linkConceptToSystems,
   mapConcept,
   normalizeUnit,
@@ -13,6 +14,27 @@ import {
 function asTrendInput(value: unknown): TrendObservationInput {
   return value as TrendObservationInput;
 }
+
+describe('检查事件只按明确依据分类', () => {
+  it.each([
+    ['儿童眼科检查报告', 'other'], ['视力及电脑验光检查', 'other'], ['心电图检查', 'other'],
+    ['肺功能检查', 'other'], ['普通检查报告', 'other'], ['', 'other'],
+    ['检验报告', 'laboratory'], ['血液化验报告', 'laboratory'], ['Laboratory report', 'laboratory'],
+    ['ACTH检验报告', 'laboratory'], ['HLA-DR检验报告', 'laboratory'],
+    ['胸部CT检查', 'imaging'], ['MR检查报告', 'imaging'], ['甲状腺彩超', 'imaging'], ['X线检查', 'imaging'],
+    ['年度健康体检：检验与胸部CT', 'checkup'], ['检验与影像联合记录', 'other'],
+    ['ACTH', 'other'], ['HCT', 'other'], ['HLA-DR', 'other']
+  ] as const)('%s → %s', (verifiedReportText, expected) => {
+    expect(classifyHealthEventType({ verifiedReportText })).toBe(expected);
+  });
+
+  it('有报告类型时不让单项影像覆盖父事件；无元数据时才用已接纳的检查描述', () => {
+    expect(classifyHealthEventType({ verifiedReportText: '普通检查', fallbackObservationTexts: ['胸部CT'] })).toBe('other');
+    expect(classifyHealthEventType({ verifiedReportText: '', fallbackObservationTexts: ['甲状腺超声'] })).toBe('imaging');
+    expect(classifyHealthEventType({ verifiedReportText: '', fallbackObservationTexts: ['化验'] })).toBe('laboratory');
+    expect(classifyHealthEventType({ verifiedReportText: '', fallbackObservationTexts: ['LDL-C', 'mmol/L'] })).toBe('other');
+  });
+});
 
 describe('成员档案 v2 的术语与身体系统规则', () => {
   it('提供稳定、有顺序且不重复的 12 个身体系统', () => {
@@ -44,6 +66,16 @@ describe('成员档案 v2 的术语与身体系统规则', () => {
 
   it('保留未知术语，不用模糊匹配自动改名', () => {
     expect(mapConcept({ rawName: '一个新的甲状腺复合指数' })).toMatchObject({ status: 'unmapped', conceptId: null });
+  });
+
+  it.each(['右眼电脑验光球镜', '左眼电脑验光球镜'])('设备词不把%s归入神经系统', (rawName) => {
+    expect(linkConceptToSystems(mapConcept({ rawName, unit: 'D' })))
+      .toEqual([{ systemId: 'sensory_oral', relation: 'direct' }]);
+  });
+
+  it.each(['脑电图', '脑神经检查', '电脑辅助脑电图'])('保留%s的神经系统归类', (rawName) => {
+    expect(linkConceptToSystems(mapConcept({ rawName })))
+      .toContainEqual({ systemId: 'neurological', relation: 'direct' });
   });
 
   it('同一事实可以直接归属一个系统并作为另一个系统的上下文', () => {

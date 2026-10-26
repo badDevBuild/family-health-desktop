@@ -19,7 +19,7 @@ export interface LegacyDocConversionResult {
 }
 
 export interface LegacyDocConverter {
-  convert(bytes: Uint8Array): Promise<LegacyDocConversionResult>;
+  convert(bytes: Uint8Array, inputFormat?: 'doc' | 'docx'): Promise<LegacyDocConversionResult>;
 }
 
 export interface LibreOfficeRuntimeManifest {
@@ -100,7 +100,8 @@ export class LibreOfficeLegacyDocConverter implements LegacyDocConverter {
     private readonly timeoutMs = 45_000
   ) {}
 
-  async convert(bytes: Uint8Array): Promise<LegacyDocConversionResult> {
+  async convert(bytes: Uint8Array, inputFormat: 'doc' | 'docx' = 'doc'): Promise<LegacyDocConversionResult> {
+    if (inputFormat !== 'doc' && inputFormat !== 'docx') throw new Error('WORD_CONVERSION_FORMAT_INVALID');
     if (!existsSync(this.executablePath)) throw new Error('LEGACY_DOC_CONVERTER_MISSING');
     const executableSha256 = sha256(readFileSync(this.executablePath));
     if (executableSha256 !== this.expectedExecutableSha256) throw new Error('LEGACY_DOC_CONVERTER_HASH_MISMATCH');
@@ -126,7 +127,7 @@ export class LibreOfficeLegacyDocConverter implements LegacyDocConverter {
         throw new Error('LEGACY_DOC_CONVERTER_VERSION_MISMATCH');
       }
 
-      const sourcePath = join(root, 'source.doc');
+      const sourcePath = join(root, `source.${inputFormat}`);
       writeFileSync(sourcePath, bytes, { mode: 0o600 });
       const profileUrl = pathToFileURL(profile).href;
       await runProcess({

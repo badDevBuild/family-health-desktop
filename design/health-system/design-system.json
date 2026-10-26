@@ -1,0 +1,25 @@
+{
+  "v": 3,
+  "layout": "files",
+  "createdOnFiles": {
+    "v": 1,
+    "at": "2026-10-26T04:09:46Z"
+  },
+  "title": "家庭健康",
+  "namespace": "FamilyHealth",
+  "libraries": [],
+  "sections": {},
+  "groups": [],
+  "assetGroups": {},
+  "blobs": {},
+  "docs": {
+    "readme": "README.md",
+    "sections": []
+  },
+  "lastChange": {
+    "by": "Family Health Desktop Contributors",
+    "at": "2026-10-26T04:09:46Z",
+    "via": "Codex",
+    "note": "从现有规范与桌面源码整理设计基础，保留来源值并说明可读性用法"
+  }
+}

@@ -12,14 +12,14 @@ import { ASSESSMENT_VALIDATION_RULES_VERSION } from '../assessment-validation.js
  * 因此递增后旧结果会被视为过期而不是幂等复用。
  */
 
-/** 事实提取/复核提示词版本，进入任务 inputSignature。 */
-export const EXTRACTION_PROMPT_VERSION = 'extract-v8';
+/** 事实提取/复核提示词版本；明确原件行列/字段身份及互补结果来源，进入任务 inputSignature。 */
+export const EXTRACTION_PROMPT_VERSION = 'extract-direct-original-v23';
 
 /** 派生分析/安全复核提示词版本，写入 derived_snapshots.prompt_version。 */
 export const DERIVED_PROMPT_VERSION = 'derived-v4';
 
-/** 本地事实接纳规则版本，与 health-core 的 evaluateObservationCandidate 对齐。 */
-export const ACCEPTANCE_RULES_VERSION = 'health-acceptance-v5';
+/** 原件直读的技术接纳与来源对账规则版本，进入任务与读取缓存签名。 */
+export const ACCEPTANCE_RULES_VERSION = 'direct-original-acceptance-v22';
 
 /** 派生安全规则版本，与 derived-pipeline 本地拦截对齐。 */
 export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
@@ -27,11 +27,11 @@ export const DERIVED_SAFETY_RULES_VERSION = 'derived-safety-v2';
 /** 成员档案 v2 的系统级综合与独立复核版本。 */
 export const SYSTEM_ANALYSIS_PROMPT_VERSION = 'system-analysis-v2';
 export const SYSTEM_ANALYSIS_RULES_VERSION = 'system-analysis-safety-v2';
-export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v11';
-/** 本地校验规则变化必须使旧成员快照过期，避免旧结果被误当成新规则产物。 */
-export const MEMBER_ASSESSMENT_RULES_VERSION = `lean-health-v3.9+${ASSESSMENT_VALIDATION_RULES_VERSION}`;
+export const MEMBER_ASSESSMENT_PROMPT_VERSION = 'member-assessment-v51';
+/** 本地校验变化使生成缓存失效；已登记的旧结果仍可只读查看，不冒充新版产物。 */
+export const MEMBER_ASSESSMENT_RULES_VERSION = `lean-health-v3.61+${ASSESSMENT_VALIDATION_RULES_VERSION}`;
 export const HEALTH_PIPELINE_VERSION = 'lean-health-v3';
-export const RUNTIME_PROMPT_VERSION = 'health-runtime-v3';
+export const RUNTIME_PROMPT_VERSION = 'health-runtime-v4';
 
 export interface PromptSection {
   title: string;
@@ -112,7 +112,16 @@ export const NARRATIVE_LEVEL_GUIDE: string[] = [
  */
 export const FAMILY_TONE_RULES: string[] = [
   '读者是这位成员本人和家人，可能是 60 岁以上、不了解医学的老人：用平静、尊重、日常的语言，专业术语先用白话解释再给数值。',
+  '主要指标和健康问题说清“指标是什么—本人这次结果—与以前的变化—意味着什么—下一步”。先解释术语的日常含义，再结合本人日期、结果和范围；无可比历史时直说只有单次记录，不造趋势。',
+  '每一句面向家人的话都应帮助理解身体情况、解释必要临床条件或给出具体下一步；标题说主线，摘要补意义和重点行动，不逐条重复全部 claims，也不用原始数值列表代替解释。',
   '只呈现最终结论，不叙述工作过程：不要写“经核对”“模型判断”“系统检测到”“两轮读取”之类的话。',
+  '直接说明差值和比较条件，不写“程序提供的差值”或计算来自哪个软件。无法下结论时解释缺少的本人检查、症状或条件，不说“本轮没有诊断标准”“未做标准匹配”之类的软件工作说明。',
+  '原报告的医生安排直接说明安排内容及其当时背景，不解释“原文明确、可按原文保留”等编辑决定。未提供某项记录不等于本人没有该记录；未知背景用“本次未提供”表述。',
+  'overview、system、claim、action、question 的所有正文，包括 rationale、materialUncertainty、limitations、why、firstStep 等，都不写提取、接纳、入库、发布、隔离、重跑、验证状态、阶段编号、内部 ID、哈希或版本。处理问题由应用在处理中心表达，不能变成健康判断或让用户替模型复核。',
+  '保留真正影响医学理解的条件和范围：未散瞳、是否空腹、用药时点、孕周未提供、检测方法不可比、资料日期、缺少关键检查等。医学上尚不能确定的内容须指出具体条件及它影响哪项判断，不使用软件处理失败替代医学不确定。',
+  '儿童、孕期、老人及身体限制实际影响相关说明和行动；不从姓名猜年龄或性别，也不对无关的未知设置固定问卷。没有资料时说清目前能知道的范围和补充什么有帮助，不填“正常”。',
+  '原报告已有诊断、药名、剂量和医嘱按时间、来源如实转述；过去的医嘱不是今天重新给出的建议。当前关联解释标注仅供参考，不升级为新的医生确诊，不新增个体处方、药物启停或加减量指令。',
+  '只有实际引用的报告原文写有对应安排，才能使用 documented_plan 或 timingBasis=documented；在 firstStep 中保留可对应的具体原安排，不只写“遵医嘱”。普通检验结果、本人自述、知识来源和 AI 建议不能充当医生安排的来源。相对时间保留原文，不从本次处理或采纳日期重新起算。',
   '不用无证据的恐吓性措辞，也不用空洞安慰；若资料本身出现需要及时就医的明确线索，要用平静、直接、可行动的方式说清楚。',
   '说明中不得出现姓名、内部 ID、文件名或本机路径。'
 ];

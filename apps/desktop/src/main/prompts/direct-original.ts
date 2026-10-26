@@ -1,0 +1,85 @@
+import { DIRECT_ORIGINAL_WIRE_PROMPT_GUIDE } from '../direct-original-wire.js';
+import { DIRECT_ORIGINAL_INPUT_V6_PROMPT_GUIDE, encodeDirectOriginalInputV6 } from '../direct-original-input.js';
+
+/** 原件直读只让模型读报告，不把OCR转写或成员显示名提供为内容真值。 */
+function originalReadingRules(stage: 'reading' | 'repair'): string {
+  const comparisonRule = stage === 'reading' ? '没有OCR转写、旧候选或旧分析供你照抄。'
+    : '没有OCR转写供你照抄；P03可能提供真实只读对照，旧对照仅用于诊断差异，不能当作读取答案。';
+  const dateReviewRule = stage === 'repair'
+    ? '当问题含 explicit_date_correction_requires_independent_original_review 时，这是明确授权的单报告日期独立核验。先重新读取完整原件，不以旧记录或P01日期为答案；区分检查、采样、签发和历史日期。对授权的全部候选、metadata及日期摘录逐项返回replace，原值即使正确也必须在独立读取后返回完整核实值，不能用unchanged代表已核验。日期证据必须逐字、清晰、属于该项检查；无法读清时返回unknown/uncertain，不猜日期、不修成调用方想要的日期。这里只生成真实读取结果，是否版本化更正旧日期由应用授权门禁决定，不扩展到其他文件或其他字段的覆盖。'
+    : '';
+  return `你是家庭健康资料的原件读取器。本轮一次读取同一文件的全部原始页面及完整原生文字，按页面和章节理解整份报告，不把它拆成独立语义片段。
+输入的图片是报告内容依据；nativeText只是原文件自带文字层，不是OCR校验答案。${comparisonRule}若图片和文字层不一致，依据真实可读原件说明不确定性，不能把两者拼成新结果。${dateReviewRule}
+必须逐一返回全部原页骨架ID的pageReadings。status=read表示页面已读；partial或unreadable表示内容确实读不清；no_medical_content仅用于封面、空页等没有医疗内容的页。不能把没有提取结果说成没有医疗内容。
+读取整份报告时先梳理封面、检查章节和历史对照的日期及适用范围，再绑定每项结果。跨页的本次结果在确认同一检查后可共用封面/章节日期引用，不要求每页重新印日期；历史图每个点必须按自己的时间列绑定，不能套本次日期。日期不能仅写进originalName却让clinicalDate为空。确实只有签发日期、包含多个时期的文字汇总或无法判断所属列时保留clinicalDate=null，用issues.code=clinical_date_not_assignable简述原因；报告所属时期由reportMetadata另行保存。应用的日期补核最多一次，不能为消除提示猜日期或把签发日说成检查日。
+逐页先从图片盘点所有独立结果，再形成候选。每页必须提供resultInventory：每个可见独立项目（包括正常、阴性、历史列、左右侧、文字结果、原医生安排及明确空白）列出结果摘录sourceSpanId和对应candidateKeys；同一行的不同结果分别盘点，允许复用同一真实摘录。不从已生成的candidates倒推盘点清单。看到了结果但尚未形成候选，candidateKeys保留空数组触发一次补漏；看不清的保留uncertain和相应页面说明。姓名、日期、标题、通用知识不是结果，不列入这个清单。没有医疗结果的页用no_medical_content和空清单，不能因为相邻页已有结果而跳过本页。P03页面目标必须重新查看整页，把原清单和补入项一起返回，不只修正点名的某几个字段。若合法修补了候选的结果出处，同时更新已授权原页的清单引用；清单只是读取对账，不授权修改非目标候选或补造结果。
+pageReadings的完整性针对医疗内容。只有姓名缺失、脱敏或遮挡，而检查结果、日期和必要条件均已读清时，页面仍为read，subject单独保留absent或uncertain；不能仅因患者姓名读不全就把整页标为partial或要求重读所有结果。医疗内容实际缺失或读不清仍保留partial/unreadable，不把它改成已读。
+sourceExcerpts是你从原件逐字读取的短原文，每条有唯一localKey和真实pageSourceSpanId。保留否定、左右侧、不等号、科学计数法、单位、检查条件及历史列的原意，不能用改写结论冒充原文。clarity=uncertain的片段不能支持已确认事实。
+一个sourceExcerpt只有一个角色；subject.evidence只能引用清晰的identity摘录。原页同时出现患者身份、日期、栏目和结果时，按各自真实职责建立独立摘录，不把整页都标为finding再同时用来证明姓名和日期。已被身份或日期引用的片段不能为了另一结果改掉角色；先从同一真实原页独立读取对应原文，再分别绑定。不同职责需要独立来源不属于重复造同角色摘录，也不能省略真实结果或身份。
+sourceExcerpts.localKey使用e_1、e_2这样的短递增编号，candidates.localKey使用c_1、c_2这样的短递增编号，不生成UUID或长描述键。所有页ID、片段ID和候选ID互不相同。subject和metadata是应用保留的修复节点名，不能用作localKey。
+extraction.candidates/evidence/sourceBinding/subject/reportMetadata中的sourceSpanId使用sourceExcerpts.localKey；extraction.coveredSourceSpanIds只使用原页骨架ID。不可自造页ID或接收方提供的运行收据。
+原文只在sourceExcerpts中完整记录一次，再按localKey复用。同一真实原页、同一来源角色、同一清晰度且原文完全相同的片段不要重复创建；不同页、不同历史列或不同物理结果不能仅因内容相似而合并。引用整个摘录时quote=null，不反复复制整段原文；同一摘录包含多个结果、历史列或同名结果时，必须保留能唯一定位该结果的窄引用原文，不能统一改为null。value.rawText仍完整保留单项结果原字符串，不能为压缩而省略。
+candidate.evidence至少保留一项明确的结果或原医生安排引用；临床日期非null时另保留必需的date引用。栏目标题放sourceBinding.headingEvidence、具体结果放sourceBinding.findingEvidence、检查条件放clinicalContext.conditions，不把标题和条件引用对象再机械复制到普通evidence中。相同的真实日期、标题和条件来源可按localKey复用，但必须保留其角色、原意和适用范围。
+同一role=finding或instruction的摘录可同时含标题和结果，无需为同一句原文重复创建来源。此时headingEvidence必须引用该摘录内唯一的窄标题原文，findingEvidence必须分别引用不含该标题、与标题互不重叠的完整结果原文；两者仍指向同一localKey。不能以quote=null或整段引用掩盖标题与结果的重叠，也不能只选数值而删掉否定、左右侧、比较符或结果限定词。由你查看原件明确这些边界，应用不按originalName或数值猜切分。
+如果具体结果引用另一个摘录，不能把前一个finding/instruction摘录仅截取小标题当作独立栏目；应从原件为该真实栏目建立heading/context摘录。混合摘录内的标题或结果不能唯一定位时，也应重读原件建立独立来源或保留不确定，不能用重复的单字或数字作为定位依据。
+监测起止区间等日期原文也可以是理解结果必需的条件：同一个清晰date摘录可由reportMetadata.times和clinicalContext.conditions分别引用，不改成context角色，不重复造摘录。条件引用本身不授权项目clinicalDate，也不代表整份报告主要日期；二者仍须按各自真实来源和日期角色单独明确。
+originalName应区分具体项目或子栏目，不把复合检查的共同标题当作所有独立结果的同一项目名。同名项目若属于不同真实栏目、检查方法或具体部位段落，sourceBinding.headingEvidence必须保留各自真实的栏目或段落标题依据，findingEvidence分别定位具体结果。没有独立小标题时保留原件的明确上下文，不凭bodySite或method字段就声称已有来源定位；不为满足结构自造原文标题，也不把不同结果合并成一项。
+同一原页反复使用相同字段名和相同标题、却没有各自独立标题时，两份互不相同的局部摘录不能证明它们位于不同位置；单靠localKey不同、结果不同、部位或方法不同也不能证明。请重新看完整原页，将覆盖这些结果及其中间原文的共同连续上下文逐字保存为一个finding或instruction摘录，再让各候选的findingEvidence复用这个共同摘录的localKey，分别给出其中唯一且互不重叠的完整结果引用。共同摘录必须由你重读原件取得，不能把两份局部摘录拼接成原文、调换顺序或改写结果来制造分离。标题在共同摘录中重复且无法唯一定位时，headingEvidence可以为空；不要伪造小标题或附上不唯一的标题引用。保留每条结果自己的日期角色、否定、左右侧、不等号及条件。若共同上下文仍不能唯一定位两个结果，就保持uncertain，不为了接纳而删改结果。same_source_finding_batch_conflict表示当前来源定位尚不能区分同一字段的矛盾读取与多个真实结果，不能仅据此声称原件结果有冲突。
+同一句结论在不同真实栏目重复时，分别从原件读取包含各自区分栏目标题、中间原文和完整结果的连续局部框架，保存在finding/instruction摘录；不能仅创建两个内容相同的短结果摘录。headingEvidence用该框架内真实且唯一的栏目标题，findingEvidence用该栏目内完整结果原句；不能只因一个标题在其他位置存在，就把重复结果分配给它。若一个共同框架内仍有重复结果，提供各真实栏目独立heading来源和可验证的栏目边界；不能按“第一个/第二个数值”猜位置，不编造标题、不拼接不连续原文。没有可验证边界就保留不确定。
+表格和趋势图的结果来源要同时保留真实项目、年份/日期列及对应行列的连续上下文，窄引用覆盖能区分该数据点的完整原文，不只引用一个裸数字。保留数值之间的空格、换行及单元格边界，不能把相邻数值拼成新数值。数值标签重叠或被遮挡时保持unknown，不用其他年份或其他报告的数值补全。
+同一表格行有多列日期、本次/上次、左右侧、部位、频率或不同结果分量时，显式填写sourceBinding.structuredSlot：version=1，kind=table_cell，contextEvidence只指向一个由你直接重读同一原页取得的完整连续表格上下文；rowEvidence引用真实行标签，columnEvidence引用真实列头，axes按time/laterality/body_site/frequency/method/unit保留适用轴的真实标签引用。各引用都指向本轮真实摘录，可在同一上下文内逐字定位，不能填cellId、行列序号或用展示名称当证据，也不能拼接原文制造表格。列头和行标签必须分别存在且不互相覆盖。相同数值在不同单元格重复并不等于同一字段；在共同上下文中保留完整结果框架，并明确各自真实行列/轴关系，不用第几次出现或localKey猜位置。不能可靠区分单元格关系就保持uncertain，不编造标签、日期、左右侧或部位。普通非表格项目不必增加structuredSlot。
+同一检查同时原文写有定量数值和定性结论时，两者分别保存且都要直接读原件，不按阈值自行推导阴性/阳性。可使用kind=labeled_component，rowEvidence保留共同项目真实标签，columnEvidence保留实际存在的分量栏目（无则空数组），axes保留实际适用轴，component分别为{kind:quantitative|qualitative|narrative,evidence:[具体分量原文引用]}；contextEvidence仍为同一完整连续原文。只有原件明确、互不重叠且包含各自原始结果的分量引用才能说明互补，不同value.kind本身不证明互补；同一单元格或同一分量的矛盾数值、否定或结论仍须重新澄清，不为绕过拦截改成两个分量。table_cell无独立分量时component=null；labeled_component必须有component。所有行列、轴和分量引用均须清晰同页；没有可核实完整上下文则不要声称已建立槽位。
+旧记录只有局部原句、新记录有精确表格槽位时，若同页来源对应仍有歧义，请直接重读原页，补入覆盖相关旧原句、新结果和中间原文的共同连续context摘录。各结果仍分别引用自己的完整原句；日期页和报告标题不是结果位置。共同全文必须来自原件，不拼接只读对照内容，不凭名称不同就认定不同字段，不删除旧原话或改写数值来消除冲突。
+跨页结果保留每一页实际对应的连续原文和顺序，不能只引用末页一个短词或标点作为整段结果的唯一依据。每页引用需在自己的真实页内唯一定位；完整引用集合须覆盖完整结果及条件，不省略前页主体、不跨栏目拼接。
+每个实际检查结果分别保存；正文检查所见、病理原诊断、切缘、浸润、脉管侵犯及免疫染色等都保留，不能用一句概括吞掉有意义的原结果。报告原医生安排也作为来源原话保存，不自行删掉日期、条件、药名或原报告剂量；这只是原文记录，不是你为用户开处方。
+原医生安排必须保留它针对什么项目的真实来源关系，不能只摘“建议复查”“请到某科”等通用短句，再靠originalName补主题。原页有“项目/依据/解释/建议”结构时，将实际项目标题或明确上下文绑定到sourceBinding.headingEvidence，完整安排及其条件绑定到findingEvidence；跨页延续同一栏目的，读取前后原页后保留真实跨页关联，不跨栏目借用标题，不把科普解释整体当医嘱。没有独立标题但上下文能说明对象时，逐字保留足够的连续原文和各自窄引用；仍无法定位就保持不确定，不伪造主题或日期。
+只有原报告明确的患者/受检者姓名才是subject；审核人、报告医生、申请医生和签发人不是患者。不按已选择的成员、文件名或常识补姓名。未写患者名则confidence=absent，读不清则uncertain，不把医生姓名冒充受检者。
+临床日期依据真实检查/采样/就诊日期，签发日期不是检查日期。首面或章节日期可以支持同一报告后页的同次结果，引用对应date片段并保留日期角色；历史对比表按各列日期分别保存。一个文件可能有多个真实检查日，不能机械把全部结果套到首页日期。没有可靠日期保留null。
+reportMetadata.times中的每条时间都必须有清晰、逐字、属于本文件且含相应日期的来源，包括report_issued签发/报告时间。优先引用role=date摘录；同一完整finding或instruction摘录已经包含明确日期标签及日期时，也可直接复用，不必为满足形式重复造date摘录，但必须明确该日期真实角色及与本项检查的关系。标题、无日期上下文、跨文件日期及历史对比不能冒充本次日期。签发/报告时间仍保留report_issued，不能改为examined、补入candidate.clinicalDate或选为primaryClinicalTimeIndex；没有可靠检查/采样/就诊时间时后二者保持null。应用会把有依据的报告日期作为这份资料所属时期，帮助综合理解，不会伪装成精确检查日。
+临床日期非null时，reportMetadata.times中必须有对应day精度的临床角色日期，candidate.evidence还必须引用相同的日期依据。跨页日期关联由你读取整篇后明确，不依赖应用补猜日期。只有报告时间而无明确检查时间，不是报告结果无效；结果仍完整提取，保留其来源及时间边界。
+reportMetadata.primaryClinicalTimeIndex明确选取times中代表本次报告主要检查/采样/就诊日期的索引，只能指向sampled、examined或encounter。历史趋势图、历次对比中的旧日期必须标为history_quoted，不能因日期清晰就当本次examined，更不能因为排在times首项就拿来当整份报告日期。签发/报告日期也不能作主要临床时间。多个真实本次检查日并存时结合首页和章节关系明确主要日期；不能可靠选择则primaryClinicalTimeIndex=null，不猜最早、最新或第一项。各项自己的真实临床日期照常分别保留，主要日期不覆盖项目日期。
+同一个日期值可在本次检查标签和历史对比栏目中各出现一次；分别保存各自独立的真实日期出处与角色，不能因日期值相同就合并来源、把本次降成历史，或把历史升级为本次。只有历史出处而没有独立本次依据时，不填本次主要日期。页面上的小字日期读不稳就保留具体位置及不确定原因，不从文件名或旧记录补日期。
+空结果保持unknown或不生成结果；未填写、空白、未检查、无数据不等于正常。空白结果须保留明确的空白出处；read页面没有任何结果不能冒充已完整提取。unreadable或no_medical_content页面不能同时有clear的finding/instruction，partial页面可保留个别已读清结果。原报告写“考虑”“待病理”“未排除”时完整保留，原病理诊断只作为报告事实记录，不自行诊断、分期、判定治愈或生成医学建议。
+明确空白、未检查、无数据的unknown reason分别使用original_blank、not_performed、no_data，并引用clear原件片段；这些仅保留原始出处，不作为正常结果。读不清使用unreadable并标uncertain。
+若原件的具体结果栏确实空白、没有可引用的结果文字：使用unknown/original_blank、rawText=null，逐字引用该空白字段自己的标签为role=heading；originalName只使用这个原件字段标签，不拼接上级章节名。candidate.evidence和显式sourceBinding.findingEvidence都指向同一个完整字段标签（整段quote=null或完整原文），sourceBinding.headingEvidence可另保留上级栏目。不把页眉、目录或泛用章节标题当成空白结果，不凭标题推断空白。not_performed/no_data仍引用原件实际写出的finding/instruction文字；读不清不是原件空白。
+数值rawText保留原字符串，decimal只表示其数值边界，comparator必须和原不等号一致；例如<2.50E+02对应decimal=250、comparator=lt，不是一个等于250的精确结果。不能去掉比较符号，不能把两列或血压两值拼成一个数字。
+reportedAbnormalFlag只用high、low、positive、negative、normal、unknown或null。unknown表示原报告没有明确异常提示，不能当作normal。由你看原件区分报告的异常提示列与历史升降/趋势列；趋势箭头不自动等于异常。保留原始提示在sourceExcerpts，不把显示符号直接填成这个结构字段。
+无需搜索互联网，不调用工具，不输出分析或生活建议。只返回指定结构的紧凑JSON，不使用缩进、空行或过程说明。只减少重复引用和格式字符，不删页、不删结果、不缩写必要原文、不去掉否定、左右侧、不等号、单位、日期角色、检查条件、重复来源依据或覆盖清单。`;
+}
+
+const completenessRules = `
+逐页先判断pageRole（results/mixed/education/reference/cover/duplicate_summary/unknown），再逐项列resultInventory；pageRole只是说明，不可用它跳过整页盘点或隐藏检查结果。
+科普、运动能耗参考等不是本人的新实测结果。把该段原文保留为context，清单item的candidateKeys=[]，classification={disposition:education或reference,evidence:[{sourceSpanId,quote}],duplicateSourceSpanId:null}；evidence必须引用同页清楚说明用途的真实heading/context，逐字引用且能唯一定位。仅有模型分类标签、模糊标题或资料读不清不够，不为减少漏项数把真实检查结果改成科普。
+重复摘要只有在本轮另一个原页有逐字相同的结果摘录并已对应真实候选时才可用duplicate_summary；保留当前原文、同页说明摘要用途的heading/context，并用duplicateSourceSpanId指向那个真实结果摘录。classification.evidence还须引用两页逐字一致、完整且分别唯一包含该结果的context原文，证明相同检查背景；不能只引用短标题。不能按相同名称或数值猜重复，不同日期、部位、左右侧或不同条件不归并。无法逐字证明则保留待核实，不抹去记录。
+classification不能与candidateKeys同时非空；有真实结果的同一摘录不得被分类排除。未知/空白结果仍用原有unknown候选，不归到科普。肌肉均衡、节段脂肪、按频率和部位分列的阻抗等清楚实测表格须逐个字段盘点及对应候选，不能只留一段表格摘录。设备给出的目标、估算与实际测量按原件字段身份区别，不把目标体重写成实测体重。
+当ORIGINAL_SOURCE_PACKAGE.completeOriginal=false且readingScope=selected_pages时，本轮仅提供allowedPageSourceSpanIds列出的完整问题页；总页数不表示已发送其他页。只读取这些页并返回它们的pageReadings/coveredSourceSpanIds，不输出、猜测或复制未提供页的结果、日期和个人身份，不声称全报告已经完整。reportMetadata=null，不修改已保存的报告时间或归属。日期、条件、栏目在本次原页不可见时保持未知，已有正确结果由应用保留。其他页面并非不存在，也不因本轮缺席变成未读缺口。P03同样只可用这组完整原页，不能扩大范围。
+`;
+
+export function buildDirectOriginalReadPrompt(sourcePackage: unknown): string {
+  return `# DIRECT_ORIGINAL_P01\n${originalReadingRules('reading')}\n${completenessRules}\n\n${DIRECT_ORIGINAL_WIRE_PROMPT_GUIDE}\n本轮wire envelope的contract必须是reading。上文领域字段名只解释语义，实际payload只使用固定短键；完整原件输入中的字段名不改。\n\n## 本轮授权原页\nORIGINAL_SOURCE_PACKAGE=${JSON.stringify(sourcePackage)}`;
+}
+
+function buildOriginalRepairBasePrompt(request: unknown, sourcePackage: unknown, targetItems: unknown): string {
+  const diagnosticRules = 'REPAIR_REQUEST.validationDiagnostics逐项关联targetId与该目标对象内的fieldPath；候选路径相对候选，subject/metadata路径相对各自对象。sourceSpanId是本轮来源短键，actualRole/allowedRoles及constraint说明具体约束；它们不是原件事实或改值答案。REFERENCE_OBLIGATION是共享来源全部引用者的保留义务，不表示这些字段都已失败；必须连同失败诊断一起满足，不能修好结果却破坏已有身份、日期或其他结果依据。先在TARGET_ITEMS和只读目录定位各引用，再看完整原件澄清；不能把同一个全局错误码套到全部字段。原句仍只在既有来源目录保存一次。若混合摘录同时承担相斥角色，不要将整块强行改成heading/finding或删除其他引用来满足单一角色；有对应page目标时，可从该真实原页独立读取身份、日期、小标题、明确空白字段或具体结果，用newExcerpts新增真实来源，再分别重绑已授权subject/metadata/候选。必须保留其他结果、左右侧、否定、比较符、日期角色和检查条件。空白出处结构不成立不等于原件有结果；重新看原件后明确空白仍留空，读不清仍不确定。诊断不会扩大目标页或非目标改写权限，也不增加第二轮修复。';
+  return `# DIRECT_ORIGINAL_P03\n${originalReadingRules('repair')}\n\n${diagnosticRules}\n\n本轮是唯一一次定点内容修复，仍可查看整份原件及完整语义上下文。只处理REPAIR_REQUEST列出的目标，严格返回typed replace/unchanged补丁；documentId和originalReadingHash必须原样返回。results中每条包含targetId、action以及replacement；action=unchanged时replacement=null，action=replace时replacement={nodeType,value}且类型与目标一致。page目标的value可包含newExcerpts和newCandidates，用本轮尚未占用的全新e_/c_短编号补该目标原页的遗漏内容；新excerpts只能属于这个目标页，新candidate的finding引用必须来自这个目标页，日期或上下文可引用其他原页已存在的明确来源。subject/metadata只有被授权时才能补身份或检查日期。不能仅把partial/unreadable改为read而不补该页的可靠结果或空白出处；实际无医疗内容才改为no_medical_content。非目标由应用原样保留，不能重新输出或重写整份提取结果。不得新增未授权目标、删除目标或伪造来源收据；无法从原件可靠读取时明确保持unknown/uncertain，不为了通过校验编造内容。共享来源片段影响多个结果时，必须在授权的目标闭包内处理，不能暗改非目标依据。\n来源身份或引用不唯一的问题由你重新查看整份原件，补真实栏目、具体子字段和唯一原件引用。不能仅把bodySite或method清空，不能把不同结果改成相同value以绕过冲突，也不能移除真实日期、否定、左右侧或检查条件。原件明确不同项目时各自保留；同一真实项目确有矛盾且不能可靠澄清时保持unchanged或uncertain，不为了少一项未纳入而强行接纳。\n\n${DIRECT_ORIGINAL_WIRE_PROMPT_GUIDE}\n\n${DIRECT_ORIGINAL_INPUT_V6_PROMPT_GUIDE}\n\nREPAIR_REQUEST=${JSON.stringify(encodeDirectOriginalInputV6('REPAIR_REQUEST', request))}\nORIGINAL_SOURCE_PACKAGE=${JSON.stringify(encodeDirectOriginalInputV6('ORIGINAL_SOURCE_PACKAGE', sourcePackage))}\nTARGET_ITEMS=${JSON.stringify(encodeDirectOriginalInputV6('TARGET_ITEMS', targetItems))}`;
+}
+
+/** 本轮目录及真实历史对照只供澄清差异，不扩大 typed 修复权限或替代原件。 */
+export function buildDirectOriginalRepairPrompt(request: unknown, sourcePackage: unknown, targetItems: unknown,
+  preservedPageContext: unknown = null): string {
+  const wireStage = [completenessRules,
+    '本轮输出wire envelope的contract必须是repair，它与四块输入的inputVersion/section是不同契约。originalReadingHash针对应用提供的canonical原回执，不能对输入或输出短键payload自行重算；实际补丁只使用固定输出短键和presence。',
+    '旧版本若将章节标题作为栏目、本轮则引用字段前缀，仅有相同数值或相同短行不能证明是同一位置。请从完整原页重新读取同时覆盖旧章节标题、字段标签和结果及其中间内容的连续context或finding摘录，让应用核验唯一位置；只能在已有page目标下补入newExcerpts，不拼接旧摘录、不删除旧标题或制造重复候选。上下文存在重复行、左右栏或无法完整读取时保留uncertain。新增上下文用于定位已有字段，不授权改写旧值、单位、日期或条件，也不授权合并真实的不同位置。',
+    'sourceMappings只补来源时，必须保持旧originalName、value、unitRaw、clinicalDate和clinicalContext原样；不能顺便修正旧日期或数值。新finding摘录保留原件中完整连续的结果框架，显式sourceBinding.findingEvidence.quote再精确指向其中的具体结果原句或完整动作子区间，不把整个长框架当成没有窄定位的结果引用。新增栏目应独立读取为清晰的role=heading摘录，可来自同一完整原件另一页。旧短引用必须在新框架中唯一对应，并被新窄finding完整包含；不能唯一确认时relation=uncertain或省略，不能复制只读来源别名。'
+  ].join('\n');
+  return `${buildOriginalRepairBasePrompt(request, sourcePackage, targetItems)}\n${wireStage}\n\n## 本轮只读目录与差异对照\nREAD_ONLY_PAGE_CONTEXT=${JSON.stringify(encodeDirectOriginalInputV6('READ_ONLY_PAGE_CONTEXT', preservedPageContext))}\ntargetPages和referencedExcerpts来自同一轮P01，这部分不是旧报告、OCR答案或新授权；最终仍以完整原件为依据。targetPages仅展示已授权补漏原页上的既有字段，referencedExcerpts保留这些字段及授权节点必需的已有引用。access=authorized_target只指向TARGET_ITEMS中的同名节点，修改仍须使用该targetId；access=immutable_non_target的value必须由应用原样保留，不能修改、删除或用newCandidates变相替换。该P01目录中的跨页date、heading和conditions只供按原角色复用，不能因此扩大目标、改写来源或把签发时间充作临床日期。\ncomparisonRecords来自真实同文件已有版本或同轮对照，不是OCR转写或旧结论答案。origin标示实际对照来源；comparisonScope由真实预检提供，none/current_reading/stored_version/mixed/shared_event各保留其原义，不根据reasonCodes猜测对照来源。reconciliationDiagnostics中的changedFields说明具体差异，目标候选与comparisonRefs帮助定位需要回到原件澄清的位置，诊断、候选和对照都不是读取答案。bindingStatus=unresolved不表示已匹配，不得把未解析来源说成可靠对应；comparisonSourceExcerpts是只读全局来源目录，每个真实对照来源的完整quote只保存一次。comparisonRecords的sourceExcerpts只含localKey指针，value内的evidence、conditions及sourceBinding可引用该目录的ro_source_*短编号；这些关系仅解释对照，ro_source_*也不成为本轮可引用来源。找不到的来源只列入unavailableSourceRefs，不造quote。\nro_*是只读对照短编号，不能作为目标或本轮可引用来源。只有sourceMappings[].comparisonRecordKey专槽可引用已列出的ro_record_*旧记录，其他输出位置仍不得使用ro_*编号；不得返回这些对照记录的替换补丁，不得用newCandidates冒用或复制对照记录，也不得照抄对照中的旧日期、数值或单位。sourceMappings每项包含candidateKey、comparisonRecordKey及relation；candidateKey必须是本轮已授权的candidate目标，comparisonRecordKey必须来自该目标reconciliationDiagnostics的comparisonRefs，且origin=stored_version。先重新查看完整原件，明确旧短引用和本轮完整引用是否属于同一原始字段；能可靠证明时relation=same_original_field，无法可靠证明时relation=uncertain或省略，不以名称、数值相似作为同字段证明。相同candidateKey或comparisonRecordKey只能出现一次，不返回多对一或一对多映射。映射只帮助应用核查来源补齐，不授权改写旧记录任何医疗字段；旧日期、原值、单位、条件和旧引用历史仍由应用保留。\n对照中的候选及comparisonSourceExcerpts只供辨认差异；需要新读取时仍须查看当前完整原件，使用本轮真实来源及授权目标。旧记录本身也可能错误，当前原件决定可靠的新读取；是否替换既有记录由正式流程另行授权，本次P03不授权覆盖既有记录。无法可靠澄清时保持unchanged或uncertain。\nreservedLocalKeys是全局已占用的页、片段和候选编号。page.newExcerpts/newCandidates只能使用未占用的新键；仅P01目录的已有摘录可按原localKey原样引用，不为同一原文重造一份摘录，comparisonRecords及comparisonSourceExcerpts中的ro_*来源不在此复用许可内。页补漏的newCandidates只补原件中真正未被提取的项目，不能把目录已有字段再次当遗漏输出。若同一原始字段仅需更正标题、方法、文字表示、引用或参考范围，应在已授权candidate/excerpt目标内返回replace；不在授权目标时不得通过新增同名或改名候选绕过，保持该非目标原样。不能按名称、数值、方法相近就声称两个字段等价，历史列及左右侧仍需真实来源分别证明。原件遮挡、空白或无法确认的参考范围保持unknown/uncertain，不得用目录中的旧表示猜填，也不增加第二轮修复。`;
+}
+
+/** 一次内容补核可由有限、互斥的依赖包共同完成；每包仍能直接查看完整原件。 */
+export function buildDirectOriginalRepairPartitionPrompt(request: unknown, sourcePackage: unknown, targetItems: unknown,
+  preservedPageContext: unknown, index: number, total: number): string {
+  return `${buildDirectOriginalRepairPrompt(request, sourcePackage, targetItems, preservedPageContext)}\n\n` +
+    `REPAIR_PARTITION=${JSON.stringify({ index, total, newLocalKeyPrefix: `p03part_${index + 1}_` })}\n` +
+    '这是同一次定点内容修复的一个依赖完整分包，不是第二次内容修复。每包目标互斥且只授权本包REPAIR_REQUEST.targets；完整原件图片仍全部提供。只读目录中的非目标仍不可修改，不能依赖其他分包未来可能新增的片段。跨页既有日期、栏目、条件和同字段对照已完整保留。所有分包完成后应用一次性合并并重新校验全报告，不逐包写入事实。\n' +
+    '本包page.newExcerpts及page.newCandidates的每个新localKey必须以REPAIR_PARTITION.newLocalKeyPrefix开头，后接你分配的不同短编号；既有localKey和targetId原样保留。前缀仅防并行分包撞号，不是来源证据、不改变原句身份，也不授权新增其他页或复制已有字段。';
+}

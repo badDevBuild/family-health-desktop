@@ -1,5 +1,6 @@
 import type { MetricSeriesSummary, TrendPointV2 } from '@contracts';
 import { formatResult } from './metric-presentation.js';
+import { memberText } from './member-content.js';
 
 const WIDTH = 760;
 const HEIGHT = 250;
@@ -20,7 +21,7 @@ export function MemberTrendChart({ series }: { series: MetricSeriesSummary }) {
   const exact = series.points.filter((point) => point.comparable && point.comparator === 'eq'
     && point.timestamp !== null && point.numericValue !== null);
   if (exact.length === 0) {
-    return <div className="member-trend-empty">没有可按时间比较的精确数值；日期、单位或条件未明确的记录，以及带“&lt; / &gt;”的结果会保留在表格中，但不会伪装成点。</div>;
+    return <div className="member-trend-empty">这些记录的日期或检测条件不明确，或结果带有“&lt; / &gt;”，暂不能直接比较。完整结果见下方表格。{memberText(series.trendFacts.statement) && <p>{memberText(series.trendFacts.statement)}</p>}</div>;
   }
   const values = exact.flatMap((point) => [point.numericValue!, point.referenceLow, point.referenceHigh].filter((value): value is number => value !== null));
   const rawMin = Math.min(...values);
@@ -75,6 +76,6 @@ export function MemberTrendChart({ series }: { series: MetricSeriesSummary }) {
         {visibleDateLabels.has(index) && <text x={xFor(point, timestamps)} y={HEIGHT - 18} textAnchor={index === 0 ? 'start' : index === exact.length - 1 ? 'end' : 'middle'}>{point.time.value}</text>}
       </g>)}
     </svg>
-    <div className="member-trend-legend"><span><i className="is-value" />报告数值{series.unit ? `（${series.unit}）` : ''}</span>{(referenceSegments('referenceHigh').length > 0 || referenceSegments('referenceLow').length > 0) && <span><i className="is-reference" />各次报告参考边界</span>}<span>{series.trendFacts.statement}</span></div>
+    <div className="member-trend-legend"><span><i className="is-value" />报告数值{series.unit ? `（${series.unit}）` : ''}</span>{(referenceSegments('referenceHigh').length > 0 || referenceSegments('referenceLow').length > 0) && <span><i className="is-reference" />各次报告参考范围</span>}<span>{memberText(series.trendFacts.statement)}</span></div>
   </div>;
 }

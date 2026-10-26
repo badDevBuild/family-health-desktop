@@ -59,6 +59,26 @@ printf '%s' '%PDF-1.4\n%%EOF' > "$outdir/source.pdf"
     await expect(converter.convert(Buffer.from('synthetic legacy doc'))).rejects.toThrow('LEGACY_DOC_CONVERTER_HASH_MISMATCH');
   });
 
+  it('DOCX使用显式扩展名且仍保留独立转换profile，不把它伪装成DOC', async () => {
+    const executable = fakeExecutable(`
+if [ "\${1:-}" = "--version" ]; then echo "LibreOffice 25.8.7.2"; exit 0; fi
+outdir=""
+previous=""
+last=""
+for argument in "$@"; do
+  if [ "$previous" = "--outdir" ]; then outdir="$argument"; fi
+  previous="$argument"
+  last="$argument"
+done
+case "$last" in */source.docx) ;; *) exit 93 ;; esac
+[ -f "$last" ]
+printf '%s' '%PDF-1.4\n%%EOF' > "$outdir/source.pdf"
+`);
+    const converter = new LibreOfficeLegacyDocConverter(executable.path, executable.sha256, '25.8.7.2');
+    const result = await converter.convert(Buffer.from('synthetic docx bytes'), 'docx');
+    expect(result.sha256).toBe(createHash('sha256').update(result.bytes).digest('hex'));
+  });
+
   it('转换超时会终止自己的子进程并清理临时目录', async () => {
     const executable = fakeExecutable(`
 if [ "\${1:-}" = "--version" ]; then echo "LibreOffice 25.8.7.2"; exit 0; fi

@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, shell, Tray } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, powerMonitor, session, shell, Tray } from 'electron';
+import { createOfficialKnowledgeTransport } from './official-knowledge-retrieval.js';
 import { is } from '@electron-toolkit/utils';
 import {
   accountStateSchema,
@@ -41,7 +42,8 @@ import {
   memberPersonInputSchema,
   memberSystemInputSchema,
   mergeHealthEventsInputSchema,
-  processNowInputSchema,
+  rebuildProcessingInputSchema,
+  processingRebuildReceiptSchema,
   personSchema,
   resolveReviewInputSchema,
   restoreBackupInputSchema,
@@ -60,6 +62,7 @@ import {
   updateDesktopBehaviorInputSchema,
   updateDisplayPreferencesInputSchema,
   updateActionStatusInputSchema,
+  updateActionScheduleInputSchema,
   updateAiPreferencesInputSchema,
   updatePersonDisplayInputSchema
 } from '@contracts';
@@ -71,8 +74,11 @@ import { CodexRuntimeManager } from './codex-runtime.js';
 import { createEncryptedBackup, prepareEncryptedRestore, recoverInterruptedWorkspaceSwitch, replaceWorkspaceWithPreparedRestore } from './backup-service.js';
 import { InboxWatcherManager } from './inbox-watcher.js';
 import { ProcessingJobRunner } from './job-runner.js';
+import { localResourceFailureCode } from './local-resource-failure.js';
+import { requeueCurrentAccountWaitingJobs } from './account-job-recovery.js';
 import { PersonalWorkspaceService } from './workspace-service.js';
-import { buildMemberSummaryData, renderMemberSummaryHtml, renderMemberSummaryJson } from './export-service.js';
+import { createProcessNowHandler } from './process-now-ipc.js';
+import { renderMemberSummaryHtml, renderMemberSummaryJson } from './export-service.js';
 import { ensureLocalRecoveryPoints, getLocalRecoveryPointStatus } from './recovery-point-service.js';
 import { buildDiagnosticBundle, renderDiagnosticBundle } from './diagnostic-service.js';
 import { cleanupOwnedTemporaryEntries } from './cleanup-service.js';
@@ -96,6 +102,7 @@ let jobRunner: ProcessingJobRunner | null = null;
 let activeWorkspaceMode: 'demo' | 'personal' = 'demo';
 let scheduleTimer: NodeJS.Timeout | null = null;
 let scheduleCoordinatorRunning = false;
+let processingRebuildRunning = false;
 let lastInboxReconcileAt = 0;
 let recoveryPointDay: string | null = null;
 let recoveryPointPromise: Promise<void> | null = null;
@@ -119,7 +126,7 @@ interface DesktopState {
 }
 
 const allowedExternalHosts = new Set(['auth.openai.com', 'chatgpt.com', 'openai.com']);
-const lockedRuntimeVersion = '0.156.1';
+const lockedRuntimeVersion = '0.160.1';
 
 function bundledCodexPath(): string {
   const executableName = process.platform === 'win32' ? 'codex.exe' : 'codex';
@@ -278,14 +285,14 @@ function rebuildTrayMenu(): void {
   const paused = personalWorkspace?.store.isQueuePaused() ?? false;
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '打开家庭健康看板', click: showMainWindow },
-    { label: `${snapshot.pendingInboxCount} 份资料待处理`, enabled: false },
-    { label: '立即处理…', enabled: activeWorkspaceMode === 'personal', click: () => {
+    { label: processingRebuildRunning ? '正在准备重建报告结果' : `${snapshot.pendingInboxCount} 份资料待处理`, enabled: false },
+    { label: '立即处理…', enabled: activeWorkspaceMode === 'personal' && !processingRebuildRunning, click: () => {
       showMainWindow();
       mainWindow?.webContents.send('tray:process-now-requested');
     } },
     { type: 'separator' },
-    { label: paused ? '继续处理队列' : '暂停处理队列', enabled: Boolean(personalWorkspace), click: () => {
-      if (!personalWorkspace) return;
+    { label: paused ? '继续处理队列' : '暂停处理队列', enabled: Boolean(personalWorkspace) && !processingRebuildRunning, click: () => {
+      if (!personalWorkspace || processingRebuildRunning) return;
       personalWorkspace.store.setQueuePaused(!paused);
       emitSnapshotChanged();
       if (paused) void jobRunner?.runAvailableJobs(personalWorkspace.store);
@@ -338,8 +345,9 @@ async function ensureRecoveryPointBeforeWrite(): Promise<void> {
   await recoveryPointPromise;
 }
 
-async function importSelectedPaths(paths: string[], personId: string | null): Promise<ImportFilesReceipt> {
+async function importSelectedPaths(paths: string[], personId: string | null, autoProcess = false): Promise<ImportFilesReceipt> {
   if (!personalWorkspace) throw new Error('PERSONAL_WORKSPACE_REQUIRED');
+  if (processingRebuildRunning) throw new Error('PROCESSING_REBUILD_BUSY');
   const receipt: ImportFilesReceipt = {
     selectedCount: paths.length,
     importedCount: 0,
@@ -349,6 +357,7 @@ async function importSelectedPaths(paths: string[], personId: string | null): Pr
   };
   if (paths.length === 0) return receipt;
   await ensureRecoveryPointBeforeWrite();
+  const files: Array<{ path: string; bytes: () => Promise<Uint8Array> }> = [];
   for (const selectedPath of paths.slice(0, INGESTION_LIMITS.maxBatchFiles)) {
     const displayName = basename(selectedPath);
     try {
@@ -356,14 +365,22 @@ async function importSelectedPaths(paths: string[], personId: string | null): Pr
       if (!metadata.isFile()) throw new Error('NOT_A_REGULAR_FILE');
       if (metadata.size <= 0) throw new Error('FILE_EMPTY');
       if (metadata.size > INGESTION_LIMITS.maxFileBytes) throw new Error('INPUT_LIMIT_EXCEEDED');
-      const single = await personalWorkspace.importFiles([{ path: selectedPath, bytes: await readFile(selectedPath) }], personId);
-      receipt.importedCount += single.importedCount;
-      receipt.duplicateCount += single.duplicateCount;
-      receipt.suppressedCount += single.suppressedCount;
-      receipt.rejected.push(...single.rejected);
+      files.push({ path: selectedPath, bytes: () => readFile(selectedPath) });
     } catch (error) {
       receipt.rejected.push({ displayName, code: error instanceof Error ? error.message : 'IMPORT_FAILED' });
     }
+  }
+  if (files.length) {
+    const imported = autoProcess
+      ? await personalWorkspace.importFilesAndProcess(files, personId, { accountState: currentAccountState(), consentVersion: 1 })
+      : await personalWorkspace.importFiles(files, personId);
+    receipt.importedCount += imported.importedCount;
+    receipt.duplicateCount += imported.duplicateCount;
+    receipt.suppressedCount += imported.suppressedCount;
+    receipt.rejected.push(...imported.rejected);
+    if (imported.processing) receipt.processing = imported.processing;
+    emitSnapshotChanged();
+    if (imported.processing?.status === 'queued') void jobRunner?.runAvailableJobs(personalWorkspace.store);
   }
   return receipt;
 }
@@ -419,32 +436,15 @@ function initializeRuntime(): void {
     codexHome: join(app.getPath('userData'), 'codex-home'),
     workingDirectory: join(app.getPath('userData'), 'runtime-work')
   });
-  jobRunner = new ProcessingJobRunner(runtimeManager, () => readDesktopState().aiPreferences);
-  jobRunner.on('changed', emitSnapshotChanged);
-  jobRunner.on('terminal', ({ status }: { status: string }) => {
-    if (!readDesktopState().notificationsEnabled) return;
-    if (!Notification.isSupported()) return;
-    const presentation = status === 'succeeded'
-      ? { title: '家庭健康资料已处理', body: '报告事实和说明已完成保存，可打开看板查看。' }
-      : status === 'completed_with_issues'
-        ? { title: '家庭健康资料已部分处理', body: '报告事实已保存，但有身体系统说明未通过核对，可单独重试。' }
-      : status === 'waiting_user'
-        ? { title: '家庭健康资料需要确认', body: '有一项来源或内容需要你打开看板核对。' }
-        : status === 'cancelled'
-          ? { title: '家庭健康处理已停止', body: '已保存的事实仍然保留。' }
-          : { title: '家庭健康处理暂未完成', body: '请打开看板查看等待原因和可恢复操作。' };
-    const notification = new Notification(presentation);
-    notification.on('click', showMainWindow);
-    notification.show();
-  });
+  initializeJobRunner();
   runtimeManager.on('stateChanged', (state: AccountState) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('account:state-changed', accountStateSchema.parse(state));
-    if (state.status === 'connected' && personalWorkspace) {
+    if (state.status === 'connected' && personalWorkspace && !processingRebuildRunning) {
       void (async () => {
         await ensureRecoveryPointBeforeWrite();
-        if (!personalWorkspace) return;
-        personalWorkspace.store.requeueWaitingJobs('waiting_auth');
-        if (state.quota.status === 'available' || state.quota.status === 'low') personalWorkspace.store.requeueWaitingJobs('waiting_quota');
+        if (!personalWorkspace || processingRebuildRunning || !runtimeManager) return;
+        await personalWorkspace.automaticUploadRecovery;
+        requeueCurrentAccountWaitingJobs(personalWorkspace.store, () => runtimeManager!.getState());
         void runScheduleCoordinator();
         void jobRunner?.runAvailableJobs(personalWorkspace.store);
       })().catch(() => undefined);
@@ -453,8 +453,40 @@ function initializeRuntime(): void {
   if (executable) void runtimeManager.start().catch(() => undefined);
 }
 
+function initializeJobRunner(): void {
+  if (!runtimeManager) return;
+  jobRunner?.shutdown();
+  jobRunner = new ProcessingJobRunner(runtimeManager, () => readDesktopState().aiPreferences, {},
+    createOfficialKnowledgeTransport((url) => session.defaultSession.resolveProxy(url)));
+  jobRunner.on('changed', emitSnapshotChanged);
+  jobRunner.on('localStorageFull', () => {
+    // 数据库已满时不能依赖任务状态写入或快照成功；系统提示仍须独立显示。
+    try { emitSnapshotChanged(); } catch { /* 保留真实磁盘失败，不用读取异常取代恢复提示。 */ }
+    dialog.showErrorBox('本机磁盘空间不足',
+      '本机空间不足，处理已停止；原件及已保存结果保留。释放空间后重新打开应用，在处理中心从断点继续。');
+  });
+  jobRunner.on('terminal', ({ status }: { status: string }) => {
+    // 模型暂时繁忙会按有限预算继续，不把每次等待当成失败通知。
+    if (status === 'retry_wait') return;
+    if (!readDesktopState().notificationsEnabled) return;
+    if (!Notification.isSupported()) return;
+    const presentation = status === 'succeeded'
+      ? { title: '家庭健康资料已处理', body: '报告事实和说明已完成保存，可打开看板查看。' }
+      : status === 'completed_with_issues'
+        ? { title: '本次资料整理已结束', body: '已保留可靠结果；无法确认的内容会在看板说明，不需要逐项批准。' }
+      : status === 'waiting_user'
+        ? { title: '本次整理已暂停', body: '部分资料受来源或处理范围限制，原件和已有结果保留；看板可查看具体说明。' }
+        : status === 'cancelled'
+          ? { title: '家庭健康处理已停止', body: '已保存的事实仍然保留。' }
+          : { title: '家庭健康处理暂未完成', body: '请打开看板查看等待原因和可恢复操作。' };
+    const notification = new Notification(presentation);
+    notification.on('click', showMainWindow);
+    notification.show();
+  });
+}
+
 async function runScheduleCoordinator(forceReconcile = false): Promise<void> {
-  if (!personalWorkspace || scheduleCoordinatorRunning) return;
+  if (!personalWorkspace || scheduleCoordinatorRunning || processingRebuildRunning) return;
   scheduleCoordinatorRunning = true;
   try {
     await ensureRecoveryPointBeforeWrite();
@@ -466,9 +498,14 @@ async function runScheduleCoordinator(forceReconcile = false): Promise<void> {
       await inboxWatcher?.reconcile(personalWorkspace.store.listActiveInboxBindings());
       lastInboxReconcileAt = Date.now();
     }
+    const resumed = requeueCurrentAccountWaitingJobs(personalWorkspace.store, currentAccountState);
     const outcome = personalWorkspace.runScheduleCheck(currentAccountState());
-    if (outcome.created) emitSnapshotChanged();
-    if (outcome.queued) await jobRunner?.runAvailableJobs(personalWorkspace.store);
+    if (outcome.created || resumed) emitSnapshotChanged();
+    // 重试时间是最早可排队时间；仍由领取事务检查暂停、授权和任务状态。
+    if (outcome.queued || resumed || personalWorkspace.store.hasQueuedAutomaticUploads()
+      || personalWorkspace.store.hasDueModelBusyRetry()) {
+      await jobRunner?.runAvailableJobs(personalWorkspace.store);
+    }
   } finally {
     scheduleCoordinatorRunning = false;
   }
@@ -497,6 +534,7 @@ async function syncInboxWatcher(): Promise<void> {
     inboxWatcher = new InboxWatcherManager({
       importFile: async ({ bindingId, personId, path, bytes }) => {
         if (!personalWorkspace) return;
+        if (processingRebuildRunning) throw new Error('PROCESSING_REBUILD_BUSY');
         await ensureRecoveryPointBeforeWrite();
         await personalWorkspace.importFiles([{ path, bytes }], personId, bindingId);
         emitSnapshotChanged();
@@ -597,7 +635,7 @@ function registerIpc(): void {
         temporaryEntriesRemoved,
         terminalTaskAttemptsRemoved,
         codexSessionDataRemoved: false,
-        explanation: '只清理本应用超过 7 天的临时渲染目录和超过 30 天、且没有开放核对事项的终结任务尝试记录。正式报告、事实、事项、审计和其他 Codex 工作区未删除；当前锁定运行时没有经过验证的逐会话清理接口，因此本应用 Codex 会话资料未自动删除。'
+        explanation: '只清理本应用超过 7 天的临时渲染目录和超过 30 天、且没有开放核对事项的终结任务尝试记录。为说明任务最终结果所需的最小完成凭据会保留，不含会话编号、模型配置和详细调用用量。正式报告、事实、事项、审计和其他 Codex 工作区未删除；当前锁定运行时没有经过验证的逐会话清理接口，因此本应用 Codex 会话资料未自动删除。'
       })
     };
   });
@@ -891,7 +929,7 @@ function registerIpc(): void {
     const input = updateDesktopBehaviorInputSchema.parse(rawInput);
     const state = { ...readDesktopState(), ...input };
     writeDesktopState(state);
-    app.setLoginItemSettings({ openAtLogin: input.openAtLogin });
+    if (!smokeUserDataDirectory) app.setLoginItemSettings({ openAtLogin: input.openAtLogin });
     if (input.stayInTray) ensureTray();
     else if (mainWindow?.isVisible()) {
       tray?.destroy();
@@ -1047,8 +1085,10 @@ function registerIpc(): void {
     const input = createWorkspaceInputSchema.parse(rawInput);
     await inboxWatcher?.close();
     inboxWatcher = null;
+    jobRunner?.shutdown();
     personalWorkspace?.close();
     personalWorkspace = openPersonalWorkspace(personalWorkspacePath(), input.workspaceName);
+    initializeJobRunner();
     recoveryPointDay = null;
     personalWorkspace.ensurePrimaryMember({ displayName: input.primaryMemberName, relation: input.relation });
     activeWorkspaceMode = 'personal';
@@ -1059,6 +1099,7 @@ function registerIpc(): void {
 
   ipcMain.handle('workspace:switch', (event, rawInput: unknown) => {
     validateSender(event);
+    if (processingRebuildRunning) return { ok: false, error: { code: 'PROCESSING_REBUILD_BUSY', messageKey: 'jobs.rebuild_busy', retryable: true, correlationId: randomUUID() } };
     const input = switchWorkspaceInputSchema.parse(rawInput);
     if (input.mode === 'personal' && !personalWorkspace) {
       return { ok: false, error: { code: 'WORKSPACE_NOT_CREATED', messageKey: 'workspace.not_created', retryable: false, correlationId: randomUUID() } };
@@ -1149,10 +1190,14 @@ function registerIpc(): void {
     if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
       return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
+    const workspace = personalWorkspace;
     try {
       await ensureRecoveryPointBeforeWrite();
-      personalWorkspace.setDocumentIncluded(input);
-      const snapshot = personalWorkspace.getSnapshot(currentAccountState());
+      if (personalWorkspace !== workspace || activeWorkspaceMode !== 'personal') throw new Error('WORKSPACE_CHANGED');
+      await workspace.prepareDocumentForReinclusion(input);
+      if (personalWorkspace !== workspace || activeWorkspaceMode !== 'personal') throw new Error('WORKSPACE_CHANGED');
+      workspace.setDocumentIncluded(input);
+      const snapshot = workspace.getSnapshot(currentAccountState());
       emitSnapshotChanged();
       return { ok: true, data: snapshot };
     } catch (error) {
@@ -1207,9 +1252,14 @@ function registerIpc(): void {
     if (activeWorkspaceMode !== 'personal' || !personalWorkspace || !mainWindow) {
       return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
+    const uploadPerson = input.personId ? personalWorkspace.store.listPersons().find((person) => person.id === input.personId && person.archivedAt === null) : null;
+    if (input.personId && !uploadPerson) {
+      return { ok: false, error: { code: 'PERSON_NOT_FOUND', messageKey: 'person.not_found', retryable: false, correlationId: randomUUID() } };
+    }
     const selection = await dialog.showOpenDialog(mainWindow, {
-      title: '选择健康资料',
-      buttonLabel: '导入到本机',
+      title: uploadPerson ? `为${uploadPerson.displayName}上传报告` : '选择文件并保存原件',
+      message: uploadPerson ? `本次文件将放入${uploadPerson.displayName}的档案，以你选择的成员为准。` : '原件保存在本机，暂不归属成员或发送给 AI。',
+      buttonLabel: input.autoProcess === true && input.personId ? '上传并自动整理' : '导入到本机',
       properties: ['openFile', 'multiSelections'],
       filters: [
         { name: '健康资料', extensions: ['pdf', 'jpg', 'jpeg', 'png', 'heic', 'heif', 'docx', 'doc', 'txt'] }
@@ -1219,7 +1269,7 @@ function registerIpc(): void {
       return { ok: true, data: { selectedCount: 0, importedCount: 0, duplicateCount: 0, suppressedCount: 0, rejected: [] } };
     }
     const selectedPaths = selection.filePaths.slice(0, 100);
-    return { ok: true, data: await importSelectedPaths(selectedPaths, input.personId) };
+    return { ok: true, data: await importSelectedPaths(selectedPaths, input.personId, input.autoProcess === true) };
   });
 
   ipcMain.handle('inbox:import-dropped', async (event, rawInput: unknown) => {
@@ -1229,7 +1279,7 @@ function registerIpc(): void {
       return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
     try {
-      return { ok: true, data: await importSelectedPaths(input.paths, input.personId) };
+      return { ok: true, data: await importSelectedPaths(input.paths, input.personId, input.autoProcess === true) };
     } catch (error) {
       const code = error instanceof Error ? error.message : 'DROPPED_FILE_IMPORT_FAILED';
       return { ok: false, error: { code, messageKey: 'inbox.dropped_import_failed', retryable: true, correlationId: randomUUID() } };
@@ -1349,6 +1399,23 @@ function registerIpc(): void {
     return { ok: true, data: demoSnapshot.actions.find((item) => item.id === input.actionId)!, revision: input.expectedRevision + 1 };
   });
 
+  ipcMain.handle('actions:set-schedule', async (event, rawInput: unknown) => {
+    validateSender(event);
+    if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
+      return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
+    }
+    try {
+      const input = updateActionScheduleInputSchema.parse(rawInput);
+      await ensureRecoveryPointBeforeWrite();
+      const action = personalWorkspace.updateActionSchedule(input);
+      emitSnapshotChanged();
+      return { ok: true, data: action, revision: action.userRevision };
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'ACTION_SCHEDULE_UPDATE_FAILED';
+      return { ok: false, error: { code, messageKey: 'action.schedule_update_failed', retryable: code.startsWith('REVISION_CONFLICT'), correlationId: randomUUID() } };
+    }
+  });
+
   ipcMain.handle('actions:create', async (event, rawInput: unknown) => {
     validateSender(event);
     if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
@@ -1381,24 +1448,56 @@ function registerIpc(): void {
     }
   });
 
-  ipcMain.handle('jobs:process-now', async (event, rawInput: unknown) => {
+  ipcMain.handle('jobs:process-now', createProcessNowHandler({
+    validateSender,
+    getWorkspace: () => activeWorkspaceMode === 'personal' ? personalWorkspace : null,
+    isRebuildRunning: () => processingRebuildRunning,
+    currentAccountState,
+    ensureRecoveryPointBeforeWrite,
+    runAvailableJobs: (workspace) => { void jobRunner?.runAvailableJobs(workspace.store); }
+  }));
+
+  ipcMain.handle('jobs:rebuild-from-sources', async (event, rawInput: unknown) => {
     validateSender(event);
-    if (activeWorkspaceMode === 'demo' || !personalWorkspace) {
-      return { ok: false, error: { code: 'DEMO_MODE', messageKey: 'demo.process_disabled', retryable: false, correlationId: randomUUID() } };
+    if (activeWorkspaceMode !== 'personal' || !personalWorkspace || !jobRunner) {
+      return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
+    if (processingRebuildRunning || scheduleCoordinatorRunning || activeRestoreAbortController) {
+      return { ok: false, error: { code: 'PROCESSING_REBUILD_BUSY', messageKey: 'jobs.rebuild_busy', retryable: true, correlationId: randomUUID() } };
+    }
+    const workspace = personalWorkspace;
+    processingRebuildRunning = true;
     try {
-      await ensureRecoveryPointBeforeWrite();
-      const input = processNowInputSchema.parse(rawInput);
-      const result = personalWorkspace.processNow({
-        accountState: currentAccountState(),
+      const input = rebuildProcessingInputSchema.parse(rawInput);
+      const account = currentAccountState();
+      const result = await workspace.rebuildProcessingFromSources({
+        accountState: account,
         consentVersion: input.consentVersion,
-        ...(input.documentIds ? { documentIds: input.documentIds } : {})
+        confirmedRebuildReportResults: input.confirmedRebuildReportResults,
+        expectedSources: input.expectedSources,
+        ...(input.personIds ? { personIds: input.personIds } : {}),
+        ...(input.clearPersonalData ? { clearPersonalData: true as const,
+          confirmedClearPersonalData: true as const } : {}),
+        ...(input.confirmedPersonAliases ? { confirmedPersonAliases: input.confirmedPersonAliases } : {}),
+        validateBeforeCommit: () => {
+          const fresh = currentAccountState();
+          if (personalWorkspace !== workspace || activeWorkspaceMode !== 'personal'
+            || fresh.status !== 'connected' || fresh.displayLabel !== account.displayLabel) {
+            throw new Error('PROCESSING_REBUILD_AUTH_CHANGED');
+          }
+        }
       });
-      void jobRunner?.runAvailableJobs(personalWorkspace.store);
-      return { ok: true, data: { batchId: result.batchId }, revision: result.idempotent ? 0 : 1 };
+      processingRebuildRunning = false;
+      // 明确同意重建也同意启动本次新批次；不延用原队列的暂停状态。
+      workspace.store.setQueuePaused(false);
+      emitSnapshotChanged();
+      void jobRunner.runAvailableJobs(workspace.store);
+      return { ok: true, data: processingRebuildReceiptSchema.parse(result), revision: 1 };
     } catch (error) {
-      const code = error instanceof Error ? error.message : 'PROCESS_FAILED';
-      return { ok: false, error: { code, messageKey: code === 'NO_READY_DOCUMENTS' || code === 'DOCUMENT_ALREADY_IN_PROCESSING' ? 'jobs.no_ready_documents' : code === 'AUTH_REQUIRED' ? 'jobs.auth_required' : 'jobs.process_failed', retryable: code === 'AUTH_REQUIRED', action: code === 'AUTH_REQUIRED' ? 'login' : undefined, correlationId: randomUUID() } };
+      const code = localResourceFailureCode(error) ?? (error instanceof Error ? error.message : 'PROCESSING_REBUILD_FAILED');
+      return { ok: false, error: { code, messageKey: 'jobs.rebuild_failed', retryable: ['PROCESSING_REBUILD_BUSY', 'PROCESSING_REBUILD_HAS_ACTIVE_JOB', 'PROCESSING_REBUILD_SOURCE_SCOPE_CHANGED', 'PROCESSING_REBUILD_AUTH_CHANGED'].includes(code), correlationId: randomUUID() } };
+    } finally {
+      processingRebuildRunning = false;
     }
   });
 
@@ -1443,6 +1542,7 @@ function registerIpc(): void {
       return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
     try {
+      if (processingRebuildRunning) throw new Error('PROCESSING_REBUILD_BUSY');
       await ensureRecoveryPointBeforeWrite();
       const input = jobActionInputSchema.parse(rawInput);
       personalWorkspace.store.retryFailedJob(input.jobId);
@@ -1457,6 +1557,7 @@ function registerIpc(): void {
 
   ipcMain.handle('jobs:set-queue-paused', async (event, rawInput: unknown) => {
     validateSender(event);
+    if (processingRebuildRunning) return { ok: false, error: { code: 'PROCESSING_REBUILD_BUSY', messageKey: 'jobs.rebuild_busy', retryable: true, correlationId: randomUUID() } };
     if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
       return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
@@ -1475,8 +1576,7 @@ function registerIpc(): void {
     }
     try {
       const input = exportMemberSummaryInputSchema.parse(rawInput);
-      const snapshot = personalWorkspace.getSnapshot(currentAccountState());
-      const summary = buildMemberSummaryData(snapshot, input, undefined, personalWorkspace.getMemberAssessment(input.personId));
+      const summary = personalWorkspace.getMemberSummaryExport(input);
       const safeMemberName = [...summary.member.displayName]
         .map((character) => character.charCodeAt(0) < 32 ? '_' : character)
         .join('')
@@ -1530,6 +1630,7 @@ function registerIpc(): void {
 
   ipcMain.handle('backup:create', async (event, rawInput: unknown) => {
     validateSender(event);
+    if (processingRebuildRunning) return { ok: false, error: { code: 'PROCESSING_REBUILD_BUSY', messageKey: 'jobs.rebuild_busy', retryable: true, correlationId: randomUUID() } };
     if (activeWorkspaceMode !== 'personal' || !personalWorkspace || !mainWindow) {
       return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
@@ -1591,6 +1692,7 @@ function registerIpc(): void {
 
   ipcMain.handle('backup:restore', async (event, rawInput: unknown) => {
     validateSender(event);
+    if (processingRebuildRunning) return { ok: false, error: { code: 'PROCESSING_REBUILD_BUSY', messageKey: 'jobs.rebuild_busy', retryable: true, correlationId: randomUUID() } };
     if (activeWorkspaceMode !== 'personal' || !personalWorkspace) {
       return { ok: false, error: { code: 'PERSONAL_WORKSPACE_REQUIRED', messageKey: 'workspace.personal_required', retryable: false, correlationId: randomUUID() } };
     }
@@ -1620,6 +1722,7 @@ function registerIpc(): void {
       });
       await inboxWatcher?.close();
       inboxWatcher = null;
+      jobRunner?.shutdown();
       personalWorkspace.close();
       personalWorkspace = null;
       const replacement = await replaceWorkspaceWithPreparedRestore({
@@ -1629,6 +1732,7 @@ function registerIpc(): void {
       });
       recoveryRoot = replacement.recoveryRoot;
       personalWorkspace = openPersonalWorkspace(personalWorkspacePath(), prepared.workspaceName);
+      initializeJobRunner();
       recoveryPointDay = null;
       personalWorkspace.store.sanitizeRestoredMachineState();
       if (personalWorkspace.store.integrityCheck() !== 'ok') throw new Error('RESTORED_WORKSPACE_INTEGRITY_FAILED');
@@ -1641,6 +1745,7 @@ function registerIpc(): void {
       void runScheduleCoordinator(true);
       return { ok: true, data: dashboardSnapshotSchema.parse(currentSnapshot()) };
     } catch (error) {
+      jobRunner?.shutdown();
       personalWorkspace?.close();
       personalWorkspace = null;
       if (recoveryRoot) {
@@ -1651,6 +1756,7 @@ function registerIpc(): void {
       }
       if (existsSync(join(personalWorkspacePath(), 'health.db'))) {
         personalWorkspace = openPersonalWorkspace(personalWorkspacePath(), previousWorkspaceName);
+        initializeJobRunner();
         recoveryPointDay = null;
         await syncInboxWatcher().catch(() => undefined);
       }
@@ -1733,7 +1839,8 @@ if (!gotLock) {
   void app.whenReady().then(() => {
     nativeTheme.themeSource = 'light';
     const desktopState = readDesktopState();
-    app.setLoginItemSettings({ openAtLogin: desktopState.openAtLogin });
+    // 隔离验收不能改变同一 App 标识下正式安装的系统登录项。
+    if (!smokeUserDataDirectory) app.setLoginItemSettings({ openAtLogin: desktopState.openAtLogin });
     initializeRuntime();
     initializeWorkspaceState();
     void syncInboxWatcher();
@@ -1766,6 +1873,7 @@ app.on('before-quit', () => {
   tray = null;
   void inboxWatcher?.close();
   inboxWatcher = null;
+  jobRunner?.shutdown();
   runtimeManager?.shutdown();
   runtimeManager = null;
   jobRunner = null;

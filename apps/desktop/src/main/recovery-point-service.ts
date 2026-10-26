@@ -93,7 +93,7 @@ export async function ensureLocalRecoveryPoints(input: {
 export async function getLocalRecoveryPointStatus(workspaceRoot: string): Promise<RecoveryPointStatus> {
   const root = join(workspaceRoot, 'recovery-points');
   const files = await readdir(root).catch(() => [] as string[]);
-  const databases = files.filter((name) => /^(daily|weekly|schema-upgrade)-.+\.db$/.test(name));
+  const databases = files.filter((name) => /^(daily|weekly|schema-upgrade|processing-rebuild)-.+\.db$/.test(name));
   const metadata = await Promise.all(databases.map(async (name) => ({ name, stats: await stat(join(root, name)) })));
   return {
     pointCount: metadata.length,
@@ -107,7 +107,7 @@ export async function getLocalRecoveryPointStatus(workspaceRoot: string): Promis
 export async function recoveryPointsReferenceSourceHash(workspaceRoot: string, sourceHash: string): Promise<boolean> {
   const root = join(workspaceRoot, 'recovery-points');
   const files = await readdir(root).catch(() => [] as string[]);
-  for (const name of files.filter((file) => /^(daily|weekly|schema-upgrade)-.+\.db$/.test(file))) {
+  for (const name of files.filter((file) => /^(daily|weekly|schema-upgrade|processing-rebuild)-.+\.db$/.test(file))) {
     const database = new Database(join(root, name), { readonly: true, fileMustExist: true });
     try {
       const hasSourceObjects = database.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_objects'`).get();

@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import type { UpdateActionScheduleInput } from '@contracts';
 import type { AccountState, ActionItem, ActionStatus, AdoptedActionReceipt, AdoptLifestyleProposalInput, AiPreferences, AiSettings, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, CleanupReceipt, ConceptMappingReceipt, ConceptReviewBundle, ConfirmInboxBindingInput, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, CreateWorkspaceInput, DashboardSnapshot, DeleteDocumentInput, DeleteDocumentReceipt, DeletedDocumentSummary, DiagnosticBundle, DiagnosticExportReceipt, DisplayPreferences, EvidencePreview, EvidencePreviewRequest, ExportMemberSummaryInput, ExportMemberSummaryReceipt, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, ManualNote, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, Person, ProcessNowInput, ReportMetadataCorrectionReceipt, ResolveReviewInput, RestorePersonInput, Result, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
 import type { AdoptMemberAssessmentActionInput } from '@contracts';
+import type { ProcessingRebuildReceipt, RebuildProcessingInput } from '@contracts';
 
 export interface HealthDesktopBridge {
   getBootstrap(): Promise<{
@@ -48,13 +50,14 @@ export interface HealthDesktopBridge {
   deleteDocument(input: DeleteDocumentInput): Promise<Result<{ receipt: DeleteDocumentReceipt; snapshot: DashboardSnapshot }>>;
   releaseDeletedDocument(sourceHash: string): Promise<Result<{ sourceHash: string }>>;
   switchWorkspace(mode: 'demo' | 'personal'): Promise<Result<DashboardSnapshot>>;
-  selectFiles(personId: string | null): Promise<Result<ImportFilesReceipt>>;
-  importDroppedFiles(personId: string | null, files: File[]): Promise<Result<ImportFilesReceipt>>;
+  selectFiles(personId: string | null, autoProcess?: true): Promise<Result<ImportFilesReceipt>>;
+  importDroppedFiles(personId: string | null, files: File[], autoProcess?: true): Promise<Result<ImportFilesReceipt>>;
   pickInboxDirectory(): Promise<Result<{ selectionId: string; displayName: string } | null>>;
   confirmInboxDirectory(input: ConfirmInboxBindingInput): Promise<Result<InboxBindingSummary>>;
   listInboxDirectories(): Promise<Result<InboxBindingSummary[]>>;
   disableInboxDirectory(bindingId: string): Promise<Result<{ bindingId: string }>>;
   processNow(input: ProcessNowInput): Promise<Result<{ batchId: string }>>;
+  rebuildProcessing(input: RebuildProcessingInput): Promise<Result<ProcessingRebuildReceipt>>;
   cancelJob(jobId: string): Promise<Result<{ running: boolean; alreadyTerminal: boolean }>>;
   retryJob(jobId: string): Promise<Result<{ jobId: string }>>;
   setQueuePaused(paused: boolean): Promise<Result<{ paused: boolean }>>;
@@ -79,6 +82,7 @@ export interface HealthDesktopBridge {
     expectedRevision: number;
   }): Promise<Result<ActionItem>>;
   createAction(input: CreateActionItemInput): Promise<Result<ActionItem>>;
+  updateActionSchedule(input: UpdateActionScheduleInput): Promise<Result<ActionItem>>;
   createManualNote(input: CreateManualNoteInput): Promise<Result<ManualNote>>;
   exportMemberSummary(input: ExportMemberSummaryInput): Promise<Result<ExportMemberSummaryReceipt | null>>;
 }
@@ -122,9 +126,10 @@ const bridge: HealthDesktopBridge = {
   deleteDocument: (input) => ipcRenderer.invoke('documents:delete', input),
   releaseDeletedDocument: (sourceHash) => ipcRenderer.invoke('documents:release-deleted', { sourceHash }),
   switchWorkspace: (mode) => ipcRenderer.invoke('workspace:switch', { mode }),
-  selectFiles: (personId) => ipcRenderer.invoke('inbox:select-files', { personId }),
-  importDroppedFiles: (personId, files) => ipcRenderer.invoke('inbox:import-dropped', {
+  selectFiles: (personId, autoProcess) => ipcRenderer.invoke('inbox:select-files', { personId, ...(autoProcess ? { autoProcess } : {}) }),
+  importDroppedFiles: (personId, files, autoProcess) => ipcRenderer.invoke('inbox:import-dropped', {
     personId,
+    ...(autoProcess ? { autoProcess } : {}),
     paths: files.map((file) => webUtils.getPathForFile(file)).filter(Boolean)
   }),
   pickInboxDirectory: () => ipcRenderer.invoke('inbox:pick-directory'),
@@ -132,6 +137,7 @@ const bridge: HealthDesktopBridge = {
   listInboxDirectories: () => ipcRenderer.invoke('inbox:list-directories'),
   disableInboxDirectory: (bindingId) => ipcRenderer.invoke('inbox:disable-directory', { bindingId }),
   processNow: (input) => ipcRenderer.invoke('jobs:process-now', input),
+  rebuildProcessing: (input) => ipcRenderer.invoke('jobs:rebuild-from-sources', input),
   cancelJob: (jobId) => ipcRenderer.invoke('jobs:cancel', { jobId }),
   retryJob: (jobId) => ipcRenderer.invoke('jobs:retry', { jobId }),
   setQueuePaused: (paused) => ipcRenderer.invoke('jobs:set-queue-paused', { paused }),
@@ -164,6 +170,7 @@ const bridge: HealthDesktopBridge = {
   },
   setActionStatus: (input) => ipcRenderer.invoke('actions:set-status', input),
   createAction: (input) => ipcRenderer.invoke('actions:create', input),
+  updateActionSchedule: (input) => ipcRenderer.invoke('actions:set-schedule', input),
   createManualNote: (input) => ipcRenderer.invoke('notes:create', input),
   exportMemberSummary: (input) => ipcRenderer.invoke('export:member-summary', input)
 };

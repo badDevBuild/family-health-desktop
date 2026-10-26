@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { ExtractionResult, SystemAnalysisCandidate, SystemAnalysisReview } from '@contracts';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { SystemAnalysisPipeline } from './system-analysis-pipeline.js';
-import { PersonalWorkspaceService } from './workspace-service.js';
+import { LegacyTextFixtureWorkspaceService as PersonalWorkspaceService } from './legacy-text-source.fixture.js';
 
 const roots: string[] = [];
 

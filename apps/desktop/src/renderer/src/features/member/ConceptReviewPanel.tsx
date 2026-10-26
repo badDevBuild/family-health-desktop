@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { ChevronDown, FileCheck2, RotateCcw, Search, Tags } from 'lucide-react';
 import type { ConceptReviewBundle, ConceptReviewItem, SetConceptMappingInput } from '@contracts';
 import { StatusBadge } from '../../components/StatusBadge.js';
+import { reportDateLabel, uniqueMemberTexts } from './member-content.js';
 
 type EvidenceRequest = {
   title: string;
@@ -15,6 +16,16 @@ type EvidenceRequest = {
 function mappingLabel(item: ConceptReviewItem): string {
   if (item.mapping.status === 'unmapped') return '待归类';
   return item.mapping.canonicalName ?? item.mapping.normalizedName;
+}
+
+/** 整理页只呈现影响结果比较的条件；名称匹配和模型候选记录留在内部。 */
+function comparisonCautions(item: ConceptReviewItem): string[] {
+  return uniqueMemberTexts(item.mapping.reasons.flatMap((reason) => {
+    const mismatch = reason.match(/^(单位|标本) (.+) 与已验证定义不一致。$/);
+    if (mismatch) return [`报告中的${mismatch[1]}为“${mismatch[2]}”，与当前归类的检测条件不同，暂不能直接比较。`];
+    if (/^(?:只有模型候选名命中词典；原报告名称尚未核实为同一概念。|原报告名称与模型候选名指向不同概念。|(?:术语)?词典中没有(?:经过验证的)?精确映射[。；](?:原始名称仍会保留。)?|名称精确匹配。)$/.test(reason)) return [];
+    return [reason];
+  }));
 }
 
 export function ConceptReviewPanel({ bundle, busyObservationId, onSave, onUndo, onOpenEvidence }: {
@@ -41,7 +52,7 @@ export function ConceptReviewPanel({ bundle, busyObservationId, onSave, onUndo, 
     <div className="concept-review__summary">
       <div><span className="eyebrow">高级整理 · 可选</span><h2>发现指标名称或趋势分组不对？</h2><p>只有需要修正归类时再打开。这里的操作不会改写报告原文、检查结果或单位。</p></div>
       <div className="concept-review__summary-actions">
-        <StatusBadge tone={expanded && needsReview > 0 ? 'warning' : 'neutral'}>{expanded ? `${needsReview} 项未归类` : '默认收起'}</StatusBadge>
+        {expanded && <StatusBadge tone={needsReview > 0 ? 'warning' : 'neutral'}>{needsReview} 项名称待确认</StatusBadge>}
         <button className="secondary-button" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>{expanded ? '收起高级整理' : '打开高级整理'}<ChevronDown size={17} /></button>
       </div>
     </div>
@@ -54,18 +65,19 @@ export function ConceptReviewPanel({ bundle, busyObservationId, onSave, onUndo, 
       const selected = drafts[item.observationId] ?? item.mapping.conceptId ?? '';
       const changed = selected !== (item.mapping.conceptId ?? '');
       const busy = busyObservationId === item.observationId;
+      const cautions = comparisonCautions(item);
       return <article key={item.observationId}>
-        <div className="concept-review__source"><Tags size={18} /><div><strong>{item.rawName}</strong><small>{item.displayValue}{item.unit ? ` ${item.unit}` : ''} · {item.clinicalDate ?? '日期待确认'}</small></div></div>
+        <div className="concept-review__source"><Tags size={18} /><div><strong>{item.rawName}</strong><small>{item.displayValue}{item.unit ? ` ${item.unit}` : ''} · {reportDateLabel(item.clinicalDate)}</small></div></div>
         <label>当前归类<select value={selected} disabled={busy} onChange={(event) => setDrafts((current) => ({ ...current, [item.observationId]: event.target.value }))}><option value="">暂不归类</option>{bundle.catalog.map((concept) => <option key={concept.id} value={concept.id}>{concept.canonicalName}</option>)}</select></label>
-        <div className="concept-review__meta"><StatusBadge tone={item.mapping.status === 'verified' ? 'success' : item.mapping.status === 'proposed' ? 'warning' : 'neutral'}>{item.mapping.status === 'verified' ? '已确认' : item.mapping.status === 'proposed' ? '条件不一致' : '待归类'}</StatusBadge><span>映射版本 {item.mappingVersion}</span></div>
-        <p>{item.mapping.reasons.join(' ')}</p>
+        <div className="concept-review__meta"><StatusBadge tone={item.mapping.status === 'verified' ? 'success' : item.mapping.status === 'proposed' ? 'warning' : 'neutral'}>{item.mapping.status === 'verified' ? '归类已确认' : '名称待确认'}</StatusBadge></div>
+        {cautions.length > 0 && <p>{cautions.join(' ')}</p>}
         <div className="concept-review__actions">
-          <button className="evidence-link" onClick={() => onOpenEvidence({ title: `${item.rawName}原始依据`, label: item.evidence.label, quote: item.evidence.quote ?? '原始资料中已定位到对应依据。', meta: item.evidence.locator ?? '受控来源定位', sourceSpanId: item.evidence.sourceSpanId, documentId: item.evidence.documentId })}><FileCheck2 size={16} /> 查看原文</button>
+          <button className="evidence-link" onClick={() => onOpenEvidence({ title: `${item.rawName}原始依据`, label: item.evidence.label, quote: item.evidence.quote ?? '查看原报告中的对应内容。', meta: item.evidence.locator ?? '原始资料', sourceSpanId: item.evidence.sourceSpanId, documentId: item.evidence.documentId })}><FileCheck2 size={16} /> 查看原文</button>
           {item.canUndo && <button className="text-button" disabled={busy} onClick={() => onUndo(item.observationId)}><RotateCcw size={16} /> 撤销上次修正</button>}
           <button className="secondary-button" disabled={!changed || busy} onClick={() => onSave({ personId: bundle.personId, observationId: item.observationId, conceptId: selected || null, reason: '用户在指标整理页确认概念归类' })}>{busy ? '正在保存…' : '保存归类'}</button>
         </div>
       </article>;
-      })}</div> : <div className="table-empty compact-empty"><Tags size={24} /><strong>{query ? '没有匹配项目' : '当前没有需要整理的指标'}</strong><span>{query ? '可以清空搜索词重试。' : '已验证别名会自动归入标准概念；不确定项目仍保留原始名称。'}</span></div>}
+      })}</div> : <div className="table-empty compact-empty"><Tags size={24} /><strong>{query ? '没有匹配项目' : '当前没有需要整理的指标'}</strong><span>{query ? '可以清空搜索词重试。' : '如需修改某项归类，可以选择“查看全部指标”。'}</span></div>}
     </div>}
   </section>;
 }

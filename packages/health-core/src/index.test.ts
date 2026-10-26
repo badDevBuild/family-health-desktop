@@ -16,7 +16,7 @@ const manifest: SourceManifest = {
   totalUnits: 2,
   coveredUnitIndexes: [0, 1],
   spans: [
-    { id: 'span-1', documentId: 'doc-1', spanKind: 'page', page: 1, blockId: null, lineStart: null, lineEnd: null, quote: '2026-09-12 LDL 4.2', readability: 'clear' },
+    { id: 'span-1', documentId: 'doc-1', spanKind: 'page', page: 1, blockId: null, lineStart: null, lineEnd: null, quote: '2026-09-12 LDL 4.2 mmol/L', readability: 'clear' },
     { id: 'span-2', documentId: 'doc-1', spanKind: 'page', page: 2, blockId: null, lineStart: null, lineEnd: null, quote: null, readability: 'clear' }
   ],
   normalizerVersion: '1',
@@ -36,7 +36,7 @@ const candidate: ObservationCandidate = {
   method: null,
   bodySite: null,
   clinicalDate: '2026-09-12',
-  evidence: [{ sourceSpanId: 'span-1', quote: '2026-09-12 LDL 4.2' }],
+  evidence: [{ sourceSpanId: 'span-1', quote: '2026-09-12 LDL 4.2 mmol/L' }],
   issues: []
 };
 
@@ -62,6 +62,38 @@ describe('自动接纳规则', () => {
     };
     expect(evaluateObservationCandidate(unknown, manifest, { personConsistent: true, overwritesUserLockedValue: false }))
       .toEqual({ decision: 'reject', reasons: ['value_unknown'] });
+  });
+
+  it.each([
+    { kind: 'numeric' as const, rawText: '4.2', decimal: '4.2', comparator: 'eq' as const },
+    { kind: 'text' as const, rawText: '检查正常' },
+    { kind: 'qualitative' as const, rawText: '阴性', category: 'negative' }
+  ])('纯图没有独立证据时不直接接纳 $kind 候选或它自报的错误日期', (value) => {
+    const imageManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, spanKind: 'image', quote: null, readability: 'partial' }]
+    };
+    const imageCandidate: ObservationCandidate = {
+      ...candidate, value, clinicalDate: '2023-02-02',
+      evidence: [{ sourceSpanId: 'span-1', quote: '2023-02-02 LDL 4.2 检查正常 阴性' }]
+    };
+    expect(evaluateObservationCandidate(imageCandidate, imageManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['image_evidence_unverified'] });
+  });
+
+  it('可信本机 OCR 的图片引用仍核对日期，不能把模型错误年份写入', () => {
+    const quote = '检查日期 2026/7/2 LDL 4.2 mmol/L';
+    const imageManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, spanKind: 'image', quote, readability: 'clear' }]
+    };
+    const imageCandidate: ObservationCandidate = {
+      ...candidate, clinicalDate: '2023-02-02', evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(imageCandidate, imageManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['clinical_date_not_in_evidence'] });
+    expect(evaluateObservationCandidate({ ...imageCandidate, clinicalDate: '2026-07-02' }, imageManifest,
+      { personConsistent: true, overwritesUserLockedValue: false })).toEqual({ decision: 'accept', warnings: [] });
   });
 
   it('数值必须和对应指标出现在同一证据行，不能借用邻项数字', () => {
@@ -206,6 +238,74 @@ describe('自动接纳规则', () => {
       value: { kind: 'numeric', rawText: '<0.01', decimal: '0.01', comparator: 'lt' }
     }, troponinManifest, { personConsistent: true, overwritesUserLockedValue: false }))
       .toEqual({ decision: 'accept_with_warnings', warnings: ['reference_range_not_provided'] });
+  });
+
+  it.each([
+    { raw: '<2.00E＋02', decimal: '200', comparator: 'lt' as const },
+    { raw: '≥1.25e+3', decimal: '1250', comparator: 'gte' as const },
+    { raw: '2.50E-03', decimal: '0.0025', comparator: 'eq' as const },
+    { raw: '2.50 E - 03', decimal: '0.0025', comparator: 'eq' as const }
+  ])('完整读取科学计数法 $raw，保留指数与比较符', ({ raw, decimal, comparator }) => {
+    const quote = `采样日期 2026/1/10 HBV-DNA ${raw} IU/mL，参考范围 <2.00E+02 IU/mL`;
+    const viralManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const viralCandidate: ObservationCandidate = {
+      ...candidate, originalName: 'HBV-DNA', standardNameCandidate: 'HBV-DNA',
+      value: { kind: 'numeric', rawText: raw, decimal, comparator },
+      unitRaw: 'IU/mL', clinicalDate: '2026-01-10', referenceRangeRaw: '<2.00E+02 IU/mL',
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(viralCandidate, viralManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'accept', warnings: [] });
+  });
+
+  it.each([
+    { quote: 'HBV-DNA <2.00E+02 IU/mL', decimal: '2', comparator: 'lt' as const, reason: 'numeric_value_not_in_evidence' },
+    { quote: 'HBV-DNA <2.00E+02 IU/mL', decimal: '200', comparator: 'eq' as const, reason: 'numeric_comparator_not_in_evidence' },
+    { quote: 'HBV-DNA 2.00E-02 IU/mL', decimal: '-2', comparator: 'eq' as const, reason: 'numeric_value_not_in_evidence' },
+    { quote: 'HBV-DNA 2.00E+ IU/mL', decimal: '2', comparator: 'eq' as const, reason: 'numeric_value_not_in_evidence' },
+    { quote: 'HBV-DNA 2.00E -  IU/mL', decimal: '2', comparator: 'eq' as const, reason: 'numeric_value_not_in_evidence' },
+    { quote: 'HBV-DNA 2.00E+02.3 IU/mL', decimal: '200', comparator: 'eq' as const, reason: 'numeric_value_not_in_evidence' },
+    { quote: 'HBV-DNA 1E-999 IU/mL', decimal: '0', comparator: 'eq' as const, reason: 'numeric_value_not_in_evidence' },
+    { quote: 'HBV-DNA 2.0000000000000001E+02 IU/mL', decimal: '200', comparator: 'eq' as const, reason: 'numeric_value_not_in_evidence' },
+    { quote: 'HBV-DNA 4.20E+02 IU/mL 参考范围 <2.00E+02 IU/mL', decimal: '200', comparator: 'lt' as const, reason: 'numeric_value_not_in_evidence' }
+  ])('不借用科学计数法碎片、比较符或参考值：$quote', ({ quote, decimal, comparator, reason }) => {
+    const viralManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    const viralCandidate: ObservationCandidate = {
+      ...candidate, originalName: 'HBV-DNA', standardNameCandidate: 'HBV-DNA',
+      value: { kind: 'numeric', rawText: decimal, decimal, comparator },
+      unitRaw: 'IU/mL', clinicalDate: null, referenceRangeRaw: null,
+      evidence: [{ sourceSpanId: 'span-1', quote }]
+    };
+    expect(evaluateObservationCandidate(viralCandidate, viralManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: [reason] });
+  });
+
+  it.each(['2026/1/10', '2026.1.10', '2026-1-10', '2026年1月10日'])('不补零的来源日期 %s 也可以支持相同临床日', (sourceDate) => {
+    const quote = `检查日期 ${sourceDate} LDL 4.2 mmol/L`;
+    const dateManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    expect(evaluateObservationCandidate({ ...candidate, clinicalDate: '2026-01-10', evidence: [{ sourceSpanId: 'span-1', quote }] },
+      dateManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'accept', warnings: [] });
+  });
+
+  it('无效来源日期不能被滚动为另一临床日', () => {
+    const quote = '检查日期 2026/2/30 LDL 4.2 mmol/L';
+    const dateManifest: SourceManifest = {
+      ...manifest, totalUnits: 1, coveredUnitIndexes: [0],
+      spans: [{ ...manifest.spans[0]!, quote }]
+    };
+    expect(evaluateObservationCandidate({ ...candidate, clinicalDate: '2026-03-02', evidence: [{ sourceSpanId: 'span-1', quote }] },
+      dateManifest, { personConsistent: true, overwritesUserLockedValue: false }))
+      .toEqual({ decision: 'reject', reasons: ['clinical_date_not_in_evidence'] });
   });
 
   it('定性结果必须绑定当前项目，不借用相邻项的阳性', () => {
@@ -401,7 +501,7 @@ describe('自动接纳规则', () => {
       standardNameCandidate: '右眼',
       value: { kind: 'text', rawText: '右眼正常' }
     }, eyeManifest, { personConsistent: true, overwritesUserLockedValue: false }))
-      .toEqual({ decision: 'reject', reasons: ['reported_value_not_in_evidence'] });
+      .toEqual({ decision: 'reject', reasons: ['laterality_name_conflict'] });
   });
 
   it('同页文字结果只能来自对应项目，不能借用另一科室的小结', () => {

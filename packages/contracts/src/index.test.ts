@@ -1,6 +1,46 @@
 import { describe, expect, it } from 'vitest';
-import { localDateSchema, reportMetadataCandidateSchema, resolveReviewInputSchema } from './index.js';
+import { localDateSchema, personSummarySchema, processNowInputSchema, reportMetadataCandidateSchema, resolveReviewInputSchema } from './index.js';
 import { clinicalTimeSchema } from './member-v2.js';
+
+describe('手动处理范围契约', () => {
+  const consent = { consentVersion: 1, confirmedDataRecipient: 'OpenAI/Codex' };
+  const expectedAssessmentDataRevision = 'a'.repeat(64);
+
+  it('兼容全量和指定报告，并接受独立的指定成员综合范围', () => {
+    expect(processNowInputSchema.parse(consent)).toEqual(consent);
+    expect(processNowInputSchema.parse({ ...consent, documentIds: ['synthetic-document'] }).documentIds)
+      .toEqual(['synthetic-document']);
+    expect(processNowInputSchema.parse({ ...consent, assessmentPersonId: 'synthetic-person', expectedAssessmentDataRevision }).assessmentPersonId)
+      .toBe('synthetic-person');
+  });
+
+  it('拒绝混用两种范围、非法成员标识和未定义字段', () => {
+    expect(processNowInputSchema.safeParse({ ...consent, documentIds: ['synthetic-document'],
+      assessmentPersonId: 'synthetic-person', expectedAssessmentDataRevision }).success).toBe(false);
+    for (const assessmentPersonId of ['', ' ', ' synthetic-person', 'synthetic\nperson', 'x'.repeat(121), null, 7, []]) {
+      expect(processNowInputSchema.safeParse({ ...consent, assessmentPersonId, expectedAssessmentDataRevision }).success).toBe(false);
+    }
+    expect(processNowInputSchema.safeParse({ ...consent, personId: 'synthetic-person' }).success).toBe(false);
+  });
+
+  it('成员与确认版本必须成对，版本只能是64位小写hex，报告路径不能带综合版本', () => {
+    expect(processNowInputSchema.safeParse({ ...consent, assessmentPersonId: 'synthetic-person' }).success).toBe(false);
+    expect(processNowInputSchema.safeParse({ ...consent, expectedAssessmentDataRevision }).success).toBe(false);
+    expect(processNowInputSchema.safeParse({ ...consent, documentIds: ['synthetic-document'], expectedAssessmentDataRevision }).success).toBe(false);
+    for (const revision of ['', 'a'.repeat(63), 'a'.repeat(65), 'A'.repeat(64), 'g'.repeat(64), null, 7]) {
+      expect(processNowInputSchema.safeParse({ ...consent, assessmentPersonId: 'synthetic-person',
+        expectedAssessmentDataRevision: revision }).success).toBe(false);
+    }
+  });
+});
+
+describe('综合更新必要性契约', () => {
+  it('兼容旧快照，并区分无需、必须及可选规则更新，不复用健康结论状态', () => {
+    const field = personSummarySchema.shape.assessmentRefreshStatus;
+    for (const value of [undefined, 'none', 'required', 'optional_rules']) expect(field.safeParse(value).success).toBe(true);
+    for (const value of [null, 'stale', 'current', 'optional', true]) expect(field.safeParse(value).success).toBe(false);
+  });
+});
 
 describe('本地日期契约', () => {
   it('接受真实日历日，拒绝只是格式像日期的无效值', () => {
@@ -38,6 +78,16 @@ describe('报告元数据日期契约', () => {
       sampleIdentifiers: [],
       times: []
     }).success).toBe(false);
+  });
+  it('主要临床时间索引保留明确未知及旧版兼容，不把负数、小数或文本当索引', () => {
+    const evidence = [{ sourceSpanId: 'synthetic-date', quote: '合成检查日期' }];
+    const metadata = { ...base, times: [{ value: '2025-03-04', precision: 'day', role: 'examined', evidence }] };
+    expect(reportMetadataCandidateSchema.parse({ ...metadata, primaryClinicalTimeIndex: 0 }).primaryClinicalTimeIndex).toBe(0);
+    expect(reportMetadataCandidateSchema.parse({ ...metadata, primaryClinicalTimeIndex: null }).primaryClinicalTimeIndex).toBeNull();
+    expect(reportMetadataCandidateSchema.parse(metadata).primaryClinicalTimeIndex).toBeUndefined();
+    for (const invalid of [-1, 0.5, '0', Infinity]) {
+      expect(reportMetadataCandidateSchema.safeParse({ ...metadata, primaryClinicalTimeIndex: invalid }).success).toBe(false);
+    }
   });
 });
 

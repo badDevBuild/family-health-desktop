@@ -2,14 +2,16 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Database from 'better-sqlite3';
+import { WORKSPACE_SCHEMA_VERSION } from '@storage';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ClinicalContext, ExtractionResult, ReportClinicalContext, SourceSpan } from '@contracts';
-import { PersonalWorkspaceService } from './workspace-service.js';
+import { LegacyTextFixtureWorkspaceService as PersonalWorkspaceService } from './legacy-text-source.fixture.js';
 import { DocumentExtractionPipeline } from './processing-pipeline.js';
 import { buildMemberAssessmentInput } from './member-assessment-input.js';
 import { buildMemberAnalysisPackage, createMemberAnalysisTransport } from './member-analysis-package.js';
 import { prepareClinicalRecords, validContextPatch } from './clinical-record-preparation.js';
 import { buildClinicalContextPrompt } from './prompts/clinical-context.js';
+import { syntheticExtractionRepair } from './extraction-repair.fixture.js';
 
 const services: PersonalWorkspaceService[] = [];
 const roots: string[] = [];
@@ -37,8 +39,15 @@ async function fixture(context?: (spanId: string) => ClinicalContext) {
       evidence: [{ sourceSpanId: span.id, quote: span.quote }], issues: [],
       ...(context ? { clinicalContext: context(span.id) } : {})
     }] };
+  let extractionCalls = 0;
   expect((await new DocumentExtractionPipeline(service.store, {
-    runStructuredTurn: async () => ({ threadId: 'extract', turnId: 'extract', output: extraction })
+    runStructuredTurn: async (input) => {
+      extractionCalls += 1;
+      const corrected: ExtractionResult = { ...extraction,
+        candidates: extraction.candidates.map((candidate) => ({ ...candidate, clinicalContext: null })) };
+      return { threadId: 'extract', turnId: 'extract', output: input.prompt.includes('REPAIR_REQUEST=')
+        ? syntheticExtractionRepair(input.prompt, extraction, corrected) : extraction };
+    }
   }).process(documentId)).status).toBe('published');
   const build = () => buildMemberAssessmentInput(service.store, personId, {
     modelId: 'synthetic-model', reasoningEffort: 'medium', analysisReferenceDate: '2026-09-26', webSearchAllowed: true
@@ -46,11 +55,11 @@ async function fixture(context?: (spanId: string) => ClinicalContext) {
   const prepare = (built: ReturnType<typeof build>, runTurn: Parameters<typeof prepareClinicalRecords>[0]['runTurn'],
     assertActive = () => {}) => prepareClinicalRecords({ store: service.store, personId, evidencePackage: built.evidencePackage,
     factRevision: built.factRevision, contextRevision: built.contextRevision, runTurn, assertActive });
-  return { service, personId, documentId, span, build, prepare };
+  return { service, personId, documentId, span, build, prepare, extractionCalls };
 }
 
 describe('可直接分析的临床记录', () => {
-  it('v35 升级只新增条件存储与缓存，原事实和引用不变，旧记录明确为未补齐', async () => {
+  it('v35 升级新增条件及可空日程存储，原事实和引用不变，旧记录明确为未补齐', async () => {
     const { service, personId } = await fixture();
     const before = service.store.listAcceptedObservations(personId);
     const root = service.store.rootDirectory;
@@ -60,6 +69,7 @@ describe('可直接分析的临床记录', () => {
     const legacy = new Database(path);
     legacy.exec(`DROP TABLE report_clinical_contexts;
       ALTER TABLE observation_revisions DROP COLUMN clinical_context_json;
+      ALTER TABLE action_items DROP COLUMN user_schedule_text;
       UPDATE workspaces SET schema_version = 35; PRAGMA user_version = 35;`);
     legacy.close();
     const upgraded = new PersonalWorkspaceService(root, '合成条件升级测试');
@@ -67,7 +77,7 @@ describe('可直接分析的临床记录', () => {
     expect(upgraded.store.listAcceptedObservations(personId)).toEqual(before);
     const check = new Database(path, { readonly: true });
     try {
-      expect(check.pragma('user_version', { simple: true })).toBe(36);
+      expect(check.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
       expect(check.prepare('SELECT COUNT(*) AS n FROM report_clinical_contexts').get()).toEqual({ n: 0 });
     } finally { check.close(); }
   });
@@ -129,10 +139,11 @@ describe('可直接分析的临床记录', () => {
   });
 
   it('提取的额外条件无效时保留可靠数值，不把问题变成新的人工核对', async () => {
-    const { service, personId } = await fixture(() => ({ version: 1, status: 'complete',
+    const { service, personId, extractionCalls } = await fixture(() => ({ version: 1, status: 'complete',
       conditions: [{ sourceSpanId: 'foreign-span', quote: '不属于这份资料' }] }));
     expect(service.store.listAcceptedObservations(personId)).toMatchObject([{ rawText: '4.9', clinicalContext: null }]);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(extractionCalls).toBe(2);
   });
 
   it('取消后的迟到补齐不能缓存；再次执行仍需合法补齐', async () => {

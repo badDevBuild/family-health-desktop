@@ -11,6 +11,8 @@ import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import type { SourceManifest, SourceSpan } from '@contracts';
 
 export * from './legacy-doc-converter.js';
+export * from './local-visual-evidence.js';
+export * from './direct-original-source.js';
 
 const require = createRequire(import.meta.url);
 // pdf.js 要求资源根路径以正斜杠结尾；Node 的本地文件读取在 Windows
@@ -371,7 +373,7 @@ function unsafeArchivePath(path: string): boolean {
   return normalized.startsWith('/') || normalized.split('/').some((part) => part === '..');
 }
 
-async function assertSafeDocxArchive(bytes: Uint8Array): Promise<void> {
+export async function assertSafeDocxArchive(bytes: Uint8Array): Promise<void> {
   const archive = await JSZip.loadAsync(Buffer.from(bytes), { createFolders: false });
   const entries = Object.values(archive.files).filter((entry) => !entry.dir);
   if (entries.length > INGESTION_LIMITS.maxDocxEntries) throw new Error('DOCX_ENTRY_COUNT_LIMIT_EXCEEDED');

@@ -12,6 +12,33 @@ interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
+  method: string;
+  startedAt: number;
+  recovery?: RpcRecoveryOptions;
+  removeAbort?: () => void;
+}
+
+export interface RpcLifecycleEvent {
+  requestId: number;
+  method: string;
+  phase: 'sent' | 'reply' | 'error_reply' | 'waiting_late_reply' | 'event_receipt' | 'unknown' | 'cancelled' | 'late_reply';
+  elapsedMs: number;
+}
+
+export interface RpcRecoveryOptions {
+  /** 同一个 RPC 的有限回执等待窗口；绝不重新发送请求。 */
+  lateReplyMs: number;
+  signal?: AbortSignal;
+  onLifecycle?: (event: RpcLifecycleEvent) => void;
+  /** 仅由拥有独立 thread 的调用方提供可关联的正式 turn 事件。 */
+  receiptFromNotification?: (method: string, params: unknown) => unknown | undefined;
+  /** 取消或最终超时后迟到的已接受回执只用于目标轮次清理，不能重启任务。 */
+  onLateResult?: (result: unknown) => void;
+}
+
+interface RetiredRequest {
+  pending: PendingRequest;
+  timer: NodeJS.Timeout;
 }
 
 export interface JsonRpcTransport {
@@ -28,6 +55,7 @@ export class CodexRpcClient extends EventEmitter {
   private buffer = '';
   private closed = false;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly retired = new Map<number, RetiredRequest>();
   private readonly requestTimeoutMs: number;
   private readonly serverRequestHandler: ServerRequestHandler;
   private readonly maxFrameBytes: number;
@@ -58,7 +86,6 @@ export class CodexRpcClient extends EventEmitter {
         mcpServerOpenaiFormElicitation: false,
         optOutNotificationMethods: [
           'item/reasoning/textDelta',
-          'item/reasoning/summaryTextDelta',
           'item/reasoning/summaryPartAdded'
         ]
       }
@@ -68,16 +95,66 @@ export class CodexRpcClient extends EventEmitter {
   }
 
   request<T = unknown>(method: string, params?: unknown, timeoutMs = this.requestTimeoutMs): Promise<T> {
+    return this.sendRequest(method, params, timeoutMs);
+  }
+
+  requestWithRecovery<T = unknown>(method: string, params: unknown, recovery: RpcRecoveryOptions,
+    timeoutMs = this.requestTimeoutMs): Promise<T> {
+    if (!['thread/start', 'turn/start'].includes(method) || !Number.isSafeInteger(recovery.lateReplyMs)
+      || recovery.lateReplyMs < 0 || recovery.lateReplyMs > 120_000) return Promise.reject(new Error('CODEX_RPC_RECOVERY_OPTIONS_INVALID'));
+    return this.sendRequest(method, params, timeoutMs, recovery);
+  }
+
+  private sendRequest<T>(method: string, params: unknown, timeoutMs: number, recovery?: RpcRecoveryOptions): Promise<T> {
     if (this.closed) return Promise.reject(new Error('CODEX_RPC_CLOSED'));
+    if (recovery?.signal?.aborted) return Promise.reject(recovery.signal.reason ?? new Error('CODEX_RPC_CANCELLED'));
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`CODEX_RPC_TIMEOUT:${method}`));
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        if (recovery?.lateReplyMs) {
+          this.reportLifecycle(id, pending, 'waiting_late_reply');
+          pending.timer = setTimeout(() => this.expireRequest(id), recovery.lateReplyMs);
+        } else this.expireRequest(id);
       }, timeoutMs);
-      this.pending.set(id, { resolve: (value) => resolve(value as T), reject, timer });
-      this.write({ method, id, params });
+      const pending: PendingRequest = { resolve: (value) => resolve(value as T), reject, timer,
+        method, startedAt: Date.now(), ...(recovery ? { recovery } : {}) };
+      this.pending.set(id, pending);
+      const onAbort = () => this.expireRequest(id, recovery?.signal?.reason ?? new Error('CODEX_RPC_CANCELLED'));
+      recovery?.signal?.addEventListener('abort', onAbort, { once: true });
+      pending.removeAbort = () => recovery?.signal?.removeEventListener('abort', onAbort);
+      // 调用方先持久化发送意图；失败时不能仍把健康资料发出去。
+      try {
+        recovery?.onLifecycle?.({ requestId: id, method, phase: 'sent', elapsedMs: 0 });
+        if (recovery?.signal?.aborted) throw recovery.signal.reason ?? new Error('CODEX_RPC_CANCELLED');
+        this.write({ method, id, params });
+      } catch (error) {
+        this.pending.delete(id); clearTimeout(timer); pending.removeAbort();
+        reject(error instanceof Error ? error : new Error('CODEX_RPC_SEND_FAILED'));
+      }
     });
+  }
+
+  private reportLifecycle(id: number, pending: PendingRequest, phase: RpcLifecycleEvent['phase']): void {
+    const event: RpcLifecycleEvent = { requestId: id, method: pending.method, phase,
+      elapsedMs: Math.max(0, Date.now() - pending.startedAt) };
+    // 回执到达之后的诊断写入失败不丢弃有效回包；接纳仍受外层持久化门禁保护。
+    try { pending.recovery?.onLifecycle?.(event); } catch { this.emit('recoveryDiagnosticFailed', { requestId: id, phase }); }
+  }
+
+  private expireRequest(id: number, cancelled?: Error): void {
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id); clearTimeout(pending.timer); pending.removeAbort?.();
+    this.reportLifecycle(id, pending, cancelled ? 'cancelled' : 'unknown');
+    if (pending.recovery?.onLateResult) {
+      // 有界墓碑只保留关联信息和清理回调，不保存请求正文或重发许可。
+      const timer = setTimeout(() => this.retired.delete(id), 120_000);
+      timer.unref();
+      this.retired.set(id, { pending, timer });
+    }
+    pending.reject(cancelled ?? new Error(`CODEX_RPC_TIMEOUT:${pending.method}`));
   }
 
   notify(method: string, params?: unknown): void {
@@ -132,13 +209,24 @@ export class CodexRpcClient extends EventEmitter {
   private async onMessage(message: Record<string, unknown>): Promise<void> {
     if (typeof message.id === 'number' && ('result' in message || 'error' in message) && !('method' in message)) {
       const pending = this.pending.get(message.id);
-      if (!pending) return;
+      if (!pending) {
+        const retired = this.retired.get(message.id);
+        if (retired) {
+          clearTimeout(retired.timer); this.retired.delete(message.id);
+          this.reportLifecycle(message.id, retired.pending, 'late_reply');
+          if ('result' in message) try { retired.pending.recovery?.onLateResult?.(message.result); } catch { /* 清理回调不能打断其他请求。 */ }
+        }
+        return;
+      }
       clearTimeout(pending.timer);
+      pending.removeAbort?.();
       this.pending.delete(message.id);
       if ('error' in message) {
+        this.reportLifecycle(message.id, pending, 'error_reply');
         const rpcError = message.error as JsonRpcErrorShape;
         pending.reject(new Error(`CODEX_RPC_ERROR:${rpcError?.code ?? 'unknown'}:${rpcError?.message ?? 'unknown'}`));
       } else {
+        this.reportLifecycle(message.id, pending, 'reply');
         pending.resolve(message.result);
       }
       return;
@@ -158,6 +246,19 @@ export class CodexRpcClient extends EventEmitter {
     }
 
     if (typeof message.method === 'string') {
+      for (const [id, pending] of this.pending) {
+        const result = pending.recovery?.receiptFromNotification?.(message.method, message.params);
+        if (result === undefined) continue;
+        clearTimeout(pending.timer); pending.removeAbort?.(); this.pending.delete(id);
+        this.reportLifecycle(id, pending, 'event_receipt');
+        pending.resolve(result);
+      }
+      for (const [id, retired] of this.retired) {
+        const result = retired.pending.recovery?.receiptFromNotification?.(message.method, message.params);
+        if (result === undefined) continue;
+        clearTimeout(retired.timer); this.retired.delete(id);
+        try { retired.pending.recovery?.onLateResult?.(result); } catch { /* 清理回调不能打断其他请求。 */ }
+      }
       this.emit('notification', { method: message.method, params: message.params });
       // App Server 的 `error` 是普通通知；Node EventEmitter 会把同名事件当作未捕获异常。
       this.emit(message.method === 'error' ? 'serverError' : message.method, message.params);
@@ -172,9 +273,12 @@ export class CodexRpcClient extends EventEmitter {
     this.closed = true;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
+      pending.removeAbort?.();
       pending.reject(reason);
     }
     this.pending.clear();
+    for (const retired of this.retired.values()) clearTimeout(retired.timer);
+    this.retired.clear();
     this.emit('closed', reason);
   }
 }

@@ -24,6 +24,19 @@ function fixture() {
 afterEach(() => { cleanup(); delete window.healthDesktop; });
 
 describe('指标阅读分组', () => {
+  it('缺单项日期时显示可追溯的报告时间，仍不把这条历史记录当最新检查或趋势点', () => {
+    const series = fixture(); const base = series[0]!.points[0]!;
+    const point = { ...base, id: 'undated-context', timestamp: null, comparable: false,
+      time: { ...base.time, value: null, precision: 'unknown' as const, displayLabel: '日期待确认' },
+      documentTime: { value: '2026-10-01', endValue: null, precision: 'day' as const, role: 'report' as const,
+        source: 'inherited' as const, basis: 'report' as const, displayLabel: '2026-10-01 · 所属报告的检查日期' } };
+    series[0]!.points.push(point); series[0]!.tableRows = series[0]!.points;
+    expect(groupMetricSeries(series)[0]).toMatchObject({ latestDate: '2026-09-12', reportDatedCount: 1, unknownDateCount: 0 });
+    render(<MetricHistory series={series} onBack={vi.fn()} onOpenEvidence={vi.fn()} />);
+    expect(screen.getByText('2026-10-01 · 所属报告的检查日期')).toBeTruthy();
+    expect(screen.getByText('单项检查日期尚未对应')).toBeTruthy();
+    expect(point.timestamp).toBeNull(); expect(point.time.value).toBeNull();
+  });
   it('进入详情时把标题滚入可见区域并移动键盘焦点，切换分组不再跳动', () => {
     const original = HTMLElement.prototype.scrollIntoView;
     const scroll = vi.fn();
@@ -92,12 +105,60 @@ describe('指标阅读分组', () => {
     const table = screen.getByRole('table');
     expect(within(table).getAllByRole('row')).toHaveLength(4);
     expect(within(table).getAllByRole('row')[1]!.textContent).toContain('2026-09-12');
+    expect(within(table).getAllByRole('row')[1]!.textContent).toContain('报告参考范围：0–3.4 mmol/l');
     const picker = screen.getByRole('combobox', { name: '选择趋势分组' });
     fireEvent.change(picker, { target: { value: series.find((item) => item.points.length === 2)!.id } });
     expect(container.querySelectorAll('.trend-data-line')).toHaveLength(1);
     expect(within(table).getAllByRole('row')).toHaveLength(4);
     fireEvent.click(within(table).getAllByRole('button', { name: '查看依据' })[0]!);
     expect(open).toHaveBeenCalledWith(expect.stringContaining('原始依据'), expect.objectContaining({ sourceSpanId: 'span-cv-2026' }));
+  });
+
+  it('检测条件默认收起但不同分组仍分开，未知日期不会变成核对任务', () => {
+    const series = fixture();
+    const undated = { ...series[0]!.tableRows[0]!, id: 'undated-row', timestamp: null,
+      time: { ...series[0]!.tableRows[0]!.time, value: null, displayLabel: '报告日期待确认' } };
+    series[0]!.tableRows.push(undated);
+    render(<MetricHistory series={series} onBack={vi.fn()} onOpenEvidence={vi.fn()} />);
+    const conditions = screen.getByText('为什么分开比较').closest('details')!;
+    expect(conditions.open).toBe(false);
+    expect(conditions.textContent).toContain('方法：未记录');
+    expect(conditions.textContent).toContain('方法：酶法');
+    expect(screen.getByRole('combobox').textContent).not.toContain('方法：');
+    expect(screen.getByText('单位、标本或检测方法不同，或检测条件未记录的结果，分组查看，不能直接比较。')).toBeTruthy();
+    expect(screen.getByText('检查日期未记录')).toBeTruthy();
+    expect(screen.queryByText('报告日期待确认')).toBeNull();
+    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(5);
+    fireEvent.click(screen.getByText('为什么分开比较'));
+    expect(conditions.open).toBe(true);
+  });
+
+  it('单次、单边和未知参考范围如实展示，不补造阈值或改写报告原文', () => {
+    const base = fixture()[0]!;
+    const point = base.tableRows[0]!;
+    const rows = [
+      { ...point, id: 'upper-only', referenceLow: null, referenceHigh: 3.4 },
+      { ...point, id: 'lower-only', referenceLow: 1, referenceHigh: null },
+      { ...point, id: 'unknown-range', referenceLow: null, referenceHigh: null }
+    ];
+    render(<MetricHistory series={[{ ...base, tableRows: rows }]} onBack={vi.fn()} onOpenEvidence={vi.fn()} />);
+    const table = screen.getByRole('table');
+    expect(within(table).getByText('报告参考上限：3.4 mmol/l')).toBeTruthy();
+    expect(within(table).getByText('报告参考下限：1 mmol/l')).toBeTruthy();
+    expect(within(table).getByText('报告未记录参考范围')).toBeTruthy();
+  });
+
+  it('不能画趋势时仍保留已有的检测条件限制，不展示处理状态或补写医学解释', () => {
+    const base = fixture()[0]!;
+    const limitation = '检测方法未记录，暂不能判断这些数值是否可以直接比较。';
+    render(<MetricHistory series={[{ ...base,
+      points: base.points.map((point) => ({ ...point, comparable: false })),
+      trendFacts: { ...base.trendFacts, statement: limitation, reasons: [limitation, '尚未按新规则复核。', '没有记录检查时是否用药。'] }
+    }]} onBack={vi.fn()} onOpenEvidence={vi.fn()} />);
+    expect(screen.getAllByText(limitation)).toHaveLength(1);
+    expect(screen.getByText('没有记录检查时是否用药。')).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/新规则|复核/);
+    expect(screen.getByRole('table').textContent).toContain(base.tableRows[0]!.displayValue!);
   });
 });
 
@@ -126,7 +187,7 @@ describe('身体指标入口端到端读模型', () => {
     } as unknown as HealthDesktopBridge;
     render(<MemberProfileV2 snapshot={{ ...snapshot, persons: [person] }} person={person}
       onSelectPerson={vi.fn()} onOpenEvidence={vi.fn()} onAddPerson={vi.fn()} onEditPerson={vi.fn()}
-      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onImport={vi.fn()} onRefreshAssessment={vi.fn()}
+      onArchivedPeople={vi.fn()} onAddNote={vi.fn()} onExport={vi.fn()} onUploadReports={vi.fn()} onRefreshAssessment={vi.fn()}
       onExcludeDocument={vi.fn()} onReincludeDocument={vi.fn()} onDeleteDocument={vi.fn()} onDeletedDocuments={vi.fn()} />);
     return { getMetricSeries };
   }

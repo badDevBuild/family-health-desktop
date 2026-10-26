@@ -37,6 +37,7 @@ describe('ConceptReviewPanel', () => {
     expect(screen.queryByText('院内简称 X')).toBeNull();
     expect(screen.getByText('发现指标名称或趋势分组不对？')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '打开高级整理' }));
+    expect(document.body.textContent).not.toMatch(/映射版本|词典|已验证别名|默认收起/);
     expect(screen.getByRole('button', { name: '收起高级整理' })).toBeTruthy();
     expect(screen.getByText('院内简称 X')).toBeTruthy();
     expect(screen.getByText('TSH')).toBeTruthy();
@@ -48,5 +49,19 @@ describe('ConceptReviewPanel', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: '撤销上次修正' }));
     expect(onUndo).toHaveBeenCalledWith('observation-2');
+  });
+
+  it('隐藏名称匹配过程，同时保留单位、标本差异和检查条件', () => {
+    const item = bundle.items[0]!;
+    const reasons = ['只有模型候选名命中词典；原报告名称尚未核实为同一概念。', '原报告名称与模型候选名指向不同概念。',
+      '单位 mIU/mL 与已验证定义不一致。', '标本 尿液 与已验证定义不一致。', '未记录检查时是否用药，不能确定变化原因。'];
+    render(<ConceptReviewPanel bundle={{ ...bundle, items: [{ ...item, mapping: { ...item.mapping, reasons } }] }}
+      busyObservationId={null} onSave={vi.fn()} onUndo={vi.fn()} onOpenEvidence={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: '打开高级整理' }));
+    expect(document.body.textContent).not.toMatch(/模型|候选|词典|已验证定义|命中/);
+    expect(document.body.textContent).toContain('报告中的单位为“mIU/mL”，与当前归类的检测条件不同，暂不能直接比较。');
+    expect(document.body.textContent).toContain('报告中的标本为“尿液”，与当前归类的检测条件不同，暂不能直接比较。');
+    expect(document.body.textContent).toContain('未记录检查时是否用药，不能确定变化原因。');
+    expect(reasons[0]).toContain('模型候选');
   });
 });

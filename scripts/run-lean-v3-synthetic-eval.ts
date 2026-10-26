@@ -3,13 +3,13 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fro
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
-import { aiReasoningEffortSchema, clinicalFocusedReviewV1Schema, memberAssessmentCandidateV3Schema } from '@contracts';
+import { aiReasoningEffortSchema, clinicalFocusedReviewV1Schema, memberAssessmentCandidateV3Schema, memberAssessmentRepairV1Schema } from '@contracts';
 import { stableHash } from '@core';
 import { redactSensitiveLog, spawnCodexAppServer } from '../packages/codex-adapter/src/index.js';
 import { createAssessmentV3SyntheticCases, prepareSyntheticWebExcerptChallenge } from '../packages/evaluation/src/assessment-v3-cases.js';
 import { completedSyntheticSearchAction, syntheticQueryMatchKinds } from '../packages/evaluation/src/synthetic-web-search-audit.js';
 import { normalizeAssessmentStructuralFields, validateAssessmentCandidate } from '../apps/desktop/src/main/assessment-validation.js';
-import { repairChangedOnlyAllowed, repairTargets } from '../apps/desktop/src/main/member-assessment-pipeline.js';
+import { assessmentRepairNode, buildAssessmentRepairRequest, mergeAssessmentRepair, repairChangedOnlyAllowed } from '../apps/desktop/src/main/member-assessment-pipeline.js';
 import { applyFocusedReview, routeFocusedReview } from '../apps/desktop/src/main/clinical-review-router.js';
 import { CodexRuntimeManager } from '../apps/desktop/src/main/codex-runtime.js';
 import { buildP02Prompt, buildP03Prompt, buildP04Prompt } from '../apps/desktop/src/main/prompts/lean.js';
@@ -126,16 +126,19 @@ try {
         }
         const validationInput = validationInputFor(item);
         const originalIssues = validateAssessmentCandidate(candidate, validationInput).issues;
-        const targetIds = repairTargets(candidate, originalIssues);
+        const repairRequest = buildAssessmentRepairRequest(candidate, originalIssues, item.evidencePackage.evidenceCatalog,
+          item.evidencePackage.facts);
+        const targetIds = repairRequest.targets;
         if (targetIds.length === 0) throw new Error('SYNTHETIC_TARGETED_REPAIR_NOT_TRIGGERED');
-        const repairRequest = { stage: 'assessment', targets: targetIds,
-          allowedPaths: targetIds.map((id) => id === 'overview' ? 'overview' : `node:${id}`),
-          issues: originalIssues, originalCandidateHash: stableHash(candidate) };
         const turn = await runtime.runStructuredTurn<unknown>({
-          prompt: buildP03Prompt(repairRequest, item.evidencePackage, candidate),
-          outputSchema, aiPreferences: { modelId, reasoningEffort }, allowWebSearch: false, timeoutMs: 240_000
+          prompt: buildP03Prompt(repairRequest, item.evidencePackage,
+            targetIds.map((targetId) => ({ targetId, ...assessmentRepairNode(candidate, targetId)! }))),
+          outputSchema: z.toJSONSchema(memberAssessmentRepairV1Schema, { target: 'draft-7' }),
+          aiPreferences: { modelId, reasoningEffort }, allowWebSearch: false, timeoutMs: 240_000
         });
-        const repaired = normalizeAssessmentStructuralFields(memberAssessmentCandidateV3Schema.parse(turn.output));
+        const merged = mergeAssessmentRepair(candidate, repairRequest, turn.output);
+        if (!merged.candidate) throw new Error(merged.reason);
+        const repaired = normalizeAssessmentStructuralFields(merged.candidate);
         const repairScoped = repairChangedOnlyAllowed(candidate, repaired, targetIds);
         const postValidationIssues = validateAssessmentCandidate(repaired, validationInput).issues;
         if (!repairScoped || postValidationIssues.length > 0) process.exitCode = 1;

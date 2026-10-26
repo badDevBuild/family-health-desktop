@@ -9,6 +9,8 @@ files:
   - package.json
   - docs/THIRD_PARTY_NOTICES.md
 extraResources:
+  - from: .runtime-stage/vision
+    to: runtime/vision
   - from: .runtime-stage/codex
     to: runtime/codex
   - from: .runtime-stage/libreoffice

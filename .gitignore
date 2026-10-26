@@ -16,6 +16,12 @@ fhd-rereview-*/
 family-health-desktop-rereview-*.zip
 fhd-review-*/
 family-health-desktop-review-*.zip
+family-health-desktop-full-review-*.zip
+family-health-review-*/
+family-health-review-*.zip
+review-*/
+docs/screenshots/*.zip
+promo-video/
 family-health-member-redesign-v2/
 family-health-member-redesign-v2-*.zip
 artifacts/

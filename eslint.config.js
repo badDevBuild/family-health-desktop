@@ -9,6 +9,8 @@ export default tseslint.config(
       'out/**',
       'release/**',
       'coverage/**',
+      // 本机私有核查产物不是产品源码，也不应被公共代码检查收集。
+      'artifacts/private-audit/**',
       'schemas/codex/**',
       'family-health-desktop-review-evidence-*/**',
       'family-health-review-*/**',

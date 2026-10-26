@@ -1,0 +1,27 @@
+*{box-sizing:border-box}
+body{margin:0}
+button,input,select{font:inherit}
+a{color:#2b7a55;text-decoration:none}
+a:hover{text-decoration:underline;text-underline-offset:4px}
+a:focus-visible,button:focus-visible,summary:focus-visible,select:focus-visible{outline:3px solid #2b7a55;outline-offset:3px}
+button,summary{cursor:pointer}
+svg{flex-shrink:0}
+summary::marker{color:#2b7a55}
+.ui-nav a:hover{background:#e8f5ee;text-decoration:none}
+.ui-action:hover{background:#f5f3f0!important;text-decoration:none}
+.ui-card{transition:box-shadow 180ms ease-out}
+.ui-card:hover{box-shadow:0 2px 8px rgba(44,40,36,.08),0 8px 24px rgba(44,40,36,.06)}
+.ui-row{flex-wrap:wrap}
+.ui-tabs{flex-wrap:wrap}
+@media(max-width:760px){
+.ui-shell{flex-direction:column}
+.ui-aside{flex-basis:auto!important;width:100%!important;border-right:0!important;border-bottom:1px solid #e8e5e0}
+.ui-nav{display:flex!important;flex-wrap:wrap;gap:8px!important;margin-top:16px!important}
+.ui-aside-footer{display:none!important}
+.ui-content{padding:24px 16px!important}
+.ui-topbar{padding:16px!important;gap:12px;flex-wrap:wrap}
+.ui-cards{grid-template-columns:minmax(0,1fr)!important}
+.ui-two{grid-template-columns:minmax(0,1fr)!important}
+.ui-heading{font-size:28px!important}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}

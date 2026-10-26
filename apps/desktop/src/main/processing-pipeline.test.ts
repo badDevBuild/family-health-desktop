@@ -4,16 +4,40 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { createCanvas } from '@napi-rs/canvas';
-import { afterEach, describe, expect, it } from 'vitest';
-import type { ExtractionResult } from '@contracts';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ExtractionResult, SourceManifest } from '@contracts';
+import { buildDocxManifest, buildPdfManifest } from '@ingestion';
 import { createSyntheticTwoPageScannedPdf } from '../../../../packages/evaluation/src/scanned-pdf-fixture.js';
 import { HEALTH_MODEL_TURN_TIMEOUT_MS } from './ai-runtime-policy.js';
-import { PersonalWorkspaceService as BasePersonalWorkspaceService } from './workspace-service.js';
+import { syntheticExtractionRepair } from './extraction-repair.fixture.js';
+import * as sourceNormalization from './source-normalization.js';
+import { LegacyTextFixtureWorkspaceService as BasePersonalWorkspaceService } from './legacy-text-source.fixture.js';
 import { compareIndependentExtractions, DocumentExtractionPipeline, mergeIndependentlyConfirmedEvidence, partitionPdfSpans, partitionSourceSpans, scopeCandidateKeys } from './processing-pipeline.js';
 
 const roots: string[] = [];
 const openServices = new Set<BasePersonalWorkspaceService>();
 const require = createRequire(import.meta.url);
+
+function setSyntheticFolderAssignment(service: BasePersonalWorkspaceService, documentId: string): void {
+  const database = new Database(service.store.databasePath);
+  try { database.prepare("UPDATE documents SET person_assignment_basis = 'folder_binding' WHERE id = ?").run(documentId); }
+  finally { database.close(); }
+}
+
+function persistSyntheticOcrFixture(service: BasePersonalWorkspaceService, manifest: SourceManifest): void {
+  // 仅测试目录：模拟独立 OCR 的持久化结果，不使用真实个人报告或模型生成来源。
+  const database = new Database(service.store.databasePath);
+  try {
+    database.transaction(() => {
+      const update = database.prepare('UPDATE source_spans SET span_kind = ?, quote = ?, readability = ?, normalizer_version = ? WHERE id = ?');
+      for (const span of manifest.spans) update.run(span.spanKind, span.quote, span.readability, manifest.normalizerVersion, span.id);
+      database.prepare('UPDATE source_manifests SET normalizer_version = ? WHERE document_id = ?')
+        .run(manifest.normalizerVersion, manifest.spans[0]!.documentId);
+    })();
+  } finally {
+    database.close();
+  }
+}
 
 class PersonalWorkspaceService extends BasePersonalWorkspaceService {
   constructor(...args: ConstructorParameters<typeof BasePersonalWorkspaceService>) {
@@ -28,6 +52,7 @@ class PersonalWorkspaceService extends BasePersonalWorkspaceService {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const service of [...openServices]) service.close();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
@@ -245,6 +270,8 @@ describe('DocumentExtractionPipeline', () => {
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '旧版 PDF 工作区', () => new Date('2026-09-18T00:00:00Z'));
     const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    // 只模拟历史已存在文字层的旧版本，不把正式直读导入回退成文字提取。
+    vi.spyOn(sourceNormalization, 'normalizeStoredSource').mockImplementationOnce((input) => buildPdfManifest(input));
     const receipt = await service.importFiles([{
       path: '/tmp/legacy-report.pdf',
       bytes: createTextPdf('LDL 4.2 mmol/L')
@@ -286,11 +313,13 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
-  it('DOCX 嵌入图会带着对应 source span 进入一次视觉读取，完成后清理', async () => {
+  it('DOCX 嵌入图带原图局部补救，无独立文字依据的模型数值不能入库', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-docx-pipeline-'));
     roots.push(root);
     const service = new PersonalWorkspaceService(root, 'DOCX 工作区', () => new Date('2026-09-18T00:00:00Z'));
     const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
+    // 仅旧格式兼容 fixture 使用历史语义视图；新原件集成测试严格要求全页PDF转换。
+    vi.spyOn(sourceNormalization, 'normalizeStoredSource').mockImplementationOnce((input) => buildDocxManifest(input));
     const fixturePath = join(dirname(require.resolve('mammoth/package.json')), 'test', 'test-data', 'tiny-picture.docx');
     const receipt = await service.importFiles([{ path: '/tmp/含图虚构报告.docx', bytes: readFileSync(fixturePath) }], personId);
     expect(receipt.rejected).toEqual([]);
@@ -322,13 +351,14 @@ describe('DocumentExtractionPipeline', () => {
         return { threadId: `docx-thread-${turn}`, turnId: `docx-turn-${++turn}`, output };
       }
     });
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
-    expect(observedPaths).toHaveLength(1);
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'partial', reason: 'NO_ACCEPTABLE_FACTS' });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([]);
+    expect(observedPaths).toHaveLength(2);
     expect(existsSync(observedPaths[0]!)).toBe(false);
     service.close();
   });
 
-  it('扫描 PDF 页会渲染成临时图片供一次视觉读取，成功后清理', async () => {
+  it('扫描 PDF 原图用于一次有界补救，无独立来源日期和数值时不接受', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-scanned-pipeline-'));
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '扫描件工作区', () => new Date('2026-09-18T00:00:00Z'));
@@ -360,13 +390,14 @@ describe('DocumentExtractionPipeline', () => {
         return { threadId: `scan-thread-${turn}`, turnId: `scan-turn-${++turn}`, output };
       }
     });
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
-    expect(observedPaths).toHaveLength(1);
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'partial', reason: 'NO_ACCEPTABLE_FACTS' });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([]);
+    expect(observedPaths).toHaveLength(2);
     expect(existsSync(observedPaths[0]!)).toBe(false);
     service.close();
   });
 
-  it('双页无文字层 PDF 一次传入两页，跨页日期与各页来源均可接纳', async () => {
+  it('双页扫描 PDF 有独立 OCR 后仍一次带两页原图，跨页日期依据可接纳', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-two-page-scan-'));
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '双页扫描工作区', () => new Date('2026-09-22T00:00:00Z'));
@@ -376,19 +407,30 @@ describe('DocumentExtractionPipeline', () => {
     }], personId);
     expect(receipt.rejected).toEqual([]);
     const documentId = service.getSnapshot(null).inbox[0]!.id;
-    const spans = service.store.getDocumentExtractionBundle(documentId).manifest.spans;
+    const manifest = service.store.getDocumentExtractionBundle(documentId).manifest;
+    const spans = manifest.spans;
     expect(spans.map((span) => [span.page, span.quote])).toEqual([[1, null], [2, null]]);
+    // 独立 OCR 与模型输出分开注入；这些文字来自上方纯合成图片，不是模型自述。
+    spans[0]!.spanKind = 'image';
+    spans[0]!.quote = '姓名：合成成员 检查日期：2025-06-10 低密度脂蛋白胆固醇 LDL-C：4.2 mmol/L 参考范围：0-3.4 mmol/L';
+    spans[0]!.readability = 'clear';
+    spans[1]!.spanKind = 'image';
+    spans[1]!.quote = '空腹血糖：5.1 mmol/L 参考范围：3.9-6.1 mmol/L';
+    spans[1]!.readability = 'clear';
+    manifest.normalizerVersion = 'legacy-synthetic-visual-fixture-v1';
+    persistSyntheticOcrFixture(service, manifest);
     const candidates = [
       { localKey: 'ldl', originalName: '低密度脂蛋白胆固醇 LDL-C', standardNameCandidate: 'LDL-C',
         value: { kind: 'numeric' as const, rawText: '4.2', decimal: '4.2', comparator: 'eq' as const },
         unitRaw: 'mmol/L', referenceRangeRaw: '0-3.4 mmol/L', reportedAbnormalFlag: '偏高',
         specimen: null, method: null, bodySite: null, clinicalDate: '2025-06-10',
-        evidence: [{ sourceSpanId: spans[0]!.id, quote: null }], issues: [] },
+        evidence: [{ sourceSpanId: spans[0]!.id, quote: spans[0]!.quote }], issues: [] },
       { localKey: 'glucose', originalName: '空腹血糖', standardNameCandidate: '空腹血糖',
         value: { kind: 'numeric' as const, rawText: '5.1', decimal: '5.1', comparator: 'eq' as const },
         unitRaw: 'mmol/L', referenceRangeRaw: '3.9-6.1 mmol/L', reportedAbnormalFlag: null,
         specimen: null, method: null, bodySite: null, clinicalDate: '2025-06-10',
-        evidence: [{ sourceSpanId: spans[1]!.id, quote: null }], issues: [] }
+        evidence: [{ sourceSpanId: spans[1]!.id, quote: spans[1]!.quote },
+          { sourceSpanId: spans[0]!.id, quote: '检查日期：2025-06-10' }], issues: [] }
     ];
     let turns = 0;
     const observedPaths: string[] = [];
@@ -403,7 +445,7 @@ describe('DocumentExtractionPipeline', () => {
         observedPaths.push(...input.imagePaths!);
         return { threadId: 'two-page-scan', turnId: 'two-page-scan', output: {
           schemaVersion: 1, documentId,
-          subject: { reportedName: '合成成员', evidence: [{ sourceSpanId: spans[0]!.id, quote: null }], confidence: 'explicit' },
+          subject: { reportedName: '合成成员', evidence: [{ sourceSpanId: spans[0]!.id, quote: '姓名：合成成员' }], confidence: 'explicit' },
           coveredSourceSpanIds: spans.map((span) => span.id), candidates
         } satisfies ExtractionResult };
       }
@@ -416,7 +458,7 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   }, 20_000);
 
-  it('扫描图像中明确读到不同姓名时必须阻断，不因缺少文字层放行', async () => {
+  it('目录自动归属的扫描图像明确读到不同姓名时仍阻断', async () => {
     const root = mkdtempSync(join(tmpdir(), 'family-health-image-identity-conflict-'));
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '图像身份工作区', () => new Date('2026-09-18T00:00:00Z'));
@@ -424,6 +466,7 @@ describe('DocumentExtractionPipeline', () => {
     const receipt = await service.importFiles([{ path: '/tmp/扫描件.pdf', bytes: createScannedLikePdf() }], personId);
     expect(receipt.rejected).toEqual([]);
     const documentId = service.getSnapshot(null).inbox[0]!.id;
+    setSyntheticFolderAssignment(service, documentId);
     const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
     const output: ExtractionResult = {
       schemaVersion: 1,
@@ -470,7 +513,12 @@ describe('DocumentExtractionPipeline', () => {
     }], personId);
     expect(receipt.rejected).toEqual([]);
     const documentId = service.getSnapshot(null).inbox[0]!.id;
-    const spanId = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!.id;
+    const manifest = service.store.getDocumentExtractionBundle(documentId).manifest;
+    const spanId = manifest.spans[0]!.id;
+    manifest.spans[0]!.quote = '报告者：测试报告者/870376 低密度脂蛋白胆固醇 4.2 mmol/L';
+    manifest.spans[0]!.readability = 'clear';
+    manifest.normalizerVersion = 'legacy-synthetic-visual-fixture-v1';
+    persistSyntheticOcrFixture(service, manifest);
     const output: ExtractionResult = {
       schemaVersion: 1, documentId,
       subject: {
@@ -483,7 +531,7 @@ describe('DocumentExtractionPipeline', () => {
         value: { kind: 'numeric', rawText: '4.2', decimal: '4.2', comparator: 'eq' },
         unitRaw: 'mmol/L', referenceRangeRaw: null, reportedAbnormalFlag: null,
         specimen: null, method: null, bodySite: null, clinicalDate: null,
-        evidence: [{ sourceSpanId: spanId, quote: null }], issues: []
+        evidence: [{ sourceSpanId: spanId, quote: '低密度脂蛋白胆固醇 4.2 mmol/L' }], issues: []
       }]
     };
     const pipeline = new DocumentExtractionPipeline(service.store, {
@@ -628,7 +676,15 @@ describe('DocumentExtractionPipeline', () => {
         value: { kind: 'qualitative', rawText: '未见异常', category: 'no abnormality detected' },
         unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
         specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
-        evidence: [{ sourceSpanId: span.id, quote: '内科 内科 检查日期：2023-10-08 心脏未见异常 小结 未见异常' }],
+        evidence: [
+          { sourceSpanId: span.id, quote: '内科 内科 检查日期：2023-10-08 心脏未见异常 小结 未见异常' },
+          { sourceSpanId: span.id, quote: '内科 内科' },
+          { sourceSpanId: span.id, quote: '小结 未见异常 外科' }
+        ],
+        sourceBinding: {
+          headingEvidence: [{ sourceSpanId: span.id, quote: '内科 内科' }],
+          findingEvidence: [{ sourceSpanId: span.id, quote: '小结 未见异常 外科' }]
+        },
         issues: []
       }]
     };
@@ -641,10 +697,10 @@ describe('DocumentExtractionPipeline', () => {
     };
     let turn = 0;
     const pipeline = new DocumentExtractionPipeline(service.store, {
-      runStructuredTurn: async () => ({
+      runStructuredTurn: async (input) => ({
         threadId: `section-abbreviation-thread-${turn}`,
         turnId: `section-abbreviation-turn-${++turn}`,
-        output: turn === 1 ? base : abbreviated
+        output: turn === 1 ? abbreviated : syntheticExtractionRepair(input.prompt, abbreviated, base)
       })
     });
 
@@ -780,7 +836,7 @@ describe('DocumentExtractionPipeline', () => {
       })
     });
 
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 1 });
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([
       expect.objectContaining({ severity: 'warning', candidateOptions: [expect.objectContaining({ originalName: emptyUnknown.originalName })] })
@@ -821,20 +877,26 @@ describe('DocumentExtractionPipeline', () => {
       candidates: [
         {
           localKey: 'model-sbp', originalName: '收缩压', standardNameCandidate: 'SBP',
-          value: { kind: 'numeric', rawText: '107', decimal: '107', comparator: 'eq' }, ...shared, issues: []
+          value: { kind: 'numeric', rawText: '107', decimal: '107', comparator: 'eq' }, ...shared, issues: [],
+          evidence: [{ sourceSpanId: span.id, quote: '收缩压 107 mmHg' }],
+          sourceBinding: { headingEvidence: [{ sourceSpanId: span.id, quote: '收缩压 107 mmHg' }],
+            findingEvidence: [{ sourceSpanId: span.id, quote: '收缩压 107 mmHg' }] }
         },
         {
           localKey: 'model-dbp', originalName: '舒张压', standardNameCandidate: 'DBP',
-          value: { kind: 'numeric', rawText: '70', decimal: '70', comparator: 'eq' }, ...shared, issues: []
+          value: { kind: 'numeric', rawText: '70', decimal: '70', comparator: 'eq' }, ...shared, issues: [],
+          evidence: [{ sourceSpanId: span.id, quote: '舒张压 70 mmHg' }],
+          sourceBinding: { headingEvidence: [{ sourceSpanId: span.id, quote: '舒张压 70 mmHg' }],
+            findingEvidence: [{ sourceSpanId: span.id, quote: '舒张压 70 mmHg' }] }
         }
       ]
     };
     let turn = 0;
     const pipeline = new DocumentExtractionPipeline(service.store, {
-      runStructuredTurn: async () => ({
+      runStructuredTurn: async (input) => ({
         threadId: `bp-thread-${turn}`,
         turnId: `bp-turn-${++turn}`,
-        output: turn === 1 ? combined : separated
+        output: turn === 1 ? combined : syntheticExtractionRepair(input.prompt, combined, separated)
       })
     });
 
@@ -923,7 +985,7 @@ describe('DocumentExtractionPipeline', () => {
     roots.push(root);
     const service = new PersonalWorkspaceService(root, '年度对比日期工作区', () => new Date('2026-09-20T00:00:00Z'));
     const personId = service.ensurePrimaryMember({ displayName: '测试成员', relation: '本人' });
-    const sourceText = '合成医院 体检中心 报告日期 2024-10-23 历次体检结果对比 一般检查 2023-10-08 2024-10-22 趋势 正常参考 单位 体重 91 94 ▲ --- kg';
+    const sourceText = '合成医院 体检中心 本次检查日期 2024-10-22 报告日期 2024-10-23 历次体检结果对比 一般检查 2023-10-08 2024-10-22 趋势 正常参考 单位 体重 91 94 ▲ --- kg';
     await service.importFiles([{ path: '/tmp/年度对比报告.txt', bytes: Buffer.from(sourceText) }], personId);
     const documentId = service.getSnapshot(null).inbox[0]!.id;
     const span = service.store.getDocumentExtractionBundle(documentId).manifest.spans[0]!;
@@ -955,7 +1017,7 @@ describe('DocumentExtractionPipeline', () => {
         reportNumber: null,
         examItems: [{ value: '一般检查', evidence: [{ sourceSpanId: span.id, quote: '一般检查' }] }],
         times: [
-          { value: '2024-10-22', precision: 'day', role: 'examined', evidence: [{ sourceSpanId: span.id, quote: '2024-10-22' }] },
+          { value: '2024-10-22', precision: 'day', role: 'examined', evidence: [{ sourceSpanId: span.id, quote: '本次检查日期 2024-10-22' }] },
           { value: '2024-10-23', precision: 'day', role: 'report_issued', evidence: [{ sourceSpanId: span.id, quote: '报告日期 2024-10-23' }] },
           { value: '2023-10-08', precision: 'day', role: 'history_quoted', evidence: [{ sourceSpanId: span.id, quote: '2023-10-08' }] }
         ]
@@ -968,10 +1030,13 @@ describe('DocumentExtractionPipeline', () => {
     };
     let turn = 0;
     const pipeline = new DocumentExtractionPipeline(service.store, {
-      runStructuredTurn: async () => ({ threadId: 'comparison-date-thread', turnId: `comparison-date-${++turn}`, output })
+      runStructuredTurn: async (input) => ({ threadId: 'comparison-date-thread', turnId: `comparison-date-${++turn}`,
+        output: turn === 1 ? output : syntheticExtractionRepair(input.prompt, output, output) })
     });
 
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 2 });
+    const processResult = await pipeline.process(documentId);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(processResult).toMatchObject({ status: 'published', candidateCount: 2 });
     expect(service.store.listAcceptedObservations(personId)).toEqual([
       expect.objectContaining({ conceptKey: '体重', decimalValue: '91', clinicalDate: '2023-10-08' }),
       expect.objectContaining({ conceptKey: '体重', decimalValue: '94', clinicalDate: '2024-10-22' })
@@ -1020,6 +1085,8 @@ describe('DocumentExtractionPipeline', () => {
       SET total_units = 2, covered_unit_indexes_json = '[0,1]'
       WHERE document_id = ?
     `).run(documentId);
+    database.prepare('INSERT INTO source_manifest_spans (document_id, source_span_id) VALUES (?, ?)')
+      .run(documentId, secondSpanId);
     database.close();
 
     const output: ExtractionResult = {
@@ -1081,6 +1148,8 @@ describe('DocumentExtractionPipeline', () => {
     `).run(secondSpanId, '一般检查 身高 187 厘米', firstSpan.id);
     database.prepare("UPDATE source_manifests SET total_units = 2, covered_unit_indexes_json = '[0,1]' WHERE document_id = ?")
       .run(documentId);
+    database.prepare('INSERT INTO source_manifest_spans (document_id, source_span_id) VALUES (?, ?)')
+      .run(documentId, secondSpanId);
     database.close();
     const output: ExtractionResult = {
       schemaVersion: 1,
@@ -1176,7 +1245,7 @@ describe('DocumentExtractionPipeline', () => {
       '体检报告 检查日期：2024-10-22',
       ...Array.from({ length: 39 }, (_, index) => `无可提取正文 ${index + 1}`),
       contextLine,
-      '检查结果 甲状腺回声分布不均匀'
+      '甲状腺小结 甲状腺回声分布不均匀'
     ];
     await service.importFiles([{ path: '/tmp/跨块多日期报告.txt', bytes: Buffer.from(lines.join('\n')) }], personId);
     const documentId = service.getSnapshot(null).inbox[0]!.id;
@@ -1205,7 +1274,7 @@ describe('DocumentExtractionPipeline', () => {
             value: { kind: 'text', rawText: '甲状腺回声分布不均匀' },
             unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
             specimen: null, method: '超声', bodySite: '甲状腺', clinicalDate: null,
-            evidence: [{ sourceSpanId: spans[1]!.id, quote: '检查结果 甲状腺回声分布不均匀' }], issues: []
+            evidence: [{ sourceSpanId: spans[1]!.id, quote: '甲状腺小结 甲状腺回声分布不均匀' }], issues: []
           }] : []
         };
         return { threadId: 'cross-chunk-competing-date-thread', turnId: `cross-chunk-competing-date-${turn}`, output };
@@ -1279,9 +1348,13 @@ describe('DocumentExtractionPipeline', () => {
     ) SELECT ?, document_id, 'page', ?, NULL, NULL, NULL, ?, 'clear', normalizer_version
       FROM source_spans WHERE id = ?`);
     insert.run(secondId, 2, '超声科 检查日期：2024-10-25', first.id);
-    insert.run(thirdId, 3, '检查结果 甲状腺回声分布不均匀', first.id);
+    insert.run(thirdId, 3, '甲状腺小结 甲状腺回声分布不均匀', first.id);
     db.prepare("UPDATE source_manifests SET total_units=3, covered_unit_indexes_json='[0,1,2]' WHERE document_id=?")
       .run(documentId);
+    for (const sourceSpanId of [secondId, thirdId]) {
+      db.prepare('INSERT INTO source_manifest_spans (document_id, source_span_id) VALUES (?, ?)')
+        .run(documentId, sourceSpanId);
+    }
     db.close();
     const output: ExtractionResult = {
       schemaVersion: 1, documentId,
@@ -1299,7 +1372,7 @@ describe('DocumentExtractionPipeline', () => {
         value: { kind: 'text', rawText: '甲状腺回声分布不均匀' },
         unitRaw: null, referenceRangeRaw: null, reportedAbnormalFlag: null,
         specimen: null, method: '超声', bodySite: '甲状腺', clinicalDate: null,
-        evidence: [{ sourceSpanId: thirdId, quote: '检查结果 甲状腺回声分布不均匀' }], issues: []
+        evidence: [{ sourceSpanId: thirdId, quote: '甲状腺小结 甲状腺回声分布不均匀' }], issues: []
       }]
     };
     await expect(new DocumentExtractionPipeline(service.store, {
@@ -1361,7 +1434,10 @@ describe('DocumentExtractionPipeline', () => {
         value: { kind: 'qualitative', rawText: '阴性', category: 'negative' },
         unitRaw: null, referenceRangeRaw: '阴性 (-)', reportedAbnormalFlag: null,
         specimen: null, method: null, bodySite: null, clinicalDate: '2023-10-08',
-        evidence: [{ sourceSpanId: span.id, quote: '幽门螺杆菌抗体测定 阴性 阴性 (-)' }], issues: []
+        evidence: [{ sourceSpanId: span.id, quote: '幽门螺杆菌抗体测定 阴性 阴性 (-)' },
+          { sourceSpanId: span.id, quote: '幽门螺杆菌抗体测定 阴性' }],
+        sourceBinding: { headingEvidence: [{ sourceSpanId: span.id, quote: '幽门螺杆菌抗体测定 阴性' }],
+          findingEvidence: [{ sourceSpanId: span.id, quote: '幽门螺杆菌抗体测定 阴性' }] }, issues: []
       }]
     };
     let turn = 0;
@@ -1405,7 +1481,7 @@ describe('DocumentExtractionPipeline', () => {
     });
 
     await expect(pipeline.process(documentId)).resolves.toMatchObject({
-      status: 'needs_review', reason: 'NO_ACCEPTABLE_FACTS'
+      status: 'partial', reason: 'NO_ACCEPTABLE_FACTS'
     });
     expect(service.store.getFactRevision(personId)).toBe(0);
     expect(service.store.listAcceptedObservations(personId)).toEqual([]);
@@ -1467,7 +1543,7 @@ describe('DocumentExtractionPipeline', () => {
         output: { ...output, coveredSourceSpanIds: [] }
       })
     });
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 1 });
     expect(service.store.getFactRevision(personId)).toBe(1);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([expect.objectContaining({
       severity: 'warning', reasonCodes: expect.arrayContaining([expect.stringContaining('UNCOVERED_SPAN:')])
@@ -1479,10 +1555,11 @@ describe('DocumentExtractionPipeline', () => {
     const { service, personId, documentId, output } = await setup();
     let turn = 0;
     const pipeline = new DocumentExtractionPipeline(service.store, {
-      runStructuredTurn: async () => ({
+      runStructuredTurn: async (input) => ({
         threadId: `coverage-recovery-thread-${turn}`,
         turnId: `coverage-recovery-turn-${++turn}`,
-        output: turn === 1 ? { ...output, coveredSourceSpanIds: [] } : output
+        output: turn === 1 ? { ...output, coveredSourceSpanIds: [] }
+          : syntheticExtractionRepair(input.prompt, { ...output, coveredSourceSpanIds: [] }, output)
       })
     });
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
@@ -1554,8 +1631,9 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
-  it('报告姓名与成员昵称不同时要求身份确认，确认后按原姓名再次核对并发布', async () => {
+  it('目录自动归属的报告姓名与成员昵称不同时，确认后按原姓名再次核对并发布', async () => {
     const { service, personId, documentId, output, subjectSpanId } = await setup();
+    setSyntheticFolderAssignment(service, documentId);
     const conflicting = {
       ...output,
       subject: {
@@ -1581,6 +1659,19 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
+  it('手动上传已选成员时异名不触发二次确认，可靠医疗结果仍归入所选成员', async () => {
+    const { service, personId, documentId, output, subjectSpanId } = await setup();
+    const originalSubject = { reportedName: '测试姓名甲', confidence: 'explicit' as const,
+      evidence: [{ sourceSpanId: subjectSpanId, quote: '姓名：测试姓名甲 性别：男' }] };
+    const pipeline = new DocumentExtractionPipeline(service.store, {
+      runStructuredTurn: async () => ({ threadId: 'selected-person', turnId: 'selected-person', output: { ...output, subject: originalSubject } })
+    });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    expect(service.store.listAcceptedObservations(personId)).toEqual([expect.objectContaining({ personId, rawText: '4.2' })]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(service.store.getDocumentExtractionBundle(documentId).confirmedReportedName).toBeNull();
+  });
+
   it('候选数值与所引原文不一致时阻止入库', async () => {
     const { service, personId, documentId, output } = await setup();
     const forged = {
@@ -1594,7 +1685,7 @@ describe('DocumentExtractionPipeline', () => {
       runStructuredTurn: async () => ({ threadId: 'evidence-thread', turnId: 'evidence-turn', output: forged })
     });
     await expect(pipeline.process(documentId)).resolves.toMatchObject({
-      status: 'needs_review', reason: 'NO_ACCEPTABLE_FACTS'
+      status: 'partial', reason: 'NO_ACCEPTABLE_FACTS'
     });
     expect(service.store.getFactRevision(personId)).toBe(0);
     service.close();
@@ -1660,7 +1751,7 @@ describe('DocumentExtractionPipeline', () => {
         if (calls === 1) return { threadId: 'p01', turnId: 'first', output: wrong };
         expect(input.prompt).toContain('REPAIR_REQUEST=');
         expect(input.prompt).toContain('numeric_value_not_in_evidence');
-        return { threadId: 'p03', turnId: 'second', output: correct };
+        return { threadId: 'p03', turnId: 'second', output: syntheticExtractionRepair(input.prompt, wrong, correct) };
       }
     });
     await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 2 });
@@ -1681,7 +1772,7 @@ describe('DocumentExtractionPipeline', () => {
     const pipeline = new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'p03-thread', turnId: 'turn-' + (++calls), output: partlyWrong })
     });
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 1 });
     expect(calls).toBe(2);
     const observations = service.store.listAcceptedObservations(personId);
     expect(observations).toHaveLength(1);
@@ -1692,7 +1783,7 @@ describe('DocumentExtractionPipeline', () => {
     service.close();
   });
 
-  it('已完成报告重读后只增量补入缺失事实，保留原有事实并关闭已解决警告', async () => {
+  it('已完成报告重读后只增量补入可靠结果，保留原有事实及仍无法唯一定位的旧误候选', async () => {
     const { service, personId, documentId, result } = await setupTwoMeasurements();
     const correct = result('0-3.4', '1.0-1.8', 'high', 'normal');
     const partlyWrong: ExtractionResult = { ...correct, candidates: [correct.candidates[0]!, {
@@ -1700,21 +1791,26 @@ describe('DocumentExtractionPipeline', () => {
     }] };
     await expect(new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'old-extract', turnId: 'old-turn', output: partlyWrong })
-    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
+    }).process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 1 });
     expect(service.store.getFactRevision(personId)).toBe(1);
     expect(service.store.listOpenExtractionReviewIssues()).toHaveLength(1);
-    const oldObservationId = service.store.listAcceptedObservations(personId)[0]!.id;
+    const oldObservation = service.store.listAcceptedObservations(personId)[0]!;
+    const oldObservationId = oldObservation.id;
 
     await expect(new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'new-extract', turnId: 'new-turn', output: correct })
-    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1, revision: 2 });
+    }).process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 1, revision: 2, requiresUser: false });
     const observations = service.store.listAcceptedObservations(personId);
     expect(observations).toHaveLength(2);
     expect(observations.some((observation) => observation.id === oldObservationId)).toBe(true);
+    expect(observations.find((observation) => observation.id === oldObservationId)).toEqual(oldObservation);
     expect(observations.map((observation) => observation.originalName).sort()).toEqual([
       '低密度脂蛋白胆固醇', '高密度脂蛋白胆固醇'
     ].sort());
-    expect(service.store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(service.store.listOpenExtractionReviewIssues()).toEqual([expect.objectContaining({
+      reasonCodes: expect.arrayContaining(['PREVIOUS_CANDIDATE_NOT_VERIFIED']),
+      candidateOptions: [expect.objectContaining({ value: { kind: 'numeric', rawText: '999', decimal: '999', comparator: 'eq' } })]
+    })]);
   });
 
   it('已完成报告新一轮仍无法核实的项目不会被当成已解决，也不会重复写入事实', async () => {
@@ -1728,7 +1824,7 @@ describe('DocumentExtractionPipeline', () => {
     }).process(documentId);
     await expect(new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'new-extract', turnId: 'new-turn', output: partlyWrong })
-    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 0, revision: 1 });
+    }).process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 0, revision: 1 });
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([
       expect.objectContaining({ severity: 'warning', candidateOptions: expect.arrayContaining([
@@ -1737,8 +1833,9 @@ describe('DocumentExtractionPipeline', () => {
     ]);
   });
 
-  it('已入档报告重核发现另一位受检者时暂时退出分析，确认同一人后恢复原事实', async () => {
+  it('目录自动归属的已入档报告重核发现另一位受检者时仍保护原事实', async () => {
     const { service, personId, documentId, output, subjectSpanId } = await setup();
+    setSyntheticFolderAssignment(service, documentId);
     await expect(new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'first', turnId: 'first', output })
     }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 1 });
@@ -1816,7 +1913,7 @@ describe('DocumentExtractionPipeline', () => {
     });
     await expect(new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'retry', turnId: 'retry', output: firstOnly })
-    }).process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 0 });
+    }).process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 0 });
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([
       expect.objectContaining({ severity: 'warning', evidenceRefs: [missedSpanId],
         reasonCodes: [`UNCOVERED_SPAN:${missedSpanId}`] })
@@ -1908,7 +2005,7 @@ describe('DocumentExtractionPipeline', () => {
         empty('裸眼视力（左）', 'bare-right', '裸眼视力 ( 左 ) 矫正视力 ( 右 ) 5.0')
       ]
     });
-    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'published', candidateCount: 0, revision: 1 });
+    await expect(pipeline.process(documentId)).resolves.toMatchObject({ status: 'partial', candidateCount: 0, revision: 1 });
     expect(service.store.listAcceptedObservations(personId)).toHaveLength(1);
     expect(service.store.listOpenExtractionReviewIssues()).toEqual([
       expect.objectContaining({ candidateOptions: expect.arrayContaining([
@@ -1967,7 +2064,7 @@ describe('DocumentExtractionPipeline', () => {
     let calls = 0;
     await expect(new DocumentExtractionPipeline(service.store, {
       runStructuredTurn: async () => ({ threadId: 'p03', turnId: 'turn-' + (++calls), output })
-    }).process(documentId)).resolves.toMatchObject({ status: 'needs_review', reason: 'NO_ACCEPTABLE_FACTS' });
+    }).process(documentId)).resolves.toMatchObject({ status: 'partial', reason: 'NO_ACCEPTABLE_FACTS' });
     expect(calls).toBe(2);
     expect(service.store.listAcceptedObservations(personId)).toEqual([]);
     service.close();

@@ -2,9 +2,15 @@ import type {
   ClinicalFocusedReviewV1, HealthAction, HealthClaim, MemberAssessmentCandidateV3,
   OverviewNode, QuestionNode, SystemNode
 } from '@contracts';
-import { hasDirectMedicationChange, hasHighConsequenceAssertion } from './assessment-validation.js';
+import {
+  hasDirectMedicationChange, hasHighConsequenceNodeAssertion,
+  hasNovelHighConsequenceClaimAssertion, hasNumericSupplementDose, visibleAssessmentTextFields
+} from './assessment-validation.js';
+import { presentAssessmentText } from './assessment-content-quality.js';
+import { retainedAssessmentNarrative, retainedOverviewNarrative } from './assessment-presentation.js';
+import { hasSubstantiveActionRewrite } from './assessment-independent-habit-repair.js';
 
-export const CLINICAL_ROUTER_VERSION = 'clinical-router-v3';
+export const CLINICAL_ROUTER_VERSION = 'clinical-router-v9';
 
 const highConsequenceDisease = /(?:恶性肿瘤|恶性淋巴瘤|癌症|癌变|[\p{Script=Han}]{1,8}癌|心肌梗死|急性冠脉综合征|主动脉夹层|肺栓塞|脑卒中|脑梗死|脑出血|败血症|脓毒症|急性肾衰|急性肾损伤|肝衰竭|器官衰竭)/iu;
 const directlyNegatedDisease = /(?:已排除|明确排除|未见|无|不支持|未确诊|不能确诊|尚不能确诊)\s*$/i;
@@ -13,8 +19,9 @@ function onlyDirectlyNegatedDiseaseMentions(claim: HealthClaim): boolean {
   const disease = claim.diseaseName;
   if (!disease) return false;
   // 另一个高后果病名即使与当前 diseaseName 同处一句，也不能被此病名的否定吞掉。
-  if (highConsequenceDisease.test(claim.text.replaceAll(disease, ''))) return false;
-  const clauses = claim.text.split(/[。；;！？!?\n]/).filter((clause) => clause.includes(disease));
+  const texts = visibleAssessmentTextFields(claim).filter(({ field }) => field !== 'diseaseName').map(({ text }) => text);
+  if (texts.some((text) => highConsequenceDisease.test(text.replaceAll(disease, '')))) return false;
+  const clauses = texts.flatMap((text) => text.split(/[。；;！？!?\n]/)).filter((clause) => clause.includes(disease));
   if (clauses.length === 0) return false;
   for (const clause of clauses) {
     let position = clause.indexOf(disease);
@@ -33,7 +40,7 @@ export interface FocusedReviewRoute {
   reasons: string[];
 }
 
-/** 路由是漏标补查，不是用病名正则作疾病诊断或自动否决。 */
+/** 路由覆盖高影响内容与问句前提，不用病名正则作疾病诊断或自动否决。 */
 export function routeFocusedReview(candidate: MemberAssessmentCandidateV3): FocusedReviewRoute {
   const targets = new Set<string>();
   const reasons: string[] = [];
@@ -42,7 +49,8 @@ export function routeFocusedReview(candidate: MemberAssessmentCandidateV3): Focu
     const highConsequence = novel && (claim.kind === 'diagnostic_assessment' && claim.diagnosticStatus !== null
       && highConsequenceDisease.test(`${claim.diseaseName ?? ''} ${claim.text}`)
       && (claim.diagnosticStatus !== 'undetermined' || !onlyDirectlyNegatedDiseaseMentions(claim))
-      || hasHighConsequenceAssertion(claim.text));
+      || hasHighConsequenceNodeAssertion(claim))
+      || hasNovelHighConsequenceClaimAssertion(claim);
     if (claim.consequenceLevel !== 'high' && !highConsequence) continue;
     targets.add(claim.id);
     reasons.push(highConsequence ? `high_consequence_disease:${claim.id}` : `reported_high_consequence:${claim.id}`);
@@ -51,20 +59,34 @@ export function routeFocusedReview(candidate: MemberAssessmentCandidateV3): Focu
     if (candidate.overview.claimIds.includes(claim.id)) targets.add('overview');
   }
   for (const action of candidate.actions) {
+    const numericSupplementDose = hasNumericSupplementDose(action);
     if (action.urgency === 'emergency' || hasDirectMedicationChange(action)
-      || hasHighConsequenceAssertion(`${action.title} ${action.why} ${action.firstStep} ${action.reviewPlan ?? ''}`)) {
+      || hasHighConsequenceNodeAssertion(action) || numericSupplementDose) {
       targets.add(action.id);
       reasons.push(`high_impact_action:${action.id}`);
+      if (numericSupplementDose) reasons.push(`numeric_supplement_dose:${action.id}`);
       for (const system of candidate.systems.filter((item) => item.actionIds.includes(action.id))) targets.add(system.id);
       if (candidate.overview.actionIds.includes(action.id)) targets.add('overview');
     }
   }
-  if (hasHighConsequenceAssertion(`${candidate.overview.headline} ${candidate.overview.summary}`)) {
+  for (const question of candidate.questions) {
+    // 普通问句也会暗含“做过哪种操作”等既知事实；不靠医学术语穷举判断是否需要核对。
+    // 与高影响内容共用既有的一次 P04，不要求用户补答，也不因此扩大其他节点的替换权限。
+    targets.add(question.id);
+    reasons.push(`question_premise:${question.id}`);
+    if (!hasHighConsequenceNodeAssertion(question)) continue;
+    reasons.push(`high_impact_question:${question.id}`);
+    for (const system of candidate.systems.filter((item) => item.claimIds.some((id) => question.relatedClaimIds.includes(id)))) {
+      targets.add(system.id);
+    }
+    if (candidate.overview.claimIds.some((id) => question.relatedClaimIds.includes(id))) targets.add('overview');
+  }
+  if (hasHighConsequenceNodeAssertion(candidate.overview)) {
     targets.add('overview');
     reasons.push('high_consequence_statement:overview');
   }
   for (const system of candidate.systems) {
-    if (!hasHighConsequenceAssertion(`${system.headline} ${system.summary}`)) continue;
+    if (!hasHighConsequenceNodeAssertion(system)) continue;
     targets.add(system.id);
     reasons.push(`high_consequence_statement:${system.id}`);
   }
@@ -77,8 +99,9 @@ type NodeType = 'claim' | 'action' | 'overview' | 'system' | 'question';
 export function applyFocusedReview(
   candidate: MemberAssessmentCandidateV3,
   review: ClinicalFocusedReviewV1,
-  targetIds: string[]
-): { candidate: MemberAssessmentCandidateV3; heldTargetIds: string[] } {
+  targetIds: string[],
+  options?: { deferIndependentHabitRepair?: boolean; finalDependencyGraph?: boolean }
+): { candidate: MemberAssessmentCandidateV3; heldTargetIds: string[]; rebuiltNodeIds: string[]; dependentActionIds: string[] } {
   if (review.personId !== candidate.personId || review.inputSignature !== candidate.inputSignature) {
     throw new Error('FOCUSED_REVIEW_SCOPE_MISMATCH');
   }
@@ -108,43 +131,97 @@ export function applyFocusedReview(
     if (result.replacement?.nodeType !== original.type || result.replacement.value.id !== result.targetId) {
       throw new Error('FOCUSED_REVIEW_REPLACEMENT_SCOPE_MISMATCH');
     }
-    byId.set(result.targetId, { type: original.type, value: result.replacement.value });
+    let replacement: Node = result.replacement.value;
+    if (original.type === 'action') {
+      const originalAction = original.value as HealthAction;
+      const replacementAction = replacement as HealthAction;
+      // 可选字段兼容旧模型/快照；省略不是解除生活依据门禁，显式变更仍由后续校验核对。
+      replacement = {
+        ...replacementAction,
+        ...(replacementAction.lifestyleDomain === undefined && originalAction.lifestyleDomain !== undefined
+          ? { lifestyleDomain: originalAction.lifestyleDomain } : {}),
+        ...(replacementAction.lifestyleBasis === undefined && originalAction.lifestyleBasis !== undefined
+          ? { lifestyleBasis: originalAction.lifestyleBasis } : {})
+      };
+    }
+    byId.set(result.targetId, { type: original.type, value: replacement });
   }
   const heldClaims = new Set(candidate.claims.filter((item) => held.has(item.id)).map((item) => item.id));
+  if (options?.finalDependencyGraph) {
+    for (const original of candidate.actions) {
+      if (held.has(original.id) || !original.claimIds.some((id) => heldClaims.has(id))) continue;
+      const after = byId.get(original.id)!.value as HealthAction;
+      const explicitRewrite = review.results.some((result) => result.targetId === original.id && result.verdict === 'replace');
+      if (!explicitRewrite || after.claimIds.some((id) => heldClaims.has(id))
+        || after.claimIds.length + after.evidenceIds.length === 0 || !hasSubstantiveActionRewrite(original, after)) held.add(original.id);
+    }
+  }
+  // 低影响的日常建议可以有独立报告依据。先修复失效引用，不因一个被隔离判断就丢掉整类建议。
+  // 这只是临时保留给 P03；发布前仍须完整校验，失败时沿用隔离，不直接删引用放行正文。
+  const dependentActionIds = options?.deferIndependentHabitRepair ? candidate.actions.filter((item) => {
+    const action = byId.get(item.id)!.value as HealthAction;
+    return !held.has(item.id) && action.kind === 'habit' && action.urgency === 'routine'
+      && !hasDirectMedicationChange(action) && !hasHighConsequenceNodeAssertion(action) && !hasNumericSupplementDose(action)
+      && action.claimIds.some((id) => heldClaims.has(id))
+      && (action.evidenceIds.length > 0 || action.claimIds.some((id) => !heldClaims.has(id)));
+  }).map((item) => item.id) : [];
+  const pendingActions = new Set(dependentActionIds);
   const heldActions = new Set(candidate.actions.filter((item) => held.has(item.id)
-    || (byId.get(item.id)!.value as HealthAction).claimIds.some((id) => heldClaims.has(id))).map((item) => item.id));
+    || !pendingActions.has(item.id) && (byId.get(item.id)!.value as HealthAction).claimIds.some((id) => heldClaims.has(id))).map((item) => item.id));
   for (const id of heldActions) held.add(id);
   const claims = candidate.claims.filter((item) => !heldClaims.has(item.id)).map((item) => byId.get(item.id)!.value as HealthClaim);
   const actions = candidate.actions.filter((item) => !heldActions.has(item.id)).map((item) => byId.get(item.id)!.value as HealthAction);
+  const claimsById = new Map(claims.map((claim) => [claim.id, claim]));
+  const actionsById = new Map(actions.map((action) => [action.id, action]));
+  const rebuiltNodeIds: string[] = [];
+  const cleanLimitations = (values: string[]) => values.map((value) => presentAssessmentText(value).text).filter(Boolean);
   const systems = candidate.systems.map((item) => {
     const node = byId.get(item.id)!.value as SystemNode;
     const claimIds = node.claimIds.filter((id) => !heldClaims.has(id));
-    const actionIds = node.actionIds.filter((id) => !heldActions.has(id));
+    const actionIds = node.actionIds.filter((id) => !heldActions.has(id) && !pendingActions.has(id));
     const dependent = held.has(item.id) || node.claimIds.length !== claimIds.length || node.actionIds.length !== actionIds.length;
+    if (dependent) rebuiltNodeIds.push(item.id);
     return dependent ? {
       ...node, claimIds, actionIds,
-      // 原状态可能只由被隔离的高影响主张支撑，不能沿用“需关注”或“本范围无提示”。
-      status: claimIds.length === 0 ? 'insufficient' as const : 'monitor' as const,
-      headline: claimIds.length === 0 ? '这部分判断仍需核实' : '部分判断仍需核实',
-      summary: '已接纳的报告事实仍可查看；本系统有部分判断暂未纳入本次解读。',
-      limitations: [...node.limitations, '部分判断因证据不足暂未发布。']
+      // 原状态可能只由被隔离主张支撑；不从剩余主张数量推断“继续观察”或“本范围正常”。
+      // 展示层通过 rebuiltNodeIds 单独表达解读范围，身体情况仍由具体主张说明。
+      status: 'insufficient' as const,
+      ...retainedAssessmentNarrative(claimIds.map((id) => claimsById.get(id)!).filter(Boolean),
+        actionIds.map((id) => actionsById.get(id)!).filter(Boolean), cleanLimitations(node.limitations)),
+      limitations: cleanLimitations(node.limitations)
     } : node;
   });
   const originalOverview = byId.get('overview')!.value as OverviewNode;
   const overviewChanged = held.has('overview') || originalOverview.claimIds.some((id) => heldClaims.has(id))
-    || originalOverview.actionIds.some((id) => heldActions.has(id));
+    || originalOverview.actionIds.some((id) => heldActions.has(id) || pendingActions.has(id));
+  if (overviewChanged) rebuiltNodeIds.push('overview');
+  // 原总览可能只关联一个器官；重建整体概况时覆盖本轮仍可用的全部主张。
+  const overviewClaimIds = overviewChanged ? claims.map((claim) => claim.id)
+    : originalOverview.claimIds.filter((id) => !heldClaims.has(id));
   const overview = overviewChanged ? {
     ...originalOverview,
-    headline: '部分健康判断仍需核实',
-    summary: '已接纳的报告事实和其他行动仍可查看；有部分判断暂未纳入本次总览。',
-    claimIds: originalOverview.claimIds.filter((id) => !heldClaims.has(id)),
-    actionIds: originalOverview.actionIds.filter((id) => !heldActions.has(id)),
-    limitations: [...originalOverview.limitations, '部分判断因证据不足暂未发布。']
+    ...retainedOverviewNarrative(claims, cleanLimitations(originalOverview.limitations), 2_000, { systems, rebuiltNodeIds }),
+    claimIds: overviewClaimIds,
+    actionIds: originalOverview.actionIds.filter((id) => !heldActions.has(id) && !pendingActions.has(id)),
+    limitations: cleanLimitations(originalOverview.limitations)
   } : originalOverview;
-  const questions = candidate.questions.filter((item) => !held.has(item.id)
-    && !(byId.get(item.id)!.value as QuestionNode).relatedClaimIds.some((id) => heldClaims.has(id))).map((item) => {
+  const questions = candidate.questions.filter((item) => !held.has(item.id)).flatMap((item) => {
     const node = byId.get(item.id)!.value as QuestionNode;
-    return node;
+    const relatedClaimIds = node.relatedClaimIds.filter((id) => !heldClaims.has(id));
+    if (relatedClaimIds.length === node.relatedClaimIds.length) return [node];
+    // 最终图必须由同次 P04 显式给出独立问句，不能在 pass 后由程序另删前提冒充复核。
+    if (options?.finalDependencyGraph) { held.add(item.id); return []; }
+    // 对检查条件、症状或当前用药的独立问题仍有个人依据时保留；移除失效引用。
+    // 依赖“这个高风险”等失效判断、或直接复述其病名的问题不能冒充有效下一步。
+    const removedClaims = node.relatedClaimIds.filter((id) => heldClaims.has(id))
+      .map((id) => byId.get(id)?.value as HealthClaim | undefined).filter(Boolean);
+    const questionText = `${node.question} ${node.whyItMatters}`;
+    const reliesOnRemovedAssessment = /(?:这个|该项|上述|这一)(?:判断|风险|问题)|这个高风险|立即处理这个/.test(questionText)
+      || removedClaims.some((claim) => claim?.diseaseName && questionText.includes(claim.diseaseName));
+    if (relatedClaimIds.length === 0 && (node.evidenceIds.length === 0 || reliesOnRemovedAssessment)) return [];
+    return [{ ...node, relatedClaimIds }];
   });
-  return { candidate: { ...candidate, overview, systems, claims, actions, questions }, heldTargetIds: [...held] };
+  // 总览和系统节点已由有效内容替换，原文隔离信息放在展示元信息；held ID 仅指实际移除的节点。
+  const heldTargetIds = [...held].filter((id) => byId.get(id)?.type !== 'overview' && byId.get(id)?.type !== 'system');
+  return { candidate: { ...candidate, overview, systems, claims, actions, questions }, heldTargetIds, rebuiltNodeIds, dependentActionIds };
 }

@@ -3,10 +3,11 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { DEFAULT_AI_PREFERENCES } from '../packages/contracts/src/index.js';
 import { createHealthThreadStartParams } from '../apps/desktop/src/main/codex-thread-config.js';
 import { spawnCodexAppServer } from '../packages/codex-adapter/src/index.js';
 
-const expectedRuntimeVersion = '0.156.1';
+const expectedRuntimeVersion = '0.160.1';
 const targetByPlatform = {
   'darwin-arm64': { packageName: '@openai/codex-darwin-arm64', triple: 'aarch64-apple-darwin', executableName: 'codex' },
   'darwin-x64': { packageName: '@openai/codex-darwin-x64', triple: 'x86_64-apple-darwin', executableName: 'codex' },
@@ -44,7 +45,7 @@ try {
   for (const allowWebSearch of [false, true]) {
     const response = await client.request<{ thread: { id: string } }>('thread/start', createHealthThreadStartParams({
       workingDirectory: taskDirectory,
-      aiPreferences: { modelId: allowWebSearch ? 'gpt-6-sol' : 'gpt-5.6-sol', reasoningEffort: 'medium' },
+      aiPreferences: allowWebSearch ? DEFAULT_AI_PREFERENCES : { modelId: 'gpt-5.6-sol', reasoningEffort: 'medium' },
       allowWebSearch
     }));
     if (!response.thread.id) throw new Error('CODEX_THREAD_START_MISSING_ID');

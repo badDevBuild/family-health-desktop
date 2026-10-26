@@ -1,6 +1,13 @@
 import { z } from 'zod';
+export { containsEditorialInstruction, containsProcessNarrative, presentAssessmentText, type PresentedAssessmentText } from './health-content-presentation.js';
+export { documentedPlanEvidence, inspectDocumentedPlanEvidence, DOCUMENTED_PLAN_NEUTRAL_TITLE } from './documented-plan-evidence.js';
+export type { DocumentedPlanEvidenceCheck } from './documented-plan-evidence.js';
+export { reviewedSourceInstructionEvidence } from './reviewed-source-instruction.js';
 import { actionStatusSchema } from './action-status.js';
 import { clinicalContextSchema } from './clinical-context.js';
+import { memberEvidenceRefSchema } from './member-v2.js';
+import { sourceModelEvidenceSchema } from './direct-original-reading.js';
+import { processingRebuildSourceIdentitySchema } from './processing-rebuild.js';
 
 export * from './member-v2.js';
 export * from './member-assessment-v3.js';
@@ -72,6 +79,31 @@ export const evidenceRefSchema = z.object({
   duplicateBasis: z.enum(['report_structure', 'exam_item_id', 'sample_id']).nullable().optional()
 }).strict();
 
+// 栏目标题与具体发现的依据分开：标题可以重复，不承担正式事实身份。
+// 模型只指出原文位置；永久编号和唯一来源绑定由应用核验后分配。
+export const observationSourceBindingSchema = z.object({
+  headingEvidence: z.array(evidenceRefSchema),
+  findingEvidence: z.array(evidenceRefSchema).min(1),
+  // 行列身份来自同一原页的真实锚点，不接受模型任意命名的 cellId/rowId。
+  // 缺省保持旧回执兼容；一旦提供，接纳层必须完整验证，不能降级忽略坏槽位。
+  structuredSlot: z.object({
+    version: z.literal(1),
+    kind: z.enum(['table_cell', 'labeled_component']),
+    contextEvidence: z.array(evidenceRefSchema).min(1).max(1),
+    rowEvidence: z.array(evidenceRefSchema).min(1).max(6),
+    columnEvidence: z.array(evidenceRefSchema).max(6),
+    axes: z.array(z.object({
+      kind: z.enum(['time', 'laterality', 'body_site', 'frequency', 'method', 'unit']),
+      evidence: z.array(evidenceRefSchema).min(1).max(6)
+    }).strict()).max(6),
+    component: z.object({
+      kind: z.enum(['quantitative', 'qualitative', 'narrative']),
+      evidence: z.array(evidenceRefSchema).min(1).max(6)
+    }).strict().nullable()
+  }).strict().optional()
+}).strict();
+export type ObservationSourceBinding = z.infer<typeof observationSourceBindingSchema>;
+
 export const observationCandidateSchema = z.object({
   localKey: idSchema,
   originalName: z.string().min(1),
@@ -87,6 +119,8 @@ export const observationCandidateSchema = z.object({
   // 缺字段表示旧版本尚未检查，不能把它当成“没有额外条件”。
   clinicalContext: clinicalContextSchema.nullable().optional(),
   evidence: z.array(evidenceRefSchema).min(1),
+  // 可选扩展，旧候选仍可读取；缺失时应用只能从旧引用作保守定位。
+  sourceBinding: observationSourceBindingSchema.optional(),
   issues: z.array(z.object({
     code: z.string().min(1),
     message: z.string().min(1)
@@ -94,6 +128,13 @@ export const observationCandidateSchema = z.object({
 }).strict();
 
 export type ObservationCandidate = z.infer<typeof observationCandidateSchema>;
+
+/** 来源闭包共用此目录，避免新行列引用在修复、保留义务或保存时遗漏。 */
+export function observationStructuredSlotEvidence(candidate: ObservationCandidate): ObservationCandidate['evidence'] {
+  const slot = candidate.sourceBinding?.structuredSlot;
+  return slot ? [...slot.contextEvidence, ...slot.rowEvidence, ...slot.columnEvidence,
+    ...slot.axes.flatMap((axis) => axis.evidence), ...(slot.component?.evidence ?? [])] : [];
+}
 
 const metadataTextFieldSchema = z.object({
   value: z.string().trim().min(1).max(500),
@@ -122,6 +163,9 @@ export const reportMetadataCandidateSchema = z.object({
   encounterIdentifier: metadataTextFieldSchema.nullable().optional(),
   sampleIdentifiers: z.array(metadataTextFieldSchema).optional(),
   examItems: z.array(metadataTextFieldSchema),
+  // 原件模型明确选择本次报告的主要临床时间；null 表示无法可靠选择，不取数组首项猜测。
+  // 可选仅用于读取旧版回执，索引指向的角色和真实来源由接纳门禁核验。
+  primaryClinicalTimeIndex: z.number().int().min(0).nullable().optional(),
   times: z.array(z.object({
     value: partialClinicalDateSchema,
     precision: z.enum(['year', 'month', 'day']),
@@ -223,6 +267,32 @@ export const derivedSafetyReviewSchema = z.object({
 
 export type DerivedSafetyReview = z.infer<typeof derivedSafetyReviewSchema>;
 
+export * from './processing-rebuild.js';
+
+// 原图中的位置只来自受控本机识别，不把几何排版结果当作医学事实。
+const visualBoundsSchema = z.tuple([z.number().min(0).max(1), z.number().min(0).max(1),
+  z.number().positive().max(1), z.number().positive().max(1)])
+  .refine(([x, y, width, height]) => x + width <= 1.000001 && y + height <= 1.000001);
+const visualTextBoxSchema = z.object({
+  text: z.string().max(16_384), confidence: z.number().min(0).max(1), bounds: visualBoundsSchema
+}).strict();
+export const sourceVisualEvidenceSchema = z.object({
+  version: z.literal(1), engine: z.literal('apple-vision-local-v1'),
+  layoutVersion: z.literal('local-visual-layout-v2'), coordinateSystem: z.literal('normalized-bottom-left'),
+  imageSize: z.object({ width: z.number().int().positive(), height: z.number().int().positive() }).strict().optional(),
+  recognitionRevision: z.number().int().nonnegative().optional(),
+  reading: z.object({ mode: z.enum(['full_image', 'region']), regionBounds: visualBoundsSchema.optional(),
+    fallbackUsed: z.boolean() }).strict(),
+  rows: z.array(z.object({ line: z.number().int().positive(), text: z.string(), bounds: visualBoundsSchema,
+    boxes: z.array(visualTextBoxSchema).max(10_000) }).strict()).max(10_000),
+  omittedBoxes: z.array(visualTextBoxSchema).max(10_000)
+}).strict().superRefine((value, context) => {
+  if ((value.reading.mode === 'region') !== Boolean(value.reading.regionBounds)) {
+    context.addIssue({ code: 'custom', message: 'VISUAL_REGION_BOUNDARY_REQUIRED', path: ['reading'] });
+  }
+});
+export type SourceVisualEvidence = z.infer<typeof sourceVisualEvidenceSchema>;
+
 export const sourceSpanSchema = z.object({
   id: idSchema,
   documentId: idSchema,
@@ -232,7 +302,9 @@ export const sourceSpanSchema = z.object({
   lineStart: z.number().int().positive().nullable(),
   lineEnd: z.number().int().positive().nullable(),
   quote: z.string().nullable(),
-  readability: z.enum(['clear', 'partial', 'unreadable'])
+  readability: z.enum(['clear', 'partial', 'unreadable']),
+  visualEvidence: sourceVisualEvidenceSchema.optional(),
+  modelEvidence: sourceModelEvidenceSchema.optional()
 }).strict();
 
 export type SourceSpan = z.infer<typeof sourceSpanSchema>;
@@ -465,12 +537,80 @@ export const actionItemSchema = z.object({
   status: actionStatusSchema,
   dueDate: localDateSchema.nullable(),
   dueText: z.string().nullable(),
+  userScheduleText: z.string().nullable().optional(),
+  completedAt: utcTimestampSchema.nullable().optional(),
+  evidenceRefs: z.array(memberEvidenceRefSchema).optional(),
   evidenceLabel: z.string().nullable(),
   userRevision: z.number().int().positive(),
   updatedAt: utcTimestampSchema
 }).strict();
 
 export type ActionItem = z.infer<typeof actionItemSchema>;
+
+export const reportReadingLedgerSchema = z.object({
+  version: z.literal(1),
+  scope: z.enum(['full_report', 'selected_pages']),
+  baseAuditId: idSchema.optional(),
+  totalOriginalPages: z.number().int().positive().optional(),
+  originalSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  promptVersion: z.string().min(1), rulesVersion: z.string().min(1),
+  pages: z.array(z.object({
+    sourceSpanId: idSchema, page: z.number().int().positive().nullable(),
+    status: z.enum(['read','partial','unreadable','no_medical_content']),
+    pageRole: z.enum(['results', 'mixed', 'education', 'reference', 'cover', 'duplicate_summary', 'unknown']).optional(),
+    inventory: z.array(z.object({ sourceKey: z.string(), sourceSpanId: idSchema.nullable(),
+      candidateKeys: z.array(z.string()), classification: z.object({
+        disposition: z.enum(['education','reference','duplicate_summary']),
+        evidence: z.array(z.object({ sourceSpanId: idSchema, quote: z.string() }).strict()),
+        duplicateSourceSpanId: idSchema.nullable()
+      }).strict().optional() }).strict()).nullable()
+  }).strict()),
+  candidates: z.array(z.object({
+    localKey: z.string(), originalName: z.string(), value: candidateValueSchema, unitRaw: z.string().nullable(),
+    disposition: z.enum(['saved_or_existing','original_no_result','pending']),
+    evidence: z.array(evidenceRefSchema), reasonCodes: z.array(z.string())
+  }).strict()),
+  unrepresentedSources: z.array(z.object({ sourceSpanId: idSchema, pageSourceSpanId: idSchema,
+    role: z.enum(['finding','instruction']), clarity: z.enum(['clear','uncertain']) }).strict()),
+  gapPageSourceSpanIds: z.array(idSchema)
+}).strict().refine(ledger => ledger.scope !== 'selected_pages' || ledger.baseAuditId !== undefined
+  && ledger.totalOriginalPages !== undefined && ledger.totalOriginalPages >= ledger.pages.length,
+  'REPORT_READING_LEDGER_SCOPE_INVALID');
+export type ReportReadingLedger = z.infer<typeof reportReadingLedgerSchema>;
+
+export const reportSupplementScopeSchema = z.object({
+  version: z.literal(1), documentId: idSchema, personId: idSchema,
+  originalSha256: z.string().regex(/^[a-f0-9]{64}$/), baseAuditId: idSchema,
+  pageSourceSpanIds: z.array(idSchema).min(1).max(1_500),
+  preservationSignature: z.string().regex(/^[a-f0-9]{64}$/)
+}).strict();
+export type ReportSupplementScope = z.infer<typeof reportSupplementScopeSchema>;
+
+export const reportReadingAuditSchema = z.object({
+  version: z.literal(1),
+  totalCandidates: z.number().int().nonnegative(),
+  savedCandidates: z.number().int().nonnegative(),
+  emptyCandidates: z.number().int().nonnegative(),
+  pending: z.array(z.object({ localKey: z.string(), originalName: z.string(), reasonCodes: z.array(z.string()) }).strict()),
+  historicalReadingCount: z.number().int().nonnegative(),
+  unrepresentedSourceCount: z.number().int().nonnegative(),
+  pageGapCount: z.number().int().nonnegative(),
+  // 旧聚合审计继续可读，但不能补造为已有逐项完整记录。
+  ledger: reportReadingLedgerSchema.optional()
+}).strict().refine((audit) => audit.totalCandidates === audit.savedCandidates + audit.emptyCandidates + audit.pending.length,
+  'REPORT_READING_ACCOUNTING_MISMATCH').refine(audit => !audit.ledger || (
+    audit.ledger.candidates.length === audit.totalCandidates
+    && new Set(audit.ledger.candidates.map(item => item.localKey)).size === audit.totalCandidates
+    && audit.ledger.candidates.filter(item => item.disposition === 'saved_or_existing').length === audit.savedCandidates
+    && audit.ledger.candidates.filter(item => item.disposition === 'original_no_result').length === audit.emptyCandidates
+    && audit.ledger.candidates.filter(item => item.disposition === 'pending').every(item => audit.pending.some(pending => pending.localKey === item.localKey))
+    && audit.ledger.unrepresentedSources.length === audit.unrepresentedSourceCount
+    && new Set(audit.ledger.unrepresentedSources.map(item => item.sourceSpanId)).size === audit.unrepresentedSourceCount
+    && audit.ledger.gapPageSourceSpanIds.length === audit.pageGapCount
+    && new Set(audit.ledger.gapPageSourceSpanIds).size === audit.pageGapCount
+    && new Set(audit.ledger.pages.map(page => page.sourceSpanId)).size === audit.ledger.pages.length
+  ), 'REPORT_READING_LEDGER_MISMATCH');
+export type ReportReadingAudit = z.infer<typeof reportReadingAuditSchema>;
 
 export const reviewIssueSchema = z.object({
   id: idSchema,
@@ -482,6 +622,7 @@ export const reviewIssueSchema = z.object({
   description: z.string().min(1),
   evidenceRefs: z.array(idSchema),
   candidateOptions: z.array(observationCandidateSchema),
+  readingAudit: reportReadingAuditSchema.optional(),
   candidateDiffs: z.array(reviewCandidateDiffSchema),
   reportedName: z.string().min(1).nullable(),
   reasonCodes: z.array(z.string().min(1)),
@@ -520,6 +661,8 @@ export const personSummarySchema = z.object({
   freshnessLabel: z.string(),
   changeSummary: z.string(),
   derivedStatus: derivedStatusSchema,
+  // 展示有效性与更新必要性分开：旧规则结果仍只读，但不自动变成待办或扩大处理范围。
+  assessmentRefreshStatus: z.enum(['none', 'required', 'optional_rules']).optional(),
   assessmentSummary: z.string().nullable(),
   dataRevision: z.string().regex(/^[a-f0-9]{64}$/),
   displayRevision: z.number().int().nonnegative(),
@@ -582,13 +725,19 @@ export const inboxItemSchema = z.object({
   discoveredAt: utcTimestampSchema,
   personId: idSchema.nullable(),
   personLabel: z.string().nullable(),
+  // 旧快照缺省时仍按未知归属处理；只有明确选择才能恢复历史姓名阻断。
+  personAssignmentBasis: z.enum(['user_selected', 'folder_binding', 'identity_confirmed', 'legacy']).optional(),
   status: z.enum(['discovered', 'stabilizing', 'queued', 'processing', 'needs_review', 'completed', 'ignored', 'duplicate', 'blocked']),
   format: z.string(),
   sourceLabel: z.string(),
   sentToAi: z.boolean(),
   aiTransmissionStatus: z.enum(['not_sent', 'sending', 'acknowledged', 'completed', 'unknown']),
   inProcessingCenter: z.boolean(),
-  issue: z.string().nullable()
+  issue: z.string().nullable(),
+  // 可选以兼容旧快照；使用全量聚合，而不是最近展示窗口推断零接纳。
+  acceptedFactCount: z.number().int().nonnegative().optional(),
+  // 仅提示可选日期补核，不代表已证明缺失日期，也不改变报告完成状态。
+  dateBindingReviewCount: z.number().int().nonnegative().optional()
 }).strict();
 
 export type InboxItem = z.infer<typeof inboxItemSchema>;
@@ -618,6 +767,30 @@ export const jobSystemOutcomeSchema = z.object({
 
 export type JobSystemOutcome = z.infer<typeof jobSystemOutcomeSchema>;
 
+/** 综合终态与逐份报告进度独立；只保存受控元数据，不接收模型自由正文。 */
+export const jobAssessmentOutcomeSchema = z.object({
+  status: z.enum(['published', 'rejected', 'skipped_no_data', 'reused_current']),
+  reasonCode: z.enum(['no_accepted_facts', 'validation_failed', 'schema_invalid', 'scope_mismatch',
+    'coverage_incomplete', 'focused_review_failed', 'publication_failed', 'unknown']).nullable(),
+  snapshotId: idSchema.nullable(),
+  inputSignature: z.string().regex(/^[a-f0-9]{64}$/),
+  factRevision: z.number().int().nonnegative(),
+  contextRevision: z.number().int().nonnegative(),
+  reviewScopeSignature: z.string().regex(/^[a-f0-9]{64}$/),
+  attemptId: idSchema,
+  updatedAt: utcTimestampSchema
+}).strict().superRefine((outcome, context) => {
+  const published = outcome.status === 'published' || outcome.status === 'reused_current';
+  if (published !== (outcome.snapshotId !== null)
+    || (published && outcome.reasonCode !== null)
+    || (outcome.status === 'skipped_no_data' && outcome.reasonCode !== 'no_accepted_facts')
+    || (outcome.status === 'rejected' && (outcome.reasonCode === null || outcome.reasonCode === 'no_accepted_facts'))) {
+    context.addIssue({ code: 'custom', message: '综合终态与快照或原因不一致' });
+  }
+});
+
+export type JobAssessmentOutcome = z.infer<typeof jobAssessmentOutcomeSchema>;
+
 export const jobSummarySchema = z.object({
   id: idSchema,
   batchLabel: z.string(),
@@ -628,6 +801,8 @@ export const jobSummarySchema = z.object({
   totalUnits: z.number().int().positive(),
   statusText: z.string(),
   systemOutcomes: z.array(jobSystemOutcomeSchema),
+  // 旧快照可缺省；存储投影始终返回 null，不从 publish 阶段猜测综合已发布。
+  assessmentOutcome: jobAssessmentOutcomeSchema.nullable().optional(),
   updatedAt: utcTimestampSchema,
   canCancel: z.boolean(),
   canRetry: z.boolean()
@@ -670,7 +845,7 @@ export const aiPreferencesSchema = z.object({
 }).strict();
 export type AiPreferences = z.infer<typeof aiPreferencesSchema>;
 export const DEFAULT_AI_PREFERENCES: AiPreferences = {
-  modelId: 'gpt-6-sol',
+  modelId: 'gpt-6.1-sol',
   reasoningEffort: 'medium'
 };
 
@@ -713,6 +888,8 @@ export const dashboardSnapshotSchema = z.object({
   timeline: z.array(timelineEventSchema),
   guidance: z.array(lifestyleGuidanceSummarySchema),
   inbox: z.array(inboxItemSchema),
+  // 来自主进程的完整可重建原件范围，不以收件箱的展示筛选反推发送集合。
+  processingRebuildSources: z.array(processingRebuildSourceIdentitySchema).optional(),
   jobs: z.array(jobSummarySchema),
   reviews: z.array(reviewIssueSchema),
   actions: z.array(actionItemSchema),
@@ -728,6 +905,16 @@ export const updateActionStatusInputSchema = z.object({
   status: actionStatusSchema,
   expectedRevision: z.number().int().nonnegative()
 }).strict();
+
+/** 用户安排独立于原报告或健康建议中的时间要求。 */
+export const updateActionScheduleInputSchema = z.object({
+  personId: idSchema,
+  actionId: idSchema,
+  dueDate: localDateSchema.nullable(),
+  userScheduleText: z.string().trim().max(200).nullable(),
+  expectedRevision: z.number().int().positive()
+}).strict();
+export type UpdateActionScheduleInput = z.infer<typeof updateActionScheduleInputSchema>;
 
 export const createActionItemInputSchema = z.object({
   personId: idSchema,
@@ -833,12 +1020,14 @@ export const switchWorkspaceInputSchema = z.object({
 }).strict();
 
 export const importFilesInputSchema = z.object({
-  personId: idSchema.nullable()
+  personId: idSchema.nullable(),
+  autoProcess: z.literal(true).optional()
 }).strict();
 
 export const droppedFilePathsInputSchema = z.object({
   personId: idSchema.nullable(),
-  paths: z.array(z.string().min(1).max(4_096)).min(1).max(100)
+  paths: z.array(z.string().min(1).max(4_096)).min(1).max(100),
+  autoProcess: z.literal(true).optional()
 }).strict();
 
 export const importFilesReceiptSchema = z.object({
@@ -849,7 +1038,11 @@ export const importFilesReceiptSchema = z.object({
   rejected: z.array(z.object({
     displayName: z.string(),
     code: z.string()
-  }).strict())
+  }).strict()),
+  processing: z.object({
+    status: z.enum(['queued', 'waiting_connection', 'local_only']),
+    batchId: idSchema.optional()
+  }).strict().optional()
 }).strict();
 
 export type ImportFilesReceipt = z.infer<typeof importFilesReceiptSchema>;
@@ -885,8 +1078,27 @@ export const disableInboxBindingInputSchema = z.object({
 export const processNowInputSchema = z.object({
   consentVersion: z.literal(1),
   confirmedDataRecipient: z.literal('OpenAI/Codex'),
-  documentIds: z.array(idSchema).min(1).max(100).optional()
-}).strict();
+  documentIds: z.array(idSchema).min(1).max(100).optional(),
+  readingScope: z.literal('unresolved_pages').optional(),
+  assessmentPersonId: idSchema.refine((value) => !/\s/u.test(value), '成员标识不能包含空白').optional(),
+  expectedAssessmentDataRevision: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  purpose: z.literal('date_correction').optional(),
+  dateCorrectionDocumentId: idSchema.optional(),
+  expectedDateCorrectionDataRevision: z.string().regex(/^[a-f0-9]{64}$/).optional()
+}).strict().refine(input => input.readingScope === undefined || input.documentIds !== undefined
+  && input.assessmentPersonId === undefined && input.purpose === undefined, {
+  message: '问题页补读只适用于明确选中的已保存报告', path: ['readingScope']
+}).refine((input) => (input.assessmentPersonId === undefined) === (input.expectedAssessmentDataRevision === undefined), {
+  message: '指定成员综合必须同时提交已确认的资料版本', path: ['expectedAssessmentDataRevision']
+}).refine((input) => input.documentIds === undefined
+  || input.assessmentPersonId === undefined && input.expectedAssessmentDataRevision === undefined, {
+  message: '指定报告与仅指定成员综合不能同时使用', path: ['assessmentPersonId']
+}).refine((input) => input.purpose === 'date_correction'
+  ? input.dateCorrectionDocumentId !== undefined && input.expectedDateCorrectionDataRevision !== undefined
+    && input.documentIds === undefined && input.assessmentPersonId === undefined
+  : input.dateCorrectionDocumentId === undefined && input.expectedDateCorrectionDataRevision === undefined, {
+  message: '日期纠错必须明确确认单份报告与当前资料版本，且不能混用其他任务用途', path: ['dateCorrectionDocumentId']
+});
 
 export type ProcessNowInput = z.infer<typeof processNowInputSchema>;
 
@@ -983,3 +1195,8 @@ export const appBridgeSchema = z.object({
     node: z.string()
   }).strict()
 }).strict();
+
+export * from './extraction-repair.js';
+export * from './direct-original-reading.js';
+export * from './direct-original-date-reading.js';
+export * from './runtime-recovery.js';

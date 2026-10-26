@@ -4,6 +4,7 @@ import type {
   BodySystemRegistryItem,
   ConceptDefinition,
   ConceptMapping,
+  HealthEventV2,
   MemberEvidenceRef,
   MetricSeriesSummary,
   TrendFacts,
@@ -13,6 +14,22 @@ import type {
 export const MEMBER_MODEL_VERSION = 'member-v2';
 export const BODY_SYSTEM_REGISTRY_VERSION = 'body-systems-v2';
 export const CONCEPT_DICTIONARY_VERSION = 'concepts-v1';
+
+/** 只据已验证的报告描述归类；缺少分类依据时不能默认成实验室检验。 */
+export function classifyHealthEventType(input: {
+  verifiedReportText: string;
+  fallbackObservationTexts?: readonly string[];
+}): HealthEventV2['type'] {
+  const reportText = input.verifiedReportText.normalize('NFKC').trim();
+  // 体检是父事件，其中的一项影像或检验不改变整份报告的类型。
+  if (/体检|健康检查/i.test(reportText)) return 'checkup';
+  const texts = reportText ? [reportText] : input.fallbackObservationTexts ?? [];
+  // 英文缩写需独立出现，避免把 ACTH、HCT、HLA-DR 等检验项目误认作影像。
+  const imaging = texts.some((text) => /影像|超声|彩超|磁共振|[xX]线|(?:^|[^a-z-])(?:ct|mri?|mra|mrv|mrcp|dr|x[ -]?ray)(?=$|[^a-z])/i.test(text));
+  const laboratory = texts.some((text) => /检验|化验|实验室|(?:^|[^a-z])(?:laboratory|lab report)(?=$|[^a-z])/i.test(text));
+  // 普通检查、未知资料以及没有父类别的混合报告均保持中性，不推断就诊方式。
+  return imaging === laboratory ? 'other' : imaging ? 'imaging' : 'laboratory';
+}
 
 export const bodySystemRegistry: readonly BodySystemRegistryItem[] = [
   { id: 'cardiovascular', version: BODY_SYSTEM_REGISTRY_VERSION, name: '心血管系统', shortName: '心血管', description: '血压、血脂、心脏与血管相关记录。', order: 10, topics: [{ id: 'blood-pressure', name: '血压', description: '收缩压、舒张压及相关记录。' }, { id: 'blood-lipids', name: '血脂', description: '胆固醇、甘油三酯及脂蛋白。' }, { id: 'cardiac', name: '心脏', description: '心率、心电与心脏影像。' }] },
@@ -145,7 +162,8 @@ const fallbackSystemMatchers: ReadonlyArray<[BodySystemId, RegExp]> = [
  * 这不是语义猜测；无匹配时返回空集，由上层按资料类型决定是否应当全局生效。
  */
 export function linkTextToSystems(text: string): BodySystemId[] {
-  const normalized = text.normalize('NFKC');
+  // “电脑验光”等设备名称里的“脑”不是身体部位；仍保留脑电图、脑神经等真实检查词。
+  const normalized = text.normalize('NFKC').replace(/电脑|電腦/g, '');
   return fallbackSystemMatchers
     .filter(([, matcher]) => matcher.test(normalized))
     .map(([systemId]) => systemId);
@@ -219,6 +237,8 @@ export interface TrendObservationInput {
   referenceHigh: number | null;
   abnormalFlag: 'high' | 'low' | 'positive' | 'negative' | 'normal' | 'unknown';
   clinicalDate: string | null;
+  documentTime?: TrendPointV2['documentTime'];
+  effectiveTime?: TrendPointV2['time'];
   dateRole?: 'specimen' | 'measurement' | 'exam' | 'report' | 'onset' | 'unknown';
   specimen: string | null;
   method: string | null;
@@ -250,9 +270,10 @@ function parseTimestamp(date: string | null): number | null {
 function buildTrendFacts(points: TrendPointV2[]): TrendFacts {
   const numeric = points.filter((point) => point.comparable && point.numericValue !== null && point.timestamp !== null);
   const hasUnknownContext = points.some((point) => point.comparabilityReasons.includes('comparison_context_unknown'));
+  const hasReportDate = points.some((point) => point.comparabilityReasons.includes('report_date_used'));
   const status: TrendFacts['status'] = numeric.length < 2
     ? 'not_comparable'
-    : hasUnknownContext ? 'conditional' : 'comparable';
+    : hasUnknownContext || hasReportDate ? 'conditional' : 'comparable';
   if (numeric.length < 2) {
     return {
       status,
@@ -332,6 +353,7 @@ function buildTrendFacts(points: TrendPointV2[]): TrendFacts {
     referenceBoundaryCrossings: boundaryCrossings,
     reasons: [
       ...(hasUnknownContext ? ['部分标本、方法或部位未记录，因此比较结果需保留条件。'] : []),
+      ...(hasReportDate ? ['部分结果按报告日期记录，可比较报告期变化，不推定精确检查间隔。'] : []),
       ...(numeric.length === 2 ? ['两点只能说明前后差异，不能证明长期趋势。'] : [])
     ],
     statement: directionText[direction]
@@ -365,7 +387,12 @@ export function buildMetricSeries(observations: TrendObservationInput[]): Metric
       : null;
     const requiresKnownUnit = Boolean(definition && definition.compatibleUnits.length > 0);
     const points: TrendPointV2[] = group.rows.map((row): TrendPointV2 => {
-      const timestamp = parseTimestamp(row.clinicalDate);
+      const time: TrendPointV2['time'] = row.clinicalDate ? { value: row.clinicalDate, endValue: null, precision: 'day' as const,
+        role: row.dateRole ?? 'unknown', source: 'explicit' as const, displayLabel: row.clinicalDate }
+        : row.effectiveTime ?? { value: null, endValue: null, precision: 'unknown' as const,
+          role: 'unknown' as const, source: 'unknown' as const, displayLabel: '日期待确认' };
+      // 月/年精度仍可展示，但不能补成月初/年初参与日级趋势。
+      const timestamp = time.precision === 'day' ? parseTimestamp(time.value) : null;
       const evidence: MemberEvidenceRef = {
         id: `evidence-${row.sourceSpanId ?? row.id}`,
         kind: 'observation',
@@ -381,15 +408,9 @@ export function buildMetricSeries(observations: TrendObservationInput[]): Metric
       return {
         id: `point-${row.id}`,
         observationId: row.id,
-        time: {
-          value: row.clinicalDate,
-          endValue: null,
-          precision: row.clinicalDate ? 'day' : 'unknown',
-          role: row.dateRole ?? 'unknown',
-          source: row.clinicalDate ? 'explicit' : 'unknown',
-          displayLabel: row.clinicalDate ?? '日期待确认'
-        },
+        time,
         timestamp,
+        ...(row.documentTime ? { documentTime: row.documentTime } : {}),
         displayValue: row.rawText,
         numericValue: row.comparator === 'eq' ? row.numericValue : null,
         comparator: row.comparator,
@@ -403,6 +424,7 @@ export function buildMetricSeries(observations: TrendObservationInput[]): Metric
           ...(row.numericValue === null ? ['not_numeric'] : []),
           ...(row.comparator && row.comparator !== 'eq' ? ['bounded_value_not_exact'] : []),
           ...(timestamp === null ? ['clinical_date_unknown'] : []),
+          ...(time.basis === 'report' ? ['report_date_used'] : []),
           ...(requiresKnownUnit && normalizeUnit(row.unit) === null ? ['unit_unknown_for_dimensional_concept'] : []),
           ...(contextUnknown ? ['comparison_context_unknown'] : [])
         ],

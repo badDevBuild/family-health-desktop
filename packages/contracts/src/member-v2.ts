@@ -52,6 +52,7 @@ export const clinicalTimeSchema = z.object({
   precision: z.enum(['day', 'month', 'year', 'unknown']),
   role: z.enum(['specimen', 'measurement', 'exam', 'report', 'onset', 'unknown']),
   source: z.enum(['explicit', 'inherited', 'corrected', 'unknown']),
+  basis: z.enum(['clinical', 'report', 'unknown']).optional(),
   displayLabel: z.string().min(1)
 }).strict().superRefine((time, context) => {
   if (time.value === null) {
@@ -65,6 +66,18 @@ export const clinicalTimeSchema = z.object({
   }
 });
 export type ClinicalTime = z.infer<typeof clinicalTimeSchema>;
+
+const compactResultUnit = (value: string) => value.normalize('NFKC').toLowerCase().replace(/[µμ]/g, 'u').replace(/\s+/g, '');
+
+/** 原值已经带相同单位时不再追加；不改数值、不换算，也不自动修正 OCR 标点。 */
+export function formatResult(value: string | null, unit: string | null): string {
+  if (!value?.trim()) return '—';
+  if (!unit?.trim()) return value;
+  const text = compactResultUnit(value);
+  const suffix = compactResultUnit(unit);
+  if (text.endsWith(suffix) && /[\d.:：]$/.test(text.slice(0, -suffix.length))) return value;
+  return `${value} ${unit}`;
+}
 
 export const memberEvidenceRefSchema = z.object({
   id: idSchema,
@@ -179,6 +192,8 @@ export const trendPointV2Schema = z.object({
   id: idSchema,
   observationId: idSchema,
   time: clinicalTimeSchema,
+  // 保留报告背景；是否用于趋势由主进程的有据 effectiveTime 投影决定，不直接使用此字段兜底。
+  documentTime: clinicalTimeSchema.optional(),
   timestamp: z.number().int().nullable(),
   displayValue: z.string().min(1),
   numericValue: z.number().finite().nullable(),
@@ -429,7 +444,18 @@ export const memberOverviewV2Schema = z.object({
     title: z.string().min(1),
     explanation: z.string().min(1),
     nextStep: z.string().nullable(),
-    systemId: bodySystemIdSchema
+    systemId: bodySystemIdSchema,
+    // 只读投影携带完整理解依据及系统/总体条件；缺失时只可展示主题入口，不能孤立摘取解释。
+    readingContext: z.array(z.string().min(1)).optional(),
+    // 同一主题只占一个入口，其他解释及其临床条件仍按原句提供。
+    relatedExplanations: z.array(z.object({
+      id: idSchema,
+      title: z.string().min(1),
+      explanation: z.string().min(1),
+      systemId: bodySystemIdSchema
+    }).strict()).optional(),
+    additionalNextSteps: z.array(z.string().min(1)).optional(),
+    isHighPriority: z.boolean().optional()
   }).strict()),
   importantChanges: z.array(z.object({
     id: idSchema,
@@ -508,6 +534,9 @@ export const healthEventDetailV2Schema = healthEventV2Schema.extend({
     id: idSchema,
     label: z.string().min(1),
     value: z.string().min(1),
+    time: clinicalTimeSchema.default({
+      value: null, endValue: null, precision: 'unknown', role: 'unknown', source: 'unknown', displayLabel: '检查日期未记录'
+    }),
     abnormalFlag: z.enum(['high', 'low', 'positive', 'negative', 'normal', 'unknown'])
   }).strict()),
   historicalReferences: z.array(z.object({
@@ -650,6 +679,7 @@ export const lifestylePlanV2Schema = z.object({
     userGoal: z.string().min(1),
     selectedStartingOption: z.string().min(1),
     plannedTime: z.string().nullable(),
+    reportTiming: z.string().nullable().optional(),
     owner: z.string().min(1),
     progressNote: z.string().nullable(),
     status: actionStatusSchema,

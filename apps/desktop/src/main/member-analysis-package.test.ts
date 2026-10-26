@@ -40,6 +40,17 @@ function fixture(): MemberEvidencePackageV3 {
 }
 
 describe('完整事实优先的成员分析输入', () => {
+  it('前后比较的两侧引用经过真实事实短编号往返，不能把正文当编号改写', () => {
+    const source = fixture();
+    const transport = createMemberAnalysisTransport(source);
+    const value = { evidenceIds: source.facts.flatMap((fact) => fact.evidenceIds), changeAssessment: {
+      currentEvidenceIds: source.facts[1]!.evidenceIds, previousEvidenceIds: source.facts[0]!.evidenceIds,
+      summary: source.facts[0]!.evidenceIds[0]! } };
+    const sent = transport.aliasCandidate(value);
+    expect(sent.changeAssessment.currentEvidenceIds).not.toEqual(value.changeAssessment.currentEvidenceIds);
+    expect(sent.changeAssessment.summary).toEqual(value.changeAssessment.summary);
+    expect(transport.restoreOutput(sent)).toEqual(value);
+  });
   it('保留全部事实和用户范围，不改本地包；单次检查只去掉趋势包装', () => {
     const source = fixture();
     const before = structuredClone(source);

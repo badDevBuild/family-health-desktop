@@ -20,7 +20,8 @@ export interface MemberAnalysisPackage extends Omit<MemberEvidencePackageV3, 'fa
   sourceContext: Array<{ observationIds: string[]; quote: string }>;
 }
 
-export function buildMemberAnalysisPackage(input: MemberEvidencePackageV3): MemberAnalysisPackage {
+export function buildMemberAnalysisPackage(input: MemberEvidencePackageV3,
+  analysisSourceCatalog: readonly MemberEvidencePackageV3['evidenceCatalog'][number][] = input.evidenceCatalog): MemberAnalysisPackage {
   const facts = new Map(input.facts.map((fact) => [fact.observationId, fact]));
   const systemGroups = new Map<string, MemberAnalysisPackage['systemGroups'][number]>();
   for (const fact of input.facts) {
@@ -38,13 +39,14 @@ export function buildMemberAnalysisPackage(input: MemberEvidencePackageV3): Memb
     if (!existing.observationIds.includes(observationId)) existing.observationIds.push(observationId);
     context.set(quote, existing);
   };
-  for (const evidence of input.evidenceCatalog) retainContext(evidence.quote, evidence.observationId);
+  // 综合传输沿用整理条件后的原始引用；本机核对实体化的全文不能变成新增上下文。
+  for (const evidence of analysisSourceCatalog) retainContext(evidence.quote, evidence.observationId);
   const trends: MemberEvidencePackageV3['trends'] = [];
   for (const trend of input.trends) {
     const parsed = metricSeriesSummarySchema.safeParse(trend.payload);
     if (!parsed.success || parsed.data.points.some((point) => {
       const fact = facts.get(point.observationId);
-      return !fact || fact.rawValue !== point.displayValue || fact.clinicalDate !== point.time.value
+      return !fact || fact.rawValue !== point.displayValue || (fact.clinicalDate ?? fact.effectiveTime?.value ?? null) !== point.time.value
         || fact.reportedAbnormalFlag !== point.abnormalFlag;
     })) {
       // 未知/冲突的结构不能当作冗余删除；保持显式回退，供模型保留不确定性。
@@ -74,7 +76,7 @@ export function buildMemberAnalysisPackage(input: MemberEvidencePackageV3): Memb
           comparable: point.comparable, comparabilityReasons: [...point.comparabilityReasons],
           duplicateSourceCount: point.duplicateSourceCount ?? 0,
           time: { endValue: point.time.endValue, precision: point.time.precision,
-            role: point.time.role, source: point.time.source }
+            role: point.time.role, source: point.time.source, ...(point.time.basis ? { basis: point.time.basis } : {}) }
         };
       })
     } });
@@ -96,7 +98,7 @@ export function buildMemberAnalysisPackage(input: MemberEvidencePackageV3): Memb
 /** 只转换证据引用字段，不能替换正文、节点 ID、趋势 ID 或其他普通字符串。 */
 function mapCitations<T>(input: T, mapping: ReadonlyMap<string, string[]>, key = ''): T {
   if (Array.isArray(input)) {
-    if (key === 'evidenceIds' || key === 'counterEvidenceIds') {
+    if (['evidenceIds', 'counterEvidenceIds', 'currentEvidenceIds', 'previousEvidenceIds'].includes(key)) {
       return [...new Set(input.flatMap((id) => typeof id === 'string' ? mapping.get(id) ?? [id] : [id]))] as T;
     }
     return input.map((item) => mapCitations(item, mapping, key)) as T;
@@ -106,8 +108,9 @@ function mapCitations<T>(input: T, mapping: ReadonlyMap<string, string[]>, key =
   return input;
 }
 
-export function createMemberAnalysisTransport(input: MemberEvidencePackageV3) {
-  const transport = createMemberEvidenceTransport(buildMemberAnalysisPackage(input));
+export function createMemberAnalysisTransport(input: MemberEvidencePackageV3,
+  analysisSourceCatalog: readonly MemberEvidencePackageV3['evidenceCatalog'][number][] = input.evidenceCatalog) {
+  const transport = createMemberEvidenceTransport(buildMemberAnalysisPackage(input, analysisSourceCatalog));
   const toEvidence = new Map(input.facts.map((fact) => [fact.observationId, fact.evidenceIds]));
   const toFacts = new Map<string, string[]>();
   for (const fact of input.facts) for (const id of fact.evidenceIds) {

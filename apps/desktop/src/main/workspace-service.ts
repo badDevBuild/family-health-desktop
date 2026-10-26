@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
+import type { UpdateActionScheduleInput } from '@contracts';
+import { processNowInputSchema, type ProcessNowInput } from '@contracts';
 import type { AccountState, ActionItem, ActionStatus, AdoptMemberAssessmentActionInput, AdoptedActionReceipt, AdoptLifestyleProposalInput, ArchivePersonInput, BodySystemDetailV2, BodySystemId, BodySystemSummaryV2, ConceptMappingReceipt, ConceptReviewBundle, CreateActionItemInput, CreateManualNoteInput, CreatePersonInput, DashboardSnapshot, DeleteDocumentInput, HealthEventDetailV2, HealthEventRelationReceipt, HealthEventV2, ImportFilesReceipt, InboxBindingSummary, LifestylePlanV2, LifestyleProposalDecisionReceipt, MemberAssessmentSnapshotV3, MemberEvidenceBundle, MemberEvidenceRef, MemberOverviewV2, MergeHealthEventsInput, MetricSeriesDetailV2, MetricSeriesSummary, ObservationCandidate, ReportMetadataCorrectionReceipt, RestorePersonInput, SetConceptMappingInput, SetDocumentInclusionInput, SetLifestyleProposalDecisionInput, SplitHealthEventInput, SystemAnalysisSnapshot, SystemEvidenceBundle, UndoConceptMappingInput, UndoHealthEventRelationInput, UndoReportMetadataInput, UpdatePersonDisplayInput, UpdateReportMetadataInput, UpdateScheduleInput } from '@contracts';
-import { bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, dashboardSnapshotSchema, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema } from '@contracts';
-import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, sameAdoptedActionScope, stableHash, type TrendObservationInput } from '@core';
-import { buildDocxManifest, buildHeicManifest, buildImageManifest, buildPdfManifest, buildTextManifest, decodeText, detectInput, type LegacyDocConverter } from '@ingestion';
+import { bodySystemDetailV2Schema, bodySystemSummaryV2Schema, conceptMappingReceiptSchema, conceptReviewBundleSchema, containsProcessNarrative, dashboardSnapshotSchema, formatResult, healthEventDetailV2Schema, healthEventV2Schema, lifestylePlanV2Schema, memberAssessmentSnapshotV3Schema, memberEvidenceBundleSchema, memberOverviewV2Schema, metricSeriesDetailV2Schema, presentAssessmentText } from '@contracts';
+import { bodySystemRegistry, buildMetricSeries as buildMetricSeriesV2, classifyHealthEventType, conceptDictionary, evaluateObservationCandidate, linkConceptToSystems, linkLegacyCandidateToSystems, sameAdoptedActionScope, stableHash, type TrendObservationInput } from '@core';
+import { detectInput, prepareDirectOriginalReport, type LegacyDocConverter } from '@ingestion';
 import { WorkspaceStore, type AcceptedObservationSummary, type OpenExtractionReviewIssue } from '@storage';
 import { determineEligibleSlot, jobInputSignature, nextScheduledRunUtc } from '@workflow';
 import { recoveryPointsReferenceSourceHash } from './recovery-point-service.js';
@@ -11,7 +14,15 @@ import { buildSourceUrgentNotices } from './source-urgent-notice.js';
 import { buildCurrentSymptomNotices } from './current-symptom-notice.js';
 import { ACCEPTANCE_RULES_VERSION, MEMBER_ASSESSMENT_PROMPT_VERSION, MEMBER_ASSESSMENT_RULES_VERSION, promptMetaForStage } from './prompts/index.js';
 import { buildSystemEvidenceBundle as buildSystemEvidenceBundleFromStore } from './system-evidence.js';
-import { presentMemberAssessment } from './assessment-presentation.js';
+import { familyAssessmentNarrative, presentMemberAssessment } from './assessment-presentation.js';
+import { buildAssessmentPriorities } from './assessment-priorities.js';
+import { buildMemberSummaryData, type MemberSummaryData } from './export-service.js';
+import { normalizeStoredSource } from './source-normalization.js';
+import { processingRebuildExpectedSourcesSchema, type ProcessingRebuildReceipt, type ProcessingRebuildSourceIdentity } from '@contracts';
+import { projectEventDate, readEventDateSources } from './event-date-projection.js';
+import { withDocumentTimes, observationDisplayTime, type ObservationWithDocumentTime } from './observation-date-presentation.js';
+import { hasSurvivingSystemSupport } from './assessment-review-boundary.js';
+import { isReadableAssessmentVersion } from './assessment-readable-versions.js';
 
 const organNames = [
   ['cardiovascular', '心血管'],
@@ -25,6 +36,29 @@ const organNames = [
 ] as const;
 
 type OrganId = typeof organNames[number][0];
+
+function savedAiActionTitle(value: string): string {
+  const text = presentAssessmentText(value).text;
+  return containsProcessNarrative(text) ? '已有行动记录，安排前需确认依据' : text || '已保存的行动安排';
+}
+
+/** 只读整理历史 AI 行动；生活采纳的正文由本人填写，不能按 AI 来源一并改写。 */
+export function presentSavedAction(action: ActionItem, userDetail = false): ActionItem {
+  if (action.origin !== 'ai_proposed') return action;
+  const title = presentAssessmentText(action.title).text;
+  const detail = userDetail ? action.detail : presentAssessmentText(action.detail).text;
+  const dueText = userDetail || action.dueText === null ? action.dueText : presentAssessmentText(action.dueText).text || null;
+  // 无法安全剥离的混合句不能继续成为做法；整条派生安排暂不用于执行，原文仍留在数据库。
+  const unsafeInstruction = !userDetail && [title, detail, dueText ?? ''].some(containsProcessNarrative);
+  return {
+    ...action,
+    title: unsafeInstruction ? '已有行动记录，安排前需确认依据' : savedAiActionTitle(action.title),
+    detail: userDetail ? action.detail : unsafeInstruction
+      ? '这项行动记录仍保留。安排前请回看原始依据及适用限制，不宜直接按这段文字执行。'
+      : detail || '具体做法待确认，请结合本人原有安排决定。',
+    dueText: unsafeInstruction ? null : dueText
+  };
+}
 
 const organMatchers: Record<OrganId, RegExp> = {
   cardiovascular: /低密度|高密度|胆固醇|甘油三酯|载脂蛋白|血压|ldl|hdl|cholesterol|triglyceride|apolipoprotein/i,
@@ -121,6 +155,34 @@ function isReadOnlyPartialPublishIssue(
     && issue.candidateDiffs.length === 0
     && documentStatus === 'completed'
     && committed;
+}
+
+/** 只有来源对账事项可从收件箱迁移，身份、值选择及其他开放事项仍保留原入口。 */
+function isSourceOnlyExtractionIssue(issue: OpenExtractionReviewIssue): boolean {
+  return (issue.kind === 'field_conflict' || issue.kind === 'coverage_gap')
+    && issue.candidateDiffs.length === 0
+    && !issue.reasonCodes.some((code) => code.startsWith('PERSON_'));
+}
+
+/** 原因只解释处理阶段，不把本机识别失败说成原件坏了，也不让用户猜结果。 */
+function sourceRepairExplanation(reasonCodes: string[], latestRepairOutcome: string | null): string {
+  const codes = reasonCodes.map((code) => code.split(':')[0]!);
+  if (codes.length > 0 && codes.every((code) => [
+    'direct_original_clinical_date_unverified', 'direct_original_clinical_date_binding_missing', 'direct_original_metadata_field_unverified',
+    'direct_original_metadata_time_unverified'
+  ].includes(code))) {
+    return codes.some(code => ['direct_original_clinical_date_unverified', 'direct_original_clinical_date_binding_missing'].includes(code))
+      ? '检查结果已保存；部分检查日期暂不能确认，未用于按日期判断变化。'
+      : '检查结果已保存；报告标题、机构或报告日期等辅助信息仍有未确认项。';
+  }
+  if (latestRepairOutcome && ['schema_invalid', 'scope_violation', 'candidate_drift'].includes(latestRepairOutcome)
+    || codes.some((code) => /^EXTRACTION_REPAIR_(?:SCHEMA|SCOPE|CANDIDATE)/u.test(code))) {
+    return '自动修复的内容或格式没有通过检查，本次修复未被采用；没有改动已经保存的结果。';
+  }
+  if (codes.some((code) => /^(?:LOCAL_VISUAL_|local_visual_|ORIGINAL_VISUAL_|source_span_missing|missing_evidence|evidence_missing|source_readability|SOURCE_REBINDING_)/u.test(code))) {
+    return '部分来源文字或位置还没有可靠读出、对应到检查结果；本机识别未成功不等于原件不可读。';
+  }
+  return '模型读取的结果与本机来源在项目、结果、单位或日期上尚未核验一致；这不等于原报告的检查结果有误。';
 }
 
 function normalizeAbnormalFlag(value: string | null) {
@@ -226,7 +288,7 @@ function trendMapping(observation: AcceptedObservationSummary) {
   };
 }
 
-function asTrendObservation(observation: AcceptedObservationSummary): TrendObservationInput {
+function asTrendObservation(observation: ObservationWithDocumentTime): TrendObservationInput {
   const range = parseReferenceRange(observation.referenceRange);
   const qualifier = ['eq', 'lt', 'lte', 'gt', 'gte'].includes(observation.qualifier ?? '')
     ? observation.qualifier as TrendObservationInput['comparator']
@@ -248,6 +310,8 @@ function asTrendObservation(observation: AcceptedObservationSummary): TrendObser
     referenceHigh: range.high,
     abnormalFlag: observation.abnormalFlag,
     clinicalDate: observation.clinicalDate,
+    ...(observation.documentTime ? { documentTime: observation.documentTime } : {}),
+    ...(observation.effectiveTime ? { effectiveTime: observation.effectiveTime } : {}),
     dateRole: 'unknown',
     specimen: observation.specimen,
     method: observation.method,
@@ -261,7 +325,7 @@ function asTrendObservation(observation: AcceptedObservationSummary): TrendObser
   };
 }
 
-function buildMemberMetricSeries(observations: AcceptedObservationSummary[]): MetricSeriesSummary[] {
+function buildMemberMetricSeries(observations: ObservationWithDocumentTime[]): MetricSeriesSummary[] {
   return buildMetricSeriesV2(observations.map(asTrendObservation));
 }
 
@@ -276,8 +340,16 @@ const legacyOrganToSystem: Record<string, BodySystemId> = {
   sensory: 'sensory_oral'
 };
 
+// 发送范围与 IPC 共用契约类型，新增范围字段不再维护第二份手写名单。
+export type ProcessNowOptions = Omit<ProcessNowInput, 'confirmedDataRecipient' | 'consentVersion'> & {
+  accountState: AccountState;
+  consentVersion: number;
+};
+
 export class PersonalWorkspaceService {
   readonly store: WorkspaceStore;
+  readonly automaticUploadRecovery: Promise<void>;
+  private closed = false;
 
   constructor(
     rootDirectory: string,
@@ -288,7 +360,39 @@ export class PersonalWorkspaceService {
   ) {
     this.store = new WorkspaceStore({ rootDirectory, now });
     this.store.recoverInterruptedJobs();
+    // 正常工作区启动时仅升级旧自动签发日期投影；只读页面轮询不触发结果修订。
+    this.store.upgradeDirectOriginalReportDateProjection();
     this.store.revokeUnreferencedManualProcessingConsents();
+    // 启动恢复失败保持意图未完成，下次正常启动仍可恢复；不能产生未处理的 Promise 拒绝。
+    this.automaticUploadRecovery = this.resumeInterruptedUploads().catch(() => undefined);
+  }
+
+  /** 只恢复持久上传意图已绑定的保险库原件，不重扫旧待处理资料或重新打开用户路径。 */
+  private async resumeInterruptedUploads(): Promise<void> {
+    const assertOpen = () => { if (this.closed) throw new Error('WORKSPACE_CLOSED'); };
+    for (const item of this.store.automaticUploadIntents.listRecoveryItems()) {
+      try {
+        const source = this.store.getDocumentOriginalSource(item.documentId);
+        if (source.personId !== item.personId || source.sourceObjectId !== item.sourceObjectId || source.sha256 !== item.sha256) {
+          throw new Error('AUTOMATIC_UPLOAD_INTENT_SOURCE_CHANGED');
+        }
+        const bytes = await readFile(source.sourcePath);
+        assertOpen();
+        if (createHash('sha256').update(bytes).digest('hex') !== item.sha256) throw new Error('SOURCE_HASH_MISMATCH');
+        const manifest = await normalizeStoredSource({ store: this.store, documentId: item.documentId,
+          sourceObjectId: item.sourceObjectId, sha256: item.sha256, displayName: source.displayName, bytes,
+          createdAt: this.now().toISOString(), legacyDocConverter: this.legacyDocConverter, validateBeforeCommit: assertOpen });
+        assertOpen();
+        this.store.saveSourceManifest(manifest);
+        this.store.automaticUploadIntents.markReady(item.intentId, item.itemIndex);
+      } catch (error) {
+        if (this.closed) return;
+        this.store.automaticUploadIntents.markRejected(item.intentId, item.itemIndex,
+          error instanceof Error ? error.message : 'IMPORT_FAILED');
+      }
+    }
+    if (this.closed) return;
+    for (const intentId of this.store.automaticUploadIntents.listOpenIntentIds()) this.store.automaticUploadIntents.finalize(intentId);
   }
 
   private requireActivePerson(personId: string) {
@@ -297,25 +401,44 @@ export class PersonalWorkspaceService {
     return person;
   }
 
-  private memberObservations(personId: string): AcceptedObservationSummary[] {
+  private memberObservations(personId: string, includeDocumentTime = false): ObservationWithDocumentTime[] {
     this.requireActivePerson(personId);
     const conflictedDocumentIds = new Set(this.store.listOpenExtractionReviewIssues()
       .filter((issue) => issue.personId === personId && issue.kind === 'person_conflict')
       .map((issue) => issue.documentId));
-    return this.store.listAcceptedObservations(personId)
+    const observations = this.store.listAcceptedObservations(personId)
       .filter((observation) => !conflictedDocumentIds.has(observation.documentId));
+    return includeDocumentTime ? withDocumentTimes(this.store, personId, observations) : observations;
+  }
+
+  /** 导出按成员读取完整事实，不复用页面最近 500 条的展示窗口，也不扩大 UI 快照。 */
+  getMemberSummaryExport(
+    input: { personId: string; dateFrom: string | null; dateTo: string | null },
+    exportedAt = this.now().toISOString()
+  ): MemberSummaryData {
+    const observations = this.memberObservations(input.personId);
+    return buildMemberSummaryData(this.getSnapshot(), input, exportedAt,
+      this.getMemberAssessment(input.personId), observations);
   }
 
   getMemberAssessment(personId: string): MemberAssessmentSnapshotV3 | null {
     this.requireActivePerson(personId);
     const snapshot = this.store.listMemberAssessmentSnapshots(personId, true)[0];
-    if (!snapshot || snapshot.promptVersion !== MEMBER_ASSESSMENT_PROMPT_VERSION
-      || snapshot.rulesVersion !== MEMBER_ASSESSMENT_RULES_VERSION
+    if (!snapshot) return null;
+    const latestRules = snapshot.promptVersion === MEMBER_ASSESSMENT_PROMPT_VERSION
+      && snapshot.rulesVersion === MEMBER_ASSESSMENT_RULES_VERSION;
+    // 只读兼容登记过的已发布版本；事实、背景及核查范围仍必须匹配。
+    const readablePrevious = isReadableAssessmentVersion(snapshot.promptVersion, snapshot.rulesVersion);
+    if ((!latestRules && !readablePrevious)
       || snapshot.factRevision !== this.store.getFactRevision(personId)
       || snapshot.contextRevision !== this.store.getClinicalContextRevision(personId)
       || snapshot.reviewScopeSignature !== this.store.getOpenReviewScopeSignature(personId)) return null;
     const parsed = memberAssessmentSnapshotV3Schema.safeParse(snapshot);
-    return parsed.success ? presentMemberAssessment(parsed.data) : null;
+    if (!parsed.success) return null;
+    // 未发布正文只供本机核查，不进入普通健康页面、摘要导出或其他展示投影。
+    const visibleSnapshot = { ...parsed.data, status: latestRules ? 'current' as const : 'stale' as const };
+    delete visibleSnapshot.reviewAuditRecords;
+    return presentMemberAssessment(visibleSnapshot);
   }
 
   getConceptReview(personId: string): ConceptReviewBundle {
@@ -477,8 +600,14 @@ export class PersonalWorkspaceService {
       const analysis = this.currentSystemAnalysis(personId, registry.id, observations);
       const v3System = assessment?.systems.find((item) => item.systemId === registry.id);
       const rebuilt = v3System && assessment?.presentation?.rebuiltNodeIds.includes(v3System.id);
+      const survivingSystemSupport = v3System && assessment
+        && hasSurvivingSystemSupport(assessment, v3System, assessment.evidenceCatalog);
+      const reviewedConcern = v3System && assessment?.validationMode === 'local_and_focused_review'
+        && assessment.reviewedTargetIds.includes(v3System.id)
+        && (v3System.status === 'attention' || v3System.status === 'monitor')
+        && survivingSystemSupport;
       const interpretationState = rebuilt
-        ? v3System.claimIds.some((id) => assessment?.claims.some((claim) => claim.id === id)) ? 'partial' : 'unavailable'
+        ? survivingSystemSupport || v3System.claimIds.some((id) => assessment?.claims.some((claim) => claim.id === id)) ? 'partial' : 'unavailable'
         : v3System ? 'complete' : undefined;
       const currentAnalysis = analysis?.status === 'current' && analysis.review.status === 'passed'
         ? analysis
@@ -494,11 +623,13 @@ export class PersonalWorkspaceService {
         id: registry.id,
         name: registry.name,
         shortName: registry.shortName,
-        // 隔离结果的 monitor/insufficient 是处理回退状态，不是新的健康判断。
-        status: rebuilt ? 'building' : v3System?.status ?? (direct.length === 0
+        // 重建范围单独用 partial 表达；同次真实复核且仍有来源的关注状态不再被处理状态盖住。
+        // 未复核、空支持或正常类仍保持中性，不能从事实异常标记反推健康状态。
+        status: rebuilt && !reviewedConcern ? 'building' : v3System?.status ?? (direct.length === 0
           ? legacyRelatedCount > 0 ? 'building' : 'insufficient'
           : currentAnalysis?.assessmentStatus === 'attention' || attention.length > 0 ? 'attention'
-            : currentAnalysis?.assessmentStatus === 'undetermined' || !currentAnalysis ? 'building' : 'stable'),
+            : currentAnalysis?.assessmentStatus === 'monitor' ? 'monitor'
+              : currentAnalysis?.assessmentStatus === 'no_signal_in_scope' ? 'no_signal_in_scope' : 'building'),
         summary: v3System?.headline ?? currentAnalysis?.headline
           ?? (direct.length === 0
             ? related.length > 0 ? '有相关背景资料，但还没有本系统的直接检查。' : '尚无相关检查。'
@@ -517,6 +648,7 @@ export class PersonalWorkspaceService {
   getMemberOverview(personId: string): MemberOverviewV2 {
     const observations = this.memberObservations(personId);
     const assessment = this.getMemberAssessment(personId);
+    const assessmentNarrative = assessment ? familyAssessmentNarrative(assessment) : null;
     const systems = this.listBodySystems(personId);
     const events = this.listHealthEvents(personId);
     const actions = this.store.listActionItems(personId).filter((item) => !['completed', 'dismissed'].includes(item.status));
@@ -533,15 +665,12 @@ export class PersonalWorkspaceService {
         return order[left.analysis.assessmentStatus] - order[right.analysis.assessmentStatus]
           || (right.analysis.scope.clinicalAsOf ?? '').localeCompare(left.analysis.scope.clinicalAsOf ?? '');
       });
-    const lead = analyses[0]?.analysis ?? null;
-    const priorityIssues = assessment ? assessment.claims
-      .filter((claim) => claim.consequenceLevel !== 'routine' && claim.systemIds.length > 0)
-      .slice(0, 3)
-      .map((claim) => ({
-        id: claim.id, title: claim.text, explanation: claim.rationale,
-        nextStep: assessment.actions.find((action) => action.claimIds.includes(claim.id))?.firstStep ?? null,
-        systemId: claim.systemIds[0]!
-      })) : analyses
+    const legacyOverview = analyses.length > 0 ? {
+      headline: '整体健康情况',
+      summary: analyses.map(({ system, analysis }) => `${system.shortName}：${[analysis.overview,
+        ...analysis.clinicallyImportantUnknowns].join('\n')}`).join('\n\n')
+    } : null;
+    const priorityIssues = assessment ? buildAssessmentPriorities(assessment) : analyses
       .filter(({ analysis }) => ['attention', 'monitor'].includes(analysis.assessmentStatus))
       .slice(0, 3)
       .map(({ system, analysis }) => ({
@@ -571,15 +700,15 @@ export class PersonalWorkspaceService {
       dataQuality: observations.length === 0 ? 'insufficient' : assessment?.processingPlan.aggregateSummarizedOnlyObservationIds?.length
         || legacyObservationCount > 0 || unclassifiedFactCount > 0
         || observations.some((item) => !item.clinicalDate) ? 'partial' : 'complete',
-      headline: assessment?.overview.headline ?? (observations.length === 0
+      headline: assessmentNarrative?.headline ?? (observations.length === 0
         ? '还没有可解读的健康资料。'
-        : lead?.headline ?? '报告内容已保存，健康解读正在准备。'),
-      overview: assessment ? [assessment.overview.summary,
+        : legacyOverview?.headline ?? '报告内容已保存，健康解读正在准备。'),
+      overview: assessment ? [assessmentNarrative!.summary,
         ...(assessment.processingPlan.aggregateSummarizedOnlyObservationIds?.length
           ? assessment.overview.limitations.filter((item) => item.includes('仅经分区摘要参与综合')) : [])].join(' ')
         : (observations.length === 0
         ? '添加体检、门诊或检查资料后，这里会先告诉你最值得知道的情况和下一步。'
-        : lead?.overview
+        : legacyOverview?.summary
           ?? (legacyObservationCount > 0
             ? '旧资料仍然保留；系统正在按新的结果优先方式重新整理，完成前不会用数量冒充健康结论。'
             : '已有资料不会丢失；综合分析完成后，这里会给出结论、原因和可执行的下一步。')),
@@ -608,7 +737,7 @@ export class PersonalWorkspaceService {
   }
 
   getBodySystemDetail(personId: string, systemId: BodySystemId): BodySystemDetailV2 {
-    const observations = this.memberObservations(personId);
+    const observations = this.memberObservations(personId, true);
     const registry = bodySystemRegistry.find((item) => item.id === systemId);
     if (!registry) throw new Error('BODY_SYSTEM_NOT_FOUND');
     const summary = this.listBodySystems(personId).find((item) => item.id === systemId)!;
@@ -616,7 +745,7 @@ export class PersonalWorkspaceService {
     const mappings = related.map((observation) => ({ observation, mapping: memberMapping(observation) }));
     const metrics = buildMemberMetricSeries(related)
       .filter((series) => series.points.some((point) => point.numericValue !== null));
-    const latestByName = new Map<string, AcceptedObservationSummary>();
+    const latestByName = new Map<string, ObservationWithDocumentTime>();
     for (const observation of related) {
       const name = memberDisplayName(observation);
       const previous = latestByName.get(name);
@@ -635,14 +764,7 @@ export class PersonalWorkspaceService {
         id: `finding-${observation.id}`,
         title,
         value: `${observation.rawText}${observation.unit ? ` ${observation.unit}` : ''}`,
-        time: {
-          value: observation.clinicalDate,
-          endValue: null,
-          precision: observation.clinicalDate ? 'day' : 'unknown',
-          role: 'unknown',
-          source: observation.clinicalDate ? 'explicit' : 'unknown',
-          displayLabel: observation.clinicalDate ?? '日期待确认'
-        },
+        time: observationDisplayTime(observation),
         abnormalFlag: observation.abnormalFlag,
         evidence: memberEvidenceSources(observation)
         })),
@@ -652,7 +774,7 @@ export class PersonalWorkspaceService {
   }
 
   getMetricSeries(personId: string, seriesId: string): MetricSeriesDetailV2 {
-    const observations = this.memberObservations(personId);
+    const observations = this.memberObservations(personId, true);
     const series = buildMemberMetricSeries(observations).find((item) => item.id === seriesId);
     if (!series) throw new Error('METRIC_SERIES_NOT_FOUND');
     const pointIds = new Set(series.points.map((point) => point.observationId));
@@ -685,39 +807,29 @@ export class PersonalWorkspaceService {
       const reports = documentIds.map((documentId) => metadataByDocument.get(documentId)).filter((item): item is NonNullable<typeof item> => Boolean(item));
       const report = reports.find((item) => item.metadataStatus === 'corrected') ?? reports[0];
       const extracted = report?.extracted;
-      const dates = [...new Set(items.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)))].sort();
-      const firstDate = dates[0] ?? null;
-      const lastDate = dates.at(-1) ?? null;
-      const spanDays = firstDate && lastDate ? Math.round((Date.parse(`${lastDate}T00:00:00Z`) - Date.parse(`${firstDate}T00:00:00Z`)) / 86_400_000) : null;
-      const extractedClinicalTime = extracted?.times
-        .filter((time) => ['day', 'month', 'year'].includes(time.precision) && ['sampled', 'examined', 'encounter'].includes(time.role))
-        .sort((left, right) => ({ day: 3, month: 2, year: 1 }[right.precision as 'day' | 'month' | 'year']
-          - { day: 3, month: 2, year: 1 }[left.precision as 'day' | 'month' | 'year']))[0];
-      const explicitClinicalTime = report?.metadataStatus === 'corrected'
-        ? { ...report.clinicalTime, role: 'examined' as const }
-        : extractedClinicalTime;
-      const eventDate = explicitClinicalTime?.value ?? (dates.length === 1 || (spanDays !== null && spanDays <= 14) ? firstDate : null);
-      const endDate = explicitClinicalTime ? null : eventDate && lastDate !== eventDate ? lastDate : null;
-      const eventPrecision = explicitClinicalTime?.precision as 'year' | 'month' | 'day' | undefined
-        ?? (eventDate ? 'day' : 'unknown');
+      // 历史对比栏不属于当前事件的检查日期；同一文件中的多次独立检查则保留各自日期。
+      const currentItems = items.filter((item) => !historicalTimeForObservation(item, metadataByDocument.get(item.documentId)));
+      const dates = [...new Set(currentItems.map((item) => item.clinicalDate).filter((value): value is string => Boolean(value)))].sort();
+      const { eventDate, endDate, eventPrecision, basis, explicitClinicalTime, explicitReportTime, hasExplicitRange } = projectEventDate(
+        readEventDateSources(this.store, personId, reports), dates);
       const systemIds = [...new Set(items.flatMap((item) => memberSystemLinks(item).map((link) => link.systemId)))];
       const verifiedEventText = reports.map((item) => (
         item.metadataStatus === 'corrected'
           ? [item.reportKind, item.title]
           : [item.extracted?.reportKind?.value, item.extracted?.title?.value]
       ).filter(Boolean).join(' ')).join(' ');
-      const looksLikeCheckup = /体检|健康检查|健康体检/i.test(verifiedEventText);
-      const looksLikeImaging = items.some((item) => /超声|彩超|ct|mr|磁共振|x线|dr|影像/i.test(`${item.method ?? ''}${item.conceptKey}`));
-      const eventType: HealthEventV2['type'] = looksLikeCheckup
-        ? 'checkup'
-        : /(影像|超声|彩超|ct|mr|磁共振|x线|dr)/i.test(verifiedEventText)
-          ? 'imaging'
-          : looksLikeImaging && reports.length === 0 ? 'imaging' : 'laboratory';
+      const eventType = classifyHealthEventType({
+        verifiedReportText: verifiedEventText,
+        fallbackObservationTexts: reports.length === 0 ? items.flatMap((item) => [
+          item.method ?? '', item.originalNameStatus === 'recorded' ? item.originalName : ''
+        ]) : []
+      });
+      const looksLikeCheckup = eventType === 'checkup';
       const fallbackTitle = eventType === 'checkup'
         ? `${eventDate?.slice(0, 4) ?? '日期待确认'} 年度体检`
         : eventType === 'imaging'
           ? '影像检查'
-          : '检验记录';
+          : eventType === 'laboratory' ? '检验记录' : '检查记录';
       const reportIssued = extracted?.times.find((time) => time.role === 'report_issued' && ['day', 'month', 'year'].includes(time.precision)) ?? null;
       const historicalObservationCount = items.filter((item) => historicalTimeForObservation(item, metadataByDocument.get(item.documentId))).length;
       const attentionNames = [...new Set(items
@@ -729,7 +841,7 @@ export class PersonalWorkspaceService {
       const resultSummary = attentionNames.length > 0
         ? `${attentionNames.slice(0, 3).join('、')}${attentionNames.length > 3 ? '等项目' : ''}在原报告中标记为需要留意。`
         : systemNames.length > 0
-          ? `这次检查涉及${systemNames.slice(0, 3).join('、')}，可以打开查看完整结果。`
+          ? `${hasExplicitRange ? '这份资料' : '这次检查'}涉及${systemNames.slice(0, 3).join('、')}，可以打开查看完整结果。`
           : '可以打开查看这次检查的完整结果。';
       return healthEventV2Schema.parse({
         id: report?.eventId ?? `event-document-${first.documentId}`,
@@ -740,10 +852,11 @@ export class PersonalWorkspaceService {
           value: eventDate,
           endValue: endDate,
           precision: eventPrecision,
-          role: explicitClinicalTime?.role === 'sampled' ? 'specimen' : explicitClinicalTime ? 'exam' : looksLikeCheckup ? 'exam' : 'unknown',
-          source: explicitClinicalTime ? 'explicit' : eventDate ? 'inherited' : 'unknown',
+          basis,
+          role: eventDate === null ? 'unknown' : explicitReportTime ? 'report' : explicitClinicalTime?.role === 'sampled' ? 'specimen' : explicitClinicalTime ? 'exam' : looksLikeCheckup ? 'exam' : 'unknown',
+          source: explicitClinicalTime || explicitReportTime ? 'explicit' : eventDate ? 'inherited' : 'unknown',
           displayLabel: eventDate
-            ? (endDate ? `${eventDate} 至 ${endDate}` : clinicalTimeLabel(eventDate, eventPrecision as 'year' | 'month' | 'day'))
+            ? `${endDate ? `${eventDate} 至 ${endDate}` : clinicalTimeLabel(eventDate, eventPrecision as 'year' | 'month' | 'day')}${basis === 'report' ? ' · 按报告日期' : ''}`
             : '报告日期待确认'
         },
         organization: report?.metadataStatus === 'corrected' ? report.organization : extracted?.organization?.value ?? report?.organization ?? null,
@@ -769,13 +882,13 @@ export class PersonalWorkspaceService {
         metadataStatus: report?.metadataStatus ?? (eventDate ? 'inferred' : 'unknown')
       });
     }).filter((event) => (!filters.systemId || event.systemIds.includes(filters.systemId)) && (!filters.type || event.type === filters.type))
-      .sort((left, right) => (right.time.value ?? '').localeCompare(left.time.value ?? ''));
+      .sort((left, right) => (right.time.endValue ?? right.time.value ?? '').localeCompare(left.time.endValue ?? left.time.value ?? ''));
   }
 
   getHealthEventDetail(personId: string, eventId: string): HealthEventDetailV2 {
     const event = this.listHealthEvents(personId).find((item) => item.id === eventId);
     if (!event) throw new Error('HEALTH_EVENT_NOT_FOUND');
-    const observations = this.memberObservations(personId).filter((item) => event.documentIds.includes(item.documentId));
+    const observations = this.memberObservations(personId, true).filter((item) => event.documentIds.includes(item.documentId));
     const series = buildMemberMetricSeries(observations);
     const reportMetadata = this.store.listReportMetadata(personId).filter((item) => event.documentIds.includes(item.documentId));
     const metadataByDocument = new Map(reportMetadata.map((item) => [item.documentId, item]));
@@ -811,7 +924,8 @@ export class PersonalWorkspaceService {
       findings: currentObservations.map((observation) => ({
         id: observation.id,
         label: memberMapping(observation).canonicalName ?? observation.conceptKey,
-        value: `${observation.rawText}${observation.unit ? ` ${observation.unit}` : ''}`,
+        value: formatResult(observation.rawText, observation.unit),
+        time: observationDisplayTime(observation),
         abnormalFlag: observation.abnormalFlag
       })),
       historicalReferences: [...historicalGroups.values()]
@@ -829,7 +943,7 @@ export class PersonalWorkspaceService {
           findings: group.observations.map((observation) => ({
             id: observation.id,
             label: memberMapping(observation).canonicalName ?? observation.conceptKey,
-            value: `${observation.rawText}${observation.unit ? ` ${observation.unit}` : ''}`,
+            value: formatResult(observation.rawText, observation.unit),
             evidence: memberEvidence(observation)
           }))
         })),
@@ -979,11 +1093,11 @@ export class PersonalWorkspaceService {
         rationale: detail,
         detail,
         steps: [detail],
-        startingOptions: ['先保留为参考，等待新版复核后再决定是否采纳'],
+        startingOptions: ['先回看原有建议，结合当前身体情况再决定。'],
         scheduleSuggestion: null,
-        trackingSuggestion: '当前为旧版建议，重新复核前不自动创建跟进行动。',
-        constraints: ['旧版记录缺少新版所需的适用边界，不能直接采纳为行动。'],
-        uncertainties: ['尚未按当前提示词和安全规则重新复核。'],
+        trackingSuggestion: '按自己已经确定的安排记录进展；需要调整时先与医生确认。',
+        constraints: ['这条建议缺少适用条件，不宜直接据此改变现在的安排。'],
+        uncertainties: [],
         consultProfessional: Boolean(guidance.consultProfessional),
         status: 'proposed' as const,
         evidence: evidenceObservations.map(memberEvidence),
@@ -1036,7 +1150,7 @@ export class PersonalWorkspaceService {
           proposalId: action.proposalId,
           assessmentDedupeKey: action.proposalId === null ? null
             : legacyAssessmentKeys.get(action.proposalId) ?? null,
-          title: action.title,
+          title: savedAiActionTitle(action.title),
           userGoal: action.userGoal,
           selectedStartingOption: action.selectedStartingOption,
           plannedTime: action.plannedTime,
@@ -1046,24 +1160,31 @@ export class PersonalWorkspaceService {
           dueDate: action.dueDate,
           updatedAt: action.updatedAt
         }))
-        : legacyActions.map((action) => ({
-          id: action.id,
-          proposalId: null,
-          title: action.title,
-          userGoal: action.title,
-          selectedStartingOption: action.detail,
-          plannedTime: action.dueText,
-          owner: '本人',
-          progressNote: null,
-          status: action.status,
-          dueDate: action.dueDate,
-          updatedAt: action.updatedAt
-        }))), ...assessmentAdoptions.map(({ action, dedupeKey }) => ({
-        id: action.id, proposalId: null, assessmentDedupeKey: dedupeKey,
-        title: action.title, userGoal: action.title, selectedStartingOption: action.detail,
-        plannedTime: action.dueText, owner: '本人', progressNote: null,
-        status: action.status, dueDate: action.dueDate, updatedAt: action.updatedAt
-      }))]
+        : legacyActions.map((storedAction) => {
+          const action = presentSavedAction(storedAction);
+          return {
+            id: action.id,
+            proposalId: null,
+            title: action.title,
+            userGoal: action.title,
+            selectedStartingOption: action.detail,
+            plannedTime: action.userScheduleText ?? null,
+            reportTiming: action.origin === 'user_created' ? null : action.dueText,
+            owner: '本人',
+            progressNote: null,
+            status: action.status,
+            dueDate: action.dueDate,
+            updatedAt: action.updatedAt
+          };
+        })), ...assessmentAdoptions.map(({ action: storedAction, dedupeKey }) => {
+        const action = presentSavedAction(storedAction);
+        return {
+          id: action.id, proposalId: null, assessmentDedupeKey: dedupeKey,
+          title: action.title, userGoal: action.title, selectedStartingOption: action.detail,
+          plannedTime: action.userScheduleText ?? null, reportTiming: action.dueText, owner: '本人', progressNote: null,
+          status: action.status, dueDate: action.dueDate, updatedAt: action.updatedAt
+        };
+      })]
     });
   }
 
@@ -1076,7 +1197,7 @@ export class PersonalWorkspaceService {
   adoptMemberAssessmentAction(input: AdoptMemberAssessmentActionInput): ActionItem {
     this.requireActivePerson(input.personId);
     const current = this.getMemberAssessment(input.personId);
-    if (!current || current.id !== input.snapshotId) throw new Error('MEMBER_ASSESSMENT_ACTION_STALE');
+    if (!current || current.status !== 'current' || current.id !== input.snapshotId) throw new Error('MEMBER_ASSESSMENT_ACTION_STALE');
     return this.store.adoptMemberAssessmentAction(input);
   }
 
@@ -1087,6 +1208,7 @@ export class PersonalWorkspaceService {
   }
 
   close(): void {
+    this.closed = true;
     this.store.close();
   }
 
@@ -1120,6 +1242,23 @@ export class PersonalWorkspaceService {
     return this.store.setDocumentIncluded(input);
   }
 
+  /** 重新纳入前只补齐缺失的完整原件输入。已准备或已提交的历史结果绝不重新规范化。 */
+  async prepareDocumentForReinclusion(input: SetDocumentInclusionInput): Promise<{ prepared: boolean }> {
+    if (!input.included || this.store.countSourceSpans(input.documentId) > 0) return { prepared: false };
+    const source = this.store.getDocumentOriginalSource(input.documentId);
+    if (!source.personId || source.personArchived) throw new Error('DOCUMENT_PERSON_REQUIRED');
+    const bytes = await readFile(source.sourcePath);
+    if (createHash('sha256').update(bytes).digest('hex') !== source.sha256) throw new Error('SOURCE_HASH_MISMATCH');
+    const manifest = await normalizeStoredSource({ store: this.store, documentId: source.documentId,
+      sourceObjectId: source.sourceObjectId, sha256: source.sha256, displayName: source.displayName,
+      bytes, createdAt: this.now().toISOString(), legacyDocConverter: this.legacyDocConverter });
+    if (manifest.spans.length === 0 || new Set(manifest.coveredUnitIndexes).size !== manifest.totalUnits
+      || manifest.coveredUnitIndexes.some((index) => index < 0 || index >= manifest.totalUnits)) {
+      throw new Error('PROCESSING_REBUILD_ORIGINAL_PREPARATION_INCOMPLETE');
+    }
+    return { prepared: this.store.saveMissingSourceManifestForReinclusion(manifest, source) };
+  }
+
   listDeletedDocuments() {
     return this.store.listDeletedDocuments();
   }
@@ -1136,6 +1275,13 @@ export class PersonalWorkspaceService {
 
   createAction(input: CreateActionItemInput) {
     return this.store.createUserAction(input);
+  }
+
+  updateActionSchedule(input: UpdateActionScheduleInput): ActionItem {
+    this.requireActivePerson(input.personId);
+    const updated = this.store.updateActionSchedule(input);
+    const userDetail = this.store.listActionAdoptions(input.personId).some((item) => item.id === updated.id && item.proposalId !== null);
+    return presentSavedAction(updated, userDetail);
   }
 
   createManualNote(input: CreateManualNoteInput) {
@@ -1334,39 +1480,64 @@ export class PersonalWorkspaceService {
     };
   }
 
-  processNow(options?: {
-    accountState: AccountState;
-    consentVersion: number;
-    documentIds?: string[];
-  }): { batchId: string; idempotent: boolean } {
+  processNow(options?: ProcessNowOptions): { batchId: string; idempotent: boolean } {
+    if (options?.readingScope && (!options.documentIds?.length || options.assessmentPersonId
+      || options.expectedAssessmentDataRevision || options.purpose || options.dateCorrectionDocumentId
+      || options.expectedDateCorrectionDataRevision)) throw new Error('REPORT_SUPPLEMENT_SCOPE_UNAVAILABLE');
+    if (options?.purpose === 'date_correction' || options?.dateCorrectionDocumentId !== undefined
+      || options?.expectedDateCorrectionDataRevision !== undefined) return this.processDateCorrection(options);
+    if (options?.assessmentPersonId !== undefined || options?.expectedAssessmentDataRevision !== undefined) {
+      return this.processAssessmentOnly(options);
+    }
     const selectedIds = options?.documentIds ? new Set(options.documentIds) : null;
+    if (options?.readingScope && (!selectedIds || options.assessmentPersonId || options.purpose)) {
+      throw new Error('REPORT_SUPPLEMENT_SCOPE_UNAVAILABLE');
+    }
+    const supplementScopes = options?.readingScope === 'unresolved_pages'
+      ? [...selectedIds!].map(id => this.store.getReportSupplementScope(id)) : [];
     const trackedDocumentIds = options ? this.store.listProcessingDocumentIds() : new Set<string>();
     const activeDocumentIds = options ? this.store.listActiveProcessingDocumentIds() : new Set<string>();
+    const reviewRepairableIds = selectedIds ? this.store.listRepairableExtractionDocumentIds() : new Set<string>();
     const committedReviewIssues = selectedIds ? this.store.listOpenExtractionReviewIssues().filter((issue) => (
       issue.severity === 'warning' && issue.stage === 'extract'
       && this.store.isDocumentCommitted(issue.documentId)
     )) : [];
-    const repairableIds = new Set(committedReviewIssues.map((issue) => issue.documentId));
+    const repairableIds = reviewRepairableIds;
     if (selectedIds && [...selectedIds].some((documentId) => trackedDocumentIds.has(documentId)
-      && (!repairableIds.has(documentId) || activeDocumentIds.has(documentId)))) {
+      && !repairableIds.has(documentId))) {
       throw new Error('DOCUMENT_ALREADY_IN_PROCESSING');
     }
     const byPerson = new Map<string, { documentIds: string[]; stage: 'extract' | 'analyze' }>();
     for (const document of this.store.listReadyDocuments()) {
       if (selectedIds && !selectedIds.has(document.id)) continue;
-      if (trackedDocumentIds.has(document.id)) continue;
+      if (trackedDocumentIds.has(document.id) && !repairableIds.has(document.id)) continue;
       const group = byPerson.get(document.personId) ?? { documentIds: [], stage: 'extract' as const };
       group.documentIds.push(document.id);
       byPerson.set(document.personId, group);
     }
     if (selectedIds) {
+      // 已完成且没有开放事项的旧报告也可能缺单项日期；仅纳入用户明确选中且事务可重核的资料。
+      for (const document of this.store.listImportedDocuments()) {
+        if (!selectedIds.has(document.id) || !repairableIds.has(document.id) || !document.personId
+          || document.status !== 'completed' || !this.store.isDocumentCommitted(document.id)) continue;
+        const group = byPerson.get(document.personId) ?? { documentIds: [], stage: 'extract' as const };
+        if (!group.documentIds.includes(document.id)) group.documentIds.push(document.id);
+        byPerson.set(document.personId, group);
+      }
+      // 只为明确选中的可修复问题建局部任务；旧身份事项仅在用户已明确归属时由存储事务替代。
+      for (const issue of this.store.listOpenExtractionReviewIssues()) {
+        if (!selectedIds.has(issue.documentId) || !repairableIds.has(issue.documentId) || !issue.personId) continue;
+        const group = byPerson.get(issue.personId) ?? { documentIds: [], stage: 'extract' as const };
+        if (!group.documentIds.includes(issue.documentId)) group.documentIds.push(issue.documentId);
+        byPerson.set(issue.personId, group);
+      }
       // 明确点选旧报告时允许重新核对其未纳入项目；不把所有历史报告自动重传。
       for (const issue of committedReviewIssues) {
         if (!selectedIds.has(issue.documentId) || issue.severity !== 'warning'
           || issue.stage !== 'extract' || !issue.personId
           || !this.store.isDocumentCommitted(issue.documentId)
           || this.store.isDocumentExcluded(issue.documentId)
-          || activeDocumentIds.has(issue.documentId)) continue;
+          || !repairableIds.has(issue.documentId)) continue;
         const group = byPerson.get(issue.personId) ?? { documentIds: [], stage: 'extract' as const };
         if (!group.documentIds.includes(issue.documentId)) group.documentIds.push(issue.documentId);
         byPerson.set(issue.personId, group);
@@ -1379,12 +1550,9 @@ export class PersonalWorkspaceService {
         const observations = this.store.listAcceptedObservations(person.id);
         const sourceDocumentId = observations[0]?.documentId;
         if (!sourceDocumentId || activeDocumentIds.has(sourceDocumentId)) continue;
-        const current = this.store.listMemberAssessmentSnapshots(person.id, true)[0];
-        if (current?.promptVersion === MEMBER_ASSESSMENT_PROMPT_VERSION
-          && current.rulesVersion === MEMBER_ASSESSMENT_RULES_VERSION
-          && current.factRevision === this.store.getFactRevision(person.id)
-          && current.contextRevision === this.store.getClinicalContextRevision(person.id)
-          && current.reviewScopeSignature === this.store.getOpenReviewScopeSignature(person.id)) continue;
+        // 已验证旧规则结果仍可只读，不因安装升级就隐式扩大发送范围。
+        // 可选规则更新必须通过指定成员的独立综合确认入口发起。
+        if (this.getMemberAssessment(person.id)) continue;
         byPerson.set(person.id, { documentIds: [sourceDocumentId], stage: 'analyze' });
       }
     }
@@ -1403,6 +1571,7 @@ export class PersonalWorkspaceService {
         factRevision: this.store.getFactRevision(personId),
         contextRevision: this.store.getClinicalContextRevision(personId),
         reviewScopeSignature: this.store.getOpenReviewScopeSignature(personId),
+        ...(supplementScopes.length ? { supplementScopes: supplementScopes.filter(scope => scope.personId === personId) } : {}),
         ...promptMetaForStage(group.stage)
       })
     }));
@@ -1412,7 +1581,8 @@ export class PersonalWorkspaceService {
         personIds: groups.map((group) => group.personId),
         historicalObservationIds: groups.flatMap((group) => this.store.listAcceptedObservations(group.personId).map((observation) => observation.id)),
         accountFingerprint: stableHash({ provider: 'codex-chatgpt', displayLabel: options.accountState.displayLabel }),
-        version: options.consentVersion
+        version: options.consentVersion,
+        ...(supplementScopes.length ? { supplementScopes } : {})
       })
       : null;
     try {
@@ -1420,7 +1590,9 @@ export class PersonalWorkspaceService {
         cutoff: this.now().toISOString(),
         groups,
         initialStatus: options ? 'queued' : 'waiting_auth',
-        consentId
+        consentId,
+        ...(supplementScopes.length ? { supplementScopes } : {}),
+        ...(selectedIds ? { repairDocumentIds: [...selectedIds].filter((id) => repairableIds.has(id)) } : {})
       });
       return { batchId: created.batchId, idempotent: created.idempotent };
     } catch (error) {
@@ -1429,7 +1601,191 @@ export class PersonalWorkspaceService {
     }
   }
 
-  async importFiles(files: Array<{ path: string; bytes: Uint8Array }>, personId: string | null, bindingId: string | null = null): Promise<ImportFilesReceipt> {
+  /** 单份已提交报告的显式日期纠错；没有新日期参数，也不改个人计划。 */
+  private processDateCorrection(options: ProcessNowOptions): { batchId: string; idempotent: boolean } {
+    const { accountState: _accountState, ...request } = options;
+    const input = processNowInputSchema.parse({ ...request, confirmedDataRecipient: 'OpenAI/Codex' });
+    const documentId = input.dateCorrectionDocumentId!;
+    const scope = this.store.getDateCorrectionScope(documentId);
+    if (options.accountState.status !== 'connected' || !options.accountState.displayLabel) throw new Error('AUTH_REQUIRED');
+    if (this.getSnapshot(options.accountState).persons.find((person) => person.id === scope.personId)?.dataRevision
+      !== input.expectedDateCorrectionDataRevision) throw new Error('DATE_CORRECTION_SCOPE_CHANGED');
+    if (this.store.listActiveProcessingDocumentIds().has(documentId)) throw new Error('DOCUMENT_ALREADY_IN_PROCESSING');
+    const consentId = this.store.createManualProcessingConsent({ documentIds: [documentId], personIds: [scope.personId],
+      dateCorrectionDocumentId: documentId, historicalObservationIds: this.store.listAcceptedObservations(scope.personId).map((item) => item.id),
+      accountFingerprint: stableHash({ provider: 'codex-chatgpt', displayLabel: options.accountState.displayLabel }), version: options.consentVersion });
+    try {
+      const batch = this.store.createWaitingAuthBatch({ cutoff: this.now().toISOString(), initialStatus: 'queued', consentId,
+        dateCorrectionDocumentId: documentId, groups: [{ personId: scope.personId, documentIds: [documentId], stage: 'extract',
+          inputSignature: stableHash({ purpose: 'date_correction', scope, ...promptMetaForStage('extract') }) }] });
+      return { batchId: batch.batchId, idempotent: batch.idempotent };
+    } catch (error) { this.store.revokeConsent(consentId); throw error; }
+  }
+
+  /** 明确指定成员时，只用其已接纳事实综合；锚点仅定位任务，不代表原件读取授权。 */
+  private processAssessmentOnly(options: ProcessNowOptions): { batchId: string; idempotent: boolean } {
+    const scope = processNowInputSchema.parse({
+      consentVersion: options.consentVersion, confirmedDataRecipient: 'OpenAI/Codex',
+      assessmentPersonId: options.assessmentPersonId,
+      expectedAssessmentDataRevision: options.expectedAssessmentDataRevision,
+      ...(options.documentIds === undefined ? {} : { documentIds: options.documentIds })
+    });
+    const personId = scope.assessmentPersonId!;
+    const person = this.store.listPersons().find((item) => item.id === personId);
+    if (!person) throw new Error('PERSON_NOT_FOUND');
+    if (person.archivedAt !== null) throw new Error('PERSON_ARCHIVED');
+    if (options.accountState.status !== 'connected' || !options.accountState.displayLabel) throw new Error('AUTH_REQUIRED');
+    // 确认界面之后的异步恢复点可能跨过事实变更；建授权前同步重验用户确认的成员版本。
+    const currentPerson = this.getSnapshot(options.accountState).persons.find((item) => item.id === personId);
+    if (currentPerson?.dataRevision !== scope.expectedAssessmentDataRevision) throw new Error('ASSESSMENT_SCOPE_CHANGED');
+    const observations = this.store.listAcceptedObservations(personId);
+    const personDocumentIds = new Set(this.store.listImportedDocuments()
+      .filter((document) => document.personId === personId).map((document) => document.id));
+    const anchorDocumentId = observations.find((observation) => personDocumentIds.has(observation.documentId)
+      && this.store.isDocumentCommitted(observation.documentId)
+      && !this.store.isDocumentExcluded(observation.documentId))?.documentId;
+    if (!anchorDocumentId) throw new Error('NO_ACCEPTED_FACTS');
+    const documentIds = [anchorDocumentId];
+    const inputSignature = stableHash({
+      purpose: 'assessment_only', stage: 'analyze', personId,
+      expectedAssessmentDataRevision: scope.expectedAssessmentDataRevision,
+      documentIds, historicalObservationIds: observations.map((observation) => observation.id).sort(),
+      factRevision: this.store.getFactRevision(personId),
+      contextRevision: this.store.getClinicalContextRevision(personId),
+      reviewScopeSignature: this.store.getOpenReviewScopeSignature(personId),
+      ...promptMetaForStage('analyze')
+    });
+    const consentId = this.store.createManualProcessingConsent({
+      assessmentOnly: true, documentIds, personIds: [personId],
+      historicalObservationIds: observations.map((observation) => observation.id),
+      accountFingerprint: stableHash({ provider: 'codex-chatgpt', displayLabel: options.accountState.displayLabel }),
+      version: options.consentVersion
+    });
+    try {
+      const created = this.store.createWaitingAuthBatch({
+        cutoff: this.now().toISOString(), initialStatus: 'queued', consentId,
+        groups: [{ personId, documentIds, stage: 'analyze', inputSignature }]
+      });
+      return { batchId: created.batchId, idempotent: created.idempotent };
+    } catch (error) {
+      this.store.revokeConsent(consentId);
+      throw error;
+    }
+  }
+
+  /** 先完整准备新证据，再保存本次恢复点；任何准备失败都不会清理旧结果。 */
+  async rebuildProcessingFromSources(options: {
+    accountState: AccountState;
+    consentVersion: number;
+    confirmedRebuildReportResults: true;
+    expectedSources: ProcessingRebuildSourceIdentity[];
+    personIds?: string[];
+    clearPersonalData?: true;
+    confirmedClearPersonalData?: true;
+    confirmedPersonAliases?: Array<{ personId: string; reportedName: string }>;
+    validateBeforeCommit?: () => void;
+  }): Promise<ProcessingRebuildReceipt> {
+    if (options.accountState.status !== 'connected' || !options.accountState.displayLabel) {
+      throw new Error('AUTH_REQUIRED');
+    }
+    if (!Number.isInteger(options.consentVersion) || options.consentVersion < 1
+      || options.confirmedRebuildReportResults !== true
+      || Boolean(options.clearPersonalData) !== Boolean(options.confirmedClearPersonalData)) {
+      throw new Error('PROCESSING_REBUILD_AUTH_REQUIRED');
+    }
+    this.store.assertProcessingRebuildIdle();
+    const expected = processingRebuildExpectedSourcesSchema.safeParse(options.expectedSources);
+    if (!expected.success) throw new Error('PROCESSING_REBUILD_SOURCE_SCOPE_CHANGED');
+    const sourceIdentities = (sources: readonly ProcessingRebuildSourceIdentity[]) => sources
+      .map(({ documentId, personId, sourceObjectId, sha256 }) => ({ documentId, personId, sourceObjectId, sha256 }))
+      .sort((left, right) => left.documentId.localeCompare(right.documentId));
+    const sources = this.store.listProcessingRebuildSources(options.personIds);
+    if (sources.length === 0) throw new Error('NO_READY_DOCUMENTS');
+    const sourceSignature = stableHash(sourceIdentities(sources));
+    // 首次读原件前绑定预览；后置漂移检查不能替代确认到请求入口之间的范围校验。
+    if (stableHash(sourceIdentities(expected.data)) !== sourceSignature) {
+      throw new Error('PROCESSING_REBUILD_SOURCE_SCOPE_CHANGED');
+    }
+    const manifests = [];
+    for (const source of sources) {
+      this.store.assertProcessingRebuildIdle();
+      const bytes = await readFile(source.sourcePath);
+      if (createHash('sha256').update(bytes).digest('hex') !== source.sha256) {
+        throw new Error('SOURCE_HASH_MISMATCH');
+      }
+      const manifest = await normalizeStoredSource({ store: this.store, documentId: source.documentId,
+        sourceObjectId: source.sourceObjectId, sha256: source.sha256, displayName: source.displayName,
+        bytes, createdAt: this.now().toISOString(), legacyDocConverter: this.legacyDocConverter });
+      // 本机只准备完整原件输入，不调用 OCR；识别与日期语义交给后续原件模型。
+      if (manifest.spans.length === 0 || manifest.totalUnits !== new Set(manifest.coveredUnitIndexes).size
+        || manifest.coveredUnitIndexes.some((index) => index < 0 || index >= manifest.totalUnits)) {
+        throw new Error('PROCESSING_REBUILD_ORIGINAL_PREPARATION_INCOMPLETE');
+      }
+      // 页数骨架不代表模型输入已能生成：清理旧结果前真实渲染整份原件。
+      // 一份检查完立即释放，不堆积整批图片，也不调用 OCR 或发送模型请求。
+      const convertedPdf = this.store.getDocumentConvertedView(source.documentId);
+      const prepared = await prepareDirectOriginalReport({ documentId: source.documentId,
+        sourceObjectId: source.sourceObjectId, sha256: source.sha256, displayName: source.displayName,
+        bytes, createdAt: manifest.createdAt,
+        ...(convertedPdf ? { convertedPdf: { ...convertedPdf, mediaType: 'application/pdf' as const,
+          converterId: 'libreoffice-headless' as const } } : {}) });
+      try {
+        if (prepared.originalSha256 !== source.sha256 || prepared.totalUnits !== manifest.totalUnits
+          || stableHash(prepared.manifest.spans) !== stableHash(manifest.spans)
+          || prepared.unitMappings.length !== manifest.totalUnits
+          || new Set(prepared.unitMappings.map((unit) => unit.sourceSpanId)).size !== manifest.totalUnits
+          || prepared.unitMappings.some((unit) => !manifest.spans.some((span) => span.id === unit.sourceSpanId))
+          || prepared.imagePaths.length !== prepared.unitMappings.filter((unit) => unit.inputKind === 'image').length) {
+          throw new Error('PROCESSING_REBUILD_ORIGINAL_PREPARATION_INCOMPLETE');
+        }
+      } finally { await prepared.cleanup(); }
+      manifests.push(manifest);
+    }
+    // 文件归属、排除范围或导入集合在准备期间变化，必须重新预览，不能清掉另一批结果。
+    if (stableHash(sourceIdentities(this.store.listProcessingRebuildSources(options.personIds))) !== sourceSignature) {
+      throw new Error('PROCESSING_REBUILD_SOURCE_SCOPE_CHANGED');
+    }
+    const backup = await this.store.createProcessingRebuildBackup();
+    const meta = promptMetaForStage('extract');
+    // 准备证据和备份是异步过程；最终授权检查与事务提交之间不再让出执行权。
+    options.validateBeforeCommit?.();
+    return this.store.rebuildProcessingResults({ backup, manifests,
+      accountFingerprint: stableHash({ provider: 'codex-chatgpt', displayLabel: options.accountState.displayLabel }),
+      consentVersion: options.consentVersion, confirmedRebuildReportResults: true,
+      ...(options.personIds ? { personIds: options.personIds } : {}),
+      ...(options.clearPersonalData ? { clearPersonalData: true, confirmedClearPersonalData: true } : {}),
+      ...(options.confirmedPersonAliases ? { confirmedPersonAliases: options.confirmedPersonAliases } : {}),
+      promptVersion: meta.promptVersion, rulesVersion: meta.rulesVersion });
+  }
+
+  async importFiles(files: Array<{ path: string; bytes: Uint8Array | (() => Promise<Uint8Array>) }>, personId: string | null, bindingId: string | null = null): Promise<ImportFilesReceipt> {
+    return (await this.importFilesWithDocumentIds(files, personId, bindingId)).receipt;
+  }
+
+  async importFilesAndProcess(files: Array<{ path: string; bytes: Uint8Array | (() => Promise<Uint8Array>) }>, personId: string | null, options: {
+    accountState: AccountState;
+    consentVersion: number;
+  }): Promise<ImportFilesReceipt> {
+    await this.automaticUploadRecovery;
+    if (personId && !this.store.listPersons().some((person) => person.id === personId && person.archivedAt === null)) {
+      throw new Error('PERSON_NOT_FOUND');
+    }
+    const authorizationEpoch = this.store.getAutomaticUploadAuthorizationEpoch();
+    const accountFingerprint = options.accountState.status === 'connected' && options.accountState.displayLabel
+      ? stableHash({ provider: 'codex-chatgpt', displayLabel: options.accountState.displayLabel }) : null;
+    const meta = promptMetaForStage('extract');
+    const intentId = personId && files.length ? this.store.automaticUploadIntents.begin({ personId, accountFingerprint,
+      authorizationEpoch, version: options.consentVersion, promptVersion: meta.promptVersion, rulesVersion: meta.rulesVersion,
+      displayNames: files.map((file) => basename(file.path)) }) : null;
+    const { receipt } = await this.importFilesWithDocumentIds(files, personId, null, intentId);
+    const batch = intentId ? this.store.automaticUploadIntents.finalize(intentId) : null;
+    return { ...receipt, processing: batch ? { status: batch.accountFingerprint ? 'queued' : 'waiting_connection', batchId: batch.batchId }
+      : { status: 'local_only' } };
+  }
+
+  private async importFilesWithDocumentIds(files: Array<{ path: string; bytes: Uint8Array | (() => Promise<Uint8Array>) }>, personId: string | null,
+    bindingId: string | null, uploadIntentId: string | null = null): Promise<{ receipt: ImportFilesReceipt; documentIds: string[] }> {
+    const documentIds: string[] = [];
     const receipt: ImportFilesReceipt = {
       selectedCount: files.length,
       importedCount: 0,
@@ -1437,13 +1793,15 @@ export class PersonalWorkspaceService {
       suppressedCount: 0,
       rejected: []
     };
-    for (const file of files) {
+    for (const [itemIndex, file] of files.entries()) {
       const displayName = basename(file.path);
       try {
-        const detected = await detectInput(displayName, file.bytes);
+        const detected = await detectInput(displayName, typeof file.bytes === 'function' ? await file.bytes() : file.bytes);
+        if (this.closed) throw new Error('WORKSPACE_CLOSED');
         const sourceHash = createHash('sha256').update(detected.bytes).digest('hex');
         if (this.store.isSourceImportSuppressed(sourceHash)) {
           receipt.suppressedCount += 1;
+          if (uploadIntentId) this.store.automaticUploadIntents.markRejected(uploadIntentId, itemIndex, 'SOURCE_IMPORT_SUPPRESSED');
           continue;
         }
         const source = this.store.putSourceObject({
@@ -1460,7 +1818,8 @@ export class PersonalWorkspaceService {
         const document = this.store.registerImportedDocument({
           sourceObjectId: source.id,
           personId,
-          assignmentBasis: bindingId ? 'folder_binding' : 'user_selected'
+          assignmentBasis: bindingId ? 'folder_binding' : 'user_selected',
+          ...(uploadIntentId ? { uploadIntent: { intentId: uploadIntentId, itemIndex } } : {})
         });
         if (document.duplicate) {
           receipt.duplicateCount += 1;
@@ -1475,57 +1834,31 @@ export class PersonalWorkspaceService {
             displayName,
             createdAt
           };
-          if (detected.kind === 'txt') {
-            const decoded = decodeText(detected.bytes);
-            this.store.saveSourceManifest(buildTextManifest({ ...common, text: decoded.text }));
-          } else if (detected.kind === 'docx') {
-            this.store.saveSourceManifest(await buildDocxManifest({ ...common, bytes: detected.bytes }));
-          } else if (detected.kind === 'pdf') {
-            this.store.saveSourceManifest(await buildPdfManifest({ ...common, bytes: detected.bytes }));
-          } else if (detected.kind === 'heic') {
-            this.store.saveSourceManifest(await buildHeicManifest({ ...common, mediaType: detected.mediaType, bytes: detected.bytes }));
-          } else if (['jpeg', 'png'].includes(detected.kind)) {
-            this.store.saveSourceManifest(buildImageManifest({ ...common, mediaType: detected.mediaType }));
-          } else if (detected.kind === 'doc') {
-            if (!this.legacyDocConverter) throw new Error('LEGACY_DOC_CONVERSION_REQUIRED');
-            const converted = await this.legacyDocConverter.convert(detected.bytes);
-            const convertedSource = this.store.putSourceObject({
-              bytes: converted.bytes,
-              mediaType: converted.mediaType,
-              displayName: `${displayName}.converted.pdf`
-            });
-            this.store.registerDocumentConversion({
-              documentId: document.documentId,
-              convertedSourceObjectId: convertedSource.id,
-              converterId: converted.converterId,
-              converterVersion: converted.converterVersion,
-              executableSha256: converted.executableSha256,
-              warnings: ['legacy_doc_layout_may_differ_from_original']
-            });
-            const manifest = await buildPdfManifest({ ...common, bytes: converted.bytes });
-            manifest.normalizerVersion = `${converted.converterId}-${converted.converterVersion}-pdf-v1`;
-            manifest.conversionWarnings = [
-              `converted_view:${converted.converterId}:${converted.converterVersion}`,
-              'legacy_doc_layout_may_differ_from_original',
-              ...manifest.conversionWarnings
-            ];
-            this.store.saveSourceManifest(manifest);
-          } else {
-            throw new Error('UNSUPPORTED_FORMAT');
-          }
+          const manifest = await normalizeStoredSource({
+            ...common, store: this.store, bytes: detected.bytes, legacyDocConverter: this.legacyDocConverter,
+            validateBeforeCommit: () => { if (this.closed) throw new Error('WORKSPACE_CLOSED'); }
+          });
+          if (this.closed) throw new Error('WORKSPACE_CLOSED');
+          this.store.saveSourceManifest(manifest);
+          if (uploadIntentId) this.store.automaticUploadIntents.markReady(uploadIntentId, itemIndex);
           receipt.importedCount += 1;
+          documentIds.push(document.documentId);
         } catch (error) {
+          if (this.closed) throw error;
           this.store.setDocumentStatus(document.documentId, 'blocked');
           throw error;
         }
       } catch (error) {
+        if (this.closed) throw error;
+        if (uploadIntentId) this.store.automaticUploadIntents.markRejected(uploadIntentId, itemIndex,
+          error instanceof Error ? error.message : 'IMPORT_FAILED');
         receipt.rejected.push({
           displayName,
           code: error instanceof Error ? error.message : 'IMPORT_FAILED'
         });
       }
     }
-    return receipt;
+    return { receipt, documentIds };
   }
 
   getSnapshot(accountState: AccountState | null = null): DashboardSnapshot {
@@ -1537,10 +1870,15 @@ export class PersonalWorkspaceService {
     const activePersonIds = new Set(storedPersons.filter((person) => person.archivedAt === null).map((person) => person.id));
     const imported = this.store.listImportedDocuments().filter((document) => document.personId === null || activePersonIds.has(document.personId));
     const processingDocumentIds = this.store.listProcessingDocumentIds();
+    const extractionIssues = this.store.listOpenExtractionReviewIssues()
+      .filter((issue) => issue.personId === null || activePersonIds.has(issue.personId));
     // 主快照只承载每位成员最近的展示窗口；精确总数由 SQL 聚合读取，完整事实由成员级查询按需打开。
     // 这样家庭总览不会把全家数万条明细一次性传给 renderer。
-    const conflictedDocumentIds = new Set(this.store.listOpenExtractionReviewIssues()
+    const conflictedDocumentIds = new Set(extractionIssues
       .filter((issue) => issue.kind === 'person_conflict').map((issue) => issue.documentId));
+    const nonSourceReviewDocumentIds = new Set(extractionIssues.filter((issue) => !isSourceOnlyExtractionIssue(issue))
+      .map((issue) => issue.documentId));
+    const sourceReviewDocumentIds = new Set(extractionIssues.filter(isSourceOnlyExtractionIssue).map((issue) => issue.documentId));
     const acceptedObservations = this.store.listAcceptedObservations(undefined, { limitPerPerson: 500 })
       .filter((observation) => activePersonIds.has(observation.personId)
         && !conflictedDocumentIds.has(observation.documentId));
@@ -1552,7 +1890,10 @@ export class PersonalWorkspaceService {
     const latestDerivedByPerson = new Map(this.store.listLatestDerivedSnapshots()
       .filter((snapshot) => !v3HistoryPersonIds.has(snapshot.personId))
       .map((snapshot) => [snapshot.personId, snapshot]));
-    const allActions = this.store.listActionItems();
+    const userDetailActionIds = new Set([...activePersonIds].flatMap((personId) =>
+      this.store.listActionAdoptions(personId).map((action) => action.id)));
+    const allActions = this.store.listActionItems().map((action) => presentSavedAction(action, userDetailActionIds.has(action.id)));
+    const assessmentByPerson = new Map<string, MemberAssessmentSnapshotV3 | null>();
     const persons = storedPersons.filter((person) => person.archivedAt === null).map((person) => {
       const documentCount = counts.get(person.id) ?? 0;
       const pendingCount = imported.filter((document) => document.personId === person.id && document.status === 'queued' && !processingDocumentIds.has(document.id)).length;
@@ -1562,6 +1903,8 @@ export class PersonalWorkspaceService {
       const lastDocumentDate = stats.latestClinicalDate;
       const derived = latestDerivedByPerson.get(person.id);
       const assessment = this.getMemberAssessment(person.id);
+      const familyNarrative = assessment ? familyAssessmentNarrative(assessment) : null;
+      assessmentByPerson.set(person.id, assessment);
       const systemAnalyses = this.store.listSystemAnalysisSnapshots(person.id, false);
       const proposals = this.store.listLifestyleProposals(person.id);
       const personActions = allActions.filter((action) => action.personId === person.id);
@@ -1581,19 +1924,21 @@ export class PersonalWorkspaceService {
           ? `已接纳 ${stats.acceptedFactCount} 条有来源事实`
           : processingCount > 0 ? `${processingCount} 份资料已进入处理中心`
             : documentCount > 0 ? `${documentCount} 份资料等待处理` : '尚未导入资料',
-        changeSummary: assessment?.overview.headline ?? (stats.acceptedFactCount > 0
-          ? `最近处理已保存 ${stats.acceptedFactCount} 条报告事实；健康解释仍需单独生成和复核`
-          : processingCount > 0 ? '资料已安全保存在本机，请到处理中心查看进度或恢复失败任务'
+        changeSummary: familyNarrative?.headline ?? (stats.acceptedFactCount > 0
+          ? `已保存 ${stats.acceptedFactCount} 条报告事实，健康解读暂未发布`
+          : processingCount > 0 ? '资料已安全保存在本机，处理进度可在处理中心查看'
             : documentCount > 0 ? '资料已安全保存在本机，尚未形成健康结论' : '可以先添加一份体检或门诊资料'),
-        derivedStatus: assessment ? 'current' as const : derived || v3HistoryPersonIds.has(person.id)
+        derivedStatus: assessment?.status === 'current' ? 'current' as const : derived || v3HistoryPersonIds.has(person.id)
           ? 'stale' as const : 'unavailable' as const,
-        assessmentSummary: assessment?.overview.summary ?? null,
+        assessmentRefreshStatus: stats.acceptedFactCount === 0 || assessment?.status === 'current'
+          ? 'none' as const : assessment ? 'optional_rules' as const : 'required' as const,
+        assessmentSummary: familyNarrative?.summary ?? null,
         dataRevision: stableHash({
           factRevision: this.store.getFactRevision(person.id),
           clinicalContextRevision: person.clinicalContextRevision,
           displayRevision: person.displayRevision,
           derived: derived ? { id: derived.id, status: derived.status, createdAt: derived.createdAt } : null,
-          memberAssessment: assessment ? { id: assessment.id, inputSignature: assessment.inputSignature,
+          memberAssessment: assessment ? { id: assessment.id, status: assessment.status, inputSignature: assessment.inputSignature,
             presentationVersion: assessment.presentation?.version ?? null } : null,
           systemAnalyses: systemAnalyses.map((analysis) => ({ id: analysis.id, status: analysis.status, generatedAt: analysis.generatedAt })),
           proposals: proposals.map((proposal) => ({ id: proposal.id, status: proposal.status, version: proposal.version, updatedAt: proposal.updatedAt })),
@@ -1604,19 +1949,30 @@ export class PersonalWorkspaceService {
       };
     });
     const transmissionStatuses = this.store.listDocumentAiTransmissionStatuses(imported.map((document) => document.id));
+    const documentAcceptedFactCounts = this.store.listDocumentAcceptedFactCounts();
+    const dateBindingReviewCounts = this.store.listDateBindingReviewDocumentCounts();
     const inbox = imported.map((document) => ({
       id: document.id,
       displayName: document.displayName,
       discoveredAt: document.discoveredAt,
       personId: document.personId,
       personLabel: document.personLabel,
+      personAssignmentBasis: document.personAssignmentBasis,
       status: document.status,
       format: formatLabel(document.mediaType),
       sourceLabel: document.sourceLabel,
       sentToAi: transmissionStatuses.get(document.id) !== 'not_sent',
       aiTransmissionStatus: transmissionStatuses.get(document.id) ?? 'not_sent',
-      inProcessingCenter: processingDocumentIds.has(document.id),
-      issue: document.issue
+      // 已读报告的来源核查归处理中心；不篡改文档/核查终态，也不把它当作未开始的新资料。
+      inProcessingCenter: processingDocumentIds.has(document.id)
+        || document.status === 'needs_review' && document.personId !== null
+          && transmissionStatuses.get(document.id) === 'completed'
+          && sourceReviewDocumentIds.has(document.id) && !nonSourceReviewDocumentIds.has(document.id),
+      issue: document.status === 'completed' && (documentAcceptedFactCounts.get(document.id) ?? 0) === 0
+        ? '已读完，尚无可纳入分析的检查结果；原件已保留。'
+        : document.issue,
+      acceptedFactCount: documentAcceptedFactCounts.get(document.id) ?? 0,
+      dateBindingReviewCount: dateBindingReviewCounts.get(document.id) ?? 0
     }));
     const assignmentReviews = imported
       .filter((document) => document.status === 'needs_review' && document.personId === null)
@@ -1635,10 +1991,10 @@ export class PersonalWorkspaceService {
         reasonCodes: [],
         resolutionStatus: 'open' as const
       }));
-    const extractionIssues = this.store.listOpenExtractionReviewIssues()
-      .filter((issue) => issue.personId === null || activePersonIds.has(issue.personId));
     const extractionDocumentIds = new Set(extractionIssues.map((issue) => issue.documentId));
     const importedById = new Map(imported.map((document) => [document.id, document]));
+    const repairOutcomesByDocument = new Map([...extractionDocumentIds].map((documentId) => [documentId,
+      this.store.listExtractionRepairDiagnostics({ documentId }).at(-1)?.outcome ?? null]));
     const reviews = [
       ...assignmentReviews.filter((issue) => !extractionDocumentIds.has(issue.documentId)),
       ...extractionIssues.map((issue) => {
@@ -1659,6 +2015,16 @@ export class PersonalWorkspaceService {
         const mixedFieldReview = differenceCount > 0
           && issue.candidateDiffs.some((difference) => difference.fields.includes('issues'))
           && !evidenceOnlyReview;
+        const sourceOnlyIssue = (issue.kind === 'field_conflict' || issue.kind === 'coverage_gap')
+          && differenceCount === 0 && !issue.reasonCodes.some((code) => code.startsWith('PERSON_'));
+        const documentStatus = importedById.get(issue.documentId)?.status;
+        const noAcceptedResults = sourceOnlyIssue && ['completed', 'needs_review'].includes(documentStatus ?? '')
+          && (documentAcceptedFactCounts.get(issue.documentId) ?? 0) === 0;
+        const repairExplanation = sourceRepairExplanation(issue.reasonCodes, repairOutcomesByDocument.get(issue.documentId) ?? null);
+        const auxiliaryOnlyLimitation = issue.severity === 'warning' && differenceCount === 0
+          && issue.candidateOptions.length === 0 && issue.reasonCodes.length > 0
+          && issue.reasonCodes.every((code) => ['direct_original_clinical_date_unverified', 'direct_original_clinical_date_binding_missing',
+            'direct_original_metadata_field_unverified', 'direct_original_metadata_time_unverified'].includes(code.split(':')[0]!));
         return {
           id: issue.id,
           personId: issue.personId,
@@ -1666,43 +2032,48 @@ export class PersonalWorkspaceService {
           kind: issue.kind,
           severity: issue.severity,
           title: issue.kind === 'person_conflict'
-            ? '核对识别到的姓名与成员归属'
+            ? '确认报告姓名与成员归属'
+            : auxiliaryOnlyLimitation ? '结果已保存，部分日期或辅助信息待确认'
+            : noAcceptedResults ? '已读完，尚无可纳入分析的检查结果'
             : partialPublishLimitation
-              ? issue.candidateOptions.length > 0
-                ? `${issue.candidateOptions.length} 个项目未纳入本次结果`
-                : '这份报告有部分内容未纳入本次结果'
-            : legacyFieldReview ? '按新规则重新核对这份报告'
+              ? '这份报告有读取内容待核实'
+            : legacyFieldReview ? '请重新读取这份报告'
             : unverifiedIdentity ? '这份资料没有可确认的姓名'
             : issue.kind === 'field_conflict'
               ? evidenceOnlyReview
                 ? `${differenceCount} 项原始依据还不够清楚`
                 : mixedFieldReview
                   ? `发现 ${differenceCount} 项需要处理的内容`
-                  : `发现 ${differenceCount} 项核心事实差异`
-            : issue.kind === 'derived_safety' ? '健康说明未通过安全复核' : '资料覆盖需要人工确认',
+                  : `请确认 ${differenceCount} 项检查结果`
+            : issue.kind === 'derived_safety' ? '这次健康解读暂不可用' : '请确认报告中未读清的内容',
           description: issue.kind === 'person_conflict'
             ? `应用把“${issue.reportedName ?? '未识别姓名'}”识别为受检者，当前准备归入已选成员。请对照原图：如果这是报告者、审核人等工作人员，可选择重新核对姓名。`
+            : auxiliaryOnlyLimitation
+              ? `${repairExplanation}原始内容仍保留，不影响其他有独立依据的结果和建议；无需重复确认。`
+            : noAcceptedResults
+              ? `${repairExplanation}这份资料尚无检查结果纳入健康分析，原件仍已保留，不代表结果正常；不用凭猜测确认。`
             : partialPublishLimitation
-              ? '其他有可靠依据的报告事实已经保存；这部分因依据不足未纳入。未纳入只表示暂时无法可靠确认，不等于结果正常。'
+              ? `${repairExplanation}其他有可靠依据的检查结果已经保存；这些项目暂时无法可靠确认，没有用于健康分析，不代表结果正常。可查看原报告，或重新读取这份报告。`
             : issue.kind === 'derived_safety'
             ? issue.reasonCodes.some((code) => code.startsWith('evidence_mismatch:'))
-              ? '报告事实已经安全保存；这次生成的说明有内容缺少对应事实依据，因此没有发布。'
+              ? '已保存的检查结果仍可查看。这次解读中有内容无法从报告得到支持，暂不用于健康判断；你可以重新生成解读，或先保留报告结果。'
               : issue.reasonCodes.some((code) => code.startsWith('medical_boundary:') || code.startsWith('dosage_boundary:'))
-                ? '报告事实已经安全保存；这次生成的说明可能被误解为诊断、处方或剂量建议，因此没有发布。'
-                : '报告事实已经安全保存，但分析或生活指南包含需要人工核对的内容，因此没有发布这部分说明。'
+                ? '已保存的检查结果仍可查看。这次解读中有内容可能被误当成诊断、处方或用药剂量，不能据此采取行动；你可以重新生成解读，或先保留报告结果。'
+                : '已保存的检查结果仍可查看。这次健康解读暂时不能可靠使用；你可以重新生成解读，或先保留报告结果。'
             : legacyFieldReview
-              ? '这项核对由旧版逐字段完全一致规则产生。重新核对后，只在核心事实真正冲突时再请你确认。'
+              ? `${repairExplanation}这份报告的部分内容还未确认清楚。可以按当前流程重新读取，原件和已保存的结果会保留。`
               : unverifiedIdentity
-                ? '系统无法从原始资料中确认姓名，也没有发现可验证的不同姓名。已手动归属或来自成员文件夹的资料会按当前成员继续处理。'
+                ? '原报告中没有读到明确的受检者姓名。请查看原报告，确认这份资料属于哪位家人；不要把报告医生或审核人的姓名当作受检者。'
               : issue.kind === 'field_conflict'
                 ? evidenceOnlyReview
-                  ? '这些项目的数值未必有冲突，但原始依据还不足以安全入库。系统会先尝试重新核对。'
+                  ? '这些项目的原文、检查日期或异常提示还没有读清，不一定是数值有误。可以先重新读取报告；仍无法确认的单项可暂不纳入，其他结果会保留。'
                   : mixedFieldReview
-                    ? '只需修正有明确差异的项目；证据仍不清楚的单项可以先排除，不会卡住整份报告。'
-                    : `两轮核对共有 ${issue.candidateOptions.length} 项候选，其中 ${differenceCount} 项核心字段不一致。只需核对下方差异项。`
-                : '为避免把不确定内容写入健康档案，这份资料已暂停并等待你的核对。',
+                    ? '请对照原报告确认下方项目的结果、单位或检查日期。原文看不清的单项可暂不纳入，其他结果会保留。'
+                    : `请对照原报告，确认下方 ${differenceCount} 项的检查结果、单位或日期。只需处理列出的项目；看不清的单项可暂不纳入。`
+                : '报告中还有未读清的内容。请查看原报告并重新读取；仍看不清的项目可暂不纳入，不会被当作正常结果。',
           evidenceRefs: issue.evidenceRefs,
           candidateOptions: issue.candidateOptions,
+          ...(issue.readingAudit ? { readingAudit: issue.readingAudit } : {}),
           candidateDiffs: issue.candidateDiffs,
           reportedName: issue.reportedName,
           reasonCodes: issue.reasonCodes,
@@ -1712,11 +2083,25 @@ export class PersonalWorkspaceService {
     ];
     const storedJobs = this.store.listStoredJobs();
     const latestJobByDocument = new Map<string, string>();
+    const latestReadingJobByDocument = new Map<string, string>();
+    const readingDocumentIdsByJob = new Map(storedJobs.map((job) => [job.id, this.store.getJobReadingDocumentIds(job.id)]));
+    const processedDocumentIdsByJob = new Map(storedJobs.map((job) => [job.id, this.store.getJobProcessedDocumentIds(job.id)]));
     for (const job of storedJobs) {
+      // 已取消的新任务不能接替旧任务的恢复入口。
+      if (job.status === 'cancelled') continue;
       for (const documentId of job.documentIds) {
         if (!latestJobByDocument.has(documentId)) latestJobByDocument.set(documentId, job.id);
+        // 综合可以读取旧事实，但不能冒充这次重新读取的任务所有者。
+        // 读取推进到分析阶段后，明确的重核范围或真实读取传输仍能证明其读取职责。
+        if (readingDocumentIdsByJob.get(job.id)!.has(documentId) && !latestReadingJobByDocument.has(documentId)) {
+          latestReadingJobByDocument.set(documentId, job.id);
+        }
       }
     }
+    // 新综合可能只覆盖旧批次中的部分报告；旧批次独有的未保存资料仍需要恢复入口。
+    const unfinishedDocumentIds = new Set(imported.filter((document) => document.personId !== null
+      && !this.store.isDocumentCommitted(document.id)
+      && !this.store.isDocumentExcluded(document.id)).map((document) => document.id));
     return dashboardSnapshotSchema.parse({
       workspaceMode: 'personal',
       workspaceName: this.workspaceName,
@@ -1735,6 +2120,8 @@ export class PersonalWorkspaceService {
       queuePaused: this.store.isQueuePaused(),
       pendingInboxCount: inbox.filter((item) => !item.inProcessingCenter && ['queued', 'needs_review'].includes(item.status)).length,
       openReviewCount: reviews.filter((review) => review.severity === 'blocking' && review.resolutionStatus === 'open').length,
+      processingRebuildSources: this.store.listProcessingRebuildSources()
+        .map(({ documentId, personId, sourceObjectId, sha256 }) => ({ documentId, personId, sourceObjectId, sha256 })),
       persons,
       organs: persons.flatMap((person) => organNames.map(([id, name]) => {
         const related = acceptedObservations.filter((observation) => observation.personId === person.id && observationOrgans(observation).includes(id));
@@ -1806,18 +2193,60 @@ export class PersonalWorkspaceService {
       }))),
       inbox,
       jobs: storedJobs.map((job) => {
-        const superseded = job.documentIds.some((documentId) => latestJobByDocument.get(documentId) !== job.id);
+        const readingDocumentIds = readingDocumentIdsByJob.get(job.id)!;
+        const processedDocumentIds = processedDocumentIdsByJob.get(job.id)!;
+        const latestOwner = (documentId: string) => readingDocumentIds.has(documentId)
+          ? latestReadingJobByDocument.get(documentId) : latestJobByDocument.get(documentId);
+        const unfinishedOwnedCount = job.documentIds.filter((documentId) => {
+          const document = importedById.get(documentId);
+          if (!document?.personId || this.store.isDocumentExcluded(documentId) || latestOwner(documentId) !== job.id) return false;
+          // 旧提交只证明以前保存过结果，不能证明这次重核已走完。
+          // partial/needs_review/excluded等逐份终态收据均算读完，不因零接纳再称“未处理”。
+          if (readingDocumentIds.has(documentId)) return !processedDocumentIds.has(documentId);
+          // 旧派生任务可能错误地先推进了阶段；没有本轮读取证明时仍保留未提交检查。
+          return unfinishedDocumentIds.has(documentId);
+        }).length;
+        const fullyHandedOff = job.documentIds.length > 0 && job.documentIds.every((documentId) => (
+          latestOwner(documentId) !== undefined && latestOwner(documentId) !== job.id
+        ));
+        // 成员综合可能只用一份报告作为任务入口。只有日期更新、全成员范围且仍匹配当前资料的综合才能接替旧分析。
+        // getMemberAssessment 已核查事实、个人背景和待确认范围版本，不能仅凭另一项任务“成功”就宣称覆盖。
+        const coveredByAssessment = job.documentIds.length > 0 && job.documentIds.every((documentId) => {
+          const document = importedById.get(documentId);
+          if (!document?.personId || !this.store.isDocumentCommitted(documentId)) return false;
+          const assessment = assessmentByPerson.get(document.personId);
+          return Boolean(assessment && assessment.mode !== 'partition' && assessment.requestedSystemIds.length === 0
+            && Date.parse(assessment.generatedAt) > Date.parse(job.updatedAt));
+        });
+        const terminal = ['succeeded', 'failed', 'completed_with_issues', 'cancelled'].includes(job.status);
+        const superseded = terminal && unfinishedOwnedCount === 0 && (fullyHandedOff || coveredByAssessment);
+        const unfinishedFailure = ['failed', 'completed_with_issues'].includes(job.status) && unfinishedOwnedCount > 0;
+        const readFinished = ['succeeded', 'completed_with_issues'].includes(job.status) && job.completedUnits >= job.totalUnits;
+        const noResultDocumentCount = readFinished ? job.documentIds.filter((documentId) => (
+          importedById.get(documentId)?.status === 'completed'
+          && (documentAcceptedFactCounts.get(documentId) ?? 0) === 0
+        )).length : 0;
+        const hasHeldReports = readFinished && extractionIssues.some((issue) => job.documentIds.includes(issue.documentId)
+          && (issue.kind === 'field_conflict' || issue.kind === 'coverage_gap') && issue.candidateDiffs.length === 0);
+        const status = job.status === 'succeeded' && (noResultDocumentCount > 0 || hasHeldReports)
+          ? 'completed_with_issues' as const : job.status;
         const { documentIds: _documentIds, ...summary } = job;
         return {
           ...summary,
-          statusText: superseded ? '已有较新的处理任务，请使用上方任务继续' : job.statusText,
+          status,
+          statusText: superseded ? '已有较新的处理任务，请使用上方任务继续'
+            : unfinishedFailure ? `${job.status === 'failed' ? `${job.statusText}；` : ''}还有 ${unfinishedOwnedCount} 份资料未完成整理，可重试继续处理；已保存的检查结果仍可查看`
+            : job.assessmentOutcome?.status === 'rejected'
+              ? `${readFinished ? '报告处理已完成，' : ''}综合解读未更新；已保存的检查结果仍可查看`
+            : noResultDocumentCount > 0 ? `资料已读完；其中 ${noResultDocumentCount} 份尚无可纳入分析的检查结果，原件已保留`
+            : hasHeldReports ? '可靠检查结果已保存，部分项目未纳入；可按成员查看原因' : job.statusText,
           canCancel: !superseded && ['queued', 'running', 'waiting_auth', 'waiting_quota', 'waiting_user', 'retry_wait'].includes(job.status)
             && job.statusText !== '正在安全停止',
-          canRetry: !superseded && ['failed', 'completed_with_issues'].includes(job.status)
+          canRetry: !superseded && ['failed', 'completed_with_issues', 'waiting_quota'].includes(job.status)
         };
       }),
       reviews,
-      actions: this.store.listActionItems().filter((action) => activePersonIds.has(action.personId)),
+      actions: allActions.filter((action) => activePersonIds.has(action.personId)),
       notes: this.store.listManualNotes().filter((note) => activePersonIds.has(note.personId)),
       privacyNotice: '资料已保存在本机个人工作区。只有在你连接 Codex 并明确授权范围后，必要内容才会发送给 OpenAI。',
       generatedAt: generatedAt.toISOString()

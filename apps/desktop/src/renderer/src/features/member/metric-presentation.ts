@@ -1,4 +1,6 @@
 import type { MetricSeriesSummary, TrendPointV2 } from '@contracts';
+import { formatResult } from '@contracts';
+export { formatResult } from '@contracts';
 
 /** 只整理阅读入口，不修改事实、概念映射或严格的可比序列。 */
 export function groupMetricSeries(series: MetricSeriesSummary[]) {
@@ -17,16 +19,26 @@ export function groupMetricSeries(series: MetricSeriesSummary[]) {
     const lastDate = dated[0]?.time.value ?? null;
     const latest = dated.length > 0 ? dated.filter((point) => point.time.value === lastDate) : points;
     const values = new Set(latest.map((point) => formatResult(point.displayValue, point.unit)));
+    const documentLabels = new Set(points.filter(point => point.timestamp === null)
+      .map(point => point.documentTime?.displayLabel).filter((label): label is string => Boolean(label)));
+    const reportDatedCount = points.filter(point => point.timestamp === null && point.documentTime?.value).length;
     return {
       id: items[0]!.id,
       name: items[0]!.name,
       series: items,
       pointCount: points.length,
       latestDate: lastDate,
-      latestValue: values.size === 1 ? [...values][0]! : dated.length > 0 ? '同日多条结果' : '多条日期未明记录',
+      dateLabel: lastDate ? `${lastDate}${latest.some(point => point.time.basis === 'report') ? ' · 按报告日期记录' : ''}`
+        : (documentLabels.size === 1 && reportDatedCount === points.length
+        ? [...documentLabels][0]! : reportDatedCount === points.length ? '分属不同报告，查看来源时间'
+          : reportDatedCount > 0 ? '部分记录只有所属报告时间' : '检查及报告日期未记录'),
+      latestValue: values.size === 1 ? [...values][0]! : dated.length > 0 ? '同日多条结果'
+        : reportDatedCount > 0 ? '多条记录，详见来源时间' : '多条日期未明记录',
       description: items.length === 1 ? items[0]!.trendFacts.statement
         : `共 ${points.length} 条记录 · 分 ${items.length} 组查看趋势`,
-      undatedCount: points.length - dated.length
+      undatedCount: points.length - dated.length,
+      reportDatedCount,
+      unknownDateCount: points.length - dated.length - reportDatedCount
     };
   });
 }
@@ -34,18 +46,6 @@ export function groupMetricSeries(series: MetricSeriesSummary[]) {
 export function sortHistoryPoints<T extends TrendPointV2>(points: T[]): T[] {
   return [...points].sort((a, b) => (b.timestamp ?? -Infinity) - (a.timestamp ?? -Infinity)
     || a.id.localeCompare(b.id));
-}
-
-const compactUnit = (value: string) => value.normalize('NFKC').toLowerCase().replace(/[µμ]/g, 'u').replace(/\s+/g, '');
-
-/** 原值已经带相同单位时不再追加；不改数值、不换算，也不自动修正 OCR 标点。 */
-export function formatResult(value: string | null, unit: string | null): string {
-  if (!value?.trim()) return '—';
-  if (!unit?.trim()) return value;
-  const text = compactUnit(value);
-  const suffix = compactUnit(unit);
-  if (text.endsWith(suffix) && /[\d.:：]$/.test(text.slice(0, -suffix.length))) return value;
-  return `${value} ${unit}`;
 }
 
 /** 仅识别明确的空白占位。阴性、未见异常、零值都是真实结果。 */

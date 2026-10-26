@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
-import type { MemberAssessmentSnapshotV3 } from '@contracts';
-import { RevisionConflictError, WorkspaceStore } from './index.js';
+import type { MemberAssessmentSnapshotV3, SourceManifest } from '@contracts';
+import { RevisionConflictError, WorkspaceStore, WORKSPACE_SCHEMA_VERSION } from './index.js';
+import { stableHash } from '@core';
 
 const directories: string[] = [];
 function makeStore(options: {
@@ -65,11 +66,650 @@ function syntheticAssessmentSnapshot(
   };
 }
 
+function documentedPlanFixture(store: WorkspaceStore, options: {
+  quote?: string;
+  rawText?: string;
+  evidenceQuote?: string;
+  clinicalDate?: string | null;
+  metadataDate?: string;
+  metadataPrecision?: 'year' | 'month' | 'day';
+  mediaType?: string;
+  sourceLocator?: Partial<Pick<SourceManifest['spans'][number], 'spanKind' | 'page' | 'blockId' | 'lineStart' | 'lineEnd'>>;
+} = {}) {
+  const person = store.createPerson({ displayName: '合成医嘱成员', relation: '本人' });
+  const quote = options.quote ?? '2026-08-28 医生建议：3个月后复查甲状腺功能。';
+  const mediaType = options.mediaType ?? 'text/plain';
+  const source = store.putSourceObject({ bytes: Buffer.from(quote), mediaType, displayName: '合成门诊医嘱.txt' });
+  const document = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+  const sourceSpanId = `plan-span-${document.documentId}`;
+  store.saveSourceManifest({
+    id: `plan-manifest-${document.documentId}`, sourceObjectId: source.id, sha256: source.sha256,
+    mediaType, originalDisplayName: '合成门诊医嘱.txt', totalUnits: 1,
+    coveredUnitIndexes: [0], normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00Z',
+    spans: [{ id: sourceSpanId, documentId: document.documentId, spanKind: 'line', page: null,
+      blockId: null, lineStart: 1, lineEnd: 1, quote, readability: 'clear', ...options.sourceLocator }]
+  });
+  const acceptanceId = store.saveAcceptanceDecision({ method: 'auto', actor: 'policy', rulesVersion: 'test',
+    inputSignature: 'plan-input', outputHash: 'plan-output', reviewRef: null, decision: 'accept' });
+  store.publishFacts({
+    personId: person.id, documentId: document.documentId, documentCommitKey: 'p'.repeat(64),
+    expectedRevision: 0, changeSetHash: 'q'.repeat(64), summary: '合成报告安排',
+    observations: [{ conceptKey: '随访建议', originalName: '随访建议', modelStandardNameCandidate: null,
+      rawText: options.rawText ?? '3个月后复查甲状腺功能', valueKind: 'text', decimalValue: null, qualifier: null, unit: null,
+      referenceRange: null, clinicalDate: options.clinicalDate === undefined ? '2026-08-28' : options.clinicalDate,
+      abnormalFlag: 'unknown', documentId: document.documentId, sourceSpanId, acceptanceId,
+      specimen: null, method: null, bodySite: null, evidence: [{ sourceSpanId, quote }] }],
+    ...(options.metadataDate ? { reportMetadata: { reportKind: null, title: null, organization: null,
+      campus: null, department: null, reportNumber: null, encounterIdentifier: null,
+      sampleIdentifiers: [], examItems: [], times: [{ value: options.metadataDate,
+        precision: options.metadataPrecision ?? 'month', role: 'encounter' as const, evidence: [{ sourceSpanId, quote }] }] } } : {})
+  });
+  const fact = store.listAcceptedObservations(person.id)[0]!;
+  const snapshot = syntheticAssessmentSnapshot(store, person.id, document.documentId);
+  snapshot.actions[0] = { ...snapshot.actions[0]!, kind: 'documented_plan',
+    title: '复查甲状腺功能', why: '报告记录了医生的复查安排。', firstStep: '按报告建议复查甲状腺功能。',
+    timing: '3个月后', timingBasis: 'documented', evidenceIds: ['plan-evidence'] };
+  snapshot.evidenceCatalog = [{ id: 'plan-evidence', kind: 'observation', observationId: fact.id,
+    documentId: document.documentId, eventId: fact.eventId, sourceSpanId, knowledgeId: null,
+    label: '合成门诊医嘱.txt', locator: '第 1 行', quote: options.evidenceQuote ?? quote }];
+  return { person, document, snapshot };
+}
+
+function legacyAdoptionFixture(store: WorkspaceStore, plannedTime = '每周一晚饭后') {
+  const person = store.createPerson({ displayName: '合成旧计划成员' });
+  const proposalId = `legacy-proposal-${person.id}`;
+  const database = new Database(store.databasePath);
+  database.prepare(`INSERT INTO lifestyle_proposals_v2
+    (id, person_id, category, title, detail, consult_professional, evidence_refs_json,
+      status, version, created_at, updated_at)
+    VALUES (?, ?, 'exercise', '饭后散步', '循序渐进地活动', 0, '[]', 'proposed', 1, ?, ?)`)
+    .run(proposalId, person.id, '2026-10-10T00:00:00Z', '2026-10-10T00:00:00Z');
+  database.close();
+  const input = { personId: person.id, proposalId, userGoal: '保留本人目标：计划时间不能替换正文',
+    selectedStartingOption: '先从楼下走一圈开始', plannedTime, owner: '本人和家人',
+    progressNote: '已和家人商量，觉得不适就休息', dueDate: '2026-10-12' };
+  const adoption = store.adoptLifestyleProposal(input);
+  return { person, input, adoption, action: store.listActionItems(person.id)[0]! };
+}
+
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
 describe('WorkspaceStore', () => {
+  function assessmentOnlyFixture() {
+    const store = makeStore();
+    const { person, document } = documentedPlanFixture(store);
+    const observations = store.listAcceptedObservations(person.id);
+    const accountFingerprint = 'synthetic-assessment-only-account';
+    const consentId = store.createManualProcessingConsent({ assessmentOnly: true,
+      documentIds: [document.documentId], personIds: [person.id],
+      historicalObservationIds: observations.map((item) => item.id), accountFingerprint, version: 1 });
+    return { store, person, document, observations, accountFingerprint, consentId };
+  }
+
+  it.each(['failed', 'succeeded', 'completed_with_issues', 'cancelled'] as const)(
+    '同一资料综合在%s后允许新的更新意图，旧任务及同次请求的幂等性保持', (status) => {
+      const { store, person, document, observations, accountFingerprint, consentId } = assessmentOnlyFixture();
+      const groups = [{ personId: person.id, documentIds: [document.documentId],
+        stage: 'analyze' as const, inputSignature: 'synthetic-repeat-assessment' }];
+      const options = { cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued' as const, consentId, groups };
+      const first = store.createWaitingAuthBatch(options);
+      const database = new Database(store.databasePath);
+      // 模拟已安装旧版本留下的终态任务，包含不可随新意图清空的恢复证据。
+      database.prepare('UPDATE jobs SET idempotency_key=?,checkpoint_json=json_set(checkpoint_json,\'$.syntheticRecovery\',?) WHERE id=?')
+        .run(`manual:${groups[0]!.inputSignature}`, 'preserve-unknown-receipt', first.jobIds[0]);
+      expect(store.claimNextQueuedJob('synthetic-first-lease', accountFingerprint)?.id).toBe(first.jobIds[0]);
+      store.finishJob(first.jobIds[0]!, status);
+      const oldJob = database.prepare('SELECT * FROM jobs WHERE id=?').get(first.jobIds[0]);
+      const newConsentId = store.createManualProcessingConsent({ assessmentOnly: true,
+        documentIds: [document.documentId], personIds: [person.id],
+        historicalObservationIds: observations.map(item => item.id), accountFingerprint, version: 1 });
+      const second = store.createWaitingAuthBatch({ ...options, consentId: newConsentId });
+      expect(second.idempotent).toBe(false);
+      expect(second.jobIds[0]).not.toBe(first.jobIds[0]);
+      expect(database.prepare('SELECT * FROM jobs WHERE id=?').get(first.jobIds[0])).toEqual(oldJob);
+      expect(store.isAssessmentOnlyJob(second.jobIds[0]!)).toBe(true);
+      expect(store.createWaitingAuthBatch({ ...options, consentId: newConsentId }))
+        .toEqual({ ...second, idempotent: true });
+      expect(store.claimNextQueuedJob('synthetic-next-lease', accountFingerprint)?.id).toBe(second.jobIds[0]);
+      store.finishJob(second.jobIds[0]!, 'failed');
+      // 重放同一请求即使已结束也不能另建任务，更不能重置未知回执或预算。
+      expect(store.createWaitingAuthBatch({ ...options, consentId: newConsentId }))
+        .toEqual({ ...second, idempotent: true });
+      expect(database.prepare('SELECT COUNT(*) AS n FROM jobs').get()).toEqual({ n: 2 });
+      expect(store.listAcceptedObservations(person.id)).toEqual(observations);
+      database.close(); store.close();
+    });
+
+  it('仅成员综合的授权、阶段和每次发送都硬禁止原件提取，已接纳事实保持不变', () => {
+    const { store, person, document, observations, accountFingerprint, consentId } = assessmentOnlyFixture();
+    const queued = store.createWaitingAuthBatch({ cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: person.id, documentIds: [document.documentId], stage: 'analyze', inputSignature: 'assessment-only-scope' }] });
+    expect(store.isAssessmentOnlyJob(queued.jobIds[0]!)).toBe(true);
+    const database = new Database(store.databasePath);
+    const consent = database.prepare('SELECT scope_json FROM consents WHERE id=?').get(consentId) as { scope_json: string };
+    expect(JSON.parse(consent.scope_json)).toMatchObject({ assessmentOnly: true, personIds: [person.id],
+      stages: ['analyze', 'review_derived', 'publish'], historicalObservationIds: observations.map((item) => item.id) });
+    const job = store.claimNextQueuedJob('synthetic-assessment-lease', accountFingerprint)!;
+    expect(job.stage).toBe('analyze');
+    const attemptId = store.startJobAttempt(job.id, 'synthetic-runtime', 'gpt-6.1-sol', 'medium');
+    const guard = { jobId: job.id, attemptId, consentId, accountFingerprint };
+    expect(() => store.assertJobExecutionActive(guard, document.documentId)).not.toThrow();
+    expect(() => store.assertObservationScopeActive(guard, person.id, observations)).not.toThrow();
+    expect(() => store.assertObservationScopeActive(guard, person.id,
+      [{ id: 'not-in-confirmed-facts', documentId: document.documentId }])).toThrow('HISTORICAL_FACTS_OUTSIDE_CONSENT_SCOPE');
+    for (const stage of ['extract', 'review_facts', 'direct_original_read', 'other']) {
+      expect(() => store.beginAiTransmission({ guard, documentId: document.documentId, stage }))
+        .toThrow('ASSESSMENT_ONLY_STAGE_OUTSIDE_SCOPE');
+    }
+    for (const stage of ['prepare_clinical_context', 'member_assessment', 'assessment_repair', 'focused_review']) {
+      const transmission = store.beginAiTransmission({ guard, documentId: document.documentId, stage });
+      store.finishAiTransmission(transmission, 'completed');
+    }
+    expect(database.prepare('SELECT COUNT(*) AS n FROM ai_transmissions').get()).toEqual({ n: 4 });
+    expect(() => store.updateJobStage(job.id, 'extract')).toThrow('ASSESSMENT_ONLY_STAGE_OUTSIDE_SCOPE');
+    expect(() => store.publishFacts({ personId: person.id, documentId: document.documentId,
+      documentCommitKey: 'p'.repeat(64), expectedRevision: store.getFactRevision(person.id), changeSetHash: 'q'.repeat(64),
+      summary: '不应写入', observations: [], executionGuard: guard })).toThrow('ASSESSMENT_ONLY_FACT_WRITE_FORBIDDEN');
+    database.prepare("UPDATE jobs SET stage='extract' WHERE id=?").run(job.id);
+    expect(() => store.assertJobExecutionActive(guard)).toThrow('ASSESSMENT_ONLY_STAGE_OUTSIDE_SCOPE');
+    expect(store.listAcceptedObservations(person.id)).toEqual(observations);
+    database.close();
+    store.close();
+  });
+
+  it.each(['extract', 'other_person', 'repair'] as const)('仅综合授权不能创建%s范围的任务', (mode) => {
+    const { store, person, document, consentId } = assessmentOnlyFixture();
+    expect(() => store.createWaitingAuthBatch({ cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: mode === 'other_person' ? 'not-this-person' : person.id,
+        documentIds: [document.documentId], stage: mode === 'extract' ? 'extract' : 'analyze', inputSignature: 'assessment-only-invalid' }],
+      ...(mode === 'repair' ? { repairDocumentIds: [document.documentId] } : {})
+    })).toThrow('ASSESSMENT_ONLY_SCOPE_INVALID');
+    expect(store.listStoredJobs()).toEqual([]);
+    store.close();
+  });
+
+  it.each(['uncommitted', 'other_person', 'other_fact', 'no_facts'] as const)('仅综合授权%s无效时不写入新授权', (mode) => {
+    const { store, person, document, observations, accountFingerprint } = assessmentOnlyFixture();
+    const otherPerson = store.createPerson({ displayName: '合成另一成员' });
+    const otherSource = store.putSourceObject({ bytes: Buffer.from('合成另一成员资料'), mediaType: 'text/plain', displayName: '合成另一成员.txt' });
+    const otherDocument = store.registerImportedDocument({ sourceObjectId: otherSource.id, personId: otherPerson.id });
+    const source = store.putSourceObject({ bytes: Buffer.from('合成新报告未处理'), mediaType: 'text/plain', displayName: '合成待处理.txt' });
+    const pending = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const database = new Database(store.databasePath);
+    const before = database.prepare('SELECT COUNT(*) AS n FROM consents').get();
+    expect(() => store.createManualProcessingConsent({ assessmentOnly: true,
+      documentIds: [mode === 'uncommitted' ? pending.documentId : mode === 'other_person' ? otherDocument.documentId : document.documentId],
+      personIds: [person.id], historicalObservationIds: mode === 'no_facts' ? []
+        : mode === 'other_fact' ? ['fact-not-accepted-for-this-person'] : observations.map((item) => item.id),
+      accountFingerprint, version: 1 })).toThrow('ASSESSMENT_ONLY_SCOPE_INVALID');
+    expect(database.prepare('SELECT COUNT(*) AS n FROM consents').get()).toEqual(before);
+    database.close();
+    store.close();
+  });
+
+  it('仅综合任务部分完成后重试仍为综合阶段，不扩大原授权', () => {
+    const { store, person, document, accountFingerprint, consentId } = assessmentOnlyFixture();
+    const queued = store.createWaitingAuthBatch({ cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: person.id, documentIds: [document.documentId], stage: 'analyze', inputSignature: 'assessment-only-retry' }] });
+    const database = new Database(store.databasePath);
+    database.prepare("UPDATE jobs SET status='completed_with_issues', stage='publish' WHERE id=?").run(queued.jobIds[0]!);
+    const before = database.prepare('SELECT scope_json FROM consents WHERE id=?').get(consentId);
+    store.retryFailedJob(queued.jobIds[0]!);
+    expect(store.claimNextQueuedJob('synthetic-retry-lease', accountFingerprint)).toMatchObject({
+      id: queued.jobIds[0], stage: 'analyze'
+    });
+    expect(store.listStoredJobs()[0]!.status).toBe('running');
+    expect(database.prepare('SELECT scope_json FROM consents WHERE id=?').get(consentId)).toEqual(before);
+    expect(store.isAssessmentOnlyJob(queued.jobIds[0]!)).toBe(true);
+    database.close();
+    store.close();
+  });
+
+  it('仅综合任务被篡改为提取阶段时不能领取，且不创建尝试', () => {
+    const { store, person, document, accountFingerprint, consentId } = assessmentOnlyFixture();
+    const queued = store.createWaitingAuthBatch({ cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued', consentId,
+      groups: [{ personId: person.id, documentIds: [document.documentId], stage: 'analyze', inputSignature: 'assessment-only-tamper' }] });
+    const database = new Database(store.databasePath);
+    database.prepare("UPDATE jobs SET stage='extract' WHERE id=?").run(queued.jobIds[0]!);
+    expect(store.claimNextQueuedJob('synthetic-invalid-lease', accountFingerprint)).toBeNull();
+    expect(store.listStoredJobs()[0]!.status).toBe('waiting_user');
+    expect(database.prepare('SELECT COUNT(*) AS n FROM job_attempts').get()).toEqual({ n: 0 });
+    database.close();
+    store.close();
+  });
+
+  it('姓名确认跨报告持久化复用，但不同成员、撤销、归档和近似姓名不自动通过', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员甲' });
+    const other = store.createPerson({ displayName: '合成成员乙' });
+    store.confirmPersonNameAlias({ personId: person.id, reportedName: '合成昵称Ａ' });
+    expect(store.isConfirmedPersonName(person.id, ' 合成昵称A ')).toBe(true);
+    expect(store.isConfirmedPersonName(person.id, '合成昵称B')).toBe(false);
+    expect(store.isConfirmedPersonName(other.id, '合成昵称A')).toBe(false);
+    expect(() => store.confirmPersonNameAlias({ personId: other.id, reportedName: '合成昵称A' }))
+      .toThrow('PERSON_NAME_ALIAS_CONFLICT');
+    expect(() => store.confirmPersonNameAlias({ personId: person.id, reportedName: other.displayName }))
+      .toThrow('PERSON_NAME_ALIAS_CONFLICT');
+    const rootDirectory = store.rootDirectory;
+    store.close();
+    const reopened = new WorkspaceStore({ rootDirectory });
+    expect(reopened.listConfirmedPersonNameAliases(person.id)).toEqual(['合成昵称Ａ']);
+    reopened.revokePersonNameAlias({ personId: person.id, reportedName: '合成昵称A' });
+    expect(reopened.isConfirmedPersonName(person.id, '合成昵称A')).toBe(false);
+    reopened.confirmPersonNameAlias({ personId: person.id, reportedName: '合成昵称A' });
+    reopened.archivePerson({ personId: person.id, expectedDisplayRevision: 1 });
+    expect(reopened.isConfirmedPersonName(person.id, '合成昵称A')).toBe(false);
+    reopened.close();
+  });
+
+  it('单份身份确认同时保存成员别名，下一份资料仍保留原始报告姓名', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员本名' });
+    const source = store.putSourceObject({ bytes: Buffer.from('姓名：合成昵称'), mediaType: 'text/plain', displayName: '合成身份.txt' });
+    const { documentId } = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    store.saveSourceManifest({ id: 'identity-alias-manifest', sourceObjectId: source.id, sha256: source.sha256,
+      mediaType: 'text/plain', originalDisplayName: '合成身份.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00Z',
+      spans: [{ id: 'identity-alias-span', documentId, spanKind: 'line', page: null,
+        blockId: null, lineStart: 1, lineEnd: 1, quote: '姓名：合成昵称', readability: 'clear' }] });
+    const issueId = store.saveExtractionReviewIssue({ documentId, kind: 'person_conflict', severity: 'blocking',
+      evidenceRefs: ['identity-alias-span'], reportedName: '合成昵称', reasonCodes: ['PERSON_IDENTITY_NOT_CONFIRMED'] });
+    store.confirmDocumentIdentity({ issueId, documentId, personId: person.id });
+    expect(store.getDocumentExtractionBundle(documentId)).toMatchObject({
+      personDisplayName: '合成成员本名', confirmedReportedName: '合成昵称', confirmedPersonAliases: ['合成昵称']
+    });
+    const nextSource = store.putSourceObject({ bytes: Buffer.from('姓名：合成昵称；下一份报告'), mediaType: 'text/plain', displayName: '合成后续.txt' });
+    const next = store.registerImportedDocument({ sourceObjectId: nextSource.id, personId: person.id });
+    store.saveSourceManifest({ id: 'identity-next-manifest', sourceObjectId: nextSource.id, sha256: nextSource.sha256,
+      mediaType: 'text/plain', originalDisplayName: '合成后续.txt', totalUnits: 1, coveredUnitIndexes: [0],
+      normalizerVersion: 'test', conversionWarnings: [], createdAt: '2026-09-18T00:00:00Z',
+      spans: [{ id: 'identity-next-span', documentId: next.documentId, spanKind: 'line', page: null,
+        blockId: null, lineStart: 1, lineEnd: 1, quote: '姓名：合成昵称；下一份报告', readability: 'clear' }] });
+    expect(store.getDocumentExtractionBundle(next.documentId)).toMatchObject({
+      confirmedReportedName: null, confirmedPersonAliases: ['合成昵称']
+    });
+    store.close();
+  });
+
+  it('有独立恢复点和明确授权才全量重建，保留原文件、本人记录与已采纳行动', async () => {
+    const store = makeStore();
+    const { person, document, snapshot } = documentedPlanFixture(store);
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const adopted = store.adoptMemberAssessmentAction({ personId: person.id, snapshotId: published.snapshotId,
+      actionId: snapshot.actions[0]!.id });
+    const userAction = store.createUserAction({ personId: person.id, title: '本人安排', detail: '本人独立填写的计划', dueDate: null, dueText: '周末' });
+    const note = store.createManualNote({ personId: person.id, kind: 'free_text', immutableText: '本人提供的补充情况',
+      effectiveDate: null, structuredFields: {}, expectedContextRevision: 0 });
+    store.confirmPersonNameAlias({ personId: person.id, reportedName: '合成别名' });
+    const sources = store.listProcessingRebuildSources();
+    const oldBundle = store.getDocumentExtractionBundle(document.documentId);
+    const originalBytes = readFileSync(sources[0]!.sourcePath);
+    const originalActions = store.listActionItems(person.id);
+    const oldConsent = store.createManualProcessingConsent({ documentIds: [document.documentId], personIds: [person.id],
+      accountFingerprint: 'old-account', version: 1 });
+    const oldBatch = store.createWaitingAuthBatch({ cutoff: '2026-09-18T00:00:00Z', consentId: oldConsent, initialStatus: 'queued',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'old-rebuild-task' }] });
+    expect(store.claimNextQueuedJob('old-synthetic-runner', 'old-account')?.id).toBe(oldBatch.jobIds[0]!);
+    store.finishJob(oldBatch.jobIds[0]!, 'waiting_user');
+    store.saveExtractionReviewIssue({ documentId: document.documentId, jobId: oldBatch.jobIds[0]!, kind: 'coverage_gap',
+      severity: 'warning', preserveDocumentStatus: true, evidenceRefs: ['plan-span-' + document.documentId],
+      reasonCodes: ['old-warning'] });
+    // 从零验收时旧人工接纳的报告事实也要归档，不能遮盖新流程识别错误。
+    const edit = new Database(store.databasePath);
+    edit.exec(`UPDATE acceptance_decisions SET actor = 'user', method = 'user_resolution'`);
+    edit.prepare(`INSERT INTO clinical_statements
+      (id,person_id,document_id,statement_kind,text,reported_status,source_span_id,source_kind,created_at)
+      VALUES ('synthetic-user-statement', ?, NULL, 'context', '本人独立补充', NULL, NULL, 'user_reported', ?)`)
+      .run(person.id, '2026-09-18T00:00:00Z');
+    edit.close();
+    const backup = await store.createProcessingRebuildBackup();
+    const receipt = store.rebuildProcessingResults({ backup, manifests: [{ ...oldBundle.manifest,
+      id: 'rebuild-manifest', normalizerVersion: 'rebuild-normalizer',
+      spans: oldBundle.manifest.spans.map((span) => ({ ...span, id: `new-${span.id}` })) }],
+      accountFingerprint: 'new-account', consentVersion: 1, confirmedRebuildReportResults: true,
+      confirmedPersonAliases: [{ personId: person.id, reportedName: '本次明确确认的合成别名' }],
+      promptVersion: 'test-extract-new', rulesVersion: 'test-rules-new' });
+    expect(receipt).toMatchObject({ rebuildId: backup.id, documentCount: 1, personCount: 1, recoveryPointCreated: true });
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    expect(store.listMemberAssessmentSnapshots(person.id)).toEqual([]);
+    expect(store.isDocumentCommitted(document.documentId)).toBe(false);
+    expect(store.listOpenExtractionReviewIssues()).toEqual([]);
+    expect(store.listManualNotes(person.id)).toEqual([note]);
+    expect(store.listActionItems(person.id)).toEqual(originalActions);
+    expect(store.listActionItems(person.id).map((item) => item.id)).toEqual(expect.arrayContaining([adopted.id, userAction.id]));
+    expect(store.isConfirmedPersonName(person.id, '合成别名')).toBe(true);
+    expect(store.isConfirmedPersonName(person.id, '本次明确确认的合成别名')).toBe(true);
+    expect(readFileSync(sources[0]!.sourcePath)).toEqual(originalBytes);
+    expect(store.getDocumentExtractionBundle(document.documentId).manifest.normalizerVersion).toBe('rebuild-normalizer');
+    const old = new Database(backup.databasePath, { readonly: true });
+    expect((old.prepare('SELECT COUNT(*) AS count FROM observations').get() as { count: number }).count).toBe(1);
+    expect((old.prepare('SELECT COUNT(*) AS count FROM member_assessment_snapshots_v3').get() as { count: number }).count).toBe(1);
+    expect(old.prepare(`SELECT id FROM person_name_aliases WHERE reported_name = '本次明确确认的合成别名'`).get()).toBeUndefined();
+    old.close();
+    const current = new Database(store.databasePath, { readonly: true });
+    expect(current.prepare(`SELECT text,source_kind FROM clinical_statements WHERE id = 'synthetic-user-statement'`).get())
+      .toEqual({ text: '本人独立补充', source_kind: 'user_reported' });
+    expect(current.prepare('SELECT revoked_at FROM consents WHERE id = ?').get(oldConsent)).toEqual({ revoked_at: '2026-09-18T00:00:00.000Z' });
+    expect(current.prepare('SELECT status FROM jobs WHERE id = ?').get(oldBatch.jobIds[0]!)).toEqual({ status: 'cancelled' });
+    const newJob = current.prepare('SELECT id,checkpoint_json FROM jobs WHERE batch_id = ?').get(receipt.batchId) as { id: string; checkpoint_json: string };
+    const newConsent = (JSON.parse(newJob.checkpoint_json) as { consentId: string }).consentId;
+    expect(newConsent).not.toBe(oldConsent);
+    current.close();
+    store.revokeConsent(newConsent);
+    expect(store.claimNextQueuedJob('synthetic-runner', 'new-account')).toBeNull();
+    store.close();
+  });
+
+  it('重建尊重已排除报告，并清理旧接纳标识而不重新发送其原件', async () => {
+    const store = makeStore();
+    const { person, document } = documentedPlanFixture(store);
+    const manifest = store.getDocumentExtractionBundle(document.documentId).manifest;
+    const source = store.putSourceObject({ bytes: Buffer.from('合成排除报告'), mediaType: 'text/plain', displayName: '合成排除.txt' });
+    const excluded = store.registerImportedDocument({ sourceObjectId: source.id, personId: person.id });
+    const edit = new Database(store.databasePath);
+    edit.prepare(`UPDATE documents SET excluded_from_analysis = 1, status = 'accepted',
+      acceptance_id = (SELECT acceptance_id FROM documents WHERE id = ?) WHERE id = ?`)
+      .run(document.documentId, excluded.documentId);
+    edit.prepare(`INSERT INTO document_commits (document_id,commit_key,publication_id,revision,committed_at)
+      SELECT ?, 'synthetic-excluded-commit', publication_id,revision,committed_at
+      FROM document_commits WHERE document_id = ?`).run(excluded.documentId, document.documentId);
+    edit.close();
+    const excludedPath = join(store.vaultDirectory, source.vaultRelativePath);
+    const excludedBytes = readFileSync(excludedPath);
+    expect(store.listProcessingRebuildSources().map((item) => item.documentId)).toEqual([document.documentId]);
+    const backup = await store.createProcessingRebuildBackup();
+    const receipt = store.rebuildProcessingResults({ backup, manifests: [manifest], accountFingerprint: 'account',
+      consentVersion: 1, confirmedRebuildReportResults: true, promptVersion: 'new', rulesVersion: 'new' });
+    expect(receipt.documentCount).toBe(1);
+    const current = new Database(store.databasePath, { readonly: true });
+    expect(current.prepare(`SELECT status,excluded_from_analysis,acceptance_id FROM documents WHERE id = ?`).get(excluded.documentId))
+      .toEqual({ status: 'ignored', excluded_from_analysis: 1, acceptance_id: null });
+    expect(current.prepare(`SELECT id FROM jobs WHERE batch_id = ? AND checkpoint_json LIKE ?`).get(receipt.batchId,
+      `%${excluded.documentId}%`)).toBeUndefined();
+    current.close();
+    expect(store.isDocumentCommitted(excluded.documentId)).toBe(false);
+    expect(readFileSync(excludedPath)).toEqual(excludedBytes);
+    store.close();
+  });
+
+  it.each([
+    { mediaType: 'application/pdf', locator: { spanKind: 'page' as const, page: 1, lineStart: null, lineEnd: null }, newKind: 'image' as const },
+    { mediaType: 'image/png', locator: { spanKind: 'image' as const, page: 1, lineStart: null, lineEnd: null }, newKind: 'image' as const },
+    { mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      locator: { spanKind: 'block' as const, blockId: 'block-1' }, newKind: 'block' as const },
+    { mediaType: 'text/plain', locator: { spanKind: 'line' as const, lineStart: 1, lineEnd: 1 }, newKind: 'line' as const }
+  ])('重建只复用相同原件唯一定位，已采纳行动继续打开新来源而旧事实不回流：$mediaType', async ({ mediaType, locator, newKind }) => {
+    const store = makeStore();
+    const { person, document, snapshot } = documentedPlanFixture(store, { mediaType, sourceLocator: locator });
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    store.adoptMemberAssessmentAction({ personId: person.id, snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id });
+    const originalActions = store.listActionItems(person.id);
+    const oldManifest = store.getDocumentExtractionBundle(document.documentId).manifest;
+    const oldSpanId = oldManifest.spans[0]!.id;
+    const source = store.listProcessingRebuildSources()[0]!;
+    const originalBytes = readFileSync(source.sourcePath);
+    const newQuote = '新流程独立规范化的合成来源文字，不是旧核对或旧事实。';
+    const freshManifest = { ...oldManifest, id: 'fresh-locator-manifest', normalizerVersion: 'fresh-locator-normalizer',
+      spans: oldManifest.spans.map((span) => ({ ...span, id: `fresh-${span.id}`, spanKind: newKind, quote: newQuote,
+        readability: 'partial' as const })) };
+    const backup = await store.createProcessingRebuildBackup();
+    store.rebuildProcessingResults({ backup, manifests: [freshManifest], accountFingerprint: 'account', consentVersion: 1,
+      confirmedRebuildReportResults: true, promptVersion: 'new', rulesVersion: 'new' });
+    const preservedEvidence = store.listActionItems(person.id)[0]!.evidenceRefs![0]!;
+    expect(preservedEvidence.sourceSpanId).toBe(oldSpanId);
+    expect(store.listActionItems(person.id)).toEqual(originalActions);
+    expect(store.getEvidenceAccess({ sourceSpanId: oldSpanId })).toMatchObject({ documentId: document.documentId,
+      sourcePath: source.sourcePath, sourcePage: locator.page ?? null, quote: newQuote, readability: 'partial' });
+    expect(store.getDocumentExtractionBundle(document.documentId).manifest).toMatchObject({ id: 'fresh-locator-manifest',
+      normalizerVersion: 'fresh-locator-normalizer', spans: [{ id: oldSpanId, quote: newQuote, readability: 'partial' }] });
+    expect(store.listAcceptedObservations(person.id)).toEqual([]);
+    expect(store.listMemberAssessmentSnapshots(person.id)).toEqual([]);
+    expect(readFileSync(source.sourcePath)).toEqual(originalBytes);
+    store.close();
+  });
+
+  it.each(['old-duplicate', 'new-duplicate', 'changed-page', 'converted-doc', 'old-manifest-hash', 'old-manifest-object'] as const)(
+    '原件定位或旧源标识无法严格对应时不猜测复用：%s', async (condition) => {
+      const store = makeStore();
+      const { document } = documentedPlanFixture(store, {
+        mediaType: condition === 'converted-doc' ? 'application/msword' : 'application/pdf',
+        sourceLocator: { spanKind: 'page', page: 1, lineStart: null, lineEnd: null }
+      });
+      const oldManifest = store.getDocumentExtractionBundle(document.documentId).manifest;
+      const oldSpan = oldManifest.spans[0]!;
+      if (condition === 'old-duplicate') {
+        // 合成旧库存在同页多个定位的状态，不能借重建猜测哪一个历史编号正确。
+        const edit = new Database(store.databasePath);
+        edit.prepare(`INSERT INTO source_spans
+          (id,document_id,span_kind,page_number,block_id,line_start,line_end,quote,readability,normalizer_version)
+          SELECT 'another-old-page-one',document_id,span_kind,page_number,block_id,line_start,line_end,
+            quote,readability,normalizer_version FROM source_spans WHERE id = ?`).run(oldSpan.id);
+        edit.close();
+      }
+      if (condition === 'old-manifest-hash' || condition === 'old-manifest-object') {
+        const otherSource = condition === 'old-manifest-object'
+          ? store.putSourceObject({ bytes: Buffer.from('另一份合成原件'), mediaType: 'application/pdf', displayName: '另一原件.pdf' }) : null;
+        const edit = new Database(store.databasePath);
+        if (otherSource) edit.prepare(`UPDATE source_manifests SET source_object_id = ? WHERE document_id = ?`)
+          .run(otherSource.id, document.documentId);
+        else edit.prepare(`UPDATE source_manifests SET sha256 = ? WHERE document_id = ?`)
+          .run('0'.repeat(64), document.documentId);
+        edit.close();
+      }
+      const newSpan = { ...oldSpan, id: 'new-unique-page-id', page: condition === 'changed-page' ? 2 : 1,
+        quote: '本轮重新读取的来源' };
+      const spans = condition === 'new-duplicate' ? [newSpan, { ...newSpan, id: 'another-new-page-one' }] : [newSpan];
+      const freshManifest = { ...oldManifest, id: 'fresh-no-guessed-locator', spans,
+        totalUnits: spans.length, coveredUnitIndexes: spans.map((_, index) => index) };
+      const backup = await store.createProcessingRebuildBackup();
+      store.rebuildProcessingResults({ backup, manifests: [freshManifest], accountFingerprint: 'account', consentVersion: 1,
+        confirmedRebuildReportResults: true, promptVersion: 'new', rulesVersion: 'new' });
+      expect(store.getDocumentExtractionBundle(document.documentId).manifest.spans.map((span) => span.id))
+        .toEqual(expect.arrayContaining(spans.map((span) => span.id)));
+      expect(() => store.getEvidenceAccess({ sourceSpanId: oldSpan.id })).toThrow('EVIDENCE_NOT_FOUND');
+      store.close();
+    }
+  );
+
+  it('本次新增别名必须属于重建范围，别名冲突会连同清理一起回滚', async () => {
+    const store = makeStore();
+    const { person, document } = documentedPlanFixture(store);
+    const other = store.createPerson({ displayName: '合成范围外成员' });
+    const manifest = store.getDocumentExtractionBundle(document.documentId).manifest;
+    const backup = await store.createProcessingRebuildBackup();
+    const input = { backup, manifests: [manifest], accountFingerprint: 'account', consentVersion: 1,
+      confirmedRebuildReportResults: true as const, promptVersion: 'new', rulesVersion: 'new' };
+    expect(() => store.rebuildProcessingResults({ ...input,
+      confirmedPersonAliases: [{ personId: other.id, reportedName: '合成越界别名' }] }))
+      .toThrow('PROCESSING_REBUILD_ALIAS_SCOPE_INVALID');
+    expect(() => store.rebuildProcessingResults({ ...input, confirmedPersonAliases: [
+      { personId: person.id, reportedName: '合成事务暂存别名' },
+      { personId: person.id, reportedName: other.displayName }
+    ] })).toThrow('PERSON_NAME_ALIAS_CONFLICT');
+    expect(store.isConfirmedPersonName(person.id, '合成事务暂存别名')).toBe(false);
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(1);
+    expect(store.isDocumentCommitted(document.documentId)).toBe(true);
+    expect(store.listStoredJobs()).toEqual([]);
+    store.close();
+  });
+
+  it('活动任务、过期恢复点或未明确授权都不能清理旧处理结果', async () => {
+    const store = makeStore();
+    const { person, document } = documentedPlanFixture(store);
+    const manifest = store.getDocumentExtractionBundle(document.documentId).manifest;
+    store.createWaitingAuthBatch({ cutoff: '2026-09-18T00:00:00Z', initialStatus: 'queued',
+      groups: [{ personId: person.id, documentIds: [document.documentId], inputSignature: 'rebuild-active' }] });
+    await expect(store.createProcessingRebuildBackup()).rejects.toThrow('PROCESSING_REBUILD_HAS_ACTIVE_JOB');
+    expect(store.claimNextQueuedJob('synthetic-runner', 'account')).toBeNull();
+    const backup = await store.createProcessingRebuildBackup();
+    const input = { backup, manifests: [manifest], accountFingerprint: 'account', consentVersion: 1,
+      confirmedRebuildReportResults: true as const, promptVersion: 'new', rulesVersion: 'new' };
+    expect(() => store.rebuildProcessingResults({ ...input, accountFingerprint: '' })).toThrow('PROCESSING_REBUILD_AUTH_REQUIRED');
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(1);
+    store.updateClinicalContext(person.id, { synthetic: '新补充' }, 0);
+    expect(() => store.rebuildProcessingResults(input)).toThrow('PROCESSING_REBUILD_BACKUP_CHANGED');
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(1);
+    expect(store.isDocumentCommitted(document.documentId)).toBe(true);
+    store.close();
+  });
+
+  it('v36升级独立保存用户时间说明，保留原医嘱和可恢复的升级前数据库', () => {
+    const store = makeStore();
+    const { person, snapshot } = documentedPlanFixture(store);
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const action = store.adoptMemberAssessmentAction({ personId: person.id, snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id });
+    const originalFacts = store.listAcceptedObservations(person.id);
+    const originalAssessments = store.listMemberAssessmentSnapshots(person.id);
+    const rootDirectory = store.rootDirectory;
+    const databasePath = store.databasePath;
+    store.close();
+    const old = new Database(databasePath);
+    old.exec('ALTER TABLE action_items DROP COLUMN user_schedule_text; UPDATE workspaces SET schema_version = 36; PRAGMA user_version = 36;');
+    old.close();
+    const upgraded = new WorkspaceStore({ rootDirectory });
+    expect(upgraded.listActionItems(person.id)[0]).toMatchObject({ id: action.id, dueText: '3个月后', userScheduleText: null });
+    expect(upgraded.listActionItems(person.id)).toEqual([action]);
+    expect(upgraded.listAcceptedObservations(person.id)).toEqual(originalFacts);
+    expect(upgraded.listMemberAssessmentSnapshots(person.id)).toEqual(originalAssessments);
+    const backups = readdirSync(upgraded.schemaBackupDirectory).filter((name) => name.endsWith('.db'));
+    expect(backups).toHaveLength(1);
+    const backup = new Database(join(upgraded.schemaBackupDirectory, backups[0]!), { readonly: true });
+    expect(backup.pragma('user_version', { simple: true })).toBe(36);
+    expect(backup.prepare('SELECT due_text FROM action_items WHERE id = ?').get(action.id)).toEqual({ due_text: '3个月后' });
+    backup.close();
+    expect(upgraded.integrityCheck()).toBe('ok');
+    upgraded.close();
+  });
+
+  it('用户安排独立修改、清空，原医嘱时间和可打开的来源始终保留', () => {
+    const store = makeStore();
+    const { person, snapshot } = documentedPlanFixture(store);
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const action = store.adoptMemberAssessmentAction({ personId: person.id, snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id });
+    const scheduled = store.updateActionSchedule({ personId: person.id, actionId: action.id, dueDate: '2026-11-28', userScheduleText: '  上午已预约  ', expectedRevision: action.userRevision });
+    expect(scheduled).toMatchObject({ dueDate: '2026-11-28', userScheduleText: '上午已预约', dueText: '3个月后', userRevision: 2, title: action.title, detail: action.detail, evidenceRefs: snapshot.evidenceCatalog });
+    expect(() => store.updateActionSchedule({ personId: person.id, actionId: action.id, dueDate: null, userScheduleText: null, expectedRevision: 1 })).toThrow(RevisionConflictError);
+    const cleared = store.updateActionSchedule({ personId: person.id, actionId: action.id, dueDate: null, userScheduleText: '', expectedRevision: 2 });
+    expect(cleared).toMatchObject({ dueDate: null, userScheduleText: null, dueText: '3个月后', userRevision: 3 });
+    expect(store.listMemberAssessmentSnapshots(person.id)[0]!.actions[0]!.timing).toBe('3个月后');
+    store.close();
+  });
+
+  it('v36旧本人时间和旧采纳时间迁入独立字段，清空后重开不会复活', () => {
+    const store = makeStore();
+    const legacy = legacyAdoptionFixture(store);
+    const userAction = store.createUserAction({ personId: legacy.person.id, title: '本人安排',
+      detail: '保留本人正文', dueDate: null, dueText: '下周二上午' });
+    const rootDirectory = store.rootDirectory;
+    const databasePath = store.databasePath;
+    const before = new Database(databasePath, { readonly: true });
+    const originals = before.prepare('SELECT id, detail, due_text, due_date FROM action_items ORDER BY id').all();
+    const adoptionOriginal = before.prepare('SELECT * FROM action_adoptions_v2').all();
+    before.close();
+    store.close();
+    const old = new Database(databasePath);
+    old.exec('ALTER TABLE action_items DROP COLUMN user_schedule_text; UPDATE workspaces SET schema_version = 36; PRAGMA user_version = 36;');
+    old.close();
+    const upgraded = new WorkspaceStore({ rootDirectory });
+    expect(upgraded.listActionItems(legacy.person.id).find((action) => action.id === userAction.id)?.userScheduleText).toBe('下周二上午');
+    expect(upgraded.listActionItems(legacy.person.id).find((action) => action.id === legacy.action.id)?.userScheduleText).toBe('每周一晚饭后');
+    const after = new Database(databasePath, { readonly: true });
+    expect(after.prepare('SELECT id, detail, due_text, due_date FROM action_items ORDER BY id').all()).toEqual(originals);
+    expect(after.prepare('SELECT * FROM action_adoptions_v2').all()).toEqual(adoptionOriginal);
+    after.close();
+    for (const action of upgraded.listActionItems(legacy.person.id)) {
+      upgraded.updateActionSchedule({ personId: legacy.person.id, actionId: action.id,
+        dueDate: null, userScheduleText: null, expectedRevision: action.userRevision });
+    }
+    upgraded.close();
+    const reopened = new WorkspaceStore({ rootDirectory });
+    expect(reopened.listActionItems(legacy.person.id).every((action) => action.userScheduleText === null)).toBe(true);
+    expect(reopened.listActionAdoptions(legacy.person.id)[0]!.plannedTime).toBeNull();
+    reopened.close();
+  });
+
+  it.each([
+    { label: '只改日期', dueDate: '2026-10-19', userScheduleText: '每周一晚饭后' },
+    { label: '只改文字', dueDate: '2026-10-12', userScheduleText: '周末上午回顾记录' },
+    { label: '清空安排', dueDate: null, userScheduleText: null }
+  ])('旧采纳事项$label不丢失其他本人字段，不再混入旧计划时间', ({ dueDate, userScheduleText }) => {
+    const store = makeStore();
+    const { person, action, input } = legacyAdoptionFixture(store);
+    expect(action.userScheduleText).toBe(input.plannedTime);
+    expect(action.evidenceLabel).toBe('本人已采纳的生活建议');
+    expect(action.evidenceLabel).not.toContain('proposal:');
+    const database = new Database(store.databasePath, { readonly: true });
+    const original = database.prepare('SELECT detail, due_text FROM action_items WHERE id = ?').get(action.id);
+    const updated = store.updateActionSchedule({ personId: person.id, actionId: action.id,
+      dueDate, userScheduleText, expectedRevision: action.userRevision });
+    expect(updated).toMatchObject({ dueDate, userScheduleText, dueText: '由我决定开始时间' });
+    expect(updated.detail).toBe([input.userGoal, `起始方式：${input.selectedStartingOption}`,
+      `负责人：${input.owner}`, `起始备注：${input.progressNote}`].join('\n'));
+    expect(updated.detail).not.toContain(`计划时间：${input.plannedTime}`);
+    expect(store.listActionAdoptions(person.id)[0]).toMatchObject({ userGoal: input.userGoal,
+      selectedStartingOption: input.selectedStartingOption, owner: input.owner, progressNote: input.progressNote,
+      plannedTime: userScheduleText, dueDate });
+    expect(database.prepare('SELECT detail, due_text FROM action_items WHERE id = ?').get(action.id)).toEqual(original);
+    database.close();
+    store.close();
+  });
+
+  it('日程拒绝无效日期、额外医嘱字段、越权成员及已归档成员，不留下部分修改', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员' });
+    const other = store.createPerson({ displayName: '另一成员' });
+    const action = store.createUserAction({ personId: person.id, title: '复诊', detail: '原安排', dueDate: null, dueText: '原时间' });
+    const input = { personId: person.id, actionId: action.id, dueDate: null, userScheduleText: null, expectedRevision: 1 };
+    expect(() => store.updateActionSchedule({ ...input, dueDate: '2026-02-30' })).toThrow();
+    expect(() => store.updateActionSchedule({ ...input, userScheduleText: '长'.repeat(201) })).toThrow();
+    expect(() => store.updateActionSchedule({ ...input, dueText: '覆盖医嘱' } as typeof input)).toThrow();
+    expect(() => store.updateActionSchedule({ ...input, personId: other.id })).toThrow('ACTION_NOT_FOUND');
+    expect(store.listActionItems(person.id)).toEqual([action]);
+    const database = new Database(store.databasePath);
+    database.prepare('UPDATE persons SET archived_at = ? WHERE id = ?').run('2026-10-10T00:00:00Z', person.id);
+    database.close();
+    expect(() => store.updateActionSchedule(input)).toThrow('ACTION_NOT_FOUND');
+    expect(store.listActionItems(person.id)).toEqual([action]);
+    store.close();
+  });
+
+  it('旧采纳的180字时间说明只改日期时完整保存，201字仍严格拒绝', () => {
+    const store = makeStore();
+    const plannedTime = '安排'.repeat(90);
+    const { person, action } = legacyAdoptionFixture(store, plannedTime);
+    const input = { personId: person.id, actionId: action.id, dueDate: '2026-10-19',
+      userScheduleText: action.userScheduleText!, expectedRevision: action.userRevision };
+    expect(input.userScheduleText).toHaveLength(180);
+    const updated = store.updateActionSchedule(input);
+    expect(updated).toMatchObject({ dueDate: '2026-10-19', userScheduleText: plannedTime });
+    expect(store.listActionAdoptions(person.id)[0]).toMatchObject({ dueDate: '2026-10-19', plannedTime });
+    expect(() => store.updateActionSchedule({ ...input, expectedRevision: updated.userRevision,
+      userScheduleText: '长'.repeat(201) })).toThrow();
+    expect(store.listActionItems(person.id)[0]).toEqual(updated);
+    store.close();
+  });
+
+  it('完成日期仅取真实完成状态事件，修改日程不会冒充新的完成时间', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'family-health-completed-date-'));
+    directories.push(directory);
+    let now = '2026-10-10T00:00:00Z';
+    const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date(now) });
+    const person = store.createPerson({ displayName: '合成成员' });
+    const action = store.createUserAction({ personId: person.id, title: '复诊', detail: '', dueDate: null, dueText: null });
+    expect(action.completedAt).toBeNull();
+    now = '2026-10-11T00:00:00Z';
+    const done = store.updateActionStatus({ actionId: action.id, status: 'completed', expectedRevision: 1 });
+    expect(done.completedAt).toBe('2026-10-11T00:00:00.000Z');
+    now = '2026-10-12T00:00:00Z';
+    const rescheduled = store.updateActionSchedule({ personId: person.id, actionId: action.id, expectedRevision: 2, dueDate: null, userScheduleText: '补记' });
+    expect(rescheduled.completedAt).toBe('2026-10-11T00:00:00.000Z');
+    const reopened = store.updateActionStatus({ actionId: action.id, status: 'planned', expectedRevision: 3 });
+    expect(reopened.completedAt).toBeNull();
+    store.close();
+  });
+
   it('数据库被其他写入者锁定时快速失败且不留下半事务，解锁后可恢复', () => {
     const store = makeStore({ busyTimeoutMs: 5 });
     const locker = new Database(store.databasePath);
@@ -115,7 +755,7 @@ describe('WorkspaceStore', () => {
     createSchemaV2Database(directory);
     const store = new WorkspaceStore({ rootDirectory: directory, now: () => new Date('2026-09-18T00:00:00Z') });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     expect(upgraded.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'document_conversions'`).get()).toEqual({ name: 'document_conversions' });
     upgraded.close();
     expect(store.isQueuePaused()).toBe(false);
@@ -133,7 +773,7 @@ describe('WorkspaceStore', () => {
   it('schema v35 建立成员档案注册表、版本化派生表与可撤销纠错表', () => {
     const store = makeStore();
     const database = new Database(store.databasePath, { readonly: true });
-    expect(database.pragma('user_version', { simple: true })).toBe(36);
+    expect(database.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     const tables = new Set((database.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>).map((row) => row.name));
     for (const table of [
       'body_system_registry',
@@ -211,7 +851,7 @@ describe('WorkspaceStore', () => {
     ]);
     const migrated = new Database(upgraded.databasePath, { readonly: true });
     expect(migrated.prepare(`SELECT original_name FROM observations`).get()).toEqual({ original_name: null });
-    expect(migrated.pragma('user_version', { simple: true })).toBe(36);
+    expect(migrated.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     migrated.close();
     upgraded.close();
   });
@@ -1412,7 +2052,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1468,7 +2108,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1524,7 +2164,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1580,7 +2220,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1636,7 +2276,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1692,7 +2332,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1748,7 +2388,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1804,7 +2444,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1861,7 +2501,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1918,7 +2558,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -1975,7 +2615,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -2031,7 +2671,7 @@ describe('WorkspaceStore', () => {
     expect(store.getFactRevision(person.id)).toBe(0);
     expect(store.listAcceptedObservations(person.id)).toEqual([]);
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -2075,7 +2715,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -2114,7 +2754,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toEqual([{ id: document.documentId, personId: person.id }]);
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', completedUnits: 0, totalUnits: 1 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -2159,7 +2799,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -2204,7 +2844,7 @@ describe('WorkspaceStore', () => {
     expect(store.listOpenExtractionReviewIssues().some((issue) => issue.id === issueId)).toBe(false);
     expect(store.listStoredJobs()[0]).toMatchObject({ stage: 'analyze', status: 'queued' });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -2259,7 +2899,7 @@ describe('WorkspaceStore', () => {
     ]));
     expect(store.listStoredJobs()[0]).toMatchObject({ status: 'queued', stage: 'extract', completedUnits: 0, totalUnits: 2 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     const checkpoint = JSON.parse((upgraded.prepare('SELECT checkpoint_json FROM jobs WHERE id = ?').get(job.id) as { checkpoint_json: string }).checkpoint_json) as { documentIds: string[] };
     expect(checkpoint.documentIds).toEqual(documentIds);
     upgraded.close();
@@ -2317,7 +2957,7 @@ describe('WorkspaceStore', () => {
     expect(store.listReadyDocuments()).toContainEqual({ id: document.documentId, personId: person.id });
     expect(store.listStoredJobs()[0]).toMatchObject({ id: job.id, status: 'queued', stage: 'extract', completedUnits: 0 });
     const upgraded = new Database(store.databasePath, { readonly: true });
-    expect(upgraded.pragma('user_version', { simple: true })).toBe(36);
+    expect(upgraded.pragma('user_version', { simple: true })).toBe(WORKSPACE_SCHEMA_VERSION);
     upgraded.close();
     store.close();
   });
@@ -2508,6 +3148,54 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
+  it('V3 私有核查保留未发布原节点和真实回执，但不能凭此复活行动', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+    const snapshot = syntheticAssessmentSnapshot(store, person.id, 'review-audit');
+    const original = { nodeType: 'action' as const, value: { ...snapshot.actions[0]!, id: 'held-action', firstStep: '合成未发布原行动。' } };
+    const body = { targetId: 'held-action', phase: 'p04' as const, original, replacement: null,
+      modelDecision: { verdict: 'hold' as const, reason: '合成来源不能支持该安排。' },
+      receipt: { stage: 'p04' as const, threadId: 'synthetic-thread', turnId: 'synthetic-turn', outputHash: 'a'.repeat(64) },
+      origin: 'model' as const, outcome: 'held' as const, localReasonCodes: ['reviewer_hold'],
+      boundEvidenceIds: [], unboundEvidenceIds: [], boundObservationIds: [], unboundObservationIds: [] };
+    snapshot.heldTargetIds = ['held-action'];
+    snapshot.reviewAuditRecords = { version: 1, personId: person.id, inputSignature: snapshot.inputSignature,
+      records: [{ ...body, recordHash: stableHash(body) }] };
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const loaded = store.listMemberAssessmentSnapshots(person.id, true)[0]!;
+    expect(loaded.reviewAuditRecords).toEqual(snapshot.reviewAuditRecords);
+    expect(loaded.actions).toEqual(snapshot.actions);
+    expect(() => store.adoptMemberAssessmentAction({ personId: person.id, snapshotId: published.snapshotId, actionId: 'held-action' }))
+      .toThrow();
+    store.close();
+  });
+
+  it.each(['person', 'signature', 'target', 'state', 'source', 'hash', 'missing_target'])(
+    'V3 写库拒绝私有审计错绑或伪造 %s', (mode) => {
+      const store = makeStore();
+      const person = store.createPerson({ displayName: '合成成员', relation: '本人' });
+      const snapshot = syntheticAssessmentSnapshot(store, person.id, `audit-invalid-${mode}`);
+      const body = { targetId: 'held-action', phase: 'p04' as const,
+        original: { nodeType: 'action' as const, value: { ...snapshot.actions[0]!, id: 'held-action' } }, replacement: null,
+        modelDecision: { verdict: 'hold' as const, reason: '合成依据不足。' },
+        receipt: { stage: 'p04' as const, threadId: 'synthetic-thread', turnId: 'synthetic-turn', outputHash: 'a'.repeat(64) },
+        origin: 'model' as const, outcome: 'held' as const, localReasonCodes: ['reviewer_hold'],
+        boundEvidenceIds: [] as string[], unboundEvidenceIds: [], boundObservationIds: [], unboundObservationIds: [] };
+      snapshot.heldTargetIds = ['held-action'];
+      snapshot.reviewAuditRecords = { version: 1, personId: person.id, inputSignature: snapshot.inputSignature,
+        records: [{ ...body, recordHash: stableHash(body) }] };
+      if (mode === 'person') snapshot.reviewAuditRecords.personId = 'other-member';
+      if (mode === 'signature') snapshot.reviewAuditRecords.inputSignature = 'b'.repeat(64);
+      if (mode === 'target') snapshot.reviewAuditRecords.records[0]!.original.value.id = 'unrelated';
+      if (mode === 'state') snapshot.reviewAuditRecords.records[0]!.outcome = 'rebuilt';
+      if (mode === 'source') snapshot.reviewAuditRecords.records[0]!.boundEvidenceIds = ['foreign-source'];
+      if (mode === 'hash') snapshot.reviewAuditRecords.records[0]!.modelDecision!.reason = '被篡改的理由';
+      if (mode === 'missing_target') snapshot.reviewAuditRecords.records = [];
+      expect(() => store.publishMemberAssessmentSnapshot({ snapshot })).toThrow('MEMBER_ASSESSMENT_REVIEW_AUDIT_INVALID');
+      expect(store.listMemberAssessmentSnapshots(person.id)).toEqual([]);
+      store.close();
+    });
+
   it('分块提取检查点可跨失败重启复用，但签名或授权改变后不得复用', () => {
     const store = makeStore();
     const rootDirectory = store.rootDirectory;
@@ -2612,6 +3300,216 @@ describe('WorkspaceStore', () => {
     expect(checkpoint.checkpoint_json).not.toContain('SYNTHETIC_SENSITIVE_CHUNK');
     expect(checkpoint.checkpoint_json).not.toContain('extractionChunks');
     database.close();
+    store.close();
+  });
+
+  it.each(['proposed', 'discussed', 'planned', 'in_progress', 'paused', 'completed'] as const)(
+    '综合沿用本人已有事项 ID 时重复采纳保留 $0 状态、来源、正文和个人安排', (status) => {
+      const store = makeStore();
+      const person = store.createPerson({ displayName: '合成已有计划成员' });
+      const original = store.createUserAction({ personId: person.id, title: '本人安排的坐位休息',
+        detail: '本人记录：每次先休息，感到不适就停止。', dueDate: '2026-10-20', dueText: '本人原定时间' });
+      const scheduled = store.updateActionSchedule({ personId: person.id, actionId: original.id,
+        dueDate: '2026-10-21', userScheduleText: '晚饭后由家人提醒', expectedRevision: original.userRevision });
+      const existing = store.updateActionStatus({ actionId: original.id, status, expectedRevision: scheduled.userRevision });
+      const snapshot = syntheticAssessmentSnapshot(store, person.id, `existing-${status}`);
+      snapshot.actions[0] = { ...snapshot.actions[0]!, id: existing.id, title: '综合中改写的标题',
+        why: '综合中的新说明', firstStep: '综合中重新写的第一步', timing: '综合中建议的时间' };
+      snapshot.overview.actionIds = [existing.id];
+      const published = store.publishMemberAssessmentSnapshot({ snapshot });
+      const input = { personId: person.id, snapshotId: published.snapshotId, actionId: existing.id };
+      const database = new Database(store.databasePath, { readonly: true });
+      const originalRow = database.prepare('SELECT * FROM action_items WHERE id = ?').get(existing.id);
+      const originalEvents = database.prepare('SELECT * FROM action_events WHERE action_id = ? ORDER BY id').all(existing.id);
+      expect(store.listAdoptedMemberAssessmentActions(person.id)).toEqual([]);
+      expect(store.adoptMemberAssessmentAction(input)).toEqual(existing);
+      expect(store.adoptMemberAssessmentAction(input)).toEqual(existing);
+      expect(store.listActionItems(person.id)).toEqual([existing]);
+      expect(store.listAdoptedMemberAssessmentActions(person.id)).toEqual([]);
+      expect(database.prepare('SELECT * FROM action_items WHERE id = ?').get(existing.id)).toEqual(originalRow);
+      expect(database.prepare('SELECT * FROM action_events WHERE action_id = ? ORDER BY id').all(existing.id)).toEqual(originalEvents);
+      database.close();
+      store.close();
+    }
+  );
+
+  it('综合采纳只按本人成员的精确事项 ID 复用，不按标题匹配或跨成员复用', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成成员甲' });
+    const other = store.createPerson({ displayName: '合成成员乙' });
+    const own = store.createUserAction({ personId: person.id, title: '同名行动', detail: '甲的原安排', dueDate: null, dueText: null });
+    const foreign = store.createUserAction({ personId: other.id, title: '同名行动', detail: '乙的原安排', dueDate: null, dueText: null });
+    const snapshot = syntheticAssessmentSnapshot(store, person.id, 'member-scoped-id');
+    snapshot.actions[0] = { ...snapshot.actions[0]!, id: foreign.id, title: own.title };
+    snapshot.overview.actionIds = [foreign.id];
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const adopted = store.adoptMemberAssessmentAction({ personId: person.id, snapshotId: published.snapshotId, actionId: foreign.id });
+    expect(adopted).toMatchObject({ personId: person.id, origin: 'ai_proposed', title: own.title });
+    expect(adopted.id).not.toBe(own.id);
+    expect(adopted.id).not.toBe(foreign.id);
+    expect(store.listActionItems(person.id)).toHaveLength(2);
+    expect(store.listActionItems(person.id)).toContainEqual(own);
+    expect(store.listActionItems(other.id)).toEqual([foreign]);
+    store.close();
+  });
+
+  it('综合沿用本人已撤回事项 ID 时允许另建采纳项，不复活或覆盖原事项', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成撤回成员' });
+    const original = store.createUserAction({ personId: person.id, title: '本人撤回的计划', detail: '本人原说明',
+      dueDate: '2026-10-20', dueText: '本人原时间' });
+    const dismissed = store.updateActionStatus({ actionId: original.id, status: 'dismissed', expectedRevision: original.userRevision });
+    const snapshot = syntheticAssessmentSnapshot(store, person.id, 'dismissed-existing-id');
+    snapshot.actions[0] = { ...snapshot.actions[0]!, id: original.id };
+    snapshot.overview.actionIds = [original.id];
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const input = { personId: person.id, snapshotId: published.snapshotId, actionId: original.id };
+    const adopted = store.adoptMemberAssessmentAction(input);
+    expect(adopted.id).not.toBe(original.id);
+    expect(adopted.status).toBe('planned');
+    expect(store.listActionItems(person.id)).toContainEqual(dismissed);
+    expect(store.listActionItems(person.id)).toHaveLength(2);
+    expect(store.adoptMemberAssessmentAction(input)).toEqual(adopted);
+    store.close();
+  });
+
+  it('本人已有同 ID 事项仍不能从过期综合或已隔离节点采纳', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成范围门禁成员' });
+    const original = store.createUserAction({ personId: person.id, title: '本人已有事项', detail: '原说明', dueDate: null, dueText: null });
+    const snapshot = syntheticAssessmentSnapshot(store, person.id, 'existing-id-guard');
+    snapshot.actions[0] = { ...snapshot.actions[0]!, id: original.id };
+    snapshot.overview.actionIds = [original.id];
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const input = { personId: person.id, snapshotId: published.snapshotId, actionId: original.id };
+    const database = new Database(store.databasePath);
+    database.prepare(`UPDATE member_assessment_snapshots_v3 SET payload_json = json_set(payload_json, '$.heldTargetIds', json(?)) WHERE id = ?`)
+      .run(JSON.stringify([original.id]), published.snapshotId);
+    expect(() => store.adoptMemberAssessmentAction(input)).toThrow('MEMBER_ASSESSMENT_ACTION_NOT_AVAILABLE');
+    database.close();
+    store.updateClinicalContext(person.id, { synthetic: 'new-context' }, 0);
+    expect(() => store.adoptMemberAssessmentAction(input)).toThrow('MEMBER_ASSESSMENT_ACTION_STALE');
+    expect(store.listActionItems(person.id)).toEqual([original]);
+    store.close();
+  });
+
+  it.each(['valid', 'unreviewed', 'local_only', 'wrong_observation', 'partial_raw', 'no_date', 'forged_quote'] as const)(
+    '经P04核验原句计划%s仍须当前同成员同原件事实及真实日期', (mode) => {
+      const store = makeStore();
+      const rawText = '医生安排：若合成不适持续，四周之后到合成门诊评估。没有新不适时无需自行提前检查。';
+      const { person, snapshot } = documentedPlanFixture(store, { rawText, quote: `合成栏目。${rawText}`,
+        ...(mode === 'no_date' ? { clinicalDate: null } : {}) });
+      const fact = store.listAcceptedObservations(person.id)[0]!;
+      const proposal = snapshot.actions[0]!;
+      proposal.sourceInstructionObservationId = mode === 'wrong_observation' ? 'other-observation' : fact.id;
+      proposal.firstStep = mode === 'partial_raw' ? rawText.split('。')[0]! : rawText;
+      proposal.timing = null; proposal.timingBasis = 'none';
+      snapshot.validationMode = mode === 'local_only' ? 'local_only' : 'local_and_focused_review';
+      snapshot.reviewedTargetIds = mode === 'unreviewed' ? [] : [proposal.id];
+      if (mode === 'forged_quote') snapshot.evidenceCatalog[0]!.quote = `${rawText}伪造的附加安排。`;
+      const published = store.publishMemberAssessmentSnapshot({ snapshot });
+      const adopted = store.adoptMemberAssessmentAction({ personId: person.id, snapshotId: published.snapshotId, actionId: proposal.id });
+      expect(adopted.origin).toBe(mode === 'valid' ? 'clinician_document' : 'ai_proposed');
+      expect(store.listAdoptedMemberAssessmentActions(person.id)[0]!.sourceDate).toBe(mode === 'valid' ? '2026-08-28' : null);
+      expect(proposal.firstStep).toBe(mode === 'partial_raw' ? rawText.split('。')[0]! : rawText);
+      store.close();
+    });
+
+  it('采纳原医嘱保留临床来源与节点引用，重复、完成进度和撤回后重新采纳均正确', () => {
+    const store = makeStore();
+    const { person, snapshot } = documentedPlanFixture(store);
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const input = { personId: person.id, snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id };
+    const action = store.adoptMemberAssessmentAction(input);
+    expect(action).toMatchObject({ origin: 'clinician_document', dueDate: null, dueText: '3个月后', status: 'planned' });
+    expect(action.evidenceLabel).toContain('2026-08-28');
+    expect(action.evidenceLabel).toContain('报告中的医生建议');
+    expect(store.listAdoptedMemberAssessmentActions(person.id)).toMatchObject([{
+      action: { id: action.id, origin: 'clinician_document' }, sourceAssessmentId: published.snapshotId,
+      sourceActionId: snapshot.actions[0]!.id, sourceDate: '2026-08-28', evidenceRefs: snapshot.evidenceCatalog
+    }]);
+    expect(store.adoptMemberAssessmentAction(input).id).toBe(action.id);
+    const completed = store.updateActionStatus({ actionId: action.id, status: 'completed', expectedRevision: action.userRevision });
+    expect(store.adoptMemberAssessmentAction(input)).toMatchObject({ id: action.id, status: 'completed', origin: 'clinician_document' });
+    store.updateActionStatus({ actionId: action.id, status: 'dismissed', expectedRevision: completed.userRevision });
+    const readopted = store.adoptMemberAssessmentAction(input);
+    expect(readopted.id).not.toBe(action.id);
+    expect(readopted.origin).toBe('clinician_document');
+    expect(store.listAdoptedMemberAssessmentActions(person.id)).toHaveLength(2);
+    expect(store.adoptMemberAssessmentAction(input).id).toBe(readopted.id);
+    const database = new Database(store.databasePath, { readonly: true });
+    const stored = database.prepare('SELECT source_ref FROM action_items WHERE id = ?').get(action.id) as { source_ref: string };
+    expect(JSON.parse(stored.source_ref.slice('assessment-v3:'.length))).toMatchObject({
+      snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id,
+      sourceDate: '2026-08-28', evidenceRefs: snapshot.evidenceCatalog
+    });
+    database.close();
+    store.close();
+  });
+
+  it.each([
+    { label: '没有临床日期', options: { clinicalDate: null } },
+    { label: '只有普通数值', options: { quote: '2026-08-28 TSH 2.1 mIU/L，无需额外安排。' } },
+    { label: '引用中伪造医生安排', options: { quote: '2026-08-28 TSH 2.1 mIU/L。',
+      evidenceQuote: '2026-08-28 医生建议：3个月后复查甲状腺功能。' } }
+  ])('$label 不能仅凭 documented_plan 枚举升级医生来源', ({ options }) => {
+    const store = makeStore();
+    const { person, snapshot } = documentedPlanFixture(store, options);
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const action = store.adoptMemberAssessmentAction({ personId: person.id,
+      snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id });
+    expect(action.origin).toBe('ai_proposed');
+    expect(action.evidenceLabel).not.toContain('报告中的医生建议');
+    expect(store.listAdoptedMemberAssessmentActions(person.id)[0]!.sourceDate).toBeNull();
+    expect(store.listAdoptedMemberAssessmentActions(person.id)[0]!.evidenceRefs).toEqual(snapshot.evidenceCatalog);
+    store.close();
+  });
+
+  it.each([{ value: '2026-08', precision: 'month' as const }, { value: '2026', precision: 'year' as const }])(
+    '原医嘱的 $precision 日期精度保持不变，不由采纳日期补齐或重新起算', ({ value, precision }) => {
+      const store = makeStore();
+      const { person, snapshot } = documentedPlanFixture(store, { clinicalDate: null,
+        quote: `${value} 医生建议：3个月后复查甲状腺功能。`, metadataDate: value, metadataPrecision: precision });
+      const published = store.publishMemberAssessmentSnapshot({ snapshot });
+      const action = store.adoptMemberAssessmentAction({ personId: person.id,
+        snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id });
+      expect(action).toMatchObject({ origin: 'clinician_document', dueDate: null, dueText: '3个月后' });
+      expect(store.listAdoptedMemberAssessmentActions(person.id)[0]!.sourceDate).toBe(value);
+      expect(action.evidenceLabel).toContain(value);
+      store.close();
+    }
+  );
+
+  it('旧采纳 JSON 没有日期或完整引用时仍可读取与去重，不会改写其来源', () => {
+    const store = makeStore();
+    const person = store.createPerson({ displayName: '合成旧行动成员', relation: '本人' });
+    const snapshot = syntheticAssessmentSnapshot(store, person.id, 'legacy-action');
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const input = { personId: person.id, snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id };
+    const action = store.adoptMemberAssessmentAction(input);
+    const database = new Database(store.databasePath);
+    database.prepare('UPDATE action_items SET source_ref = ? WHERE id = ?').run(`assessment-v3:${JSON.stringify({
+      snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id, dedupeKey: snapshot.actions[0]!.dedupeKey
+    })}`, action.id);
+    database.close();
+    expect(store.listAdoptedMemberAssessmentActions(person.id)).toMatchObject([{
+      action: { id: action.id, origin: 'ai_proposed' }, evidenceRefs: [], sourceDate: null
+    }]);
+    expect(store.adoptMemberAssessmentAction(input).id).toBe(action.id);
+    store.close();
+  });
+
+  it('删除报告也会清除以 clinician_document 采纳的 V3 行动与完整来源', () => {
+    const store = makeStore();
+    const { person, document, snapshot } = documentedPlanFixture(store);
+    const published = store.publishMemberAssessmentSnapshot({ snapshot });
+    const action = store.adoptMemberAssessmentAction({ personId: person.id,
+      snapshotId: published.snapshotId, actionId: snapshot.actions[0]!.id });
+    expect(action.origin).toBe('clinician_document');
+    store.deleteDocument({ documentId: document.documentId, retainedByRecoveryPoint: false });
+    expect(store.listAdoptedMemberAssessmentActions(person.id)).toEqual([]);
+    expect(store.listActionItems(person.id)).toEqual([]);
+    expect(store.integrityCheck()).toBe('ok');
     store.close();
   });
 
@@ -3418,7 +4316,7 @@ describe('WorkspaceStore', () => {
     store.close();
   });
 
-  it('已提交报告补修拒绝未知值、无接纳决定与冲突覆盖，且整笔事务回滚', () => {
+  it('已提交报告拒绝无接纳决定，内容疑点局部保留且独立来源可增量保存', () => {
     const store = makeStore();
     const person = store.createPerson({ displayName: '合成成员' });
     const source = store.putSourceObject({ bytes: Buffer.from('甲 5.0'), mediaType: 'text/plain', displayName: '冲突报告.txt' });
@@ -3466,17 +4364,20 @@ describe('WorkspaceStore', () => {
       .toThrow('COMMITTED_FACT_EVIDENCE_INVALID');
     expect(() => store.appendCommittedFacts({ ...input, observations: [{ ...first, acceptanceId: 'missing-acceptance' }] }))
       .toThrow('COMMITTED_FACT_NOT_ACCEPTED');
-    expect(() => store.appendCommittedFacts({ ...input, observations: [{ ...first, rawText: '6.0', decimalValue: '6.0' }] }))
-      .toThrow('COMMITTED_FACT_CONFLICT');
-    expect(() => store.appendCommittedFacts({ ...input, observations: [{
+    const held = store.appendCommittedFacts({ ...input, observations: [{ ...first, rawText: '6.0', decimalValue: '6.0' }] });
+    expect(held).toMatchObject({ appendedCount: 0, updatedCount: 0, heldCount: 1, reviewResolved: false });
+    expect(store.listAcceptedObservations(person.id)[0]?.rawText).toBe('5.0');
+    expect(store.appendCommittedFacts({ ...input, reviewUpdate: { ...input.reviewUpdate,
+      remainingCandidates: held.heldCandidates, remainingReasonCodes: held.heldReasonCodes,
+      remainingEvidenceRefs: ['conflict-span'] }, observations: [{
       ...first, sourceSpanId: 'conflict-span-independent',
       evidence: [{ sourceSpanId: 'conflict-span-independent', quote: '甲 5.0' }]
-    }] })).toThrow('COMMITTED_FACT_AMBIGUOUS_SOURCE');
+    }] })).toMatchObject({ appendedCount: 1, heldCount: 0, reviewResolved: false });
     expect(() => store.appendCommittedFacts({ ...input, expectedRevision: 0, observations: [] }))
       .toThrow(RevisionConflictError);
-    expect(store.listAcceptedObservations(person.id)).toHaveLength(1);
+    expect(store.listAcceptedObservations(person.id)).toHaveLength(2);
     expect(store.listOpenExtractionReviewIssues()).toHaveLength(1);
-    expect(store.getFactRevision(person.id)).toBe(1);
+    expect(store.getFactRevision(person.id)).toBe(2);
     expect(store.integrityCheck()).toBe('ok');
     store.close();
   });
